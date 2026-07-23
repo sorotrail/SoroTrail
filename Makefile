@@ -2,7 +2,7 @@ BINARY := bin/sorotrail
 MIGRATIONS := internal/store/migrations
 DATABASE_URL ?= postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
 
-.PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down clean
+.PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down simtest simtest-long clean
 
 build:
 	go build -o $(BINARY) ./cmd/sorotrail
@@ -19,6 +19,15 @@ test:
 # internal/replay share one database and truncate the same tables.
 test-db:
 	TEST_DATABASE_URL=$(DATABASE_URL) go test -p 1 ./...
+
+# Run the deterministic simulation test suite (mock store, fast).
+simtest:
+	go test ./internal/simtest/... -count=1 -timeout 120s
+
+# Run the simulation test suite with randomized mode extended budget.
+# Uses a higher iteration count and prints seeds for reproducibility.
+simtest-long:
+	go test ./internal/simtest/... -count=1 -timeout 600s -v -run "TestAllCuratedScenarios|TestRandomizedMode"
 
 lint:
 	golangci-lint run

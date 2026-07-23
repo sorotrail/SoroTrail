@@ -15,6 +15,38 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
 
+// Clock abstracts time operations so tests and simulations can supply a
+// deterministic virtual clock instead of wall time.
+type Clock interface {
+	// Now returns the current time.
+	Now() time.Time
+	// SleepCtx sleeps for d or until ctx is done; it reports whether the
+	// full sleep completed. This is the only sleep seam in the ingester.
+	SleepCtx(ctx context.Context, d time.Duration) bool
+}
+
+// RealClock is the wall-clock implementation of Clock.
+type RealClock struct{}
+
+func (RealClock) Now() time.Time { return time.Now() }
+func (RealClock) SleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// JitterFunc returns a random duration in [0, max). The default uses
+// math/rand/v2; simulations inject a seeded generator for determinism.
+type JitterFunc func(max time.Duration) time.Duration
+
+// RealJitter is the wall-clock jitter function.
+func RealJitter(max time.Duration) time.Duration { return rand.N(max) }
+
 // Options configure an Ingester.
 type Options struct {
 	// PollInterval is how long to sleep once caught up. Default 5s.
@@ -32,6 +64,10 @@ type Options struct {
 	// list needs more than one getEvents request (see buildFilterBatches).
 	// Default 1000 ledgers.
 	SweepWindow uint32
+	// Clock is the time source; defaults to RealClock.
+	Clock Clock
+	// Jitter is the backoff randomizer; defaults to RealJitter.
+	Jitter JitterFunc
 }
 
 func (o *Options) applyDefaults() {
@@ -49,6 +85,12 @@ func (o *Options) applyDefaults() {
 	}
 	if o.SweepWindow == 0 {
 		o.SweepWindow = 1000
+	}
+	if o.Clock == nil {
+		o.Clock = RealClock{}
+	}
+	if o.Jitter == nil {
+		o.Jitter = RealJitter
 	}
 }
 
@@ -80,9 +122,9 @@ func (ing *Ingester) Run(ctx context.Context) error {
 		case err != nil:
 			// Jittered exponential backoff so restarts don't thundering-herd
 			// a shared endpoint.
-			sleep := backoff/2 + rand.N(backoff/2)
+			sleep := backoff/2 + ing.opts.Jitter(backoff/2)
 			ing.log.Error("ingestion pass failed", "error", err, "retry_in", sleep)
-			if !sleepCtx(ctx, sleep) {
+			if !ing.opts.Clock.SleepCtx(ctx, sleep) {
 				return ctx.Err()
 			}
 			if backoff *= 2; backoff > ing.opts.MaxBackoff {
@@ -91,7 +133,7 @@ func (ing *Ingester) Run(ctx context.Context) error {
 		default:
 			backoff = time.Second
 			if caughtUp {
-				if !sleepCtx(ctx, ing.opts.PollInterval) {
+				if !ing.opts.Clock.SleepCtx(ctx, ing.opts.PollInterval) {
 					return ctx.Err()
 				}
 			}
@@ -464,15 +506,8 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 	}, nil
 }
 
-// sleepCtx sleeps for d or until ctx is done; it reports whether the full
-// sleep completed.
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
+// RunOnceForTest exposes runOnce for deterministic simulation harnesses.
+// It is NOT a public API — only the simtest package should call it.
+func (ing *Ingester) RunOnceForTest(ctx context.Context) (caughtUp bool, err error) {
+	return ing.runOnce(ctx)
 }
