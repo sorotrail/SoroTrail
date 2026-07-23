@@ -37,6 +37,8 @@ type EventFilter struct {
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int
+	// Order is "asc" or "desc", defaults to "asc"
+	Order string
 }
 
 // IngestionState tracks how far ingestion has progressed.
@@ -136,6 +138,7 @@ type Store interface {
 	GetEvent(ctx context.Context, id string) (Event, error)
 	// QueryEvents returns a page of events in ascending ID order, plus a
 	// cursor for the next page ("" when there are no more results).
+	// Default order is ascending (oldest-first) for backward compatibility.
 	QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error)
 	// LedgerRangeCensus returns one LedgerCensus row per ledger in the
 	// inclusive [fromLedger, toLedger] range that contains at least one

@@ -226,8 +226,19 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if f.ToLedger > 0 {
 		where = append(where, "ledger <= "+arg(f.ToLedger))
 	}
+
+	// if f.Cursor != "" {
+	// 	where = append(where, "id > "+arg(f.Cursor))
+	// }
+	orderDir := "ASC"
+	cursorOp := ">"
+	if f.Order == "desc" {
+		orderDir = "DESC"
+		cursorOp = "<"
+	}
+
 	if f.Cursor != "" {
-		where = append(where, "id > "+arg(f.Cursor))
+		where = append(where, "id "+cursorOp+" "+arg(f.Cursor))
 	}
 
 	query := `SELECT ` + eventColumns + ` FROM events`
@@ -235,7 +246,8 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
 	// Fetch one extra row to know whether a next page exists.
-	query += " ORDER BY id ASC LIMIT " + arg(limit+1)
+	// query += " ORDER BY id ASC LIMIT " + arg(limit+1)
+	query += " ORDER BY id " + orderDir + " LIMIT " + arg(limit+1)
 
 	rows, err := p.pool.Query(ctx, query, args...)
 	if err != nil {

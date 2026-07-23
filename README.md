@@ -104,7 +104,7 @@ curl -s localhost:8080/health
 
 ### `GET /events`
 
-Lists stored events in ascending event-ID (chronological) order.
+Lists stored events in ascending (oldest-first) or descending (newest-first) order. Defaults to ascending.
 
 Query parameters (all optional, combinable):
 
@@ -117,6 +117,7 @@ Query parameters (all optional, combinable):
 | `to_ledger` | `260000` | Inclusive upper ledger bound. |
 | `limit` | `50` | Page size, 1–200 (default 50). |
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
+| `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
 
 ```sh
 curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic={"symbol":"transfer"}&limit=2'

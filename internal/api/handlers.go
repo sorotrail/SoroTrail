@@ -159,6 +159,15 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		}
 	}
 
+	// order controls sort direction for paginated results.
+	order := q.Get("order")
+	switch order {
+	case "", "asc", "desc":
+		f.Order = order
+	default:
+		return f, fmt.Errorf("invalid order %q (want asc or desc)", order)
+	}
+
 	var err error
 	if f.FromLedger, err = parseLedgerParam(q.Get("from_ledger"), "from_ledger"); err != nil {
 		return f, err

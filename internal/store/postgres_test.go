@@ -152,6 +152,28 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			assert.Less(t, all[i-1].ID, all[i].ID, "ascending ID order across pages")
 		}
 	})
+
+	t.Run("keyset pagination desc returns newest-first", func(t *testing.T) {
+		var all []Event
+		cursor := ""
+		for {
+			page, next, err := st.QueryEvents(ctx, EventFilter{
+				Limit:  3,
+				Cursor: cursor,
+				Order:  "desc",
+			})
+			require.NoError(t, err)
+			all = append(all, page...)
+			if next == "" {
+				break
+			}
+			cursor = next
+		}
+		require.Len(t, all, 10)
+		for i := 1; i < len(all); i++ {
+			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
+		}
+	})
 }
 
 func TestIngestionStateRoundTrip(t *testing.T) {
