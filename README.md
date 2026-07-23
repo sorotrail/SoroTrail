@@ -138,6 +138,10 @@ Query parameters (all optional, combinable):
 | `contract_id` | `CDLZ...CYSC` | Only events from this contract. |
 | `type` | `contract` | `contract` \| `system` \| `diagnostic`. |
 | `topic` | `{"symbol":"transfer"}` | Exact match against any topic position. A bare word is treated as a JSON string. |
+| `topic0` | `{"symbol":"transfer"}` | Exact match against topic position 0. |
+| `topic1` | `{"address":"G..."}` | Exact match against topic position 1. |
+| `topic2` | `{"address":"G..."}` | Exact match against topic position 2. |
+| `topic3` | `{"u64":7}` | Exact match against topic position 3. |
 | `from_ledger` | `250000` | Inclusive lower ledger bound. |
 | `to_ledger` | `260000` | Inclusive upper ledger bound. |
 | `from_time` | `2026-07-21T00:00:00Z` | Inclusive lower `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
@@ -146,8 +150,14 @@ Query parameters (all optional, combinable):
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
 | `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
 
+Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
+
 ```sh
 curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic={"symbol":"transfer"}&limit=2'
+```
+
+```sh
+curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"GABC..."}&topic2={"address":"GDEF..."}'
 ```
 
 ```json

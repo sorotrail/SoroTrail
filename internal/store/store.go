@@ -75,7 +75,13 @@ type EventFilter struct {
 	Type       string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
-	Topic      json.RawMessage
+	Topic json.RawMessage
+	// Topic0-Topic3 match the exact JSON value at that specific topic array
+	// position. Unspecified positions are wildcards.
+	Topic0     json.RawMessage
+	Topic1     json.RawMessage
+	Topic2     json.RawMessage
+	Topic3     json.RawMessage
 	FromLedger int64     // inclusive
 	ToLedger   int64     // inclusive
 	FromTime   time.Time // inclusive, zero = no constraint

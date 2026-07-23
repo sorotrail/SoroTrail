@@ -136,6 +136,23 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		assert.Len(t, got, 1)
 	})
 
+	t.Run("by topic0 and topic1 positionally", func(t *testing.T) {
+		e1 := testEvent(eventID(100), 200, contractA)
+		e1.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GABC"},{"address":"GDEF"}]`)
+		e2 := testEvent(eventID(101), 201, contractA)
+		e2.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GDEF"},{"address":"GABC"}]`)
+		_, err := st.UpsertEvents(ctx, []Event{e1, e2})
+		require.NoError(t, err)
+
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			Topic0: json.RawMessage(`{"symbol":"transfer"}`),
+			Topic1: json.RawMessage(`{"address":"GABC"}`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+		assert.Equal(t, e1.ID, got[0].ID)
+	})
+
 	t.Run("keyset pagination walks all rows in order", func(t *testing.T) {
 		var all []Event
 		cursor := ""
