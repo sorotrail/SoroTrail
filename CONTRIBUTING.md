@@ -11,7 +11,9 @@ seams — most features should slot in behind an existing interface.
 3. `make test` for the unit suite; `make test-db` runs everything including
    the Postgres integration tests (they use `TEST_DATABASE_URL` and skip
    themselves when it's unset).
-4. `make lint` (install [golangci-lint](https://golangci-lint.run/) locally).
+4. `make cover` runs the test suite with coverage and prints a per-package
+   summary; `make cover-html` opens the HTML report in your browser.
+5. `make lint` (install [golangci-lint](https://golangci-lint.run/) locally).
 
 The integration tests truncate the tables they use — point
 `TEST_DATABASE_URL` at a throwaway database, not one with data you care
