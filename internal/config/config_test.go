@@ -111,3 +111,35 @@ func TestValidContractID(t *testing.T) {
 	assert.False(t, ValidContractID(validContract[:55]), "too short")
 	assert.False(t, ValidContractID(validContract[:55]+"a"), "lowercase is not base32")
 }
+
+func TestLoggableFields(t *testing.T) {
+	c := Config{
+		RPCURL:           "https://testnet.local",
+		DatabaseURL:      "postgres://user:secretpassword@localhost:5432/db_name",
+		PollInterval:     5 * time.Second,
+		HTTPAddr:         ":8080",
+		WatchedContracts: []string{"C1", "C2"},
+		StartLedger:      100,
+		RetentionLedgers: 200,
+		LogLevel:         "info",
+		AuditEnabled:     true,
+	}
+
+	fields := c.LoggableFields()
+	
+	// Convert slice to map for easier assertions
+	m := make(map[string]any)
+	for i := 0; i < len(fields); i += 2 {
+		m[fields[i].(string)] = fields[i+1]
+	}
+
+	assert.Equal(t, "postgres://localhost:5432/db_name", m["database_url"], "credentials should be redacted")
+	assert.Equal(t, "https://testnet.local", m["rpc_url"])
+	assert.Equal(t, 5*time.Second, m["poll_interval"])
+	assert.Equal(t, ":8080", m["http_addr"])
+	assert.Equal(t, 2, m["watched_contracts"], "should log count of watched contracts")
+	assert.Equal(t, uint32(100), m["start_ledger"])
+	assert.Equal(t, uint32(200), m["retention_ledgers"])
+	assert.Equal(t, "info", m["log_level"])
+	assert.Equal(t, true, m["audit_enabled"])
+}

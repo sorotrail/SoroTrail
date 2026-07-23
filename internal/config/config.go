@@ -121,3 +121,25 @@ func cleanContractList(in []string) []string {
 	}
 	return out
 }
+
+// LoggableFields returns the configuration as a map of fields suitable for logging,
+// with credentials redacted (e.g., from DATABASE_URL).
+func (c Config) LoggableFields() []any {
+	dbURL := c.DatabaseURL
+	if u, err := url.Parse(c.DatabaseURL); err == nil {
+		u.User = nil
+		dbURL = u.String()
+	}
+
+	return []any{
+		"rpc_url", c.RPCURL,
+		"database_url", dbURL,
+		"poll_interval", c.PollInterval,
+		"http_addr", c.HTTPAddr,
+		"watched_contracts", len(c.WatchedContracts),
+		"start_ledger", c.StartLedger,
+		"retention_ledgers", c.RetentionLedgers,
+		"log_level", c.LogLevel,
+		"audit_enabled", c.AuditEnabled,
+	}
+}
