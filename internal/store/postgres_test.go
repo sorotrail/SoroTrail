@@ -33,7 +33,7 @@ func testStore(t *testing.T) *Postgres {
 	t.Cleanup(pool.Close)
 
 	_, err = pool.Exec(context.Background(),
-		`TRUNCATE events, ingestion_state, watched_contracts`)
+		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
 	require.NoError(t, err)
 	return NewPostgres(pool)
 }

@@ -84,6 +84,27 @@ All configuration comes from environment variables (see `.env.example`):
   its decoding is used verbatim; otherwise the base64 XDR is decoded locally
   into shapes like `{"symbol":"transfer"}`, `{"u64":42}`, `{"i128":"-1000"}`,
   `{"address":"C..."}`.
+- The raw base64 XDR is stored alongside the decoded JSON, so an improved
+  decoder can be applied to already-indexed events — see
+  [decoder replay](#decoder-replay).
+
+## Decoder replay
+
+Decoders improve over time. `sorotrail replay` re-runs the current decoder
+over stored raw XDR and rewrites the decoded columns, so improvements apply
+to everything already indexed instead of only to future events.
+
+```sh
+sorotrail replay --from-ledger 250000 --dry-run   # see what would change
+sorotrail replay --from-ledger 250000             # rewrite it
+```
+
+It is batched, resumable (Ctrl-C and re-run picks up where it stopped),
+idempotent, and safe to run against a live database while ingestion
+continues; a Postgres advisory lock prevents two replays at once.
+
+See [docs/replay.md](docs/replay.md) for flags, the summary output, the
+advisory-lock strategy, and the derivation order for dependent tables.
 
 ## API reference
 

@@ -15,8 +15,10 @@ test:
 
 # Run the full test suite including Postgres integration tests.
 # Requires a running Postgres, e.g. `make docker-up` first.
+# -p 1 serializes packages: the integration tests in internal/store and
+# internal/replay share one database and truncate the same tables.
 test-db:
-	TEST_DATABASE_URL=$(DATABASE_URL) go test ./...
+	TEST_DATABASE_URL=$(DATABASE_URL) go test -p 1 ./...
 
 lint:
 	golangci-lint run

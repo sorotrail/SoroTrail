@@ -1,5 +1,9 @@
 // Command sorotrail runs the SoroTrail indexer: a Stellar RPC event ingester
 // and a query API in one process.
+//
+// With no arguments it runs the indexer. Subcommands cover maintenance:
+//
+//	sorotrail replay --from-ledger N [--to-ledger M]
 package main
 
 import (
@@ -26,10 +30,44 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	err := dispatch(os.Args[1:])
+	switch {
+	case err == nil:
+	case errors.Is(err, errInterrupted):
+		os.Exit(2)
+	default:
 		fmt.Fprintln(os.Stderr, "sorotrail:", err)
 		os.Exit(1)
 	}
+}
+
+// dispatch routes to a subcommand, defaulting to the indexer so existing
+// deployments (and the Dockerfile entrypoint) keep working unchanged.
+func dispatch(args []string) error {
+	if len(args) == 0 {
+		return run()
+	}
+	switch args[0] {
+	case "replay":
+		return runReplay(args[1:])
+	case "help", "-h", "--help":
+		usage()
+		return nil
+	default:
+		usage()
+		return fmt.Errorf("unknown subcommand %q", args[0])
+	}
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `usage: sorotrail [subcommand]
+
+With no subcommand, runs the indexer (ingester + HTTP API).
+
+subcommands:
+  replay    re-decode stored events with the current decoder
+            (sorotrail replay --help)
+`)
 }
 
 func run() error {
