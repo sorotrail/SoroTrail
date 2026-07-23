@@ -34,7 +34,7 @@ func testStore(t *testing.T) *Postgres {
 	t.Cleanup(pool.Close)
 
 	_, err = pool.Exec(context.Background(),
-		`TRUNCATE events, ingestion_state, watched_contracts`)
+		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
 	require.NoError(t, err)
 	return NewPostgres(pool)
 }
@@ -151,6 +151,28 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		require.Len(t, all, 10)
 		for i := 1; i < len(all); i++ {
 			assert.Less(t, all[i-1].ID, all[i].ID, "ascending ID order across pages")
+		}
+	})
+
+	t.Run("keyset pagination desc returns newest-first", func(t *testing.T) {
+		var all []Event
+		cursor := ""
+		for {
+			page, next, err := st.QueryEvents(ctx, EventFilter{
+				Limit:  3,
+				Cursor: cursor,
+				Order:  "desc",
+			})
+			require.NoError(t, err)
+			all = append(all, page...)
+			if next == "" {
+				break
+			}
+			cursor = next
+		}
+		require.Len(t, all, 10)
+		for i := 1; i < len(all); i++ {
+			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
 		}
 	})
 }

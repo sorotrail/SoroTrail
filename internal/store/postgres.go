@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -36,6 +37,40 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 	if len(events) == 0 {
 		return 0, nil
 	}
+	rows, err := p.upsertEvents(ctx, events, false)
+	if err != nil {
+		return 0, err
+	}
+	return rows, nil
+}
+
+// insertEventsBatch builds the event INSERT used by every write path, so
+// the column list can't drift between them — notably raw_topic_xdr /
+// raw_value_xdr, which `sorotrail replay` depends on: a path that forgot
+// them would quietly make its rows unreplayable.
+//
+// onUpdate=false → ON CONFLICT DO NOTHING (idempotent ingest);
+// onUpdate=true → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
+// topic/value drift on the RPC side).
+func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
+	conflict := "ON CONFLICT (id) DO NOTHING"
+	if onUpdate {
+		conflict = `ON CONFLICT (id) DO UPDATE SET
+			contract_id = EXCLUDED.contract_id,
+			ledger = EXCLUDED.ledger,
+			type = EXCLUDED.type,
+			tx_hash = EXCLUDED.tx_hash,
+			tx_index = EXCLUDED.tx_index,
+			op_index = EXCLUDED.op_index,
+			in_successful_call = EXCLUDED.in_successful_call,
+			topics = EXCLUDED.topics,
+			value = EXCLUDED.value,
+			-- Refresh the raw XDR, but never blank it out: a repair fetch
+			-- that came back as JSON (xdrFormat "json") carries no XDR and
+			-- must not destroy what an earlier ingest managed to keep.
+			raw_topic_xdr = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+	}
 	batch := &pgx.Batch{}
 	for _, e := range events {
 		batch.Queue(`
@@ -46,24 +81,206 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 			ON CONFLICT (id) DO NOTHING`,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
+				 in_successful_call, topics, value, raw_topic_xdr, raw_value_xdr)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) `+conflict,
+			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value,
+			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
 	}
-	results := p.pool.SendBatch(ctx, batch)
+	return batch
+}
+
+// upsertEvents is shared by UpsertEvents (idempotent insert) and
+// ReplaceEventsInRange (insert-or-update, so topic/value drift on the RPC
+// side is corrected). onUpdate=false → ON CONFLICT DO NOTHING;
+// onUpdate=true → ON CONFLICT DO UPDATE SET ….
+func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bool) (int64, error) {
+	if len(events) == 0 {
+		return 0, nil
+	}
+	results := p.pool.SendBatch(ctx, insertEventsBatch(events, onUpdate))
 	defer results.Close()
 
-	var inserted int64
+	var affected int64
 	for range events {
 		tag, err := results.Exec()
 		if err != nil {
-			return inserted, fmt.Errorf("upserting events: %w", err)
+			return affected, fmt.Errorf("upserting events: %w", err)
 		}
-		inserted += tag.RowsAffected()
+		affected += tag.RowsAffected()
 	}
-	return inserted, nil
+	return affected, nil
+}
+
+// ReplaceEventsInRange makes [fromLedger, toLedger] match `events` exactly:
+// orphans are deleted and same-ID rows are updated (correcting topic/value
+// drift). The auditor calls this for targeted repair; ingest never does
+// because UpsertEvents is idempotent and therefore cheaper.
+//
+// Raw XDR is carried across the replace: incoming XDR wins, but an event
+// that arrives without any keeps whatever was already stored, so repairing
+// a range never makes its rows unreplayable.
+func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// The delete below drops the rows the ON CONFLICT clause would otherwise
+	// have preserved raw XDR from, so snapshot it first. A repair fetch that
+	// came back without XDR must not cost surviving events their
+	// replayability (see internal/replay).
+	kept, err := rawXDRInRange(ctx, tx, fromLedger, toLedger)
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM events WHERE ledger BETWEEN $1 AND $2`, fromLedger, toLedger); err != nil {
+		return fmt.Errorf("deleting events in ledger range [%d,%d]: %w", fromLedger, toLedger, err)
+	}
+
+	if len(events) > 0 {
+		events = restoreRawXDR(events, kept)
+		// Same INSERT as upsertEvents with onUpdate=true, but routed through
+		// the in-flight transaction so the delete + insert are atomic.
+		results := tx.SendBatch(ctx, insertEventsBatch(events, true))
+		for range events {
+			if _, err := results.Exec(); err != nil {
+				results.Close()
+				return fmt.Errorf("inserting repaired events: %w", err)
+			}
+		}
+		if err := results.Close(); err != nil {
+			return fmt.Errorf("closing batch in repair tx: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing repair tx: %w", err)
+	}
+	return nil
+}
+
+// rawXDR is the replayable payload kept for one event.
+type rawXDR struct {
+	topics []string
+	value  string
+}
+
+// rawXDRInRange reads the raw XDR currently stored for a ledger range,
+// keyed by event ID, so a delete-and-reinsert repair can put it back.
+func rawXDRInRange(ctx context.Context, tx pgx.Tx, fromLedger, toLedger int64) (map[string]rawXDR, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT id, raw_topic_xdr, raw_value_xdr
+		FROM events
+		WHERE ledger BETWEEN $1 AND $2
+		  AND (raw_topic_xdr IS NOT NULL OR raw_value_xdr IS NOT NULL)`,
+		fromLedger, toLedger)
+	if err != nil {
+		return nil, fmt.Errorf("reading raw XDR in ledger range [%d,%d]: %w", fromLedger, toLedger, err)
+	}
+	defer rows.Close()
+
+	kept := map[string]rawXDR{}
+	for rows.Next() {
+		var (
+			id     string
+			topics []string
+			value  *string
+		)
+		if err := rows.Scan(&id, &topics, &value); err != nil {
+			return nil, fmt.Errorf("scanning raw XDR in ledger range: %w", err)
+		}
+		r := rawXDR{topics: topics}
+		if value != nil {
+			r.value = *value
+		}
+		kept[id] = r
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading raw XDR in ledger range: %w", err)
+	}
+	return kept, nil
+}
+
+// restoreRawXDR fills in raw XDR the incoming events lack from what was
+// already stored. Incoming XDR always wins — this only fills gaps, so a
+// repair can add replayability but never remove it.
+func restoreRawXDR(events []Event, kept map[string]rawXDR) []Event {
+	if len(kept) == 0 {
+		return events
+	}
+	out := make([]Event, len(events))
+	copy(out, events)
+	for i := range out {
+		prev, ok := kept[out[i].ID]
+		if !ok {
+			continue
+		}
+		if len(out[i].RawTopicXDR) == 0 {
+			out[i].RawTopicXDR = prev.topics
+		}
+		if out[i].RawValueXDR == "" {
+			out[i].RawValueXDR = prev.value
+		}
+	}
+	return out
+}
+
+// LedgerRangeCensus returns one row per ledger that holds at least one
+// event in the inclusive [fromLedger, toLedger] range. idsOnly=false →
+// counts only (cheap path for the common "all good" sweep); idsOnly=true
+// → per-ledger sorted ID list (used to diff a ledger whose count
+// disagrees with the RPC).
+func (p *Postgres) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT ledger, count(*)::int, array_agg(id ORDER BY id)
+		FROM events
+		WHERE ledger BETWEEN $1 AND $2
+		GROUP BY ledger
+		ORDER BY ledger`,
+		fromLedger, toLedger,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("ledger range census [%d,%d]: %w", fromLedger, toLedger, err)
+	}
+	defer rows.Close()
+
+	var out []LedgerCensus
+	for rows.Next() {
+		var c LedgerCensus
+		var ids []string
+		if err := rows.Scan(&c.Ledger, &c.Count, &ids); err != nil {
+			return nil, err
+		}
+		if idsOnly {
+			c.IDs = ids
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 const eventColumns = `id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-	in_successful_call, topics, value, created_at`
+	in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr`
+
+// nullableText and nullableTextArray store empty raw-XDR values as SQL NULL
+// so "no raw XDR" is one representation, not two.
+func nullableText(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+func nullableTextArray(s []string) any {
+	if len(s) == 0 {
+		return nil
+	}
+	return s
+}
 
 func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
 	row := p.pool.QueryRow(ctx, `SELECT `+eventColumns+` FROM events WHERE id = $1`, id)
@@ -113,8 +330,19 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if !f.ToTime.IsZero() {
 		where = append(where, "created_at <= "+arg(f.ToTime))
 	}
+
+	// if f.Cursor != "" {
+	// 	where = append(where, "id > "+arg(f.Cursor))
+	// }
+	orderDir := "ASC"
+	cursorOp := ">"
+	if f.Order == "desc" {
+		orderDir = "DESC"
+		cursorOp = "<"
+	}
+
 	if f.Cursor != "" {
-		where = append(where, "id > "+arg(f.Cursor))
+		where = append(where, "id "+cursorOp+" "+arg(f.Cursor))
 	}
 
 	query := `SELECT ` + eventColumns + ` FROM events`
@@ -122,7 +350,8 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
 	// Fetch one extra row to know whether a next page exists.
-	query += " ORDER BY id ASC LIMIT " + arg(limit+1)
+	// query += " ORDER BY id ASC LIMIT " + arg(limit+1)
+	query += " ORDER BY id " + orderDir + " LIMIT " + arg(limit+1)
 
 	rows, err := p.pool.Query(ctx, query, args...)
 	if err != nil {
@@ -180,6 +409,59 @@ func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) err
 	return nil
 }
 
+func (p *Postgres) GetAuditState(ctx context.Context) (AuditState, error) {
+	var s AuditState
+	err := p.pool.QueryRow(ctx,
+		`SELECT verified_through_ledger, updated_at FROM audit_state WHERE id = 1`,
+	).Scan(&s.VerifiedThroughLedger, &s.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AuditState{}, ErrNotFound
+	}
+	if err != nil {
+		return AuditState{}, fmt.Errorf("loading audit state: %w", err)
+	}
+	return s, nil
+}
+
+func (p *Postgres) SaveAuditState(ctx context.Context, s AuditState) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO audit_state (id, verified_through_ledger, updated_at)
+		VALUES (1, $1, now())
+		ON CONFLICT (id) DO UPDATE SET
+			verified_through_ledger = EXCLUDED.verified_through_ledger,
+			updated_at              = now()`,
+		s.VerifiedThroughLedger,
+	)
+	if err != nil {
+		return fmt.Errorf("saving audit state: %w", err)
+	}
+	return nil
+}
+
+func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (AuditState, error) {
+	// Single round trip — the WHERE on the singleton row makes the
+	// upsert no-op when the candidate is not greater than what's stored.
+	row := p.pool.QueryRow(ctx, `
+		INSERT INTO audit_state (id, verified_through_ledger, updated_at)
+		VALUES (1, $1, now())
+		ON CONFLICT (id) DO UPDATE SET
+			verified_through_ledger = EXCLUDED.verified_through_ledger,
+			updated_at              = now()
+		WHERE EXCLUDED.verified_through_ledger > audit_state.verified_through_ledger
+		RETURNING verified_through_ledger, updated_at`,
+		ledger,
+	)
+	var s AuditState
+	if err := row.Scan(&s.VerifiedThroughLedger, &s.UpdatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Candidate was not greater — return the existing state.
+			return p.GetAuditState(ctx)
+		}
+		return AuditState{}, fmt.Errorf("saving audit state: %w", err)
+	}
+	return s, nil
+}
+
 func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]string, error) {
 	rows, err := p.pool.Query(ctx,
 		`SELECT contract_id FROM watched_contracts ORDER BY contract_id`)
@@ -218,9 +500,10 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 		SELECT
 			(SELECT count(*) FROM events),
 			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
+			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
 			(SELECT count(DISTINCT contract_id) FROM events),
 			(SELECT count(*) FROM watched_contracts)`,
-	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.ContractCount, &s.WatchedContracts)
+	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.ContractCount, &s.WatchedContracts)
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
 	}
@@ -231,12 +514,100 @@ func (p *Postgres) Ping(ctx context.Context) error {
 	return p.pool.Ping(ctx)
 }
 
+func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
+	err := p.pool.QueryRow(ctx, `
+		INSERT INTO audit_findings
+			(from_ledger, to_ledger, expected_count, actual_count,
+			 missing_ids, status, attempts)
+		VALUES ($1, $2, $3, $4, $5, $6, 0)
+		RETURNING id, created_at`,
+		f.FromLedger, f.ToLedger, f.ExpectedCount, f.ActualCount,
+		f.MissingIDs, f.Status,
+	).Scan(&f.ID, &f.CreatedAt)
+	if err != nil {
+		return AuditFinding{}, fmt.Errorf("recording audit finding: %w", err)
+	}
+	return f, nil
+}
+
+func (p *Postgres) UpdateAuditFinding(ctx context.Context, f AuditFinding) error {
+	// last_attempted_at is updated only when the auditor actually tried
+	// to repair (not when only the metadata is tweaked).
+	var lastAttempted any
+	if !f.LastAttemptedAt.IsZero() {
+		lastAttempted = f.LastAttemptedAt
+	} else {
+		lastAttempted = nil
+	}
+	_, err := p.pool.Exec(ctx, `
+		UPDATE audit_findings SET
+			status            = $2,
+			attempts          = $3,
+			last_attempted_at = $4,
+			last_error        = $5,
+			missing_ids       = $6
+		WHERE id = $1`,
+		f.ID, f.Status, f.Attempts, lastAttempted, nullableString(f.LastError), f.MissingIDs,
+	)
+	if err != nil {
+		return fmt.Errorf("updating audit finding %d: %w", f.ID, err)
+	}
+	return nil
+}
+
+// ListOpenFindingsByRange returns the most recent finding whose range
+// overlaps [fromLedger, toLedger] and is still in a working state (open
+// or unrecoverable). ErrNotFound means no live finding spans the range.
+func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error) {
+	row := p.pool.QueryRow(ctx, `
+		SELECT id, from_ledger, to_ledger, expected_count, actual_count,
+		       missing_ids, status, attempts, last_attempted_at, last_error, created_at
+		FROM audit_findings
+		WHERE status IN ('open', 'unrecoverable')
+		  AND from_ledger <= $2
+		  AND to_ledger   >= $1
+		ORDER BY id DESC
+		LIMIT 1`,
+		fromLedger, toLedger,
+	)
+	var f AuditFinding
+	var lastAttempted *time.Time
+	err := row.Scan(&f.ID, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
+		&f.MissingIDs, &f.Status, &f.Attempts, &lastAttempted, &f.LastError, &f.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AuditFinding{}, ErrNotFound
+	}
+	if err != nil {
+		return AuditFinding{}, fmt.Errorf("listing findings for [%d,%d]: %w", fromLedger, toLedger, err)
+	}
+	if lastAttempted != nil {
+		f.LastAttemptedAt = *lastAttempted
+	}
+	return f, nil
+}
+
+func nullableString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 func scanEvent(row pgx.Row) (Event, error) {
-	var e Event
+	var (
+		e         Event
+		rawTopics []string
+		rawValue  *string
+	)
 	err := row.Scan(&e.ID, &e.ContractID, &e.Ledger, &e.Type, &e.TxHash,
-		&e.TxIndex, &e.OpIndex, &e.InSuccessfulCall, &e.Topics, &e.Value, &e.CreatedAt)
+		&e.TxIndex, &e.OpIndex, &e.InSuccessfulCall, &e.Topics, &e.Value,
+		&e.CreatedAt, &rawTopics, &rawValue)
 	if err != nil {
 		return Event{}, err
+	}
+	e.RawTopicXDR = rawTopics
+	if rawValue != nil {
+		e.RawValueXDR = *rawValue
 	}
 	return e, nil
 }

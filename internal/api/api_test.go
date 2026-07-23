@@ -41,6 +41,34 @@ func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store
 	return s.events, s.nextCursor, s.queryErr
 }
 
+// LedgerRangeCensus, ReplaceEventsInRange, and the audit_state/findings
+// methods are unused by API tests but needed to satisfy store.Store now.
+func (s *stubStore) ReplaceEventsInRange(context.Context, []store.Event, int64, int64) error {
+	return nil
+}
+func (s *stubStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]store.LedgerCensus, error) {
+	return nil, nil
+}
+func (s *stubStore) GetAuditState(context.Context) (store.AuditState, error) {
+	return store.AuditState{}, store.ErrNotFound
+}
+func (s *stubStore) SaveAuditState(context.Context, store.AuditState) error {
+	return nil
+}
+func (s *stubStore) SaveAuditStateIfGreater(_ context.Context, ledger int64) (store.AuditState, error) {
+	return store.AuditState{VerifiedThroughLedger: ledger}, nil
+}
+func (s *stubStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) (store.AuditFinding, error) {
+	f.ID = 1
+	return f, nil
+}
+func (s *stubStore) UpdateAuditFinding(context.Context, store.AuditFinding) error {
+	return nil
+}
+func (s *stubStore) ListOpenFindingsByRange(context.Context, int64, int64) (store.AuditFinding, error) {
+	return store.AuditFinding{}, store.ErrNotFound
+}
+
 func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
 	return s.event, s.eventErr
 }

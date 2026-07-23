@@ -22,6 +22,17 @@ type Config struct {
 	StartLedger      uint32        `env:"START_LEDGER"`
 	RetentionLedgers uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
 	LogLevel         string        `env:"LOG_LEVEL" envDefault:"info"`
+
+	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
+	// entirely; the binary behaves exactly like the pre-audit build.
+	AuditEnabled        bool          `env:"AUDIT_ENABLED" envDefault:"false"`
+	AuditPollInterval   time.Duration `env:"AUDIT_POLL_INTERVAL" envDefault:"30s"`
+	AuditBatchLedgers   uint32        `env:"AUDIT_BATCH_LEDGERS" envDefault:"100"`
+	AuditLagThreshold   uint32        `env:"AUDIT_LAG_THRESHOLD" envDefault:"200"`
+	AuditBudgetShare    float64       `env:"AUDIT_BUDGET_SHARE" envDefault:"0.10"`
+	AuditMaxRPS         float64       `env:"AUDIT_MAX_RPS" envDefault:"10"`
+	AuditMaxRepair      int           `env:"AUDIT_MAX_REPAIR_ATTEMPTS" envDefault:"3"`
+	AuditFindingMaxLgrs uint32        `env:"AUDIT_FINDING_MAX_LEDGERS" envDefault:"100"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -62,6 +73,27 @@ func (c Config) Validate() error {
 		if !ValidContractID(id) {
 			return fmt.Errorf("WATCHED_CONTRACTS entry %q is not a valid contract ID (want C... strkey, 56 chars)", id)
 		}
+	}
+	if c.AuditPollInterval <= 0 {
+		return fmt.Errorf("AUDIT_POLL_INTERVAL must be positive")
+	}
+	if c.AuditBatchLedgers == 0 {
+		return fmt.Errorf("AUDIT_BATCH_LEDGERS must be positive")
+	}
+	if c.AuditLagThreshold == 0 {
+		return fmt.Errorf("AUDIT_LAG_THRESHOLD must be positive")
+	}
+	if c.AuditBudgetShare < 0 || c.AuditBudgetShare > 1 {
+		return fmt.Errorf("AUDIT_BUDGET_SHARE must be in [0,1]")
+	}
+	if c.AuditMaxRPS <= 0 {
+		return fmt.Errorf("AUDIT_MAX_RPS must be positive")
+	}
+	if c.AuditMaxRepair <= 0 {
+		return fmt.Errorf("AUDIT_MAX_REPAIR_ATTEMPTS must be positive")
+	}
+	if c.AuditFindingMaxLgrs == 0 {
+		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
 	}
 	return nil
 }

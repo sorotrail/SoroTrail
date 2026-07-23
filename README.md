@@ -57,6 +57,14 @@ All configuration comes from environment variables (see `.env.example`):
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
+| `AUDIT_ENABLED` | `false` | Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build. |
+| `AUDIT_POLL_INTERVAL` | `30s` | Sleep between audit passes. |
+| `AUDIT_BATCH_LEDGERS` | `100` | Ledger range covered by one audit pass. |
+| `AUDIT_LAG_THRESHOLD` | `200` | Auditor sleeps until ingest is at least this many ledgers past the verified mark. |
+| `AUDIT_BUDGET_SHARE` | `0.10` | Fraction of the request budget the audit pool gets (rest goes to ingest). |
+| `AUDIT_MAX_RPS` | `10` | Total request budget (split between ingest and audit). |
+| `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
+| `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
 
 ## Ingestion behavior
 
@@ -76,6 +84,27 @@ All configuration comes from environment variables (see `.env.example`):
   its decoding is used verbatim; otherwise the base64 XDR is decoded locally
   into shapes like `{"symbol":"transfer"}`, `{"u64":42}`, `{"i128":"-1000"}`,
   `{"address":"C..."}`.
+- The raw base64 XDR is stored alongside the decoded JSON, so an improved
+  decoder can be applied to already-indexed events — see
+  [decoder replay](#decoder-replay).
+
+## Decoder replay
+
+Decoders improve over time. `sorotrail replay` re-runs the current decoder
+over stored raw XDR and rewrites the decoded columns, so improvements apply
+to everything already indexed instead of only to future events.
+
+```sh
+sorotrail replay --from-ledger 250000 --dry-run   # see what would change
+sorotrail replay --from-ledger 250000             # rewrite it
+```
+
+It is batched, resumable (Ctrl-C and re-run picks up where it stopped),
+idempotent, and safe to run against a live database while ingestion
+continues; a Postgres advisory lock prevents two replays at once.
+
+See [docs/replay.md](docs/replay.md) for flags, the summary output, the
+advisory-lock strategy, and the derivation order for dependent tables.
 
 ## API reference
 
@@ -96,7 +125,7 @@ curl -s localhost:8080/health
 
 ### `GET /events`
 
-Lists stored events in ascending event-ID (chronological) order.
+Lists stored events in ascending (oldest-first) or descending (newest-first) order. Defaults to ascending.
 
 Query parameters (all optional, combinable):
 
@@ -111,6 +140,7 @@ Query parameters (all optional, combinable):
 | `to_time` | `2026-07-22T00:00:00Z` | Inclusive upper `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
 | `limit` | `50` | Page size, 1–200 (default 50). |
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
+| `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
 
 ```sh
 curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic={"symbol":"transfer"}&limit=2'
@@ -173,8 +203,55 @@ curl -s localhost:8080/stats
 ```
 
 ```json
-{"total_events":18234,"last_ingested_ledger":260123,"contract_count":57,"watched_contracts":0}
+{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
 ```
+
+`verified_through_ledger` is the inclusive highest ledger whose stored
+events have been proven to match a fresh RPC fetch by the auditor. When
+`AUDIT_ENABLED=false` it stays at `0`. See the Data integrity section
+below for the contract the field implies.
+
+## Data integrity
+
+A background auditor walks recently-ingested ledger ranges (behind the
+ingest frontier, inside the RPC's retention window) and re-fetches each
+range with the same filter configuration the ingester uses, comparing
+the stored event counts and IDs against the fresh response. Mismatches
+are logged, recorded in the `audit_findings` table, and auto-repaired
+by re-ingesting the affected range with `ReplaceEventsInRange` (which
+deletes orphans and updates same-ID rows so topic/value drift on the
+RPC side is corrected).
+
+Each pass advances an audit-only `verified_through_ledger` high-water
+mark past the clean prefix of the audited range; that field, exposed via
+`GET /stats`, is the strongest trust signal SoroTrail can offer: it
+names the highest ledger whose stored events have been *verified* against
+the RPC, not merely *ingested*.
+
+Audit behaviour:
+
+- **Filter parity**: the auditor uses the ingester's exact filter batch
+  (see `Ingester.BuildFilterBatches`), so events the RPC has for
+  contracts you're not watching are intentionally not checked and never
+  produce false findings.
+- **Idempotency**: re-running the auditor over a clean range is a no-op;
+  crashes mid-repair leave the finding open so the next pass can retry.
+- **Budget**: the auditor shares the request-rate budget with the
+  ingester via `rpc.Budget`; `AUDIT_BUDGET_SHARE` (default 10%) caps
+  the audit pool while the ingest pool gets the remainder.
+- **Lag pause**: if ingest hasn't moved at least `AUDIT_LAG_THRESHOLD`
+  ledgers past `verified_through_ledger`, the auditor sleeps until it
+  does — it never races ingestion.
+- **Retention edges**: when a finding's range ages out of the RPC's
+  retention window during repair, the auditor moves the finding to
+  `status='unverifiable'` instead of crashing or false-alarming.
+- **Self-disagreement**: if the RPC keeps returning different events
+  for the same range across repair iterations, the auditor stops after
+  `AUDIT_MAX_REPAIR_ATTEMPTS` attempts and keeps the finding visible
+  with `status='unrecoverable'` — operators see it via `/stats`.
+
+Set `AUDIT_ENABLED=false` (the default) to disable the auditor entirely;
+the binary's behavior is identical to a pre-audit build.
 
 ## Development
 
