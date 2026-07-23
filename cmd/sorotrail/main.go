@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/khaylebfortune/sorotrail/internal/api"
+	"github.com/khaylebfortune/sorotrail/internal/audit"
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/ingester"
@@ -67,13 +68,35 @@ func run() error {
 		RetentionLedgers: cfg.RetentionLedgers,
 	})
 
+	// The auditor and its request-rate budget are constructed lazily:
+	// AUDIT_ENABLED=false (the default) means a binary identical to a
+	// pre-audit build, so we skip every allocation.
+	var aud *audit.Auditor
+	if cfg.AuditEnabled {
+		budget, err := rpc.NewBudget(cfg.AuditMaxRPS, cfg.AuditBudgetShare)
+		if err != nil {
+			return err
+		}
+		auditClient := audit.NewBudgetedClient(rpcClient, budget)
+		aud = audit.New(auditClient, st, ing, log, audit.Options{
+			PollInterval:      cfg.AuditPollInterval,
+			BatchLedgers:      cfg.AuditBatchLedgers,
+			LagThreshold:      cfg.AuditLagThreshold,
+			MaxRepairAttempts: cfg.AuditMaxRepair,
+			FindingMaxLedgers: cfg.AuditFindingMaxLgrs,
+		})
+		// Expose the auditor's counters via /stats so operators don't need
+		// to parse logs to see pass/finding rates.
+		api.SetAuditor(aud)
+	}
+
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           api.New(st, rpcClient, log).Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() {
 		log.Info("ingester starting", "rpc_url", cfg.RPCURL, "poll_interval", cfg.PollInterval)
 		if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -90,15 +113,32 @@ func run() error {
 			errCh <- nil
 		}
 	}()
+	if aud != nil {
+		go func() {
+			log.Info("auditor starting",
+				"budget_share", cfg.AuditBudgetShare,
+				"batch_ledgers", cfg.AuditBatchLedgers,
+				"lag_threshold", cfg.AuditLagThreshold,
+				"max_repair_attempts", cfg.AuditMaxRepair)
+			if err := aud.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("auditor: %w", err)
+			} else {
+				errCh <- nil
+			}
+		}()
+	}
 
 	var firstErr error
-	remaining := 2 // both goroutines send exactly once
+	remaining := 2 // ingester + http server
+	if aud != nil {
+		remaining = 3
+	}
 	select {
 	case <-ctx.Done():
 		log.Info("shutdown signal received")
 	case firstErr = <-errCh:
 		remaining--
-		stop() // one component failed; wind down the other
+		stop() // one component failed; wind down the others
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

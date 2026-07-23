@@ -100,12 +100,26 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, event)
 }
 
+// Stats summarizes what the indexer has stored plus, when the auditor is
+// running, the post-processing counters it has accumulated.
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.Stats(r.Context())
 	if err != nil {
 		s.log.Error("loading stats", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
+	}
+	if a := getAuditor(); a != nil {
+		m := a.Metrics()
+		stats.Auditor = store.AuditStats{
+			PassesRun:             m.PassesRun,
+			LedgersChecked:        m.LedgersChecked,
+			FindingsOpened:        m.FindingsOpened,
+			FindingsRepaired:      m.FindingsRepaired,
+			FindingsUnverifiable:  m.FindingsUnverifiable,
+			FindingsUnrecoverable: m.FindingsUnrecoverable,
+			RPCRequests:           m.RPCRequests,
+		}
 	}
 	writeJSON(w, http.StatusOK, stats)
 }
