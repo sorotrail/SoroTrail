@@ -5,14 +5,43 @@ package api
 import (
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/khaylebfortune/sorotrail/internal/audit"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
+
+// SetAuditor registers the binary's Auditor so /stats can surface its
+// Metrics counters. There is exactly one Auditor per process; its
+// lifetime is the lifetime of main(). SetAuditor must be called BEFORE
+// ListenAndServe so the first /stats request observes a stable value.
+// The setter is guarded by a RWMutex so concurrent reader goroutines in
+// /stats handlers can never observe a torn pointer.
+//
+// When AUDIT_ENABLED=false the function is never called and /stats
+// returns Stats with the embedded AuditStats struct zero-valued (and
+// omitted from JSON, courtesy of its `omitempty` tag).
+var (
+	auditorMu sync.RWMutex
+	auditor   *audit.Auditor
+)
+
+func SetAuditor(a *audit.Auditor) {
+	auditorMu.Lock()
+	auditor = a
+	auditorMu.Unlock()
+}
+
+func getAuditor() *audit.Auditor {
+	auditorMu.RLock()
+	defer auditorMu.RUnlock()
+	return auditor
+}
 
 // Server holds the API's dependencies.
 type Server struct {

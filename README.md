@@ -57,6 +57,14 @@ All configuration comes from environment variables (see `.env.example`):
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
+| `AUDIT_ENABLED` | `false` | Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build. |
+| `AUDIT_POLL_INTERVAL` | `30s` | Sleep between audit passes. |
+| `AUDIT_BATCH_LEDGERS` | `100` | Ledger range covered by one audit pass. |
+| `AUDIT_LAG_THRESHOLD` | `200` | Auditor sleeps until ingest is at least this many ledgers past the verified mark. |
+| `AUDIT_BUDGET_SHARE` | `0.10` | Fraction of the request budget the audit pool gets (rest goes to ingest). |
+| `AUDIT_MAX_RPS` | `10` | Total request budget (split between ingest and audit). |
+| `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
+| `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
 
 ## Ingestion behavior
 
@@ -163,8 +171,55 @@ curl -s localhost:8080/stats
 ```
 
 ```json
-{"total_events":18234,"last_ingested_ledger":260123,"contract_count":57,"watched_contracts":0}
+{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
 ```
+
+`verified_through_ledger` is the inclusive highest ledger whose stored
+events have been proven to match a fresh RPC fetch by the auditor. When
+`AUDIT_ENABLED=false` it stays at `0`. See the Data integrity section
+below for the contract the field implies.
+
+## Data integrity
+
+A background auditor walks recently-ingested ledger ranges (behind the
+ingest frontier, inside the RPC's retention window) and re-fetches each
+range with the same filter configuration the ingester uses, comparing
+the stored event counts and IDs against the fresh response. Mismatches
+are logged, recorded in the `audit_findings` table, and auto-repaired
+by re-ingesting the affected range with `ReplaceEventsInRange` (which
+deletes orphans and updates same-ID rows so topic/value drift on the
+RPC side is corrected).
+
+Each pass advances an audit-only `verified_through_ledger` high-water
+mark past the clean prefix of the audited range; that field, exposed via
+`GET /stats`, is the strongest trust signal SoroTrail can offer: it
+names the highest ledger whose stored events have been *verified* against
+the RPC, not merely *ingested*.
+
+Audit behaviour:
+
+- **Filter parity**: the auditor uses the ingester's exact filter batch
+  (see `Ingester.BuildFilterBatches`), so events the RPC has for
+  contracts you're not watching are intentionally not checked and never
+  produce false findings.
+- **Idempotency**: re-running the auditor over a clean range is a no-op;
+  crashes mid-repair leave the finding open so the next pass can retry.
+- **Budget**: the auditor shares the request-rate budget with the
+  ingester via `rpc.Budget`; `AUDIT_BUDGET_SHARE` (default 10%) caps
+  the audit pool while the ingest pool gets the remainder.
+- **Lag pause**: if ingest hasn't moved at least `AUDIT_LAG_THRESHOLD`
+  ledgers past `verified_through_ledger`, the auditor sleeps until it
+  does — it never races ingestion.
+- **Retention edges**: when a finding's range ages out of the RPC's
+  retention window during repair, the auditor moves the finding to
+  `status='unverifiable'` instead of crashing or false-alarming.
+- **Self-disagreement**: if the RPC keeps returning different events
+  for the same range across repair iterations, the auditor stops after
+  `AUDIT_MAX_REPAIR_ATTEMPTS` attempts and keeps the finding visible
+  with `status='unrecoverable'` — operators see it via `/stats`.
+
+Set `AUDIT_ENABLED=false` (the default) to disable the auditor entirely;
+the binary's behavior is identical to a pre-audit build.
 
 ## Development
 
