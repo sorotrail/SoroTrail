@@ -91,10 +91,14 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
-	if f.ContractID != "" {
+	if len(f.ContractIDs) > 0 {
+		where = append(where, "contract_id = ANY("+arg(f.ContractIDs)+")")
+	} else if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
-	if f.Type != "" {
+	if len(f.Types) > 0 {
+		where = append(where, "type = ANY("+arg(f.Types)+")")
+	} else if f.Type != "" {
 		where = append(where, "type = "+arg(f.Type))
 	}
 	if len(f.Topic) > 0 {

@@ -27,8 +27,10 @@ type Event struct {
 
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
-	ContractID string
-	Type       string
+	ContractIDs []string
+	ContractID  string
+	Types       []string
+	Type        string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic      json.RawMessage

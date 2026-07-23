@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -18,6 +19,7 @@ import (
 )
 
 const testContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+const otherContract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 // stubStore returns canned values and records the filter it was queried with.
 type stubStore struct {
@@ -93,6 +95,40 @@ func TestListEvents_ParsesFilters(t *testing.T) {
 	assert.JSONEq(t, `{"symbol":"transfer"}`, string(st.lastFilter.Topic))
 }
 
+func TestListEvents_MultiValueContractAndTypeFilters(t *testing.T) {
+	st := &stubStore{}
+	s := newTestServer(st, nil)
+
+	resp, _ := doGet(t, s,
+		"/events?contract_id="+testContract+"&contract_id="+otherContract+"&type=contract&type=system")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, []string{testContract, otherContract}, st.lastFilter.ContractIDs)
+	assert.Empty(t, st.lastFilter.ContractID)
+	assert.Equal(t, []string{"contract", "system"}, st.lastFilter.Types)
+	assert.Empty(t, st.lastFilter.Type)
+}
+
+func TestListEvents_ContractIDListSizeCap(t *testing.T) {
+	st := &stubStore{}
+	s := newTestServer(st, nil)
+
+	var path strings.Builder
+	path.WriteString("/events?")
+	for i := 0; i < 21; i++ {
+		if i > 0 {
+			path.WriteString("&")
+		}
+		path.WriteString("contract_id=")
+		path.WriteString(testContract)
+	}
+
+	resp, body := doGet(t, s, path.String())
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var e map[string]string
+	require.NoError(t, json.Unmarshal(body, &e))
+	assert.Contains(t, e["error"], "at most 20 contract_id values")
+}
+
 func TestListEvents_BareTopicBecomesJSONString(t *testing.T) {
 	st := &stubStore{}
 	s := newTestServer(st, nil)
@@ -152,6 +188,14 @@ func TestContractEvents_ForcesContractFilter(t *testing.T) {
 
 	resp, _ = doGet(t, newTestServer(st, nil), "/contracts/junk/events")
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestContractEvents_RejectsContractIDQueryParam(t *testing.T) {
+	resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/contracts/"+testContract+"/events?contract_id="+otherContract)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var e map[string]string
+	require.NoError(t, json.Unmarshal(body, &e))
+	assert.Contains(t, e["error"], "contract_id query parameter is not allowed")
 }
 
 func TestHealth(t *testing.T) {

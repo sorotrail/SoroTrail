@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -66,6 +67,10 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if len(filter.ContractIDs) > 0 || filter.ContractID != "" {
+		writeError(w, http.StatusBadRequest, errors.New("contract_id query parameter is not allowed for /contracts/{id}/events"))
+		return
+	}
 	contractID := chi.URLParam(r, "id")
 	if !config.ValidContractID(contractID) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid contract ID %q", contractID))
@@ -110,24 +115,73 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
+const maxMultiValueFilters = 20
+
 // filterFromQuery parses the shared event-filter query params:
 // contract_id, type, topic, from_ledger, to_ledger, cursor, limit.
 func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	q := r.URL.Query()
-	f := store.EventFilter{
-		ContractID: q.Get("contract_id"),
-		Cursor:     q.Get("cursor"),
+	f := store.EventFilter{Cursor: q.Get("cursor")}
+
+	contractIDs := q["contract_id"]
+	if len(contractIDs) > 0 {
+		if len(contractIDs) > maxMultiValueFilters {
+			return f, fmt.Errorf("at most %d contract_id values are allowed", maxMultiValueFilters)
+		}
+		for _, raw := range contractIDs {
+			if raw == "" {
+				return f, fmt.Errorf("invalid contract_id: cannot be empty")
+			}
+			if strings.Contains(raw, ",") {
+				return f, fmt.Errorf("contract_id must be repeated, not comma-separated")
+			}
+			if !config.ValidContractID(raw) {
+				return f, fmt.Errorf("invalid contract_id %q", raw)
+			}
+			f.ContractIDs = append(f.ContractIDs, raw)
+		}
+		if len(f.ContractIDs) == 1 {
+			f.ContractID = f.ContractIDs[0]
+		}
 	}
 
-	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
-		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
+	types := q["type"]
+	if len(types) > 0 {
+		if len(types) > maxMultiValueFilters {
+			return f, fmt.Errorf("at most %d type values are allowed", maxMultiValueFilters)
+		}
+		for _, raw := range types {
+			if raw == "" {
+				return f, fmt.Errorf("invalid type: cannot be empty")
+			}
+			if strings.Contains(raw, ",") {
+				return f, fmt.Errorf("type must be repeated, not comma-separated")
+			}
+			switch raw {
+			case "contract", "system", "diagnostic":
+				f.Types = append(f.Types, raw)
+			default:
+				return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", raw)
+			}
+		}
+		if len(f.Types) == 1 {
+			f.Type = f.Types[0]
+		}
 	}
 
-	switch t := q.Get("type"); t {
-	case "", "contract", "system", "diagnostic":
-		f.Type = t
-	default:
-		return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
+	// topic accepts any JSON value; a bare word like `transfer` is treated
+	// as the JSON string "transfer". Matching is exact against the stored
+	// topic entries, e.g. topic={"symbol":"transfer"} for XDR-decoded rows.
+	if topic := q.Get("topic"); topic != "" {
+		if json.Valid([]byte(topic)) {
+			f.Topic = json.RawMessage(topic)
+		} else {
+			quoted, err := json.Marshal(topic)
+			if err != nil {
+				return f, fmt.Errorf("invalid topic: %w", err)
+			}
+			f.Topic = quoted
+		}
 	}
 
 	// topic accepts any JSON value; a bare word like `transfer` is treated

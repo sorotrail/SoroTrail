@@ -125,6 +125,41 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		assert.Equal(t, eventID(3), got[0].ID)
 	})
 
+	t.Run("by multiple contracts with stable pagination", func(t *testing.T) {
+		multiEvents := []Event{
+			testEvent(eventID(11), 110, contractA),
+			testEvent(eventID(12), 111, contractB),
+			testEvent(eventID(13), 112, contractA),
+			testEvent(eventID(14), 113, contractB),
+			testEvent(eventID(15), 114, contractA),
+			testEvent(eventID(16), 115, contractB),
+		}
+		_, err := st.UpsertEvents(ctx, multiEvents)
+		require.NoError(t, err)
+
+		page1, next, err := st.QueryEvents(ctx, EventFilter{ContractIDs: []string{contractA, contractB}, Limit: 3})
+		require.NoError(t, err)
+		require.Len(t, page1, 3)
+		assert.Equal(t, eventID(11), page1[0].ID)
+		assert.Equal(t, eventID(12), page1[1].ID)
+		assert.Equal(t, eventID(13), page1[2].ID)
+		require.NotEmpty(t, next)
+
+		page2, next2, err := st.QueryEvents(ctx, EventFilter{ContractIDs: []string{contractA, contractB}, Cursor: next, Limit: 3})
+		require.NoError(t, err)
+		require.Len(t, page2, 3)
+		assert.Equal(t, eventID(14), page2[0].ID)
+		assert.Equal(t, eventID(15), page2[1].ID)
+		assert.Equal(t, eventID(16), page2[2].ID)
+		assert.Empty(t, next2)
+	})
+
+	t.Run("by multiple types", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{Types: []string{"contract", "diagnostic"}})
+		require.NoError(t, err)
+		assert.Len(t, got, 10)
+	})
+
 	t.Run("by topic at any position", func(t *testing.T) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{Topic: json.RawMessage(`{"u64":7}`)})
 		require.NoError(t, err)
