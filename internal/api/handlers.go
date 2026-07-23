@@ -125,7 +125,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // filterFromQuery parses the shared event-filter query params:
-// contract_id, type, topic, from_ledger, to_ledger, cursor, limit.
+// contract_id, type, topic, from_ledger, to_ledger, from_time, to_time, cursor, limit.
 func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	q := r.URL.Query()
 	f := store.EventFilter{
@@ -179,6 +179,17 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("from_ledger %d is after to_ledger %d", f.FromLedger, f.ToLedger)
 	}
 
+	if f.FromTime, err = parseTimeParam(q.Get("from_time"), "from_time"); err != nil {
+		return f, err
+	}
+	if f.ToTime, err = parseTimeParam(q.Get("to_time"), "to_time"); err != nil {
+		return f, err
+	}
+	if !f.FromTime.IsZero() && !f.ToTime.IsZero() && f.FromTime.After(f.ToTime) {
+		return f, fmt.Errorf("from_time %s is after to_time %s",
+			f.FromTime.Format(time.RFC3339), f.ToTime.Format(time.RFC3339))
+	}
+
 	if raw := q.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
 		if err != nil || limit <= 0 || limit > store.MaxQueryLimit {
@@ -198,6 +209,22 @@ func parseLedgerParam(raw, name string) (int64, error) {
 		return 0, fmt.Errorf("%s must be a positive integer", name)
 	}
 	return n, nil
+}
+
+// parseTimeParam parses an RFC 3339 timestamp query parameter.
+// Sub-second precision and missing timezone offset are rejected.
+func parseTimeParam(raw, name string) (time.Time, error) {
+	if raw == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%s must be an RFC 3339 timestamp (e.g. 2026-07-21T00:00:00Z)", name)
+	}
+	if t.Nanosecond() != 0 {
+		return time.Time{}, fmt.Errorf("%s sub-second precision is not supported", name)
+	}
+	return t, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

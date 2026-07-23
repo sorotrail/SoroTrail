@@ -136,6 +136,8 @@ Query parameters (all optional, combinable):
 | `topic` | `{"symbol":"transfer"}` | Exact match against any topic position. A bare word is treated as a JSON string. |
 | `from_ledger` | `250000` | Inclusive lower ledger bound. |
 | `to_ledger` | `260000` | Inclusive upper ledger bound. |
+| `from_time` | `2026-07-21T00:00:00Z` | Inclusive lower `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
+| `to_time` | `2026-07-22T00:00:00Z` | Inclusive upper `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
 | `limit` | `50` | Page size, 1–200 (default 50). |
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
 | `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
@@ -167,6 +169,14 @@ curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47Z
 
 `cursor` is present when more results exist; pass it back as `?cursor=` for
 the next page.
+
+Time filtering narrows results and does not change ordering (events remain in
+ascending event-ID order, which agrees with `created_at` order because both
+follow ledger sequence).
+
+```sh
+curl -s 'localhost:8080/events?from_time=2026-07-21T14:00:00Z&to_time=2026-07-21T15:00:00Z'
+```
 
 ### `GET /events/{id}`
 

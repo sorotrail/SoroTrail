@@ -76,6 +76,11 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 		batch.Queue(`
 			INSERT INTO events
 				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+				 in_successful_call, topics, value, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			ON CONFLICT (id) DO NOTHING`,
+			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
 				 in_successful_call, topics, value, raw_topic_xdr, raw_value_xdr)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) `+conflict,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
@@ -318,6 +323,12 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	}
 	if f.ToLedger > 0 {
 		where = append(where, "ledger <= "+arg(f.ToLedger))
+	}
+	if !f.FromTime.IsZero() {
+		where = append(where, "created_at >= "+arg(f.FromTime))
+	}
+	if !f.ToTime.IsZero() {
+		where = append(where, "created_at <= "+arg(f.ToTime))
 	}
 
 	// if f.Cursor != "" {

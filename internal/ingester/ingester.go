@@ -444,6 +444,10 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 	if err != nil {
 		return store.Event{}, fmt.Errorf("decoding event %s: %w", re.ID, err)
 	}
+	var createdAt time.Time
+	if re.LedgerClosedAt != "" {
+		createdAt, _ = time.Parse(time.RFC3339, re.LedgerClosedAt)
+	}
 	return store.Event{
 		ID:               re.ID,
 		ContractID:       re.ContractID,
@@ -455,6 +459,7 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 		InSuccessfulCall: re.InSuccessfulContractCall,
 		Topics:           topics,
 		Value:            value,
+		CreatedAt:        createdAt,
 		// Keep the raw XDR so `sorotrail replay` can re-decode this event
 		// with a future decoder. Empty when the RPC delivered JSON directly
 		// (xdrFormat "json") — there is no XDR to keep in that case, and

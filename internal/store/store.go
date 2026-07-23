@@ -76,8 +76,10 @@ type EventFilter struct {
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic      json.RawMessage
-	FromLedger int64 // inclusive
-	ToLedger   int64 // inclusive
+	FromLedger int64     // inclusive
+	ToLedger   int64     // inclusive
+	FromTime   time.Time // inclusive, zero = no constraint
+	ToTime     time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int

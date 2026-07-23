@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -110,7 +111,7 @@ func TestListEvents_ParsesFilters(t *testing.T) {
 	s := newTestServer(st, nil)
 
 	resp, body := doGet(t, s,
-		"/events?contract_id="+testContract+`&type=contract&from_ledger=10&to_ledger=20&limit=5&topic={"symbol":"transfer"}`)
+		"/events?contract_id="+testContract+`&type=contract&from_ledger=10&to_ledger=20&limit=5&topic={"symbol":"transfer"}&from_time=2026-07-21T00:00:00Z&to_time=2026-07-22T00:00:00Z`)
 
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 	assert.Equal(t, testContract, st.lastFilter.ContractID)
@@ -119,6 +120,8 @@ func TestListEvents_ParsesFilters(t *testing.T) {
 	assert.Equal(t, int64(20), st.lastFilter.ToLedger)
 	assert.Equal(t, 5, st.lastFilter.Limit)
 	assert.JSONEq(t, `{"symbol":"transfer"}`, string(st.lastFilter.Topic))
+	assert.Equal(t, "2026-07-21T00:00:00Z", st.lastFilter.FromTime.Format(time.RFC3339))
+	assert.Equal(t, "2026-07-22T00:00:00Z", st.lastFilter.ToTime.Format(time.RFC3339))
 }
 
 func TestListEvents_BareTopicBecomesJSONString(t *testing.T) {
@@ -136,6 +139,10 @@ func TestListEvents_BadParams(t *testing.T) {
 		"/events?contract_id=nope",
 		"/events?from_ledger=abc",
 		"/events?from_ledger=20&to_ledger=10",
+		"/events?from_time=not-a-time",
+		"/events?from_time=2026-07-21T00:00:00",
+		"/events?from_time=2026-07-21T00:00:00.123Z",
+		"/events?from_time=2026-07-22T00:00:00Z&to_time=2026-07-21T00:00:00Z",
 		"/events?limit=0",
 		"/events?limit=99999",
 	} {
