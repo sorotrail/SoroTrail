@@ -455,6 +455,12 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 		InSuccessfulCall: re.InSuccessfulContractCall,
 		Topics:           topics,
 		Value:            value,
+		// Keep the raw XDR so `sorotrail replay` can re-decode this event
+		// with a future decoder. Empty when the RPC delivered JSON directly
+		// (xdrFormat "json") — there is no XDR to keep in that case, and
+		// replay skips such rows.
+		RawTopicXDR: re.Topic,
+		RawValueXDR: re.Value,
 	}, nil
 }
 
