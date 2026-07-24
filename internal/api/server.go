@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -44,22 +45,30 @@ func getAuditor() *audit.Auditor {
 	return auditor
 }
 
+// Enricher is the spec-based event enrichment interface used by the API.
+// Defined here so the API package doesn't import internal/spec directly.
+type Enricher interface {
+	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
+}
+
 // Server holds the API's dependencies.
 type Server struct {
-	store   store.Store
-	rpc     rpc.Client
-	log     *slog.Logger
-	apiKey  string
-	limiter *RateLimiter
-	bcast   *broadcast.Broadcaster
+	store    store.Store
+	rpc      rpc.Client
+	enricher Enricher
+	log      *slog.Logger
+	limiter  *RateLimiter
+	bcast    *broadcast.Broadcaster
 }
 
 // New builds the API server. rpcClient is only used by /health.
-// apiKey gates the watched-contracts management endpoints; pass "" to
-// fail closed (every request gets a 503 with "API_KEY not configured").
-// See apiKeyAuth for the exact contract.
-func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string) *Server {
-	return &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey}
+// enricher is optional — pass nil to disable spec decoding.
+func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enricher) *Server {
+	s := &Server{store: st, rpc: rpcClient, log: log}
+	if len(enricher) > 0 {
+		s.enricher = enricher[0]
+	}
+	return s
 }
 
 // SetRateLimiter wires a per-client rate limiter into the router. Pass
@@ -96,17 +105,16 @@ func (s *Server) Router() http.Handler {
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
-	// Watched-contracts management: writes and updates to the runtime
-	// filter list. Always auth-gated, even when AUTH_ENABLED would be
-	// false elsewhere — that asymmetry is intentional and part of the
-	// "writes are never open" contract. GET is gated too so an operator
-	// with the key can confirm the current list without touching /stats.
-	// Routes are absolute (no sub-router) so callers don't need a
-	// trailing slash or chi's RedirectSlashes middleware.
-	watchedMW := apiKeyAuth(s.apiKey)
-	r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
-	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
-	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
+	// contributors: new read endpoints go here. Anything that writes (e.g.
+	// managing watched contracts at runtime) should come with auth first.
+
+	// Subscription CRUD and delivery history.
+	r.Post("/subscriptions", s.handleCreateSubscription)
+	r.Get("/subscriptions", s.handleListSubscriptions)
+	r.Get("/subscriptions/{id}", s.handleGetSubscription)
+	r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
+	r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
+	r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
 
 	return r
 }
