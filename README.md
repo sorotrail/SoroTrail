@@ -17,7 +17,25 @@ long after the RPC has forgotten them.
 
 ## Quickstart
 
-### Docker (one command)
+### Published image (fastest)
+
+Tagged releases publish a multi-arch (amd64/arm64) image to GHCR. Point it at
+a Postgres you already have:
+
+```sh
+docker run --rm -p 8080:8080 \
+  -e DATABASE_URL='postgres://user:pass@host:5432/sorotrail?sslmode=disable' \
+  -e RPC_URL='https://soroban-testnet.stellar.org' \
+  ghcr.io/stephaniepez21-art/sorotrail:latest
+```
+
+Pin a specific release with a version tag instead of `latest`, e.g.
+`ghcr.io/stephaniepez21-art/sorotrail:v1.2.0`. See [Configuration](#configuration) for
+the full list of environment variables.
+
+### Docker Compose (full stack)
+
+Brings up Postgres and the indexer together — no external database required:
 
 ```sh
 docker compose up --build
