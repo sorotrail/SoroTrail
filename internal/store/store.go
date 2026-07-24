@@ -91,24 +91,23 @@ type EventFilter struct {
 	Type       string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
-	Topic      json.RawMessage
+	Topic json.RawMessage
 	// TopicContains matches events whose topics array jsonb-contains this
 	// value (Postgres @> operator). Unlike Topic, the value is passed
 	// directly without array-wrapping, so callers can use multi-element
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	Topic json.RawMessage
 	// Topic0-Topic3 match the exact JSON value at that specific topic array
 	// position. Unspecified positions are wildcards.
 	Topic0     json.RawMessage
 	Topic1     json.RawMessage
 	Topic2     json.RawMessage
 	Topic3     json.RawMessage
-	FromLedger int64     // inclusive
-	ToLedger   int64     // inclusive
-	FromTime   time.Time // inclusive, zero = no constraint
-	ToTime     time.Time // inclusive, zero = no constraint
+	FromLedger  int64     // inclusive
+	ToLedger    int64     // inclusive
+	FromTime    time.Time // inclusive, zero = no constraint
+	ToTime      time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int
@@ -172,12 +171,12 @@ type AuditFinding struct {
 // GET /events query parameters. An empty (zero-value) filter matches
 // every event.
 type SubscriptionFilter struct {
-	ContractID string          `json:"contract_id,omitempty"`
-	Type       string          `json:"type,omitempty"`
+	ContractID    string          `json:"contract_id,omitempty"`
+	Type          string          `json:"type,omitempty"`
 	Topic         json.RawMessage `json:"topic,omitempty"`
 	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
 	FromLedger    int64           `json:"from_ledger,omitempty"`
-	ToLedger   int64           `json:"to_ledger,omitempty"`
+	ToLedger      int64           `json:"to_ledger,omitempty"`
 }
 
 // MatchesEvent reports whether an event passes this filter. Zero fields
@@ -196,44 +195,44 @@ func (f SubscriptionFilter) MatchesEvent(e Event) bool {
 	if f.ToLedger > 0 && e.Ledger > f.ToLedger {
 		return false
 	}
-	if len(f.Topic) > 0 && len(e.Topics) > 0 {
-		// Match if any event topic equals the filter topic.
+	if (len(f.Topic) > 0 || len(f.TopicContains) > 0) && len(e.Topics) > 0 {
 		var topics []json.RawMessage
 		if err := json.Unmarshal(e.Topics, &topics); err != nil {
 			return false
 		}
-		matched := false
-		for _, t := range topics {
-			if string(t) == string(f.Topic) {
-				matched = true
-				break
+
+		if len(f.Topic) > 0 {
+			// Match if any event topic equals the filter topic.
+			matched := false
+			for _, t := range topics {
+				if string(t) == string(f.Topic) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return false
 			}
 		}
-		if !matched {
-			return false
-		}
-	}
-	if len(f.TopicContains) > 0 && len(e.Topics) > 0 {
-		var topics []json.RawMessage
-		if err := json.Unmarshal(e.Topics, &topics); err != nil {
-			return false
-		}
-		// Unwrap a single-element array so topic_contains=[{...}] works
-		// the same way in-memory as it does in Postgres @> containment.
-		needle := f.TopicContains
-		var arr []json.RawMessage
-		if err := json.Unmarshal(f.TopicContains, &arr); err == nil && len(arr) == 1 {
-			needle = arr[0]
-		}
-		matched := false
-		for _, t := range topics {
-			if jsonbContains(t, needle) {
-				matched = true
-				break
+
+		if len(f.TopicContains) > 0 {
+			// Unwrap a single-element array so topic_contains=[{...}] works
+			// the same way in-memory as it does in Postgres @> containment.
+			needle := f.TopicContains
+			var arr []json.RawMessage
+			if err := json.Unmarshal(f.TopicContains, &arr); err == nil && len(arr) == 1 {
+				needle = arr[0]
 			}
-		}
-		if !matched {
-			return false
+			matched := false
+			for _, t := range topics {
+				if jsonbContains(t, needle) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return false
+			}
 		}
 	}
 	return true
