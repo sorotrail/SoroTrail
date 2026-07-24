@@ -91,14 +91,13 @@ type EventFilter struct {
 	Type       string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
-	Topic      json.RawMessage
+	Topic json.RawMessage
 	// TopicContains matches events whose topics array jsonb-contains this
 	// value (Postgres @> operator). Unlike Topic, the value is passed
 	// directly without array-wrapping, so callers can use multi-element
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	Topic json.RawMessage
 	// Topic0-Topic3 match the exact JSON value at that specific topic array
 	// position. Unspecified positions are wildcards.
 	Topic0     json.RawMessage

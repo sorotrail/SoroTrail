@@ -164,3 +164,20 @@ func TestValidContractID(t *testing.T) {
 	assert.False(t, ValidContractID(validContract[:55]), "too short")
 	assert.False(t, ValidContractID(validContract[:55]+"a"), "lowercase is not base32")
 }
+
+func TestValidCursor(t *testing.T) {
+	assert.True(t, ValidCursor("0001099511627776-0000000001"))
+	assert.True(t, ValidCursor("00000000000000000102-00000"))
+	assert.True(t, ValidCursor("e1"))
+	assert.True(t, ValidCursor("cursor-42"))
+	assert.True(t, ValidCursor("pt_1"))
+	assert.True(t, ValidCursor("abc.123:45_67-89"))
+
+	assert.False(t, ValidCursor(""), "empty string")
+	assert.False(t, ValidCursor("invalid cursor"), "contains space")
+	assert.False(t, ValidCursor("e1; DROP TABLE events;"), "contains semicolon and space")
+	assert.False(t, ValidCursor("cursor'OR'1'='1"), "contains single quotes")
+	assert.False(t, ValidCursor("<script>alert(1)</script>"), "contains angle brackets")
+	assert.False(t, ValidCursor("e1\n"), "contains newline")
+	assert.False(t, ValidCursor(string(make([]byte, 129))), "too long (>128 chars)")
+}
