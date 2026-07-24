@@ -141,7 +141,7 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		// "When in doubt, don't cache" is the explicit guidance: any
 		// failure to read the frontier falls back to no-cache rather
 		// than guessing the page is safe.
-		s.log.Warn("deciding list cache policy", "error", err)
+		Logged(s.log, r.Context()).Warn("deciding list cache policy", "error", err)
 	} else if etag != "" && ifNoneMatch(r, etag) {
 		writeNotModified(w, etag, policy)
 		return
@@ -149,7 +149,7 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 
 	events, cursor, qerr := s.store.QueryEvents(r.Context(), filter)
 	if qerr != nil {
-		s.log.Error("querying events", "error", qerr)
+		Logged(s.log, r.Context()).Error("querying events", "error", qerr)
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
@@ -182,7 +182,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	if ifNoneMatch(r, etag) {
 		exists, err := s.store.EventExists(r.Context(), id)
 		if err != nil {
-			s.log.Error("checking event existence", "id", id, "error", err)
+			Logged(s.log, r.Context()).Error("checking event existence", "id", id, "error", err)
 			writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 			return
 		}
@@ -204,7 +204,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("loading event", "id", id, "error", err)
+		Logged(s.log, r.Context()).Error("loading event", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
@@ -226,7 +226,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.Stats(r.Context())
 	if err != nil {
-		s.log.Error("loading stats", "error", err)
+		Logged(s.log, r.Context()).Error("loading stats", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
 	}
@@ -590,14 +590,14 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// InsecureSkipVerify disables WebSocket Origin checking: the WS endpoint
-	// is server-to-client only (no client messages are read), so a forged
-	// Origin header cannot influence what the client sees.
+// InsecureSkipVerify disables WebSocket Origin checking: the WS endpoint
+// is server-to-client only (no client messages are read), so a forged
+// Origin header cannot influence what the client sees.
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
-		s.log.Error("websocket accept", "error", err)
+		Logged(s.log, r.Context()).Error("websocket accept", "error", err)
 		return
 	}
 	defer c.Close(websocket.StatusNormalClosure, "")
@@ -642,7 +642,7 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 			}
 			data, err := json.Marshal(ev)
 			if err != nil {
-				s.log.Error("marshal event for ws", "error", err)
+				Logged(s.log, r.Context()).Error("marshal event for ws", "error", err)
 				continue
 			}
 			err = c.Write(ctx, websocket.MessageText, data)
