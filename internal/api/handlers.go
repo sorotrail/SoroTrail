@@ -485,6 +485,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
 	}
 
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
+	}
+
 	switch t := q.Get("type"); t {
 	case "", "contract", "system", "diagnostic":
 		f.Type = t
@@ -574,10 +578,12 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if raw := q.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
-		if err != nil || limit <= 0 || limit > store.MaxQueryLimit {
+		if err != nil || limit < 1 || limit > store.MaxQueryLimit {
 			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
 		}
 		f.Limit = limit
+	} else {
+		f.Limit = store.DefaultQueryLimit
 	}
 	return f, nil
 }

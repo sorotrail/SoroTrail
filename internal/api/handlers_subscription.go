@@ -175,11 +175,11 @@ func (s *Server) handleListDeliveries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limit := 50
+	limit := store.DefaultQueryLimit
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		l, err := strconv.Atoi(raw)
-		if err != nil || l <= 0 || l > 200 {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,200]"))
+		if err != nil || l < 1 || l > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
 			return
 		}
 		limit = l
