@@ -171,6 +171,17 @@ func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event
 	return nil
 }
 
+// EventExists mirrors GetEvent but stops at presence — the auditor's
+// interface compliance is enough for the cache layer's needs.
+func (m *mockStore) EventExists(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.events[id]; !ok {
+		return false, nil
+	}
+	return true, nil
+}
+
 func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -333,6 +344,33 @@ func (m *mockStore) QueryAnalyticsEvents(context.Context, store.AnalyticsFilter)
 	return nil, nil
 }
 func (m *mockStore) QueryAnalyticsTokenVolume(context.Context, store.AnalyticsFilter) ([]store.AnalyticsTokenVolume, error) {
+// Subscription stubs for the webhook feature — unused by auditor tests.
+func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+	sub.ID = 1
+	return sub, nil
+}
+func (m *mockStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
+	return store.Subscription{}, store.ErrNotFound
+}
+func (m *mockStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
+	return nil, nil
+}
+func (m *mockStore) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+	return sub, nil
+}
+func (m *mockStore) DeleteSubscription(context.Context, int64) error { return nil }
+func (m *mockStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
+	return nil, nil
+}
+func (m *mockStore) IncrementSubscriptionFailures(context.Context, int64, int) (int, bool, error) {
+	return 0, false, nil
+}
+func (m *mockStore) ResetSubscriptionFailures(context.Context, int64) error { return nil }
+func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAttempt) (store.DeliveryAttempt, error) {
+	a.ID = 1
+	return a, nil
+}
+func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
 

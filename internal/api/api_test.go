@@ -32,6 +32,14 @@ type stubStore struct {
 	event    store.Event
 	eventErr error
 
+	exists       bool
+	existsErr    error
+	existsCalls  int // count of EventExists calls
+	lastExistsID string
+
+	ingestion    store.IngestionState
+	ingestionErr error
+
 	stats   store.Stats
 	pingErr error
 
@@ -79,6 +87,26 @@ func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
 	return s.event, s.eventErr
 }
 
+func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
+	return nil, store.ErrNotFound
+}
+func (s *stubStore) SetContractSpec(context.Context, string, string, []byte) error {
+	return nil
+// EventExists is the cheap 304 path; tests assert the handler uses it
+// (instead of GetEvent) when If-None-Match matches.
+func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
+	s.existsCalls++
+	s.lastExistsID = id
+	return s.exists, s.existsErr
+}
+
+// GetIngestionState backs the list-cache frontier lookup. Tests stage
+// LastIngestedLedger to drive the boundary decisions (just-below, at,
+// and above the frontier).
+func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, error) {
+	return s.ingestion, s.ingestionErr
+}
+
 func (s *stubStore) Stats(context.Context) (store.Stats, error) { return s.stats, nil }
 func (s *stubStore) Ping(context.Context) error                 { return s.pingErr }
 
@@ -89,6 +117,34 @@ func (s *stubStore) QueryAnalyticsEvents(_ context.Context, f store.AnalyticsFil
 func (s *stubStore) QueryAnalyticsTokenVolume(_ context.Context, f store.AnalyticsFilter) ([]store.AnalyticsTokenVolume, error) {
 	s.lastAnalyticsF = f
 	return s.analyticsVolume, s.analyticsErr
+// Subscription stubs for the webhook feature.
+func (s *stubStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+	sub.ID = 1
+	return sub, nil
+}
+func (s *stubStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
+	return store.Subscription{}, store.ErrNotFound
+}
+func (s *stubStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
+	return nil, nil
+}
+func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+	return sub, nil
+}
+func (s *stubStore) DeleteSubscription(context.Context, int64) error { return nil }
+func (s *stubStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
+	return nil, nil
+}
+func (s *stubStore) IncrementSubscriptionFailures(context.Context, int64, int) (int, bool, error) {
+	return 0, false, nil
+}
+func (s *stubStore) ResetSubscriptionFailures(context.Context, int64) error { return nil }
+func (s *stubStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAttempt) (store.DeliveryAttempt, error) {
+	a.ID = 1
+	return a, nil
+}
+func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
+	return nil, nil
 }
 
 type stubRPC struct {
@@ -126,7 +182,7 @@ func TestListEvents_ParsesFilters(t *testing.T) {
 	s := newTestServer(st, nil)
 
 	resp, body := doGet(t, s,
-		"/events?contract_id="+testContract+`&type=contract&from_ledger=10&to_ledger=20&limit=5&topic={"symbol":"transfer"}`)
+		"/events?contract_id="+testContract+`&type=contract&from_ledger=10&to_ledger=20&limit=5&topic={"symbol":"transfer"}&from_time=2026-07-21T00:00:00Z&to_time=2026-07-22T00:00:00Z`)
 
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 	assert.Equal(t, testContract, st.lastFilter.ContractID)
@@ -135,6 +191,8 @@ func TestListEvents_ParsesFilters(t *testing.T) {
 	assert.Equal(t, int64(20), st.lastFilter.ToLedger)
 	assert.Equal(t, 5, st.lastFilter.Limit)
 	assert.JSONEq(t, `{"symbol":"transfer"}`, string(st.lastFilter.Topic))
+	assert.Equal(t, "2026-07-21T00:00:00Z", st.lastFilter.FromTime.Format(time.RFC3339))
+	assert.Equal(t, "2026-07-22T00:00:00Z", st.lastFilter.ToTime.Format(time.RFC3339))
 }
 
 func TestListEvents_BareTopicBecomesJSONString(t *testing.T) {
@@ -146,12 +204,36 @@ func TestListEvents_BareTopicBecomesJSONString(t *testing.T) {
 	assert.JSONEq(t, `"transfer"`, string(st.lastFilter.Topic))
 }
 
+func TestListEvents_PositionalTopicFiltersParse(t *testing.T) {
+	st := &stubStore{}
+	s := newTestServer(st, nil)
+
+	resp, _ := doGet(t, s,
+		"/events?topic0={\"symbol\":\"transfer\"}&topic1=GABC&topic2={\"x\":123}")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.JSONEq(t, `{"symbol":"transfer"}`, string(st.lastFilter.Topic0))
+	assert.JSONEq(t, `"GABC"`, string(st.lastFilter.Topic1))
+	assert.JSONEq(t, `{"x":123}`, string(st.lastFilter.Topic2))
+}
+
+func TestListEvents_TopicAndPositionalFiltersConflict(t *testing.T) {
+	resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/events?topic=transfer&topic0=GABC")
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var e map[string]string
+	require.NoError(t, json.Unmarshal(body, &e))
+	assert.Contains(t, e["error"], "cannot be combined")
+}
+
 func TestListEvents_BadParams(t *testing.T) {
 	for _, path := range []string{
 		"/events?type=bogus",
 		"/events?contract_id=nope",
 		"/events?from_ledger=abc",
 		"/events?from_ledger=20&to_ledger=10",
+		"/events?from_time=not-a-time",
+		"/events?from_time=2026-07-21T00:00:00",
+		"/events?from_time=2026-07-21T00:00:00.123Z",
+		"/events?from_time=2026-07-22T00:00:00Z&to_time=2026-07-21T00:00:00Z",
 		"/events?limit=0",
 		"/events?limit=99999",
 	} {
