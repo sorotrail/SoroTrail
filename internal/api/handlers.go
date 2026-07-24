@@ -73,10 +73,34 @@ type eventsResponse struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
+type eventsWithXDRResponse struct {
+	Events []eventWithXDR `json:"events"`
+	// Cursor is non-empty when another page exists; pass it back as ?cursor=.
+	Cursor string `json:"cursor,omitempty"`
+}
+
 type enrichedEventsResponse struct {
 	Events []store.EnrichedEvent `json:"events"`
 	// Cursor is non-empty when another page exists.
 	Cursor string `json:"cursor,omitempty"`
+}
+
+type enrichedEventsWithXDRResponse struct {
+	Events []enrichedEventWithXDR `json:"events"`
+	// Cursor is non-empty when another page exists.
+	Cursor string `json:"cursor,omitempty"`
+}
+
+type eventWithXDR struct {
+	store.Event
+	TopicsXDR []string `json:"topics_xdr"`
+	ValueXDR  *string  `json:"value_xdr"`
+}
+
+type enrichedEventWithXDR struct {
+	eventWithXDR
+	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                        `json:"decoded"`
 }
 
 type healthResponse struct {
@@ -155,12 +179,27 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	}
 
 	decoded := r.URL.Query().Get("decoded") == "true"
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), events)
+		if includeXDR {
+			writeJSON(w, http.StatusOK, enrichedEventsWithXDRResponse{
+				Events: enrichEventsWithXDR(enriched),
+				Cursor: cursor,
+			})
+			return
+		}
 		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
 		return
 	}
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
+	if includeXDR {
+		writeJSON(w, http.StatusOK, eventsWithXDRResponse{
+			Events: eventsWithXDR(events),
+			Cursor: cursor,
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
 }
 
@@ -210,15 +249,60 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	decoded := r.URL.Query().Get("decoded") == "true"
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {
+			if includeXDR {
+				writeJSON(w, http.StatusOK, enrichEventWithXDR(enriched[0]))
+				return
+			}
 			writeJSON(w, http.StatusOK, enriched[0])
 			return
 		}
 	}
 	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+	if includeXDR {
+		writeJSON(w, http.StatusOK, eventToXDRResponse(event))
+		return
+	}
 	writeJSON(w, http.StatusOK, event)
+}
+
+func eventToXDRResponse(e store.Event) eventWithXDR {
+	var value *string
+	if e.RawValueXDR != "" {
+		value = &e.RawValueXDR
+	}
+	return eventWithXDR{
+		Event:     e,
+		TopicsXDR: e.RawTopicXDR,
+		ValueXDR:  value,
+	}
+}
+
+func eventsWithXDR(events []store.Event) []eventWithXDR {
+	out := make([]eventWithXDR, len(events))
+	for i, event := range events {
+		out[i] = eventToXDRResponse(event)
+	}
+	return out
+}
+
+func enrichEventWithXDR(e store.EnrichedEvent) enrichedEventWithXDR {
+	return enrichedEventWithXDR{
+		eventWithXDR: eventToXDRResponse(e.Event),
+		DecodedEvent: e.DecodedEvent,
+		Decoded:      e.Decoded,
+	}
+}
+
+func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
+	out := make([]enrichedEventWithXDR, len(events))
+	for i, event := range events {
+		out[i] = enrichEventWithXDR(event)
+	}
+	return out
 }
 
 // Stats summarizes what the indexer has stored plus, when the auditor is
@@ -230,6 +314,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
 	}
+	s.addStatsFreshness(r.Context(), &stats)
 	if a := getAuditor(); a != nil {
 		m := a.Metrics()
 		stats.Auditor = store.AuditStats{
@@ -244,6 +329,28 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
+}
+
+func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
+	if s.rpc == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	health, err := s.rpc.GetHealth(ctx)
+	if err != nil {
+		s.log.Warn("loading RPC health for stats", "error", err)
+		return
+	}
+	head := int64(health.LatestLedger)
+	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
+	stats.ChainHeadLedger = &head
+	stats.IngestLagLedgers = &lag
+}
+
+func ingestLagLedgers(chainHead, lastIngested int64) int64 {
+	return chainHead - lastIngested
 }
 
 // listCachePolicy decides whether a list page is cacheable as immutable
@@ -483,6 +590,16 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 			return nil, fmt.Errorf("invalid %s: %w", name, err)
 		}
 		return quoted, nil
+	}
+
+	// topic_contains accepts any valid JSON value and uses @> containment
+	// directly (no automatic array-wrapping). Unlike topic, bare words are
+	// not allowed — the input must be parseable JSON.
+	if raw := q.Get("topic_contains"); raw != "" {
+		if !json.Valid([]byte(raw)) {
+			return f, fmt.Errorf("topic_contains must be valid JSON")
+		}
+		f.TopicContains = json.RawMessage(raw)
 	}
 
 	// order controls sort direction for paginated results.

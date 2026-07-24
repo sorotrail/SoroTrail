@@ -208,6 +208,44 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		}
 	})
 
+	t.Run("by topic_contains with object in array (containment)", func(t *testing.T) {
+		// topic_contains=[{"u64":7}] should match events whose topics array
+		// contains an element that jsonb-contains {"u64":7}.
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TopicContains: json.RawMessage(`[{"u64":7}]`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 9, "all events with u64:7 (9 out of 10)")
+	})
+
+	t.Run("by topic_contains with object directly does not match array", func(t *testing.T) {
+		// Passing an object directly (not wrapped in array) won't match an
+		// array column — jsonb array @> object is always false in Postgres.
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TopicContains: json.RawMessage(`{"u64":7}`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 0, "object not in array => no match")
+	})
+
+	t.Run("by topic_contains combined with contract_id", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			ContractID:    contractB,
+			TopicContains: json.RawMessage(`[{"u64":7}]`),
+		})
+		require.NoError(t, err)
+		// contractB has 5 events (even indexes), all of which contain {"u64":7}.
+		assert.Len(t, got, 5)
+	})
+
+	t.Run("by topic_contains no match", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TopicContains: json.RawMessage(`[{"symbol":"nonexistent"}]`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 0)
+	})
+
 	t.Run("keyset pagination desc returns newest-first", func(t *testing.T) {
 		var all []Event
 		cursor := ""
@@ -322,8 +360,8 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 			topics             jsonb NOT NULL DEFAULT '[]'::jsonb,
 			value              jsonb,
 			created_at         timestamptz NOT NULL DEFAULT now(),
-			raw_topic_xdr      text[],
-			raw_value_xdr      text
+			topics_xdr         jsonb CHECK (topics_xdr IS NULL OR jsonb_typeof(topics_xdr) = 'array'),
+			value_xdr          text
 		);
 		CREATE INDEX idx_events_contract_id ON events (contract_id);
 		CREATE INDEX idx_events_ledger ON events (ledger);
@@ -332,11 +370,11 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		CREATE INDEX idx_events_created_at ON events (created_at);
 		INSERT INTO events (
 			id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-			in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr
+			in_successful_call, topics, value, created_at, topics_xdr, value_xdr
 		)
 		SELECT
 			id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-			in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr
+			in_successful_call, topics, value, created_at, topics_xdr, value_xdr
 		FROM events_partitioned
 		ORDER BY ledger, id;
 		DROP TABLE events_partitioned CASCADE;
@@ -408,6 +446,22 @@ func TestStats(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), stats.TotalEvents)
 	assert.Equal(t, int64(101), stats.LastIngestedLedger)
+	assert.Equal(t, int64(100), stats.OldestStoredLedger)
 	assert.Equal(t, int64(2), stats.ContractCount)
 	assert.Equal(t, int64(1), stats.WatchedContracts)
+
+	var plan string
+	rows, err := st.pool.Query(ctx, `EXPLAIN (COSTS OFF) SELECT coalesce(min(ledger), 0) FROM events`)
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var line string
+		require.NoError(t, rows.Scan(&line))
+		plan += line + "\n"
+	}
+	require.NoError(t, rows.Err())
+	// The exact partition index name is Postgres-generated; the important
+	// property is that min(ledger) stays index-backed.
+	assert.Contains(t, plan, "Index")
+	assert.Contains(t, plan, "ledger")
 }
