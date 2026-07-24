@@ -541,6 +541,19 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 			f.FromTime.Format(time.RFC3339), f.ToTime.Format(time.RFC3339))
 	}
 
+	f.TxHash = q.Get("tx_hash")
+
+	switch raw := q.Get("in_successful_call"); raw {
+	case "":
+		// nil — no constraint
+	case "true":
+		f.InSuccessfulCall = ptr(true)
+	case "false":
+		f.InSuccessfulCall = ptr(false)
+	default:
+		return f, fmt.Errorf("invalid in_successful_call %q (want true or false)", raw)
+	}
+
 	if raw := q.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
 		if err != nil || limit <= 0 || limit > store.MaxQueryLimit {
@@ -550,6 +563,8 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 	return f, nil
 }
+
+func ptr[T any](v T) *T { return &v }
 
 func parseLedgerParam(raw, name string) (int64, error) {
 	if raw == "" {

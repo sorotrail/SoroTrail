@@ -22,6 +22,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func ptr[T any](v T) *T { return &v }
+
 func testStore(t *testing.T) *Postgres {
 	t.Helper()
 	return testStoreWithPartitionSpan(t, int64(DefaultEventPartitionSpan))
@@ -188,6 +190,82 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
 		assert.Equal(t, e1.ID, got[0].ID)
+	})
+
+	t.Run("by tx_hash", func(t *testing.T) {
+		e1 := testEvent(eventID(200), 300, contractA)
+		e1.TxHash = "txhash1"
+		e2 := testEvent(eventID(201), 301, contractA)
+		e2.TxHash = "txhash2"
+		e3 := testEvent(eventID(202), 302, contractA)
+		e3.TxHash = "txhash1"
+		_, err := st.UpsertEvents(ctx, []Event{e1, e2, e3})
+		require.NoError(t, err)
+
+		got, _, err := st.QueryEvents(ctx, EventFilter{TxHash: "txhash1"})
+		require.NoError(t, err)
+		assert.Len(t, got, 2)
+
+		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "txhash2"})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+
+		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "nonexistent"})
+		require.NoError(t, err)
+		assert.Len(t, got, 0)
+	})
+
+	t.Run("by in_successful_call", func(t *testing.T) {
+		e1 := testEvent(eventID(300), 400, contractA)
+		e1.InSuccessfulCall = true
+		e2 := testEvent(eventID(301), 401, contractA)
+		e2.InSuccessfulCall = false
+		e3 := testEvent(eventID(302), 402, contractA)
+		e3.InSuccessfulCall = true
+		_, err := st.UpsertEvents(ctx, []Event{e1, e2, e3})
+		require.NoError(t, err)
+
+		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(true)})
+		require.NoError(t, err)
+		assert.Len(t, got, 2)
+
+		got, _, err = st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(false)})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+
+		got, _, err = st.QueryEvents(ctx, EventFilter{InSuccessfulCall: nil})
+		require.NoError(t, err)
+		assert.GreaterOrEqual(t, len(got), 3, "nil returns all")
+	})
+
+	t.Run("by tx_hash and in_successful_call combined", func(t *testing.T) {
+		e1 := testEvent(eventID(400), 500, contractA)
+		e1.TxHash = "combo1"
+		e1.InSuccessfulCall = true
+		e2 := testEvent(eventID(401), 501, contractA)
+		e2.TxHash = "combo1"
+		e2.InSuccessfulCall = false
+		e3 := testEvent(eventID(402), 502, contractA)
+		e3.TxHash = "combo2"
+		e3.InSuccessfulCall = true
+		_, err := st.UpsertEvents(ctx, []Event{e1, e2, e3})
+		require.NoError(t, err)
+
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TxHash:           "combo1",
+			InSuccessfulCall: ptr(true),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+		assert.Equal(t, e1.ID, got[0].ID)
+
+		got, _, err = st.QueryEvents(ctx, EventFilter{
+			TxHash:           "combo1",
+			InSuccessfulCall: ptr(false),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+		assert.Equal(t, e2.ID, got[0].ID)
 	})
 
 	t.Run("keyset pagination walks all rows in order", func(t *testing.T) {

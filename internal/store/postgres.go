@@ -63,6 +63,17 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // onUpdate=false → ON CONFLICT DO NOTHING (idempotent ingest);
 // onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
 // topic/value drift on the RPC side).
+func onConflictClause(update bool) string {
+	if update {
+		return `ON CONFLICT (id) DO UPDATE SET
+			topics             = EXCLUDED.topics,
+			value              = EXCLUDED.value,
+			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+	}
+	return `ON CONFLICT (id) DO NOTHING`
+}
+
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	batch := &pgx.Batch{}
 	sql := `
@@ -71,7 +82,7 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			 in_successful_call, topics, value, created_at,
 			 raw_topic_xdr, raw_value_xdr)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-		` + conflict
+		` + onConflictClause(onUpdate)
 	for _, e := range events {
 		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
 		// into SQL NULL so the column has one representation of "absent"
@@ -353,6 +364,12 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	}
 	if f.Type != "" {
 		where = append(where, "type = "+arg(f.Type))
+	}
+	if f.TxHash != "" {
+		where = append(where, "tx_hash = "+arg(f.TxHash))
+	}
+	if f.InSuccessfulCall != nil {
+		where = append(where, "in_successful_call = "+arg(*f.InSuccessfulCall))
 	}
 	if len(f.Topic) > 0 {
 		// Containment on the array matches the topic at any position.

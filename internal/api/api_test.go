@@ -171,7 +171,7 @@ func TestListEvents_ParsesFilters(t *testing.T) {
 	s := newTestServer(st, nil)
 
 	resp, body := doGet(t, s,
-		"/events?contract_id="+testContract+`&type=contract&from_ledger=10&to_ledger=20&limit=5&topic={"symbol":"transfer"}&from_time=2026-07-21T00:00:00Z&to_time=2026-07-22T00:00:00Z`)
+		"/events?contract_id="+testContract+`&type=contract&from_ledger=10&to_ledger=20&limit=5&topic={"symbol":"transfer"}&from_time=2026-07-21T00:00:00Z&to_time=2026-07-22T00:00:00Z&tx_hash=9f5c&in_successful_call=true`)
 
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 	assert.Equal(t, testContract, st.lastFilter.ContractID)
@@ -182,6 +182,47 @@ func TestListEvents_ParsesFilters(t *testing.T) {
 	assert.JSONEq(t, `{"symbol":"transfer"}`, string(st.lastFilter.Topic))
 	assert.Equal(t, "2026-07-21T00:00:00Z", st.lastFilter.FromTime.Format(time.RFC3339))
 	assert.Equal(t, "2026-07-22T00:00:00Z", st.lastFilter.ToTime.Format(time.RFC3339))
+	assert.Equal(t, "9f5c", st.lastFilter.TxHash)
+	require.NotNil(t, st.lastFilter.InSuccessfulCall)
+	assert.True(t, *st.lastFilter.InSuccessfulCall)
+}
+
+func TestListEvents_ParsesTxHash(t *testing.T) {
+	st := &stubStore{}
+	resp, _ := doGet(t, newTestServer(st, nil), "/events?tx_hash=abc123")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "abc123", st.lastFilter.TxHash)
+}
+
+func TestListEvents_ParsesInSuccessfulCall(t *testing.T) {
+	t.Run("true", func(t *testing.T) {
+		st := &stubStore{}
+		resp, _ := doGet(t, newTestServer(st, nil), "/events?in_successful_call=true")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.NotNil(t, st.lastFilter.InSuccessfulCall)
+		assert.True(t, *st.lastFilter.InSuccessfulCall)
+	})
+	t.Run("false", func(t *testing.T) {
+		st := &stubStore{}
+		resp, _ := doGet(t, newTestServer(st, nil), "/events?in_successful_call=false")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.NotNil(t, st.lastFilter.InSuccessfulCall)
+		assert.False(t, *st.lastFilter.InSuccessfulCall)
+	})
+	t.Run("omitted is nil", func(t *testing.T) {
+		st := &stubStore{}
+		resp, _ := doGet(t, newTestServer(st, nil), "/events")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Nil(t, st.lastFilter.InSuccessfulCall)
+	})
+}
+
+func TestListEvents_BadInSuccessfulCall(t *testing.T) {
+	resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/events?in_successful_call=maybe")
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var e map[string]string
+	require.NoError(t, json.Unmarshal(body, &e))
+	assert.Contains(t, e["error"], "in_successful_call")
 }
 
 func TestListEvents_BareTopicBecomesJSONString(t *testing.T) {
