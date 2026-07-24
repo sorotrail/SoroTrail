@@ -215,6 +215,33 @@ When `include_xdr=true`, events also include the original base64 XDR payload:
 }
 ```
 
+Events whose topics and value match a SEP-41 token standard shape
+(`transfer`, `mint`, `burn`, `clawback`, `approve` per SEP-41 / CAP-46-6)
+are also tagged with a `sep41_event` object carrying the normalized
+fields — addresses stay as the original `G…`/`C…` strings, amounts stay
+as decimal strings (no float precision loss), muxed transfers expose
+`to_muxed_id` from the data map, and CAP-0067 trailing SEP-0011 asset
+strings surface as `asset`. Non-matching events get no extra field; the
+augmentation is additive, never destructive.
+
+```json
+{
+  "sep41_event": {
+    "standard": "sep41",
+    "event": "transfer",
+    "from": "GA…",
+    "to": "GB…",
+    "amount": "10000000",
+    "asset": "native"
+  }
+}
+```
+
+A `mint` / `burn` / `clawback` event omits the irrelevant side
+(`transfer` has `from` and `to`; `mint` has only `to`; `burn` and
+`clawback` have only `from`; `approve` has `from`, `spender`,
+`expiration_ledger`).
+
 Time filtering narrows results and does not change ordering (events remain in
 ascending event-ID order, which agrees with `created_at` order because both
 follow ledger sequence).
@@ -381,6 +408,15 @@ Every request includes an `X-SoroTrail-Signature` header holding the
 hex-encoded HMAC-SHA256 digest of the request body, keyed with the
 subscription's secret. Subscribers **must verify** this signature to
 confirm the payload came from SoroTrail and has not been tampered with.
+
+When the event matches the SEP-41 token standard, the payload also
+includes the `sep41_event` envelope described under `GET /events` —
+subscribers can rely on `payload.event.sep41_event` (inside the existing
+`event` field of the posted JSON) to identify the transfer / mint /
+burn / clawback / approve semantics without re-implementing SEP-41
+themselves. The signature is computed over the full body including the
+`sep41_event` field, so subscribers who add or remove the field would
+change the signature and fail verification.
 
 **Verifying signatures — code samples:**
 
@@ -657,8 +693,8 @@ points.
 
 Deliberately out of scope for the MVP, with seams left for contributors:
 
-- Per-standard event decoders (e.g. SEP-41 token transfers) on top of
-  `decode.Decoder`.
+- Per-standard event decoders beyond SEP-41 (e.g. CAP-46 SAC events for
+  classic assets, payment events) on top of `decode.Decoder`.
 - Support for more than 25 watched contracts per request chain is implemented
   via windowed sweeps; smarter scheduling (parallel sweeps, per-contract
   cursors) is welcome.

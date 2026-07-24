@@ -177,6 +177,12 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
+	// Tag every event with its SEP-41 normalized envelope (if any) before
+	// rendering — the layer is additive and never destructive, so events
+	// that do not match keep exactly the same shape they had before.
+	for i := range events {
+		events[i].WithSEP41()
+	}
 
 	decoded := r.URL.Query().Get("decoded") == "true"
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
@@ -247,6 +253,9 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
+	// Additive SEP-41 normalization on the single-event path; non-matches
+	// simply omit the field.
+	event.WithSEP41()
 
 	decoded := r.URL.Query().Get("decoded") == "true"
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"

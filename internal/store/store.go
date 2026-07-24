@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/khaylebfortune/sorotrail/internal/sep41"
 )
 
 // Event is a Soroban contract event as persisted by SoroTrail.
@@ -31,6 +33,34 @@ type Event struct {
 	// They are not part of the API representation.
 	RawTopicXDR []string `json:"-"`
 	RawValueXDR string   `json:"-"`
+
+	// SEP41Event carries the SEP-41 normalized envelope when the event's
+	// topics and value match the SEP-41 / CAP-46-6 shapes (transfer, mint,
+	// burn, clawback, approve). It is computed at render time by
+	// internal/sep41 and is nil for non-matching events, so the field is
+	// omitted entirely from the JSON.
+	SEP41Event *json.RawMessage `json:"sep41_event,omitempty"`
+}
+
+// WithSEP41 populates SEP41Event from the SEP-41 normalizer when the
+// event matches any of the SEP-41 / CAP-46-6 token event shapes
+// (transfer, mint, burn, clawback, approve). Non-matches leave the
+// field nil and the JSON output without the slot, which keeps the
+// augmentation additive and never destructive.
+//
+// Both delivery points (API render, webhook signing) call this before
+// JSON serialization so the same envelope surfaces in both
+// representations.
+func (e *Event) WithSEP41() {
+	if e == nil {
+		return
+	}
+	// sep41.Normalize returns a json.RawMessage ([]byte) value; nil on no
+	// match. We need to take its address so the field's pointer stays
+	// nil when nothing matched (omitempty drops the slot in JSON).
+	if n := sep41.Normalize(e.Topics, e.Value); n != nil {
+		e.SEP41Event = &n
+	}
 }
 
 // EnrichedEvent wraps an Event with decoded field information derived from
@@ -91,14 +121,13 @@ type EventFilter struct {
 	Type       string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
-	Topic      json.RawMessage
+	Topic json.RawMessage
 	// TopicContains matches events whose topics array jsonb-contains this
 	// value (Postgres @> operator). Unlike Topic, the value is passed
 	// directly without array-wrapping, so callers can use multi-element
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	Topic json.RawMessage
 	// Topic0-Topic3 match the exact JSON value at that specific topic array
 	// position. Unspecified positions are wildcards.
 	Topic0     json.RawMessage
@@ -172,12 +201,12 @@ type AuditFinding struct {
 // GET /events query parameters. An empty (zero-value) filter matches
 // every event.
 type SubscriptionFilter struct {
-	ContractID string          `json:"contract_id,omitempty"`
-	Type       string          `json:"type,omitempty"`
+	ContractID    string          `json:"contract_id,omitempty"`
+	Type          string          `json:"type,omitempty"`
 	Topic         json.RawMessage `json:"topic,omitempty"`
 	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
 	FromLedger    int64           `json:"from_ledger,omitempty"`
-	ToLedger   int64           `json:"to_ledger,omitempty"`
+	ToLedger      int64           `json:"to_ledger,omitempty"`
 }
 
 // MatchesEvent reports whether an event passes this filter. Zero fields
