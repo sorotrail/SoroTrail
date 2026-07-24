@@ -138,6 +138,78 @@ type AuditFinding struct {
 	CreatedAt       time.Time
 }
 
+// SubscriptionFilter is a JSON-serializable filter that subscription
+// callbacks use to select which events to deliver. Same semantics as
+// GET /events query parameters. An empty (zero-value) filter matches
+// every event.
+type SubscriptionFilter struct {
+	ContractID string          `json:"contract_id,omitempty"`
+	Type       string          `json:"type,omitempty"`
+	Topic      json.RawMessage `json:"topic,omitempty"`
+	FromLedger int64           `json:"from_ledger,omitempty"`
+	ToLedger   int64           `json:"to_ledger,omitempty"`
+}
+
+// MatchesEvent reports whether an event passes this filter. Zero fields
+// mean "no constraint" — the filter is applied per-field, so an empty
+// filter matches everything.
+func (f SubscriptionFilter) MatchesEvent(e Event) bool {
+	if f.ContractID != "" && e.ContractID != f.ContractID {
+		return false
+	}
+	if f.Type != "" && e.Type != f.Type {
+		return false
+	}
+	if f.FromLedger > 0 && e.Ledger < f.FromLedger {
+		return false
+	}
+	if f.ToLedger > 0 && e.Ledger > f.ToLedger {
+		return false
+	}
+	if len(f.Topic) > 0 && len(e.Topics) > 0 {
+		// Match if any event topic equals the filter topic.
+		var topics []json.RawMessage
+		if err := json.Unmarshal(e.Topics, &topics); err != nil {
+			return false
+		}
+		matched := false
+		for _, t := range topics {
+			if string(t) == string(f.Topic) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
+// Subscription is one registered webhook callback.
+type Subscription struct {
+	ID           int64              `json:"id"`
+	URL          string             `json:"url"`
+	Filters      SubscriptionFilter `json:"filters"`
+	Secret       string             `json:"secret"`
+	Enabled      bool               `json:"enabled"`
+	FailureCount int                `json:"failure_count"`
+	CreatedAt    time.Time          `json:"created_at"`
+}
+
+// DeliveryAttempt records one attempt to POST an event to a subscriber's
+// callback URL.
+type DeliveryAttempt struct {
+	ID             int64     `json:"id"`
+	SubscriptionID int64     `json:"subscription_id"`
+	EventID        string    `json:"event_id"`
+	Status         string    `json:"status"`
+	ResponseCode   int       `json:"response_code"`
+	DurationMs     int       `json:"duration_ms"`
+	Error          string    `json:"error,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
 // Stats summarizes what the indexer has stored so far. VerifiedThroughLedger
 // is the inclusive highest ledger whose stored events have been confirmed
 // to match a fresh RPC fetch; 0 means no ledger has been verified yet.
@@ -252,6 +324,29 @@ type Store interface {
 	// range contains a single ledger, or ErrNotFound if none. The auditor
 	// uses this to keep working while a finding is being repaired.
 	ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error)
+
+	// Subscription CRUD.
+	CreateSubscription(ctx context.Context, s Subscription) (Subscription, error)
+	GetSubscription(ctx context.Context, id int64) (Subscription, error)
+	ListSubscriptions(ctx context.Context) ([]Subscription, error)
+	UpdateSubscription(ctx context.Context, s Subscription) (Subscription, error)
+	DeleteSubscription(ctx context.Context, id int64) error
+
+	// ListEnabledSubscriptions returns all subscriptions with enabled=true.
+	ListEnabledSubscriptions(ctx context.Context) ([]Subscription, error)
+
+	// IncrementSubscriptionFailures atomically increments failure_count
+	// and returns the new value. When newCount >= maxFailures the
+	// subscription is also disabled.
+	IncrementSubscriptionFailures(ctx context.Context, id int64, maxFailures int) (newCount int, disabled bool, err error)
+	// ResetSubscriptionFailures sets failure_count to 0.
+	ResetSubscriptionFailures(ctx context.Context, id int64) error
+
+	// RecordDeliveryAttempt persists one delivery attempt.
+	RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (DeliveryAttempt, error)
+	// ListDeliveryAttempts returns delivery attempts for a subscription,
+	// newest first.
+	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
 
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error
