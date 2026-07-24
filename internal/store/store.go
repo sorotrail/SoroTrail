@@ -33,6 +33,22 @@ type Event struct {
 	RawValueXDR string   `json:"-"`
 }
 
+// EnrichedEvent wraps an Event with decoded field information derived from
+// the contract's spec. The original Event is preserved in full; DecodedEvent
+// carries the enriched view when decoding succeeded.
+type EnrichedEvent struct {
+	Event        `json:",inline"`      // embed all Event fields
+	DecodedEvent *DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                  `json:"decoded"`
+}
+
+// DecodedEventResponse is the JSON shape returned when an event is successfully
+// enriched with spec-driven field names.
+type DecodedEventResponse struct {
+	Event  string         `json:"event"`
+	Fields map[string]any `json:"fields,omitempty"`
+}
+
 // DecodedEvent is one event's replayable payload: the raw XDR inputs plus the
 // decoded columns currently stored for it.
 type DecodedEvent struct {
@@ -82,6 +98,13 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
+	Topic json.RawMessage
+	// Topic0-Topic3 match the exact JSON value at that specific topic array
+	// position. Unspecified positions are wildcards.
+	Topic0     json.RawMessage
+	Topic1     json.RawMessage
+	Topic2     json.RawMessage
+	Topic3     json.RawMessage
 	FromLedger int64     // inclusive
 	ToLedger   int64     // inclusive
 	FromTime   time.Time // inclusive, zero = no constraint
@@ -340,6 +363,13 @@ type Store interface {
 	ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error
 	// GetEvent returns the event with the given ID, or ErrNotFound.
 	GetEvent(ctx context.Context, id string) (Event, error)
+	// EventExists reports whether an event with the given ID is in the
+	// store. It is the cheap 304 path used by the API when a conditional
+	// GET carries an If-None-Match whose validator matches the request
+	// URL: we want to confirm "still here" without re-serializing the
+	// full row, so retention/pruning (when it lands, see #8) can't leave
+	// cached clients believing a deleted event is still available.
+	EventExists(ctx context.Context, id string) (bool, error)
 	// QueryEvents returns a page of events in ascending ID order, plus a
 	// cursor for the next page ("" when there are no more results).
 	// Default order is ascending (oldest-first) for backward compatibility.
@@ -399,6 +429,12 @@ type Store interface {
 	// ListDeliveryAttempts returns delivery attempts for a subscription,
 	// newest first.
 	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
+	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
+	// or ErrNotFound when no spec is cached for that hash.
+	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
+	// SetContractSpec persists a JSON-serialized spec keyed by wasm_hash
+	// and contract_id so subsequent lookups avoid an RPC round trip.
+	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
 
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error

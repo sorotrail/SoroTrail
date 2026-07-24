@@ -109,6 +109,10 @@ func (m *mockRPC) GetHealth(context.Context) (rpc.Health, error) {
 	return m.health, nil
 }
 
+func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+	return rpc.GetLedgerEntriesResponse{}, nil
+}
+
 // mockStore is an in-memory implementation of store.Store good enough
 // for the auditor. It mirrors and extends the ingester test mock so we
 // don't import the ingester test package.
@@ -169,6 +173,17 @@ func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event
 		m.events[e.ID] = e
 	}
 	return nil
+}
+
+// EventExists mirrors GetEvent but stops at presence — the auditor's
+// interface compliance is enough for the cache layer's needs.
+func (m *mockStore) EventExists(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.events[id]; !ok {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) {
@@ -328,6 +343,11 @@ func (m *mockStore) Stats(context.Context) (store.Stats, error) {
 }
 
 func (m *mockStore) Ping(context.Context) error { return nil }
+
+func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
+	return nil, store.ErrNotFound
+}
+func (m *mockStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
 
 // Subscription stubs for the webhook feature — unused by auditor tests.
 func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
