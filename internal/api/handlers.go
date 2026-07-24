@@ -73,6 +73,12 @@ type eventsResponse struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
+type enrichedEventsResponse struct {
+	Events []store.EnrichedEvent `json:"events"`
+	// Cursor is non-empty when another page exists.
+	Cursor string `json:"cursor,omitempty"`
+}
+
 type healthResponse struct {
 	Status string            `json:"status"` // ok | degraded
 	Checks map[string]string `json:"checks"`
@@ -147,6 +153,13 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
+
+	decoded := r.URL.Query().Get("decoded") == "true"
+	if decoded && s.enricher != nil {
+		enriched := s.enricher.EnrichEvents(r.Context(), events)
+		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
+		return
+	}
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
 	writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
 }
@@ -194,6 +207,15 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("loading event", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
+	}
+
+	decoded := r.URL.Query().Get("decoded") == "true"
+	if decoded && s.enricher != nil {
+		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
+		if len(enriched) > 0 {
+			writeJSON(w, http.StatusOK, enriched[0])
+			return
+		}
 	}
 	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
 	writeJSON(w, http.StatusOK, event)

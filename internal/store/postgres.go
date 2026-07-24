@@ -92,17 +92,6 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 		// into SQL NULL so the column has one representation of "absent"
 		// rather than two.
 		batch.Queue(sql,
-		// Column list deliberately mirrors the eventColumns constant
-		// (13 fields including raw_topic_xdr / raw_value_xdr) so a
-		// row kept by replay never loses its raw XDR just because the
-		// INSERT forgot the columns.
-		batch.Queue(`
-			INSERT INTO events
-				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-				 in_successful_call, topics, value, created_at,
-				 raw_topic_xdr, raw_value_xdr)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) `+conflict,
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`+conflict,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value,
 			nullableJSON(e.DecodedPayload), nullableText(e.DecodedBy),
@@ -565,6 +554,35 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 
 func (p *Postgres) Ping(ctx context.Context) error {
 	return p.pool.Ping(ctx)
+}
+
+func (p *Postgres) GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error) {
+	var specJSON []byte
+	err := p.pool.QueryRow(ctx,
+		`SELECT spec_json FROM contract_specs WHERE wasm_hash = $1`, wasmHash,
+	).Scan(&specJSON)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading contract spec for wasm_hash %s: %w", wasmHash, err)
+	}
+	return specJSON, nil
+}
+
+func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO contract_specs (wasm_hash, contract_id, spec_json, fetched_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (wasm_hash) DO UPDATE SET
+			spec_json  = EXCLUDED.spec_json,
+			fetched_at = now()`,
+		wasmHash, contractID, specJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("saving contract spec for %s: %w", wasmHash, err)
+	}
+	return nil
 }
 
 func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
