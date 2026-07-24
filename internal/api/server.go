@@ -86,6 +86,23 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 }
 
 // Router returns the HTTP handler with all routes mounted.
+//
+// Middleware layering: requestLogger → Recoverer → Timeout → (Limiter) on
+// the top-level router, then middleware.Compress on the JSON group only.
+// Streaming endpoints (/events/ws) are mounted directly on the parent
+// router so they pick up the deadline / limiter protection WITHOUT being
+// wrapped by Compress — Compress buffers responses and would mangle the
+// WebSocket upgrade (its writer does not implement http.Hijacker in
+// every code path). SSE endpoints, when/if #3 lands, must likewise be
+// registered outside the Compress group.
+//
+// Compress is mounted on the JSON group (not the top-level router) for
+// the opposite reason on the error path: middleware.Timeout writes its
+// 503 BEFORE Compress sees the response, so a stalled handler's 503 is
+// served uncompressed. That path is rare (no in-flight request runs
+// that long) and bandwidth on 503s is not the issue this middleware is
+// solving; the pagination-history wins worth costlier work to keep
+// are the 200 responses that the group covers.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(s.requestLogger)
@@ -98,23 +115,40 @@ func (s *Server) Router() http.Handler {
 		r.Use(s.limiter.Middleware)
 	}
 
-	r.Get("/health", s.handleHealth)
-	r.Get("/events", s.handleListEvents)
-	r.Get("/events/{id}", s.handleGetEvent)
-	r.Get("/contracts/{id}/events", s.handleContractEvents)
-	r.Get("/stats", s.handleStats)
+	// Streaming endpoints — exempt from compression. Compress buffers
+	// responses, which is incompatible with connection-hijacking
+	// protocols (WebSocket today, SSE if/when #3 lands). Register the
+	// route here so it picks up Timeout + Limiter but NOT Compress.
 	r.Get("/events/ws", s.handleEventStreamWS)
 
-	// contributors: new read endpoints go here. Anything that writes (e.g.
-	// managing watched contracts at runtime) should come with auth first.
+	// JSON endpoints — compressed. middleware.Compress(5) negotiates
+	// gzip with the client and sets Content-Encoding/Vary accordingly;
+	// requests without Accept-Encoding: gzip get an identity response
+	// unchanged. The default min-size threshold (~512 B) means tiny
+	// error envelopes don't pay the compress cost — they fly through
+	// as identity.
+	//
+	// Contributors: when you add a new route, add it inside this
+	// group unless it is a streaming protocol that hijacks the
+	// connection, in which case register it on `r` directly next to
+	// /events/ws.
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.Compress(5))
 
-	// Subscription CRUD and delivery history.
-	r.Post("/subscriptions", s.handleCreateSubscription)
-	r.Get("/subscriptions", s.handleListSubscriptions)
-	r.Get("/subscriptions/{id}", s.handleGetSubscription)
-	r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
-	r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
-	r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+		r.Get("/health", s.handleHealth)
+		r.Get("/events", s.handleListEvents)
+		r.Get("/events/{id}", s.handleGetEvent)
+		r.Get("/contracts/{id}/events", s.handleContractEvents)
+		r.Get("/stats", s.handleStats)
+
+		// Subscription CRUD and delivery history.
+		r.Post("/subscriptions", s.handleCreateSubscription)
+		r.Get("/subscriptions", s.handleListSubscriptions)
+		r.Get("/subscriptions/{id}", s.handleGetSubscription)
+		r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
+		r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
+		r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+	})
 
 	return r
 }
