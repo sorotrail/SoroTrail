@@ -6,8 +6,8 @@
 -- and events delivered via xdrFormat "json" never had any. Replay skips and
 -- counts those rows rather than failing.
 ALTER TABLE events
-    ADD COLUMN raw_topic_xdr text[],
-    ADD COLUMN raw_value_xdr text;
+    ADD COLUMN topics_xdr jsonb CHECK (topics_xdr IS NULL OR jsonb_typeof(topics_xdr) = 'array'),
+    ADD COLUMN value_xdr text;
 
 -- Single-row progress marker for the replay tool, mirroring ingestion_state.
 -- Updated in the same transaction as each batch's rewrites, so an interrupted

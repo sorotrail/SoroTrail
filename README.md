@@ -90,7 +90,9 @@ All configuration comes from environment variables (see `.env.example`):
   `{"address":"C..."}`.
 - The raw base64 XDR is stored alongside the decoded JSON, so an improved
   decoder can be applied to already-indexed events — see
-  [decoder replay](#decoder-replay).
+  [decoder replay](#decoder-replay). This intentionally duplicates payload
+  data in `events.topics_xdr` and `events.value_xdr`; budget extra event-table
+  storage for deployments that retain large event histories.
 
 ## Decoder replay
 
@@ -138,6 +140,7 @@ Query parameters (all optional, combinable):
 | `contract_id` | `CDLZ...CYSC` | Only events from this contract. |
 | `type` | `contract` | `contract` \| `system` \| `diagnostic`. |
 | `topic` | `{"symbol":"transfer"}` | Exact match against any topic position. A bare word is treated as a JSON string. |
+| `topic_contains` | `[{"address":"G..."}]` | Postgres jsonb containment (`@>`) against the topics array. Pass an array to match one or more topic elements: `[{"address":"G..."}]` matches any event where a topic contains that address; `[{"symbol":"transfer"},{"address":"G..."}]` requires both. Must be parseable JSON (400 otherwise). Uses the GIN index on `topics`. |
 | `topic0` | `{"symbol":"transfer"}` | Exact match against topic position 0. |
 | `topic1` | `{"address":"G..."}` | Exact match against topic position 1. |
 | `topic2` | `{"address":"G..."}` | Exact match against topic position 2. |
@@ -150,12 +153,30 @@ Query parameters (all optional, combinable):
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
 | `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
 | `decoded` | `true` | When `true`, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with `"decoded": false`. |
+| `include_xdr` | `true` | When `true`, includes raw base64 `topics_xdr` and `value_xdr` on each event. Omitted by default to keep responses small. |
 
 Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
 
 ```sh
 curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic={"symbol":"transfer"}&limit=2'
 ```
+
+Containment search (`topic_contains`) lets you filter by partial topic
+structure — e.g. any event involving a specific address, even when you
+don't know the full topic shape:
+
+```sh
+# Events whose topics include a specific address
+curl -s 'localhost:8080/events?topic_contains=[{"address":"GA...5WI"}]&limit=5'
+# Events with both a transfer symbol and a specific address
+curl -s 'localhost:8080/events?topic_contains=[{"symbol":"transfer"},{"address":"GA...5WI"}]&limit=5'
+```
+
+**Semantics**: `topic_contains` uses Postgres jsonb containment (`@>`),
+not substring matching. `topic_contains=[{"address":"G..."}]` means
+"the topics array contains an element that itself jsonb-contains
+`{"address":"G..."}`", so `{"address":"G...","symbol":"transfer"}`
+matches. For exact element equality use `topic` instead.
 
 ```sh
 curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"GABC..."}&topic2={"address":"GDEF..."}'
@@ -184,6 +205,15 @@ curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"G
 
 `cursor` is present when more results exist; pass it back as `?cursor=` for
 the next page.
+
+When `include_xdr=true`, events also include the original base64 XDR payload:
+
+```json
+{
+  "topics_xdr": ["AAAADwAAAAh0cmFuc2Zlcg=="],
+  "value_xdr": "AAAACgAAAAAAAAAB"
+}
+```
 
 Time filtering narrows results and does not change ordering (events remain in
 ascending event-ID order, which agrees with `created_at` order because both
@@ -466,8 +496,15 @@ curl -s localhost:8080/stats
 ```
 
 ```json
-{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
+{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"oldest_stored_ledger":242001,"chain_head_ledger":260130,"ingest_lag_ledgers":7,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
 ```
+
+`oldest_stored_ledger` is the lowest ledger currently present in the
+store. `chain_head_ledger` is read from Stellar RPC `getHealth`, and
+`ingest_lag_ledgers` is `chain_head_ledger - last_ingested_ledger`. If
+the RPC is temporarily unreachable, `/stats` still returns HTTP 200 with
+the stored fields populated and the RPC-derived freshness fields
+(`chain_head_ledger`, `ingest_lag_ledgers`) set to `null`.
 
 `verified_through_ledger` is the inclusive highest ledger whose stored
 events have been proven to match a fresh RPC fetch by the auditor. When
