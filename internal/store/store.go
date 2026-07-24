@@ -30,7 +30,52 @@ type Event struct {
 	// DecodedPayload. "" when DecodedPayload is nil.
 	DecodedBy string `json:"decoded_by,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+	CreatedAt        time.Time       `json:"created_at"`
+
+	// RawTopicXDR and RawValueXDR keep the base64 XDR the RPC delivered, so
+	// an improved decoder can re-derive Topics/Value later without the RPC
+	// (see internal/replay). Both are empty when the RPC returned
+	// already-decoded JSON, or for rows ingested before raw XDR was stored.
+	// They are not part of the API representation.
+	RawTopicXDR []string `json:"-"`
+	RawValueXDR string   `json:"-"`
 }
+
+// DecodedEvent is one event's replayable payload: the raw XDR inputs plus the
+// decoded columns currently stored for it.
+type DecodedEvent struct {
+	ID          string
+	ContractID  string
+	Ledger      int64
+	RawTopicXDR []string
+	RawValueXDR string
+	Topics      json.RawMessage
+	Value       json.RawMessage
+}
+
+// HasRawXDR reports whether the event carries enough raw XDR to be replayed.
+// Rows without it are skipped (and counted) rather than treated as errors.
+func (d DecodedEvent) HasRawXDR() bool {
+	return len(d.RawTopicXDR) > 0 || d.RawValueXDR != ""
+}
+
+// ReplayState is the single persisted progress row for the replay tool.
+// LastEventID is the last event whose rewrite committed; replay resumes at
+// the first event after it.
+type ReplayState struct {
+	FromLedger  int64
+	ToLedger    int64
+	LastEventID string
+	Processed   int64
+	Changed     int64
+	Skipped     int64
+	StartedAt   time.Time
+	UpdatedAt   time.Time
+	CompletedAt *time.Time
+}
+
+// Done reports whether the recorded run finished its whole range.
+func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
@@ -42,11 +87,24 @@ type EventFilter struct {
 	// Decoded matches events whose plugin-decoded payload contains this
 	// JSON value (Postgres @> containment on decoded_payload).
 	Decoded json.RawMessage
+	// Topic0-Topic3 match the exact JSON value at that specific topic array
+	// position. Unspecified positions are wildcards.
+	Topic0     json.RawMessage
+	Topic1     json.RawMessage
+	Topic2     json.RawMessage
+	Topic3     json.RawMessage
 	FromLedger int64 // inclusive
 	ToLedger   int64 // inclusive
+	Topic      json.RawMessage
+	FromLedger int64     // inclusive
+	ToLedger   int64     // inclusive
+	FromTime   time.Time // inclusive, zero = no constraint
+	ToTime     time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int
+	// Order is "asc" or "desc", defaults to "asc"
+	Order string
 }
 
 // IngestionState tracks how far ingestion has progressed.
@@ -133,9 +191,41 @@ type AuditStats struct {
 	RPCRequests           uint64 `json:"rpc_requests"`
 }
 
+// ReplayBatch is one transactional unit of replay work: the rewritten
+// decoded columns for a batch of events, every dependent table re-derived
+// from them, and the progress marker to advance.
+//
+// contributors: derivation order is part of this type's contract. Dependent
+// tables are derived from the *new* Events decoding, never from what is
+// currently in the database, so a replay is a pure function of the raw XDR.
+// When a dependent table lands (e.g. token_events from a SEP-41 decoder) add
+// it as a field here and write it in CommitReplayBatch after Events — that
+// keeps the order in one place instead of spread across call sites.
+type ReplayBatch struct {
+	// Events are the events-table rewrites, applied first because every
+	// dependent table reads from them.
+	Events []EventDecoding
+	// State is the progress marker, written last and in the same
+	// transaction, so committed progress can never run ahead of committed
+	// rewrites.
+	State ReplayState
+}
+
+// EventDecoding is a freshly decoded events row, keyed by event ID.
+type EventDecoding struct {
+	ID     string
+	Topics json.RawMessage
+	Value  json.RawMessage
+}
+
 // Store is the persistence boundary. The ingester, auditor, and API depend
 // on this interface, never on Postgres directly, so alternative backends can
 // be contributed by implementing it.
+//
+// Replay-specific persistence is deliberately not part of this interface —
+// it lives on *Postgres and is consumed through the narrower interface in
+// internal/replay, so backends that don't need a maintenance replay tool
+// aren't forced to implement one.
 type Store interface {
 	// UpsertEvents inserts events idempotently (duplicates by ID are ignored)
 	// and returns the number of newly inserted rows.
@@ -145,12 +235,22 @@ type Store interface {
 	// no longer appear in `events`) are deleted, missing events are
 	// inserted, and same-ID rows are updated (so topic/value mutations on
 	// the RPC side are corrected). Designed for targeted repair from the
-	// auditor; ingest uses UpsertEvents instead.
+	// auditor; ingest uses UpsertEvents instead. Raw XDR already stored for
+	// a surviving event is preserved when the incoming event carries none,
+	// so a repair never costs a row its replayability.
 	ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error
 	// GetEvent returns the event with the given ID, or ErrNotFound.
 	GetEvent(ctx context.Context, id string) (Event, error)
+	// EventExists reports whether an event with the given ID is in the
+	// store. It is the cheap 304 path used by the API when a conditional
+	// GET carries an If-None-Match whose validator matches the request
+	// URL: we want to confirm "still here" without re-serializing the
+	// full row, so retention/pruning (when it lands, see #8) can't leave
+	// cached clients believing a deleted event is still available.
+	EventExists(ctx context.Context, id string) (bool, error)
 	// QueryEvents returns a page of events in ascending ID order, plus a
 	// cursor for the next page ("" when there are no more results).
+	// Default order is ascending (oldest-first) for backward compatibility.
 	QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error)
 	// LedgerRangeCensus returns one LedgerCensus row per ledger in the
 	// inclusive [fromLedger, toLedger] range that contains at least one

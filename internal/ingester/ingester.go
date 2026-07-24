@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/khaylebfortune/sorotrail/internal/broadcast"
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/plugins"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
@@ -61,6 +62,7 @@ type Ingester struct {
 	plugins *plugins.Manager
 	log     *slog.Logger
 	opts    Options
+	bcast   *broadcast.Broadcaster
 }
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
@@ -69,6 +71,13 @@ type Ingester struct {
 func New(client rpc.Client, st store.Store, dec decode.Decoder, pluginMgr *plugins.Manager, log *slog.Logger, opts Options) *Ingester {
 	opts.applyDefaults()
 	return &Ingester{client: client, store: st, decoder: dec, plugins: pluginMgr, log: log, opts: opts}
+}
+
+// WithBroadcaster attaches a live event broadcaster so ingested events are
+// pushed to streaming subscribers.
+func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
+	ing.bcast = b
+	return ing
 }
 
 // Run polls until ctx is canceled. Errors are logged and retried with
@@ -364,6 +373,10 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		"count", len(events), "new", inserted,
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
 		"latest_ledger", latestLedger)
+
+	if ing.bcast != nil {
+		ing.bcast.Publish(ctx, events)
+	}
 	return nil
 }
 
@@ -448,6 +461,11 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 		return store.Event{}, fmt.Errorf("decoding event %s: %w", re.ID, err)
 	}
 	ev := store.Event{
+	var createdAt time.Time
+	if re.LedgerClosedAt != "" {
+		createdAt, _ = time.Parse(time.RFC3339, re.LedgerClosedAt)
+	}
+	return store.Event{
 		ID:               re.ID,
 		ContractID:       re.ContractID,
 		Ledger:           int64(re.Ledger),
@@ -478,6 +496,14 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 		}
 	}
 	return ev, nil
+		CreatedAt:        createdAt,
+		// Keep the raw XDR so `sorotrail replay` can re-decode this event
+		// with a future decoder. Empty when the RPC delivered JSON directly
+		// (xdrFormat "json") — there is no XDR to keep in that case, and
+		// replay skips such rows.
+		RawTopicXDR: re.Topic,
+		RawValueXDR: re.Value,
+	}, nil
 }
 
 // sleepCtx sleeps for d or until ctx is done; it reports whether the full
