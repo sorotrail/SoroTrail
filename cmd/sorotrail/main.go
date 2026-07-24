@@ -93,7 +93,7 @@ func run() error {
 	}
 
 	var (
-		st  store.Store
+		st   store.Store
 		pool *pgxpool.Pool
 	)
 	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
@@ -165,7 +165,12 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpcClient, log, specEnricher).WithBroadcaster(bcast)
+	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
+		Timeout:            cfg.APIQueryTimeout,
+		SlowQueryThreshold: cfg.APISlowQueryThreshold,
+		Logger:             log,
+	})
+	apiServer := api.New(apiStore, rpcClient, log, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{

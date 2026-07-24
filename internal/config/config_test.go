@@ -17,6 +17,7 @@ const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 var envKeys = []string{
 	"RPC_URL", "DATABASE_URL", "POLL_INTERVAL", "HTTP_ADDR",
 	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL",
+	"API_QUERY_TIMEOUT", "API_SLOW_QUERY_THRESHOLD",
 	"AUDIT_ENABLED", "AUDIT_POLL_INTERVAL", "AUDIT_BATCH_LEDGERS",
 	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
 	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
@@ -36,6 +37,8 @@ func TestLoad(t *testing.T) {
 			check: func(t *testing.T, c Config) {
 				assert.Equal(t, "https://soroban-testnet.stellar.org", c.RPCURL)
 				assert.Equal(t, 5*time.Second, c.PollInterval)
+				assert.Equal(t, 25*time.Second, c.APIQueryTimeout)
+				assert.Equal(t, 2*time.Second, c.APISlowQueryThreshold)
 				assert.Equal(t, ":8080", c.HTTPAddr)
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
 				assert.Equal(t, uint32(120960), c.PartitionLedgerSpan)
@@ -75,6 +78,14 @@ func TestLoad(t *testing.T) {
 				"POLL_INTERVAL": "-3s",
 			},
 			wantErr: "POLL_INTERVAL must be positive",
+		},
+		{
+			name: "bad query timeout",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"API_QUERY_TIMEOUT": "0s",
+			},
+			wantErr: "API_QUERY_TIMEOUT",
 		},
 		{
 			name: "bad log level",
