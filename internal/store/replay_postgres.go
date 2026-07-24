@@ -120,7 +120,7 @@ func (p *Postgres) StartReplayState(ctx context.Context, fromLedger, toLedger in
 // they carry raw XDR — the caller counts the ones it has to skip.
 func (p *Postgres) NextReplayBatch(ctx context.Context, fromLedger, toLedger int64, afterID string, limit int) ([]DecodedEvent, error) {
 	rows, err := p.pool.Query(ctx, `
-		SELECT id, contract_id, ledger, raw_topic_xdr, raw_value_xdr, topics, value
+		SELECT id, contract_id, ledger, topics_xdr, value_xdr, topics, value
 		FROM events
 		WHERE ledger >= $1 AND ledger <= $2 AND id > $3
 		ORDER BY id ASC
