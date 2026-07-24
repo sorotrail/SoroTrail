@@ -33,6 +33,16 @@ type Config struct {
 	AuditMaxRPS         float64       `env:"AUDIT_MAX_RPS" envDefault:"10"`
 	AuditMaxRepair      int           `env:"AUDIT_MAX_REPAIR_ATTEMPTS" envDefault:"3"`
 	AuditFindingMaxLgrs uint32        `env:"AUDIT_FINDING_MAX_LEDGERS" envDefault:"100"`
+
+	// Retention / pruning config. When neither RETENTION_MAX_AGE nor
+	// RETENTION_MIN_LEDGER is set, the pruner is disabled and nothing is
+	// ever deleted by the background job — matching the pre-pruner
+	// behaviour.
+	RetentionMaxAge    time.Duration `env:"RETENTION_MAX_AGE"`
+	RetentionMinLedger uint64        `env:"RETENTION_MIN_LEDGER"`
+	RetentionBatchSize int           `env:"RETENTION_BATCH_SIZE" envDefault:"5000"`
+	RetentionPause     time.Duration `env:"RETENTION_PAUSE" envDefault:"100ms"`
+	RetentionInterval  time.Duration `env:"RETENTION_INTERVAL" envDefault:"1h"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -95,7 +105,25 @@ func (c Config) Validate() error {
 	if c.AuditFindingMaxLgrs == 0 {
 		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
 	}
+	if c.RetentionBatchSize <= 0 {
+		return fmt.Errorf("RETENTION_BATCH_SIZE must be positive")
+	}
+	if c.RetentionPause < 0 {
+		return fmt.Errorf("RETENTION_PAUSE must be non-negative")
+	}
+	if c.RetentionInterval <= 0 {
+		return fmt.Errorf("RETENTION_INTERVAL must be positive")
+	}
+	if c.RetentionMaxAge < 0 {
+		return fmt.Errorf("RETENTION_MAX_AGE must be non-negative")
+	}
 	return nil
+}
+
+// RetentionEnabled reports whether at least one retention policy is
+// configured — the pruner only runs when this is true.
+func (c Config) RetentionEnabled() bool {
+	return c.RetentionMaxAge > 0 || c.RetentionMinLedger > 0
 }
 
 // ValidContractID reports whether s looks like a Soroban contract strkey.

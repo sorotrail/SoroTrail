@@ -151,6 +151,15 @@ type Stats struct {
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
+	// Pruner counters are populated only when retention is configured;
+	// omitted from JSON when the pruner is a no-op.
+	Pruner PrunerStats `json:"pruner,omitempty"`
+}
+
+// PrunerStats is a JSON-friendly view of pruner.Metrics.
+type PrunerStats struct {
+	RunsCompleted   uint64 `json:"runs_completed"`
+	TotalRowsPurged int64  `json:"total_rows_purged"`
 }
 
 // AuditStats is a JSON-friendly view of audit.Metrics. Defined here so
@@ -252,6 +261,18 @@ type Store interface {
 	// range contains a single ledger, or ErrNotFound if none. The auditor
 	// uses this to keep working while a finding is being repaired.
 	ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error)
+
+	// DeleteEventsBefore deletes up to limit events that are strictly below
+	// maxLedger (the safe upper bound, typically last_ingested_ledger) AND
+	// (if beforeTime is non-zero) have a created_at strictly older than
+	// beforeTime. It returns the number of rows deleted.
+	//
+	// The caller is responsible for ensuring maxLedger is at or below the
+	// last ingested ledger so recent events are never removed. Setting
+	// beforeTime to zero means "ignore time — delete solely on ledger".
+	// This method is designed for the background pruner; it intentionally
+	// never deletes rows at or above maxLedger.
+	DeleteEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error)
 
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error

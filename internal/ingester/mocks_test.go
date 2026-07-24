@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"time"
 
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
@@ -155,6 +156,12 @@ func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
 
 func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
 func (m *mockStore) Ping(context.Context) error                 { return nil }
+
+// DeleteEventsBefore is unused by ingester tests but the pruner extends
+// the store.Store interface, so the mock has to satisfy the contract.
+func (m *mockStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}
 
 // passthroughDecoder avoids XDR fixtures in ingester tests.
 type passthroughDecoder struct{}

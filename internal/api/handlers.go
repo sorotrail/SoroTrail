@@ -121,6 +121,13 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			RPCRequests:           m.RPCRequests,
 		}
 	}
+	if p := getPruner(); p != nil {
+		m := p.Metrics()
+		stats.Pruner = store.PrunerStats{
+			RunsCompleted:   m.RunsCompleted,
+			TotalRowsPurged: m.TotalRowsPurged,
+		}
+	}
 	writeJSON(w, http.StatusOK, stats)
 }
 

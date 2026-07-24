@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
@@ -328,6 +329,14 @@ func (m *mockStore) Stats(context.Context) (store.Stats, error) {
 }
 
 func (m *mockStore) Ping(context.Context) error { return nil }
+
+// DeleteEventsBefore is unused by audit tests but the pruner extends
+// the store.Store interface, so the mock has to satisfy it. Returning
+// (0, nil) makes a no-op pruner pass harmless under the auditor if a
+// future test ever wires one up.
+func (m *mockStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}
 
 // seedLedgers records pre-existing events in m.events so tests can set up
 // "stored state that diverges from the RPC" without a database. IDs use

@@ -25,6 +25,7 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/ingester"
+	"github.com/khaylebfortune/sorotrail/internal/pruner"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -128,13 +129,28 @@ func run() error {
 		api.SetAuditor(aud)
 	}
 
+	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
+	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
+	// returns immediately. Only when at least one retention policy is
+	// configured does it allocate a goroutine and a metrics struct.
+	prn := pruner.New(st, log, pruner.Options{
+		MaxAge:    cfg.RetentionMaxAge,
+		MinLedger: cfg.RetentionMinLedger,
+		BatchSize: cfg.RetentionBatchSize,
+		Pause:     cfg.RetentionPause,
+		Interval:  cfg.RetentionInterval,
+	})
+	if cfg.RetentionEnabled() {
+		api.SetPruner(prn)
+	}
+
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           api.New(st, rpcClient, log).Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	go func() {
 		log.Info("ingester starting", "rpc_url", cfg.RPCURL, "poll_interval", cfg.PollInterval)
 		if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -165,11 +181,26 @@ func run() error {
 			}
 		}()
 	}
+	go func() {
+		if cfg.RetentionEnabled() {
+			log.Info("pruner starting",
+				"max_age", cfg.RetentionMaxAge,
+				"min_ledger", cfg.RetentionMinLedger,
+				"batch_size", cfg.RetentionBatchSize,
+				"pause", cfg.RetentionPause,
+				"interval", cfg.RetentionInterval)
+		}
+		if err := prn.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errCh <- fmt.Errorf("pruner: %w", err)
+		} else {
+			errCh <- nil
+		}
+	}()
 
 	var firstErr error
-	remaining := 2 // ingester + http server
+	remaining := 3 // ingester + http server + pruner
 	if aud != nil {
-		remaining = 3
+		remaining = 4
 	}
 	select {
 	case <-ctx.Done():
