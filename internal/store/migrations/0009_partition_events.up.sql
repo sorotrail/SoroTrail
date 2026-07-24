@@ -2,6 +2,23 @@ BEGIN;
 
 ALTER TABLE events RENAME TO events_legacy;
 
+-- Tear down the user-named indexes on events_legacy before recreating
+-- them on the new partitioned events. Postgres only auto-renames
+-- SYSTEM-GENERATED names tied to the table (e.g. events_pkey ->
+-- events_legacy_pkey). User-named indexes keep their original name;
+-- because index names are global per schema, recreating them on the
+-- new events would collide with the indexes still on events_legacy.
+-- IF EXISTS makes the step safe across partial / rerun scenarios.
+DROP INDEX IF EXISTS idx_events_contract_id;
+DROP INDEX IF EXISTS idx_events_ledger;
+DROP INDEX IF EXISTS idx_events_contract_ledger;
+DROP INDEX IF EXISTS idx_events_topics;
+DROP INDEX IF EXISTS idx_events_topic0;
+DROP INDEX IF EXISTS idx_events_topic1;
+DROP INDEX IF EXISTS idx_events_topic2;
+DROP INDEX IF EXISTS idx_events_topic3;
+DROP INDEX IF EXISTS idx_events_created_at;
+
 CREATE TABLE events (
     id                 text NOT NULL,
     contract_id        text NOT NULL,

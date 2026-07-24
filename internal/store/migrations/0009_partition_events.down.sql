@@ -2,6 +2,21 @@ BEGIN;
 
 ALTER TABLE events RENAME TO events_partitioned;
 
+-- Symmetric fix to the up migration: user-named indexes on
+-- events_partitioned keep their original names after the rename and
+-- would conflict with the CREATE INDEX statements below on the
+-- freshly-created unpartitioned events table. Drop them here before
+-- recreating.
+DROP INDEX IF EXISTS idx_events_contract_id;
+DROP INDEX IF EXISTS idx_events_ledger;
+DROP INDEX IF EXISTS idx_events_contract_ledger;
+DROP INDEX IF EXISTS idx_events_topics;
+DROP INDEX IF EXISTS idx_events_topic0;
+DROP INDEX IF EXISTS idx_events_topic1;
+DROP INDEX IF EXISTS idx_events_topic2;
+DROP INDEX IF EXISTS idx_events_topic3;
+DROP INDEX IF EXISTS idx_events_created_at;
+
 CREATE TABLE events (
     id                 text PRIMARY KEY,
     contract_id        text NOT NULL,
