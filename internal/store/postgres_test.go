@@ -42,6 +42,28 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	_, err = pool.Exec(context.Background(),
 		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
 	require.NoError(t, err)
+
+	// TRUNCATE empties the partitions but leaves them attached, and a
+	// partition's bounds are fixed at creation. Tests run with different
+	// partition spans against the same database, so a partition left by an
+	// earlier test would overlap the one this test's span wants. Detach the
+	// slate as well as clearing it.
+	_, err = pool.Exec(context.Background(), `
+		DO $$
+		DECLARE part text;
+		BEGIN
+			FOR part IN
+				SELECT c.relname
+				FROM pg_inherits i
+				JOIN pg_class c ON c.oid = i.inhrelid
+				JOIN pg_class p ON p.oid = i.inhparent
+				WHERE p.relname = 'events'
+			LOOP
+				EXECUTE format('DROP TABLE IF EXISTS %I', part);
+			END LOOP;
+		END $$;`)
+	require.NoError(t, err)
+
 	return NewPostgres(pool, span)
 }
 
@@ -202,7 +224,10 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		require.Len(t, all, 10)
+		// Count what is actually in the table rather than hardcoding it:
+		// sibling subtests above insert rows of their own, so a literal makes
+		// this assertion depend on subtest execution order.
+		require.Len(t, all, countAllEvents(t, st))
 		for i := 1; i < len(all); i++ {
 			assert.Less(t, all[i-1].ID, all[i].ID, "ascending ID order across pages")
 		}
@@ -262,7 +287,7 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		require.Len(t, all, 10)
+		require.Len(t, all, countAllEvents(t, st))
 		for i := 1; i < len(all); i++ {
 			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
 		}
@@ -348,6 +373,20 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 
 	_, err = pool.Exec(ctx, `
 		ALTER TABLE events RENAME TO events_partitioned;
+		-- Renaming a table does not rename its indexes, so the partitioned
+		-- table still holds every idx_events_* name. Free them before the
+		-- legacy table below recreates the same names (this mirrors what
+		-- 0004_partition_events does in the other direction).
+		DROP INDEX IF EXISTS idx_events_id;
+		DROP INDEX IF EXISTS idx_events_contract_id;
+		DROP INDEX IF EXISTS idx_events_ledger;
+		DROP INDEX IF EXISTS idx_events_contract_ledger;
+		DROP INDEX IF EXISTS idx_events_topics;
+		DROP INDEX IF EXISTS idx_events_created_at;
+		DROP INDEX IF EXISTS idx_events_topic0;
+		DROP INDEX IF EXISTS idx_events_topic1;
+		DROP INDEX IF EXISTS idx_events_topic2;
+		DROP INDEX IF EXISTS idx_events_topic3;
 		CREATE TABLE events (
 			id                 text PRIMARY KEY,
 			contract_id        text NOT NULL,
@@ -464,4 +503,15 @@ func TestStats(t *testing.T) {
 	// property is that min(ledger) stays index-backed.
 	assert.Contains(t, plan, "Index")
 	assert.Contains(t, plan, "ledger")
+}
+
+// countAllEvents returns how many events the store currently holds, so
+// pagination assertions stay correct regardless of what sibling subtests
+// have inserted.
+func countAllEvents(t *testing.T, st *Postgres) int {
+	t.Helper()
+	got, next, err := st.QueryEvents(context.Background(), EventFilter{Limit: MaxQueryLimit})
+	require.NoError(t, err)
+	require.Empty(t, next, "fixture must fit in one max-size page")
+	return len(got)
 }

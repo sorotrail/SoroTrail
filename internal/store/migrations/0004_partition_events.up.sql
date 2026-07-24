@@ -2,6 +2,30 @@ BEGIN;
 
 ALTER TABLE events RENAME TO events_legacy;
 
+-- Renaming a table does NOT rename its indexes or constraints, so every
+-- index name from 0001_init is still attached to events_legacy and would
+-- collide with the identically-named indexes created below. Free the names
+-- before recreating them on the partitioned table; events_legacy is dropped
+-- at the end of this migration, so nothing is lost.
+-- The new partitioned table's primary key will be auto-named events_pkey,
+-- so free that name if the legacy table holds it. Guarded, because a legacy
+-- table that arrived by some other route may have a differently-named key.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'events_pkey' AND conrelid = 'events_legacy'::regclass
+    ) THEN
+        ALTER TABLE events_legacy RENAME CONSTRAINT events_pkey TO events_legacy_pkey;
+    END IF;
+END $$;
+DROP INDEX IF EXISTS idx_events_id;
+DROP INDEX IF EXISTS idx_events_contract_id;
+DROP INDEX IF EXISTS idx_events_ledger;
+DROP INDEX IF EXISTS idx_events_contract_ledger;
+DROP INDEX IF EXISTS idx_events_topics;
+DROP INDEX IF EXISTS idx_events_created_at;
+
 CREATE TABLE events (
     id                 text NOT NULL,
     contract_id        text NOT NULL,

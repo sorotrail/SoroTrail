@@ -65,9 +65,15 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	batch := &pgx.Batch{}
-	conflict := "ON CONFLICT (id) DO NOTHING"
+	// The conflict target must be (ledger, id), not (id): events is
+	// partitioned by ledger, and Postgres requires a unique constraint on a
+	// partitioned table to include every partition-key column, so (ledger, id)
+	// is the only unique key that exists. Event IDs are TOID-derived and
+	// already encode their ledger, so this is the same identity spelled in
+	// full, not a change of meaning.
+	conflict := "ON CONFLICT (ledger, id) DO NOTHING"
 	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
+		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
 			contract_id        = EXCLUDED.contract_id,
 			ledger             = EXCLUDED.ledger,
 			type               = EXCLUDED.type,
@@ -569,9 +575,10 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 			(SELECT count(*) FROM events),
 			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
 			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
+			(SELECT coalesce(min(ledger), 0) FROM events),
 			(SELECT count(DISTINCT contract_id) FROM events),
 			(SELECT count(*) FROM watched_contracts)`,
-	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.ContractCount, &s.WatchedContracts)
+	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
 	}

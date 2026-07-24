@@ -1,7 +1,7 @@
 -- Webhook subscriptions: consumers register callback URLs with event
 -- filters. Ingested events that match a subscription's filters are POSTed to
 -- its URL asynchronously.
-CREATE TABLE subscriptions (
+CREATE TABLE IF NOT EXISTS subscriptions (
     id            bigserial PRIMARY KEY,
     url           text NOT NULL,
     -- filters uses the same shape as GET /events query parameters:
@@ -19,12 +19,12 @@ CREATE TABLE subscriptions (
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_subscriptions_enabled ON subscriptions (enabled)
+CREATE INDEX IF NOT EXISTS idx_subscriptions_enabled ON subscriptions (enabled)
     WHERE enabled = true;
 
 -- One row per delivery attempt. A subscription for an event may have
 -- multiple rows here (initial attempt + retries).
-CREATE TABLE delivery_attempts (
+CREATE TABLE IF NOT EXISTS delivery_attempts (
     id              bigserial PRIMARY KEY,
     subscription_id bigint NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
     event_id        text NOT NULL,
@@ -41,5 +41,5 @@ CREATE TABLE delivery_attempts (
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_delivery_attempts_subscription
+CREATE INDEX IF NOT EXISTS idx_delivery_attempts_subscription
     ON delivery_attempts (subscription_id, created_at DESC);
