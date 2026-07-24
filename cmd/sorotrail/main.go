@@ -95,7 +95,7 @@ func run() error {
 		return fmt.Errorf("pinging postgres: %w", err)
 	}
 
-	st := store.NewPostgres(pool)
+	st := store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
 	for _, id := range cfg.WatchedContracts {
 		if err := st.AddWatchedContract(ctx, id); err != nil {
 			return err
