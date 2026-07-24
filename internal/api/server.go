@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/khaylebfortune/sorotrail/internal/audit"
+	"github.com/khaylebfortune/sorotrail/internal/broadcast"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -49,6 +50,14 @@ type Server struct {
 	rpc    rpc.Client
 	log    *slog.Logger
 	apiKey string
+	store   store.Store
+	rpc     rpc.Client
+	log     *slog.Logger
+	limiter *RateLimiter
+	store store.Store
+	rpc   rpc.Client
+	log   *slog.Logger
+	bcast *broadcast.Broadcaster
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -59,18 +68,37 @@ func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string) 
 	return &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey}
 }
 
+// SetRateLimiter wires a per-client rate limiter into the router. Pass
+// nil to leave the limiter disabled (the default — no behavior change).
+// The limiter's Start/Stop lifecycle is owned by main, not by the Server.
+func (s *Server) SetRateLimiter(l *RateLimiter) {
+	s.limiter = l
+// WithBroadcaster attaches the live event broadcaster so streaming endpoints
+// (SSE, WebSocket) can deliver events as they arrive.
+func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
+	s.bcast = b
+	return s
+}
+
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
+	if s.limiter != nil {
+		// Limiter sits inside Timeout and Recoverer so its instant 429
+		// response always makes it back through the deadline cleanly, and
+		// a panic inside the limiter can't take down the server.
+		r.Use(s.limiter.Middleware)
+	}
 
 	r.Get("/health", s.handleHealth)
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/stats", s.handleStats)
+	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// Watched-contracts management: writes and updates to the runtime
 	// filter list. Always auth-gated, even when AUTH_ENABLED would be

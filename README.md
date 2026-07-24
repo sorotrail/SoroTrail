@@ -66,6 +66,9 @@ All configuration comes from environment variables (see `.env.example`):
 | `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
 | `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
 | `API_KEY` | empty | Required to use the runtime `/watched-contracts` surface; empty means every request there is rejected with 503. This is a placeholder until #17 (real auth) lands — at that point `API_KEY` will be replaced. |
+| `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
+| `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
+| `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
 | `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
 
 ## Ingestion behavior
@@ -136,6 +139,10 @@ Query parameters (all optional, combinable):
 | `contract_id` | `CDLZ...CYSC` | Only events from this contract. |
 | `type` | `contract` | `contract` \| `system` \| `diagnostic`. |
 | `topic` | `{"symbol":"transfer"}` | Exact match against any topic position. A bare word is treated as a JSON string. |
+| `topic0` | `{"symbol":"transfer"}` | Exact match against topic position 0. |
+| `topic1` | `{"address":"G..."}` | Exact match against topic position 1. |
+| `topic2` | `{"address":"G..."}` | Exact match against topic position 2. |
+| `topic3` | `{"u64":7}` | Exact match against topic position 3. |
 | `from_ledger` | `250000` | Inclusive lower ledger bound. |
 | `to_ledger` | `260000` | Inclusive upper ledger bound. |
 | `from_time` | `2026-07-21T00:00:00Z` | Inclusive lower `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
@@ -144,8 +151,14 @@ Query parameters (all optional, combinable):
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
 | `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
 
+Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
+
 ```sh
 curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic={"symbol":"transfer"}&limit=2'
+```
+
+```sh
+curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"GABC..."}&topic2={"address":"GDEF..."}'
 ```
 
 ```json
@@ -335,6 +348,46 @@ idempotent. The implication for runtime changes:
 In short: env seeds on every run; runtime adds and runtime deletes that
 target items NOT in the env are durable across restarts; runtime deletes
 that target env-seeded items get undone on the next restart.
+
+### `GET /events/ws` (WebSocket live stream)
+
+Pushes ingested events to the client over a single WebSocket connection
+as soon as they are written to the store. There is no replay — the
+stream starts at "now", and the client only sees events the indexer
+ingests after it connects.
+
+Query parameters share the same `EventFilter` shape as `GET /events`
+(`contract_id`, `type`, `topic`, `from_ledger`, `to_ledger`,
+`from_time`, `to_time`), so any filter that works against the query
+API works against the stream.
+
+Frame format:
+
+- One `store.Event` per WebSocket text frame, JSON-encoded.
+- Server-to-client only — clients do not send messages; the `nhooyr.io/websocket`
+  library handles ping/pong internally.
+- The server pings every 30s so proxies don't idle the connection.
+
+Behavior:
+
+- **Slow-consumer eviction**: each subscriber gets a bounded channel
+  buffer (`broadcast.DefaultBufferSize` = 64). A subscriber whose
+  channel fills is evicted silently: its `Events()` channel is closed,
+  the handler returns, and the WebSocket is closed from the server side.
+  This protects the indexer from one stuck client back-pressuring the
+  broadcaster.
+- **Broadcaster unwired**: returns `501 Not Implemented` (only happens
+  if the binary was built without the broadcaster wired).
+- **Bad filter**: returns `400 Bad Request` before the WebSocket
+  upgrade, with the standard `{"error": "..."}` JSON body.
+
+Example with [`websocat`](https://github.com/vi/websocat):
+
+```sh
+websocat 'ws://localhost:8080/events/ws?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic=mint'
+{"id":"…","contract_id":"…","topics":["mint"], …}
+{"id":"…","contract_id":"…","topics":["mint"], …}
+```
 
 ## Data integrity
 
