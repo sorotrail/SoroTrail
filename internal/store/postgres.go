@@ -65,7 +65,7 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	batch := &pgx.Batch{}
-	conflict := `ON CONFLICT (id) DO NOTHING`
+	conflict := "ON CONFLICT (id) DO NOTHING"
 	if onUpdate {
 		conflict = `ON CONFLICT (id) DO UPDATE SET
 			contract_id        = COALESCE(EXCLUDED.contract_id,        events.contract_id),
@@ -100,6 +100,8 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			created_at         = EXCLUDED.created_at,
 			topics_xdr         = COALESCE(EXCLUDED.topics_xdr, events.topics_xdr),
 			value_xdr          = COALESCE(EXCLUDED.value_xdr, events.value_xdr)`
+			topics_xdr         = COALESCE(EXCLUDED.topics_xdr,         events.topics_xdr),
+			value_xdr          = COALESCE(EXCLUDED.value_xdr,          events.value_xdr)`
 	}
 	sql := `
 		INSERT INTO events
