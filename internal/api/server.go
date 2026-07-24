@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/khaylebfortune/sorotrail/internal/audit"
 	"github.com/khaylebfortune/sorotrail/internal/broadcast"
@@ -103,6 +104,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/stats", s.handleStats)
+	r.Handle("/metrics", promhttp.Handler())
 	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// contributors: new read endpoints go here. Anything that writes (e.g.

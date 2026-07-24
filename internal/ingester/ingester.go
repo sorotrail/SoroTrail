@@ -12,6 +12,7 @@ import (
 
 	"github.com/khaylebfortune/sorotrail/internal/broadcast"
 	"github.com/khaylebfortune/sorotrail/internal/decode"
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -101,6 +102,7 @@ func (ing *Ingester) Run(ctx context.Context) error {
 		case ctx.Err() != nil:
 			return ctx.Err()
 		case err != nil:
+			metrics.IngestErrors.Inc()
 			// Jittered exponential backoff so restarts don't thundering-herd
 			// a shared endpoint.
 			sleep := backoff/2 + rand.N(backoff/2)
@@ -170,6 +172,7 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 	if err := ing.store.SaveIngestionState(ctx, state); err != nil {
 		return false, err
 	}
+	metrics.IngestLag.Set(float64(maxInt64(0, int64(resp.LatestLedger)-state.LastIngestedLedger)))
 	return caughtUp, nil
 }
 
@@ -380,6 +383,7 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	if err != nil {
 		return err
 	}
+	metrics.EventsIngested.Add(float64(len(events)))
 	ing.log.Info("ingested events",
 		"count", len(events), "new", inserted,
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
@@ -440,9 +444,12 @@ func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) erro
 	}
 	ing.log.Warn("resume ledger fell outside RPC retention window; skipping ahead — events in the gap are lost",
 		"requested_ledger", requested, "oldest_retained", health.OldestLedger)
-	return ing.store.SaveIngestionState(ctx, store.IngestionState{
-		LastIngestedLedger: int64(health.OldestLedger) - 1,
-	})
+	state := store.IngestionState{LastIngestedLedger: int64(health.OldestLedger) - 1}
+	if err := ing.store.SaveIngestionState(ctx, state); err != nil {
+		return err
+	}
+	metrics.IngestLag.Set(float64(maxInt64(0, int64(health.LatestLedger)-state.LastIngestedLedger)))
+	return nil
 }
 
 // buildFilterBatches converts the watched-contract list into getEvents
@@ -512,4 +519,11 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }

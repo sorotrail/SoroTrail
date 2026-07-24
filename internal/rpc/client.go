@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 )
 
 // Client is the RPC boundary. The ingester and API depend on this interface
@@ -111,31 +113,41 @@ func (c *HTTPClient) GetEvents(ctx context.Context, req GetEventsRequest) (GetEv
 	}
 
 	var resp GetEventsResponse
+	start := time.Now()
 	err := c.call(ctx, "getEvents", req, &resp)
+	metrics.RPCCallDuration.WithLabelValues("getEvents").Observe(time.Since(start).Seconds())
 	if err != nil && isXDRFormatRejected(err) {
 		// Older server: remember and retry once without the param.
 		c.xdrJSONUnsupported.Store(true)
 		req.XDRFormat = ""
+		start = time.Now()
 		err = c.call(ctx, "getEvents", req, &resp)
+		metrics.RPCCallDuration.WithLabelValues("getEvents").Observe(time.Since(start).Seconds())
 	}
 	return resp, err
 }
 
 func (c *HTTPClient) GetLatestLedger(ctx context.Context) (LatestLedger, error) {
 	var resp LatestLedger
+	start := time.Now()
 	err := c.call(ctx, "getLatestLedger", nil, &resp)
+	metrics.RPCCallDuration.WithLabelValues("getLatestLedger").Observe(time.Since(start).Seconds())
 	return resp, err
 }
 
 func (c *HTTPClient) GetHealth(ctx context.Context) (Health, error) {
 	var resp Health
+	start := time.Now()
 	err := c.call(ctx, "getHealth", nil, &resp)
+	metrics.RPCCallDuration.WithLabelValues("getHealth").Observe(time.Since(start).Seconds())
 	return resp, err
 }
 
 func (c *HTTPClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
 	var resp GetLedgerEntriesResponse
+	start := time.Now()
 	err := c.call(ctx, "getLedgerEntries", req, &resp)
+	metrics.RPCCallDuration.WithLabelValues("getLedgerEntries").Observe(time.Since(start).Seconds())
 	return resp, err
 }
 

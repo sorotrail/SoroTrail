@@ -166,6 +166,16 @@ func doGet(t *testing.T, s *Server, path string) (*http.Response, []byte) {
 	return resp, body
 }
 
+func TestMetrics_EndpointExposesPrometheus(t *testing.T) {
+	st := &stubStore{}
+	s := newTestServer(st, nil)
+
+	resp, body := doGet(t, s, "/metrics")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, string(body), "sorotrail_events_ingested_total")
+	assert.Contains(t, resp.Header.Get("Content-Type"), "text/plain")
+}
+
 func TestListEvents_ParsesFilters(t *testing.T) {
 	st := &stubStore{}
 	s := newTestServer(st, nil)
