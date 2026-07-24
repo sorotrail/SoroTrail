@@ -615,19 +615,15 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		}
 	}
 
-	// topic accepts any JSON value; a bare word like `transfer` is treated
-	// as the JSON string "transfer". Matching is exact against the stored
-	// topic entries, e.g. topic={"symbol":"transfer"} for XDR-decoded rows.
-	if topic := q.Get("topic"); topic != "" {
-		if json.Valid([]byte(topic)) {
-			f.Topic = json.RawMessage(topic)
-		} else {
-			quoted, err := json.Marshal(topic)
-			if err != nil {
-				return f, fmt.Errorf("invalid topic: %w", err)
-			}
-			f.Topic = quoted
-		}
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
+	}
+
+	switch t := q.Get("type"); t {
+	case "", "contract", "system", "diagnostic":
+		f.Type = t
+	default:
+		return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
 	}
 
 	parseTopic := func(name, raw string) (json.RawMessage, error) {
@@ -712,10 +708,12 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if raw := q.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
-		if err != nil || limit <= 0 || limit > store.MaxQueryLimit {
+		if err != nil || limit < 1 || limit > store.MaxQueryLimit {
 			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
 		}
 		f.Limit = limit
+	} else {
+		f.Limit = store.DefaultQueryLimit
 	}
 	return f, nil
 }
