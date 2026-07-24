@@ -148,7 +148,10 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		require.Len(t, all, 10)
+		// Count what is actually in the table rather than hardcoding it:
+		// sibling subtests above insert rows of their own, so a literal
+		// makes this assertion depend on subtest execution order.
+		require.Len(t, all, countAllEvents(t, st))
 		for i := 1; i < len(all); i++ {
 			assert.Less(t, all[i-1].ID, all[i].ID, "ascending ID order across pages")
 		}
@@ -170,11 +173,22 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		require.Len(t, all, 10)
+		require.Len(t, all, countAllEvents(t, st))
 		for i := 1; i < len(all); i++ {
 			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
 		}
 	})
+}
+
+// countAllEvents returns how many events the store currently holds, so
+// pagination assertions stay correct regardless of what sibling subtests
+// have inserted.
+func countAllEvents(t *testing.T, st *Postgres) int {
+	t.Helper()
+	got, next, err := st.QueryEvents(context.Background(), EventFilter{Limit: MaxQueryLimit})
+	require.NoError(t, err)
+	require.Empty(t, next, "fixture must fit in one max-size page")
+	return len(got)
 }
 
 func TestQueryEvents_TimeRange(t *testing.T) {

@@ -102,11 +102,37 @@ type EventFilter struct {
 	ToLedger   int64     // inclusive
 	FromTime   time.Time // inclusive, zero = no constraint
 	ToTime     time.Time // inclusive, zero = no constraint
-	// Cursor is the ID of the last event from the previous page.
+	// Cursor resumes pagination after the previous page's last row. Its
+	// contents depend on OrderBy and are opaque to callers — build it only
+	// from a previous QueryEvents result. See EncodeCursor.
 	Cursor string
 	Limit  int
 	// Order is "asc" or "desc", defaults to "asc"
 	Order string
+	// OrderBy selects the sort column: OrderByID (default), OrderByLedger,
+	// or OrderByCreatedAt. Every ordering is made total by appending id as
+	// a tiebreaker, so keyset pagination stays stable when the sort column
+	// has duplicates.
+	OrderBy string
+}
+
+// Sort columns accepted in EventFilter.OrderBy. The zero value means
+// OrderByID, which is the historical behavior.
+const (
+	OrderByID        = "id"
+	OrderByLedger    = "ledger"
+	OrderByCreatedAt = "created_at"
+)
+
+// ValidOrderBy reports whether s names a supported sort column. The empty
+// string is valid and means OrderByID.
+func ValidOrderBy(s string) bool {
+	switch s {
+	case "", OrderByID, OrderByLedger, OrderByCreatedAt:
+		return true
+	default:
+		return false
+	}
 }
 
 // IngestionState tracks how far ingestion has progressed.
