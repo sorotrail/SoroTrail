@@ -141,7 +141,7 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		// "When in doubt, don't cache" is the explicit guidance: any
 		// failure to read the frontier falls back to no-cache rather
 		// than guessing the page is safe.
-		Logged(s.log, r.Context()).Warn("deciding list cache policy", "error", err)
+		api.Logged(s.log, r.Context()).Warn("deciding list cache policy", "error", err)
 	} else if etag != "" && ifNoneMatch(r, etag) {
 		writeNotModified(w, etag, policy)
 		return
@@ -204,7 +204,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		Logged(s.log, r.Context()).Error("loading event", "id", id, "error", err)
+		api.Logged(s.log, r.Context()).Error("loading event", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
@@ -226,7 +226,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.Stats(r.Context())
 	if err != nil {
-		Logged(s.log, r.Context()).Error("loading stats", "error", err)
+		api.Logged(s.log, r.Context()).Error("loading stats", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
 	}

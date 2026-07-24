@@ -88,6 +88,7 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
+	r.Use(api.requestIDMiddleware)
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
@@ -124,7 +125,7 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		start := time.Now()
 		next.ServeHTTP(ww, r)
-		s.log.Info("http request",
+		api.Logged(s.log, r.Context()).Info("http request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", ww.Status(),
