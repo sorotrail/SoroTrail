@@ -18,20 +18,28 @@ var ErrNotFound = errors.New("not found")
 // DefaultQueryLimit applies when EventFilter.Limit is unset; MaxQueryLimit
 // caps requested page sizes.
 const (
-	DefaultQueryLimit = 50
-	MaxQueryLimit     = 200
+	DefaultQueryLimit         = 50
+	MaxQueryLimit             = 200
+	DefaultEventPartitionSpan = 120960
 )
 
 // Postgres implements Store on a pgx connection pool.
 type Postgres struct {
-	pool *pgxpool.Pool
+	pool          *pgxpool.Pool
+	partitionSpan int64
 }
 
 var _ Store = (*Postgres)(nil)
 
 // NewPostgres wraps an existing pool. The caller owns the pool's lifecycle.
-func NewPostgres(pool *pgxpool.Pool) *Postgres {
-	return &Postgres{pool: pool}
+// partitionSpan is optional; when unset or non-positive, the production
+// default is used.
+func NewPostgres(pool *pgxpool.Pool, partitionSpan ...int64) *Postgres {
+	span := int64(DefaultEventPartitionSpan)
+	if len(partitionSpan) > 0 && partitionSpan[0] > 0 {
+		span = partitionSpan[0]
+	}
+	return &Postgres{pool: pool, partitionSpan: span}
 }
 
 func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
@@ -54,11 +62,10 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // onUpdate=true → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
-	conflict := "ON CONFLICT (id) DO NOTHING"
+	conflict := "ON CONFLICT (ledger, id) DO NOTHING"
 	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
+		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
 			contract_id = EXCLUDED.contract_id,
-			ledger = EXCLUDED.ledger,
 			type = EXCLUDED.type,
 			tx_hash = EXCLUDED.tx_hash,
 			tx_index = EXCLUDED.tx_index,
@@ -92,6 +99,26 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	return batch
 }
 
+func (p *Postgres) ensureEventPartitions(ctx context.Context, events []Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+	minLedger, maxLedger := events[0].Ledger, events[0].Ledger
+	for _, e := range events[1:] {
+		if e.Ledger < minLedger {
+			minLedger = e.Ledger
+		}
+		if e.Ledger > maxLedger {
+			maxLedger = e.Ledger
+		}
+	}
+	_, err := p.pool.Exec(ctx, `SELECT ensure_event_partitions($1, $2, $3)`, minLedger, maxLedger, p.partitionSpan)
+	if err != nil {
+		return fmt.Errorf("ensuring event partitions for ledger range [%d,%d]: %w", minLedger, maxLedger, err)
+	}
+	return nil
+}
+
 // upsertEvents is shared by UpsertEvents (idempotent insert) and
 // ReplaceEventsInRange (insert-or-update, so topic/value drift on the RPC
 // side is corrected). onUpdate=false → ON CONFLICT DO NOTHING;
@@ -99,6 +126,9 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bool) (int64, error) {
 	if len(events) == 0 {
 		return 0, nil
+	}
+	if err := p.ensureEventPartitions(ctx, events); err != nil {
+		return 0, err
 	}
 	results := p.pool.SendBatch(ctx, insertEventsBatch(events, onUpdate))
 	defer results.Close()
@@ -123,6 +153,9 @@ func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bo
 // that arrives without any keeps whatever was already stored, so repairing
 // a range never makes its rows unreplayable.
 func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error {
+	if err := p.ensureEventPartitions(ctx, events); err != nil {
+		return err
+	}
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
