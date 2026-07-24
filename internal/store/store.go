@@ -37,9 +37,9 @@ type Event struct {
 // the contract's spec. The original Event is preserved in full; DecodedEvent
 // carries the enriched view when decoding succeeded.
 type EnrichedEvent struct {
-	Event        `json:",inline"` // embed all Event fields
+	Event        `json:",inline"`      // embed all Event fields
 	DecodedEvent *DecodedEventResponse `json:"decoded_event,omitempty"`
-	Decoded      bool                   `json:"decoded"`
+	Decoded      bool                  `json:"decoded"`
 }
 
 // DecodedEventResponse is the JSON shape returned when an event is successfully
@@ -98,9 +98,6 @@ type EventFilter struct {
 	Topic1     json.RawMessage
 	Topic2     json.RawMessage
 	Topic3     json.RawMessage
-	FromLedger int64 // inclusive
-	ToLedger   int64 // inclusive
-	Topic      json.RawMessage
 	FromLedger int64     // inclusive
 	ToLedger   int64     // inclusive
 	FromTime   time.Time // inclusive, zero = no constraint

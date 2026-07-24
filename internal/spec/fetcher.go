@@ -65,7 +65,7 @@ func (f *Fetcher) fetchWasmHash(ctx context.Context, contractID string) (string,
 
 	scContractID := xdr.ScAddress{
 		Type:       xdr.ScAddressTypeScAddressTypeContract,
-		ContractId: &hash32,
+		ContractId: (*xdr.ContractId)(&hash32),
 	}
 
 	// The contract instance is stored under a ContractData entry with
@@ -316,7 +316,7 @@ func parseScSpecEntriesRaw(data []byte) ([]EventSpec, error) {
 	// Unmarshal directly from raw XDR bytes (not base64-encoded).
 	// Use bytes.NewReader which implements io.Reader.
 	var entries []xdr.ScSpecEntry
-	if err := xdr.Unmarshal(bytes.NewReader(data), &entries); err != nil {
+	if _, err := xdr.Unmarshal(bytes.NewReader(data), &entries); err != nil {
 		return nil, fmt.Errorf("unmarshaling ScSpecEntry array: %w", err)
 	}
 
@@ -337,14 +337,14 @@ func extractEventsFromScVal(val xdr.ScVal) ([]EventSpec, bool) {
 
 		// Try as a single ScSpecEntry.
 		var entry xdr.ScSpecEntry
-		if err := xdr.Unmarshal(br, &entry); err == nil {
+		if _, err := xdr.Unmarshal(br, &entry); err == nil {
 			return convertScSpecEntry(entry), true
 		}
 
 		// Try as an array of ScSpecEntry.
 		br.Reset(*val.Bytes)
 		var entries []xdr.ScSpecEntry
-		if err := xdr.Unmarshal(br, &entries); err == nil {
+		if _, err := xdr.Unmarshal(br, &entries); err == nil {
 			var allEvents []EventSpec
 			for _, e := range entries {
 				allEvents = append(allEvents, convertScSpecEntry(e)...)
@@ -368,12 +368,12 @@ func extractEventsFromScVal(val xdr.ScVal) ([]EventSpec, bool) {
 // in the SDK, we fall back to integer values.
 func convertScSpecEntry(entry xdr.ScSpecEntry) []EventSpec {
 	// The Type field is the union discriminant.
-	switch entry.Type {
-	case xdr.ScSpecEntryTypeFunctionV0:
+	switch entry.Kind {
+	case xdr.ScSpecEntryKindScSpecEntryFunctionV0:
 		// Functions describe callable endpoints — skip.
 		return nil
 
-	case xdr.ScSpecEntryTypeUdtStructV0:
+	case xdr.ScSpecEntryKindScSpecEntryUdtStructV0:
 		if entry.UdtStructV0 == nil {
 			return nil
 		}
@@ -382,7 +382,7 @@ func convertScSpecEntry(entry xdr.ScSpecEntry) []EventSpec {
 			Doc:  string(entry.UdtStructV0.Doc),
 		}
 		if entry.UdtStructV0.Fields != nil {
-			for _, f := range *entry.UdtStructV0.Fields {
+			for _, f := range entry.UdtStructV0.Fields {
 				ev.TopicSpecs = append(ev.TopicSpecs, FieldSpec{
 					Name: string(f.Name),
 					Type: typeDefName(f.Type),
@@ -391,15 +391,15 @@ func convertScSpecEntry(entry xdr.ScSpecEntry) []EventSpec {
 		}
 		return []EventSpec{ev}
 
-	case xdr.ScSpecEntryTypeUdtUnionV0:
+	case xdr.ScSpecEntryKindScSpecEntryUdtUnionV0:
 		// Union variants may correspond to event types, but
 		// accurate decoding requires runtime type info — skip.
 		return nil
 
-	case xdr.ScSpecEntryTypeUdtEnumV0:
+	case xdr.ScSpecEntryKindScSpecEntryUdtEnumV0:
 		return nil
 
-	case xdr.ScSpecEntryTypeUdtErrorEnumV0:
+	case xdr.ScSpecEntryKindScSpecEntryUdtErrorEnumV0:
 		return nil
 
 	default:
@@ -419,14 +419,6 @@ func typeDefName(td xdr.ScSpecTypeDef) string {
 		return "void"
 	case xdr.ScSpecTypeScSpecTypeError:
 		return "error"
-	case xdr.ScSpecTypeScSpecTypeU8:
-		return "u8"
-	case xdr.ScSpecTypeScSpecTypeI8:
-		return "i8"
-	case xdr.ScSpecTypeScSpecTypeU16:
-		return "u16"
-	case xdr.ScSpecTypeScSpecTypeI16:
-		return "i16"
 	case xdr.ScSpecTypeScSpecTypeU32:
 		return "u32"
 	case xdr.ScSpecTypeScSpecTypeI32:
@@ -455,7 +447,7 @@ func typeDefName(td xdr.ScSpecTypeDef) string {
 		return "symbol"
 	case xdr.ScSpecTypeScSpecTypeAddress:
 		return "address"
-	case xdr.ScSpecTypeScSpecTypeOptional:
+	case xdr.ScSpecTypeScSpecTypeOption:
 		return "optional"
 	case xdr.ScSpecTypeScSpecTypeResult:
 		return "result"
@@ -465,8 +457,8 @@ func typeDefName(td xdr.ScSpecTypeDef) string {
 		return "map"
 	case xdr.ScSpecTypeScSpecTypeTuple:
 		return "tuple"
-	case xdr.ScSpecTypeScSpecTypeN:
-		return "n"
+	case xdr.ScSpecTypeScSpecTypeBytesN:
+		return "bytesN"
 	default:
 		return fmt.Sprintf("unknown(%d)", td.Type)
 	}
@@ -508,14 +500,10 @@ func decodeContractID(id string) ([]byte, error) {
 	// The Stellar SDK's strkey package handles base32 decoding with
 	// checksum verification. We use strkey.Decode which returns the
 	// raw bytes including the version byte prefix (1 byte) + data + CRC (2 bytes).
-	// For contract IDs, the version byte is strkey.VersionByteContractID.
-	_, raw, err := strkey.DecodeToRaw(strkey.VersionByteContractID, id)
+	// For contract IDs, the version byte is strkey.VersionByteContract.
+	raw, err := strkey.Decode(strkey.VersionByteContract, id)
 	if err != nil {
-		// Fallback: try the simpler Decode API if DecodeToRaw doesn't exist.
-		raw, err = strkey.Decode(strkey.VersionByteContractID, id)
-		if err != nil {
-			return nil, fmt.Errorf("decoding contract ID %q: %w", id, err)
-		}
+		return nil, fmt.Errorf("decoding contract ID %q: %w", id, err)
 	}
 	// raw is the version byte + 32-byte hash. Return just the hash.
 	if len(raw) >= 32 {
@@ -524,11 +512,7 @@ func decodeContractID(id string) ([]byte, error) {
 	return nil, fmt.Errorf("decoded contract ID too short: len=%d", len(raw))
 }
 
-
-
 // decodeWasmHash decodes a base64-encoded wasm hash into raw bytes.
 func decodeWasmHash(hash string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(hash)
 }
-
-

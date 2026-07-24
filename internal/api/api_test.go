@@ -86,6 +86,8 @@ func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
 }
 func (s *stubStore) SetContractSpec(context.Context, string, string, []byte) error {
 	return nil
+}
+
 // EventExists is the cheap 304 path; tests assert the handler uses it
 // (instead of GetEvent) when If-None-Match matches.
 func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {

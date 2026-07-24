@@ -67,12 +67,7 @@ type Ingester struct {
 	log      *slog.Logger
 	opts     Options
 	notifier EventNotifier // optional; nil means no notification
-	client  rpc.Client
-	store   store.Store
-	decoder decode.Decoder
-	log     *slog.Logger
-	opts    Options
-	bcast   *broadcast.Broadcaster
+	bcast    *broadcast.Broadcaster
 }
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
@@ -87,6 +82,8 @@ func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger
 // notification is sent — the ingester behaves exactly as before.
 func (ing *Ingester) SetNotifier(n EventNotifier) {
 	ing.notifier = n
+}
+
 // WithBroadcaster attaches a live event broadcaster so ingested events are
 // pushed to streaming subscribers.
 func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
@@ -392,6 +389,7 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	// This is a fire-and-forget call — it must never block ingestion.
 	if ing.notifier != nil {
 		ing.notifier.NotifyEvents(ctx, events)
+	}
 	if ing.bcast != nil {
 		ing.bcast.Publish(ctx, events)
 	}
