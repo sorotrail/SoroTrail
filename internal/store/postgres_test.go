@@ -231,6 +231,38 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 	})
 }
 
+func TestListContracts_GroupsByContractAndPaginates(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	_, err := st.UpsertEvents(ctx, []Event{
+		testEvent(eventID(1), 100, contractA),
+		testEvent(eventID(2), 101, contractA),
+		testEvent(eventID(3), 102, contractB),
+		testEvent(eventID(4), 103, contractB),
+		testEvent(eventID(5), 104, contractB),
+	})
+	require.NoError(t, err)
+
+	got, cursor, err := st.ListContracts(ctx, 2, "")
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, contractA, got[0].ContractID)
+	assert.Equal(t, int64(2), got[0].EventCount)
+	assert.Equal(t, int64(100), got[0].FirstLedger)
+	assert.Equal(t, int64(101), got[0].LastLedger)
+	assert.Equal(t, contractB, got[1].ContractID)
+	assert.Equal(t, int64(3), got[1].EventCount)
+	assert.Equal(t, int64(102), got[1].FirstLedger)
+	assert.Equal(t, int64(104), got[1].LastLedger)
+	assert.Equal(t, contractB, cursor)
+
+	page2, cursor2, err := st.ListContracts(ctx, 2, cursor)
+	require.NoError(t, err)
+	assert.Empty(t, page2)
+	assert.Empty(t, cursor2)
+}
+
 func TestQueryEvents_TimeRange(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

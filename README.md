@@ -202,6 +202,30 @@ Fetch a single event by its ID (the TOID-based identifier from the RPC).
 curl -s localhost:8080/events/0001099511627776-0000000001
 ```
 
+### `GET /contracts`
+
+Lists the contracts that have at least one stored event, with aggregate event
+counts and the first/last ledger seen for each contract. Results are ordered
+by `contract_id` and support keyset pagination via `cursor`.
+
+```sh
+curl -s 'localhost:8080/contracts?limit=2'
+```
+
+```json
+{
+  "contracts": [
+    {
+      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "event_count": 1204,
+      "first_ledger": 250010,
+      "last_ledger": 260123
+    }
+  ],
+  "cursor": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+}
+```
+
 ### `GET /contracts/{id}/events`
 
 Convenience wrapper for `GET /events?contract_id={id}`; accepts the same

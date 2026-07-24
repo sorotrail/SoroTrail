@@ -29,6 +29,12 @@ type stubStore struct {
 	queryErr   error
 	lastFilter store.EventFilter
 
+	contracts               []store.ContractSummary
+	nextContractsCursor     string
+	listContractsErr        error
+	lastListContractsLimit  int
+	lastListContractsCursor string
+
 	event    store.Event
 	eventErr error
 
@@ -47,6 +53,12 @@ type stubStore struct {
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
 	s.lastFilter = f
 	return s.events, s.nextCursor, s.queryErr
+}
+
+func (s *stubStore) ListContracts(_ context.Context, limit int, cursor string) ([]store.ContractSummary, string, error) {
+	s.lastListContractsLimit = limit
+	s.lastListContractsCursor = cursor
+	return s.contracts, s.nextContractsCursor, s.listContractsErr
 }
 
 // LedgerRangeCensus, ReplaceEventsInRange, and the audit_state/findings
@@ -257,6 +269,36 @@ func TestGetEvent_NotFound(t *testing.T) {
 	st := &stubStore{eventErr: store.ErrNotFound}
 	resp, _ := doGet(t, newTestServer(st, nil), "/events/0000000000-0000000000")
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestListContracts_ClampsLimitAndUsesCursor(t *testing.T) {
+	st := &stubStore{contracts: []store.ContractSummary{{ContractID: testContract, EventCount: 7}}}
+	resp, body := doGet(t, newTestServer(st, nil), "/contracts?cursor=abc&limit=99999")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, store.MaxQueryLimit, st.lastListContractsLimit)
+	assert.Equal(t, "abc", st.lastListContractsCursor)
+
+	var out struct {
+		Contracts []store.ContractSummary `json:"contracts"`
+		Cursor    string                  `json:"cursor,omitempty"`
+	}
+	require.NoError(t, json.Unmarshal(body, &out))
+	require.Len(t, out.Contracts, 1)
+	assert.Equal(t, testContract, out.Contracts[0].ContractID)
+	assert.Equal(t, int64(7), out.Contracts[0].EventCount)
+}
+
+func TestListContracts_EmptyDatabase(t *testing.T) {
+	resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/contracts")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out struct {
+		Contracts []store.ContractSummary `json:"contracts"`
+		Cursor    string                  `json:"cursor,omitempty"`
+	}
+	require.NoError(t, json.Unmarshal(body, &out))
+	assert.Empty(t, out.Contracts)
+	assert.Empty(t, out.Cursor)
 }
 
 func TestContractEvents_ForcesContractFilter(t *testing.T) {

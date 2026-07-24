@@ -63,6 +63,27 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // onUpdate=false → ON CONFLICT DO NOTHING (idempotent ingest);
 // onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
 // topic/value drift on the RPC side).
+func conflictClause(onUpdate bool) string {
+	if onUpdate {
+		return `
+		ON CONFLICT (id) DO UPDATE SET
+			contract_id = EXCLUDED.contract_id,
+			ledger = EXCLUDED.ledger,
+			type = EXCLUDED.type,
+			tx_hash = EXCLUDED.tx_hash,
+			tx_index = EXCLUDED.tx_index,
+			op_index = EXCLUDED.op_index,
+			in_successful_call = EXCLUDED.in_successful_call,
+			topics = EXCLUDED.topics,
+			value = EXCLUDED.value,
+			created_at = EXCLUDED.created_at,
+			raw_topic_xdr = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+	}
+	return `
+		ON CONFLICT (id) DO NOTHING`
+}
+
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	batch := &pgx.Batch{}
 	sql := `
@@ -71,7 +92,7 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			 in_successful_call, topics, value, created_at,
 			 raw_topic_xdr, raw_value_xdr)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-		` + conflict
+		` + conflictClause(onUpdate)
 	for _, e := range events {
 		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
 		// into SQL NULL so the column has one representation of "absent"
@@ -424,6 +445,51 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		next = events[limit-1].ID
 	}
 	return events, next, nil
+}
+
+func (p *Postgres) ListContracts(ctx context.Context, limit int, cursor string) ([]ContractSummary, string, error) {
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+
+	query := `
+		SELECT contract_id, count(*)::int, min(ledger)::bigint, max(ledger)::bigint
+		FROM events`
+	args := []any{}
+	if cursor != "" {
+		query += ` WHERE contract_id > $1`
+		args = append(args, cursor)
+	}
+	query += ` GROUP BY contract_id ORDER BY contract_id LIMIT $2`
+	args = append(args, limit+1)
+
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("listing contracts: %w", err)
+	}
+	defer rows.Close()
+
+	contracts := make([]ContractSummary, 0, limit)
+	for rows.Next() {
+		var c ContractSummary
+		if err := rows.Scan(&c.ContractID, &c.EventCount, &c.FirstLedger, &c.LastLedger); err != nil {
+			return nil, "", fmt.Errorf("scanning contract summary: %w", err)
+		}
+		contracts = append(contracts, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("reading contract summaries: %w", err)
+	}
+
+	next := ""
+	if len(contracts) > limit {
+		contracts = contracts[:limit]
+		next = contracts[len(contracts)-1].ContractID
+	}
+	return contracts, next, nil
 }
 
 func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error) {

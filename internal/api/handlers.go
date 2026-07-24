@@ -73,6 +73,11 @@ type eventsResponse struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
+type contractsResponse struct {
+	Contracts []store.ContractSummary `json:"contracts"`
+	Cursor    string                  `json:"cursor,omitempty"`
+}
+
 type enrichedEventsResponse struct {
 	Events []store.EnrichedEvent `json:"events"`
 	// Cursor is non-empty when another page exists.
@@ -162,6 +167,31 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	}
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
 	writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
+}
+
+func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
+	limit := store.DefaultQueryLimit
+	cursor := r.URL.Query().Get("cursor")
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		if parsed > store.MaxQueryLimit {
+			limit = store.MaxQueryLimit
+		} else {
+			limit = parsed
+		}
+	}
+
+	contracts, nextCursor, err := s.store.ListContracts(r.Context(), limit, cursor)
+	if err != nil {
+		s.log.Error("listing contracts", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
+		return
+	}
+	writeJSON(w, http.StatusOK, contractsResponse{Contracts: contracts, Cursor: nextCursor})
 }
 
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {

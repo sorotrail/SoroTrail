@@ -33,6 +33,15 @@ type Event struct {
 	RawValueXDR string   `json:"-"`
 }
 
+// ContractSummary aggregates a contract's stored event activity into a
+// compact listing view with event volume and ledger bounds.
+type ContractSummary struct {
+	ContractID  string `json:"contract_id"`
+	EventCount  int64  `json:"event_count"`
+	FirstLedger int64  `json:"first_ledger"`
+	LastLedger  int64  `json:"last_ledger"`
+}
+
 // EnrichedEvent wraps an Event with decoded field information derived from
 // the contract's spec. The original Event is preserved in full; DecodedEvent
 // carries the enriched view when decoding succeeded.
@@ -321,6 +330,9 @@ type Store interface {
 	// cursor for the next page ("" when there are no more results).
 	// Default order is ascending (oldest-first) for backward compatibility.
 	QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error)
+	// ListContracts returns a page of per-contract summaries, ordered by
+	// contract ID and keyset-paginated by the last returned ID.
+	ListContracts(ctx context.Context, limit int, cursor string) ([]ContractSummary, string, error)
 	// LedgerRangeCensus returns one LedgerCensus row per ledger in the
 	// inclusive [fromLedger, toLedger] range that contains at least one
 	// event, in ascending ledger order. idsOnly=true populates LedgerCensus.IDs
