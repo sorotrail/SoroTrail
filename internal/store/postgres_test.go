@@ -374,6 +374,16 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	assert.Equal(t, original.RawTopicXDR, got.RawTopicXDR)
 	assert.Equal(t, original.RawValueXDR, got.RawValueXDR)
 
+	// 0008's events_default catch-all now holds the row post-re-migrate.
+	// Re-trigger the runtime partition router (this test was created with
+	// st = NewPostgres(pool, 10), so partitionSpan=10) so events_100_109
+	// exists for the to_regclass assertion below. ON CONFLICT
+	// (ledger, id) DO NOTHING leaves the existing events_default row in
+	// place — this is purely about recreating the narrow partition for
+	// the partition-existence check.
+	_, err = st.UpsertEvents(ctx, []Event{original})
+	require.NoError(t, err)
+
 	partitions, err := pool.Query(ctx, `SELECT to_regclass('events_100_109'), to_regclass('events_110_119')`)
 	require.NoError(t, err)
 	defer partitions.Close()

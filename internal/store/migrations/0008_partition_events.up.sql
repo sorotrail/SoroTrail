@@ -82,7 +82,42 @@ BEGIN
 END;
 $$;
 
-SELECT ensure_event_partitions((SELECT min(ledger) FROM events_legacy), (SELECT max(ledger) FROM events_legacy), 120960);
+-- Use a DEFAULT partition as the catch-all for migration-time bulk
+-- inserts: rather than pre-creating one (or several) range partitions
+-- with the production span=120960 (which would later overlap the
+-- narrow events_X_Y children the runtime ensure_event_partitions
+-- creates with whatever smaller span the operator/test configured),
+-- route the migration's INSERT into a single DEFAULT child. Range
+-- partitions and a DEFAULT partition are siblings, never overlapping,
+-- so this avoids the "partition would overlap partition" cascade on
+-- the second run and on partition-span changes post-migration.
+--
+-- The ensure_event_partitions function is still CREATED here for
+-- runtime use; nothing in this migration calls it with a hard-coded
+-- span any more.
+--
+-- Mid-flight idempotency: the migration isn't always followed by a
+-- rupture before being applied again (e.g. a partially-applied run
+-- followed by m.Up() finds events_default still attached to
+-- events_legacy). PostgreSQL's CREATE TABLE PARTITION OF refuses
+-- IF NOT EXISTS, but DROP TABLE IF EXISTS does drop a child
+-- partition (auto-detaching it first), so this single line is
+-- safe across all three scenarios — fresh DB (no-op), post-rupture
+-- (no-op since the rupture already dropped events_default via
+-- CASCADE), and no-rupture re-apply (drops the stale partition,
+-- and the bulk INSERT below repopulates from events_legacy).
+DROP TABLE IF EXISTS events_default;
+
+CREATE TABLE events_default PARTITION OF events DEFAULT;
+
+-- Note on partition pruning: rows INSERTed into the partitioned events
+-- while only events_default exists (the migration's bulk copy below)
+-- live in events_default until runtime ensure_event_partitions
+-- creates narrow range children for those ledger ranges. PostgreSQL
+-- ≥ 11 can prune events_default out of a query plan when range
+-- children provably cover the queried ledger band; ensure
+-- runtime callers produce a complete ledger coverage if they want
+-- queries to skip events_default entirely.
 
 INSERT INTO events (
     id, contract_id, ledger, type, tx_hash, tx_index, op_index,

@@ -64,12 +64,12 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
-	conflict := `ON CONFLICT (id) DO NOTHING`
+	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
 	if onUpdate {
 		// Refresh every column, but never blank out raw XDR: a repair
 		// fetch that came back as JSON (xdrFormat "json") carries no XDR
 		// and must not destroy what an earlier ingest managed to keep.
-		conflict = `ON CONFLICT (id) DO UPDATE SET
+		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
 			contract_id        = EXCLUDED.contract_id,
 			ledger             = EXCLUDED.ledger,
 			type               = EXCLUDED.type,
