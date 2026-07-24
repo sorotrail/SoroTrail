@@ -14,8 +14,8 @@ CREATE TABLE events (
     topics             jsonb NOT NULL DEFAULT '[]'::jsonb,
     value              jsonb,
     created_at         timestamptz NOT NULL DEFAULT now(),
-    raw_topic_xdr      text[],
-    raw_value_xdr      text
+    topics_xdr         jsonb CHECK (topics_xdr IS NULL OR jsonb_typeof(topics_xdr) = 'array'),
+    value_xdr          text
 );
 
 CREATE INDEX idx_events_contract_id ON events (contract_id);
@@ -26,11 +26,11 @@ CREATE INDEX idx_events_created_at ON events (created_at);
 
 INSERT INTO events (
     id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-    in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr
+    in_successful_call, topics, value, created_at, topics_xdr, value_xdr
 )
 SELECT
     id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-    in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr
+    in_successful_call, topics, value, created_at, topics_xdr, value_xdr
 FROM events_partitioned
 ORDER BY ledger, id;
 

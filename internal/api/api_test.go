@@ -240,7 +240,13 @@ func TestListEvents_BadParams(t *testing.T) {
 		"/events?from_time=2026-07-21T00:00:00.123Z",
 		"/events?from_time=2026-07-22T00:00:00Z&to_time=2026-07-21T00:00:00Z",
 		"/events?limit=0",
+		"/events?limit=-1",
 		"/events?limit=99999",
+		"/events?limit=abc",
+		"/events?cursor=bad%20cursor",
+		"/events?cursor=e1%3BDROP",
+		"/events?cursor=%3Cscript%3E",
+		"/events?cursor=cursor%27OR%271%3D%271",
 		"/events?topic_contains=not-valid-json",
 	} {
 		t.Run(path, func(t *testing.T) {
@@ -250,6 +256,43 @@ func TestListEvents_BadParams(t *testing.T) {
 			require.NoError(t, json.Unmarshal(body, &e))
 			assert.NotEmpty(t, e["error"])
 		})
+	}
+}
+
+func TestListEvents_CursorAndLimitValidation(t *testing.T) {
+	st := &stubStore{
+		events: []store.Event{{ID: "e1"}},
+	}
+	srv := newTestServer(st, nil)
+
+	// Valid limit and valid cursor
+	resp, _ := doGet(t, srv, "/events?limit=10&cursor=0001099511627776-0000000001")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, 10, st.lastFilter.Limit)
+	assert.Equal(t, "0001099511627776-0000000001", st.lastFilter.Cursor)
+
+	// Omitted limit applies default
+	st.lastFilter = store.EventFilter{}
+	resp, _ = doGet(t, srv, "/events")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, store.DefaultQueryLimit, st.lastFilter.Limit)
+
+	// Invalid limit returns 400
+	for _, badLimit := range []string{"0", "-5", "201", "xyz"} {
+		resp, body := doGet(t, srv, "/events?limit="+badLimit)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var errResp map[string]string
+		require.NoError(t, json.Unmarshal(body, &errResp))
+		assert.Contains(t, errResp["error"], "limit must be an integer in [1,200]")
+	}
+
+	// Malformed cursor returns 400
+	for _, badCursor := range []string{"has%20space", "e1%3BDROP", "cursor%27OR%271%3D%271", "%3Cscript%3E"} {
+		resp, body := doGet(t, srv, "/events?cursor="+badCursor)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var errResp map[string]string
+		require.NoError(t, json.Unmarshal(body, &errResp))
+		assert.Contains(t, errResp["error"], "invalid cursor")
 	}
 }
 
@@ -270,10 +313,66 @@ func TestListEvents_ReturnsCursor(t *testing.T) {
 	assert.Equal(t, "e2", out.Cursor)
 }
 
+func TestListEvents_IncludeXDR(t *testing.T) {
+	event := store.Event{
+		ID:          "e1",
+		RawTopicXDR: []string{"topic-xdr"},
+		RawValueXDR: "value-xdr",
+	}
+	st := &stubStore{events: []store.Event{event}}
+	s := newTestServer(st, nil)
+
+	resp, body := doGet(t, s, "/events")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.NotContains(t, string(body), "topics_xdr")
+	assert.NotContains(t, string(body), "value_xdr")
+
+	resp, body = doGet(t, s, "/events?include_xdr=true")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out struct {
+		Events []struct {
+			TopicsXDR []string `json:"topics_xdr"`
+			ValueXDR  *string  `json:"value_xdr"`
+		} `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal(body, &out))
+	require.Len(t, out.Events, 1)
+	assert.Equal(t, []string{"topic-xdr"}, out.Events[0].TopicsXDR)
+	require.NotNil(t, out.Events[0].ValueXDR)
+	assert.Equal(t, "value-xdr", *out.Events[0].ValueXDR)
+}
+
 func TestGetEvent_NotFound(t *testing.T) {
 	st := &stubStore{eventErr: store.ErrNotFound}
 	resp, _ := doGet(t, newTestServer(st, nil), "/events/0000000000-0000000000")
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestGetEvent_IncludeXDR(t *testing.T) {
+	st := &stubStore{event: store.Event{
+		ID:          "0000000000-0000000001",
+		RawTopicXDR: []string{"topic-xdr"},
+		RawValueXDR: "value-xdr",
+	}}
+	s := newTestServer(st, nil)
+
+	resp, body := doGet(t, s, "/events/0000000000-0000000001")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.NotContains(t, string(body), "topics_xdr")
+	assert.NotContains(t, string(body), "value_xdr")
+
+	resp, body = doGet(t, s, "/events/0000000000-0000000001?include_xdr=true")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out struct {
+		TopicsXDR []string `json:"topics_xdr"`
+		ValueXDR  *string  `json:"value_xdr"`
+	}
+	require.NoError(t, json.Unmarshal(body, &out))
+	assert.Equal(t, []string{"topic-xdr"}, out.TopicsXDR)
+	require.NotNil(t, out.ValueXDR)
+	assert.Equal(t, "value-xdr", *out.ValueXDR)
 }
 
 func TestContractEvents_ForcesContractFilter(t *testing.T) {
@@ -351,12 +450,49 @@ func TestHealth(t *testing.T) {
 }
 
 func TestStats(t *testing.T) {
-	st := &stubStore{stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999}}
-	resp, body := doGet(t, newTestServer(st, nil), "/stats")
-	require.Equal(t, http.StatusOK, resp.StatusCode)
+	t.Run("includes store and freshness fields", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{
+			TotalEvents:        42,
+			LastIngestedLedger: 999,
+			OldestStoredLedger: 100,
+		}}
+		rc := &stubRPC{health: rpc.Health{Status: "healthy", LatestLedger: 1_020}}
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var got store.Stats
-	require.NoError(t, json.Unmarshal(body, &got))
-	assert.Equal(t, int64(42), got.TotalEvents)
-	assert.Equal(t, int64(999), got.LastIngestedLedger)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, int64(42), got.TotalEvents)
+		assert.Equal(t, int64(999), got.LastIngestedLedger)
+		assert.Equal(t, int64(100), got.OldestStoredLedger)
+		require.NotNil(t, got.ChainHeadLedger)
+		assert.Equal(t, int64(1_020), *got.ChainHeadLedger)
+		require.NotNil(t, got.IngestLagLedgers)
+		assert.Equal(t, int64(21), *got.IngestLagLedgers)
+	})
+
+	t.Run("keeps stored stats when RPC is down", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{
+			TotalEvents:        42,
+			LastIngestedLedger: 999,
+			OldestStoredLedger: 100,
+		}}
+		rc := &stubRPC{healthErr: errors.New("rpc unreachable")}
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, int64(42), got.TotalEvents)
+		assert.Equal(t, int64(999), got.LastIngestedLedger)
+		assert.Equal(t, int64(100), got.OldestStoredLedger)
+		assert.Nil(t, got.ChainHeadLedger)
+		assert.Nil(t, got.IngestLagLedgers)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(body, &raw))
+		assert.Contains(t, raw, "chain_head_ledger")
+		assert.Nil(t, raw["chain_head_ledger"])
+		assert.Contains(t, raw, "ingest_lag_ledgers")
+		assert.Nil(t, raw["ingest_lag_ledgers"])
+	})
 }
