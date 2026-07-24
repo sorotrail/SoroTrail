@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/khaylebfortune/sorotrail/internal/broadcast"
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
@@ -59,6 +60,7 @@ type Ingester struct {
 	decoder decode.Decoder
 	log     *slog.Logger
 	opts    Options
+	bcast   *broadcast.Broadcaster
 }
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
@@ -66,6 +68,13 @@ type Ingester struct {
 func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, opts Options) *Ingester {
 	opts.applyDefaults()
 	return &Ingester{client: client, store: st, decoder: dec, log: log, opts: opts}
+}
+
+// WithBroadcaster attaches a live event broadcaster so ingested events are
+// pushed to streaming subscribers.
+func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
+	ing.bcast = b
+	return ing
 }
 
 // Run polls until ctx is canceled. Errors are logged and retried with
@@ -149,6 +158,109 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 	}
 	return caughtUp, nil
 }
+
+// ReingestRange re-fetches events for the closed range [fromLedger, toLedger]
+// using the caller-supplied client (the auditor passes its budget-paced
+// client so repair traffic is accounted against the audit pool), then
+// calls the store's replace-in-range so orphans (rows the RPC no longer
+// reports) are deleted and same-ID rows are updated (topic/value drift on
+// the RPC side is corrected). It does NOT advance the ingester's
+// persisted cursor — the auditor uses this to repair specific ledger
+// ranges without disturbing the ongoing ingestion frontier.
+//
+// All events the RPC returns with ledger > toLedger are dropped: the RPC's
+// cursor pagination strips endLedger from the request, so the last page
+// may legitimately spill past the requested end.
+func (ing *Ingester) ReingestRange(ctx context.Context, client rpc.Client, fromLedger, toLedger uint32) (int, error) {
+	if fromLedger > toLedger {
+		return 0, fmt.Errorf("ReingestRange: from %d > to %d", fromLedger, toLedger)
+	}
+	if client == nil {
+		client = ing.client
+	}
+	filters, err := ing.BuildFilterBatches(ctx)
+	if err != nil {
+		return 0, err
+	}
+	repaired := 0
+	for _, batch := range filters {
+		inserted, err := ing.reingestBatch(ctx, client, fromLedger, toLedger, batch)
+		if err != nil {
+			return repaired, err
+		}
+		repaired += inserted
+	}
+	return repaired, nil
+}
+
+// reingestBatch pages one filter batch over [fromLedger, toLedger] in
+// memory, then hands the post-filtered result to the store.
+func (ing *Ingester) reingestBatch(ctx context.Context, client rpc.Client, fromLedger, toLedger uint32, batch []rpc.EventFilter) (int, error) {
+	endLedgerExcl := toLedger + 1
+	var collected []rpc.Event
+	cursor := ""
+	for {
+		resp, err := client.GetEvents(ctx, rpc.GetEventsRequest{
+			StartLedger: fromLedger,
+			EndLedger:   endLedgerExcl,
+			Filters:     batch,
+			Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
+		})
+		if rpc.IsLedgerOutOfRange(err) {
+			// Aged out during repair — not an error, just an empty answer.
+			return 0, nil
+		}
+		if err != nil {
+			return 0, fmt.Errorf("ReingestRange getEvents [%d,%d]: %w", fromLedger, toLedger, err)
+		}
+		// Defensive post-filter: cursor pagination strips endLedger from
+		// the request, so the tail of a full page may legitimately include
+		// events past our toLedger bound.
+		for _, e := range resp.Events {
+			if e.Ledger <= toLedger {
+				collected = append(collected, e)
+			}
+		}
+		if uint(len(resp.Events)) < ing.opts.PageLimit {
+			break
+		}
+		last := resp.Events[len(resp.Events)-1]
+		if last.Ledger > toLedger {
+			break
+		}
+		cursor = resp.Cursor
+		if cursor == "" {
+			cursor = last.CursorValue()
+		}
+	}
+	storeEvents := make([]store.Event, 0, len(collected))
+	for _, re := range collected {
+		ev, err := ing.toStoreEvent(re)
+		if err != nil {
+			return 0, err
+		}
+		storeEvents = append(storeEvents, ev)
+	}
+	if err := ing.store.ReplaceEventsInRange(ctx, storeEvents, int64(fromLedger), int64(toLedger)); err != nil {
+		return 0, fmt.Errorf("ReplaceEventsInRange [%d,%d]: %w", fromLedger, toLedger, err)
+	}
+	return len(storeEvents), nil
+}
+
+// BuildFilterBatches converts the watched-contract list into getEvents
+// filter batches respecting the RPC caps (≤5 contractIds per filter,
+// ≤5 filters per request, ≤25 watched contracts per request chain).
+// Exported so the auditor can fetch with the exact same filter set as
+// ingest — events outside this filter set were intentionally not stored
+// and must not be flagged as audit discrepancies.
+func (ing *Ingester) BuildFilterBatches(ctx context.Context) ([][]rpc.EventFilter, error) {
+	return ing.buildFilterBatches(ctx)
+}
+
+// PageLimit returns the getEvents pagination cap the ingester uses for
+// its own loop. The auditor reuses this so it can never silently
+// disagree on page size for an RPC round trip.
+func (ing *Ingester) PageLimit() uint { return ing.opts.PageLimit }
 
 // nextState derives the resume position after a page. A full page means more
 // data is likely waiting: keep paging via cursor immediately. A short page
@@ -258,6 +370,10 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		"count", len(events), "new", inserted,
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
 		"latest_ledger", latestLedger)
+
+	if ing.bcast != nil {
+		ing.bcast.Publish(ctx, events)
+	}
 	return nil
 }
 
@@ -341,6 +457,10 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 	if err != nil {
 		return store.Event{}, fmt.Errorf("decoding event %s: %w", re.ID, err)
 	}
+	var createdAt time.Time
+	if re.LedgerClosedAt != "" {
+		createdAt, _ = time.Parse(time.RFC3339, re.LedgerClosedAt)
+	}
 	return store.Event{
 		ID:               re.ID,
 		ContractID:       re.ContractID,
@@ -352,6 +472,13 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 		InSuccessfulCall: re.InSuccessfulContractCall,
 		Topics:           topics,
 		Value:            value,
+		CreatedAt:        createdAt,
+		// Keep the raw XDR so `sorotrail replay` can re-decode this event
+		// with a future decoder. Empty when the RPC delivered JSON directly
+		// (xdrFormat "json") — there is no XDR to keep in that case, and
+		// replay skips such rows.
+		RawTopicXDR: re.Topic,
+		RawValueXDR: re.Value,
 	}, nil
 }
 

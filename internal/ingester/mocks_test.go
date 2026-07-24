@@ -71,6 +71,20 @@ func (m *mockStore) UpsertEvents(_ context.Context, events []store.Event) (int64
 	return inserted, nil
 }
 
+func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event, fromLedger, toLedger int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, e := range m.events {
+		if e.Ledger >= fromLedger && e.Ledger <= toLedger {
+			delete(m.events, id)
+		}
+	}
+	for _, e := range events {
+		m.events[e.ID] = e
+	}
+	return nil
+}
+
 func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -81,8 +95,47 @@ func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) 
 	return e, nil
 }
 
+// EventExists is the cheap existence probe added to the Store interface
+// for the API's 304 path. Unused by ingester tests but needed to
+// satisfy the interface.
+func (m *mockStore) EventExists(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.events[id]
+	return ok, nil
+}
+
 func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Event, string, error) {
 	return nil, "", nil
+}
+
+// LedgerRangeCensus is unused by ingester tests but needed to satisfy
+// the expanded store.Store interface.
+func (m *mockStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]store.LedgerCensus, error) {
+	return nil, nil
+}
+
+// GetAuditState / SaveAuditState are unused by ingester tests.
+func (m *mockStore) GetAuditState(context.Context) (store.AuditState, error) {
+	return store.AuditState{}, store.ErrNotFound
+}
+func (m *mockStore) SaveAuditState(_ context.Context, s store.AuditState) error {
+	return nil
+}
+func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, ledger int64) (store.AuditState, error) {
+	return store.AuditState{VerifiedThroughLedger: ledger}, nil
+}
+
+// Record/Update/ListOpenFindings are unused by ingester tests.
+func (m *mockStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) (store.AuditFinding, error) {
+	f.ID = 1
+	return f, nil
+}
+func (m *mockStore) UpdateAuditFinding(context.Context, store.AuditFinding) error {
+	return nil
+}
+func (m *mockStore) ListOpenFindingsByRange(context.Context, int64, int64) (store.AuditFinding, error) {
+	return store.AuditFinding{}, store.ErrNotFound
 }
 
 func (m *mockStore) GetIngestionState(context.Context) (store.IngestionState, error) {

@@ -11,11 +11,15 @@ seams — most features should slot in behind an existing interface.
 3. `make test` for the unit suite; `make test-db` runs everything including
    the Postgres integration tests (they use `TEST_DATABASE_URL` and skip
    themselves when it's unset).
-4. `make lint` (install [golangci-lint](https://golangci-lint.run/) locally).
+4. `make cover` runs the test suite with coverage and prints a per-package
+   summary; `make cover-html` opens the HTML report in your browser.
+5. `make lint` (install [golangci-lint](https://golangci-lint.run/) locally).
 
 The integration tests truncate the tables they use — point
 `TEST_DATABASE_URL` at a throwaway database, not one with data you care
-about.
+about. `internal/store` and `internal/replay` share those tables, so the
+database suite runs with `go test -p 1` (already the case in `make test-db`
+and CI); don't drop that flag.
 
 ## Architecture
 
@@ -26,6 +30,7 @@ internal/rpc         Stellar RPC JSON-RPC client (interface: rpc.Client)
 internal/decode      ScVal → JSON            (interface: decode.Decoder)
 internal/store       Postgres + migrations   (interface: store.Store)
 internal/ingester    polling loop, pagination, backoff
+internal/replay      re-decode stored raw XDR (sorotrail replay)
 internal/api         chi HTTP handlers
 ```
 
@@ -41,7 +46,13 @@ implementations, so each layer is independently testable and replaceable.
   ingestion never stalls; keep that property.
 - **Per-standard decoders** (SEP-41 token events, etc.) — build on top of the
   stored JSON or as a decorator around `decode.Decoder`; don't widen the core
-  interface.
+  interface. When your decoder writes a derived table, wire it into replay so
+  it can be backfilled: add a field to `store.ReplayBatch` and write it in
+  `store.CommitReplayBatch` after `events`. See [docs/replay.md](docs/replay.md).
+- **Changing decoder output** — any change to what a decoder emits should
+  come with a note in the PR that operators need to run
+  `sorotrail replay --from-ledger N`, otherwise the change only applies to
+  events ingested from then on.
 - **New API endpoints** — add routes in `internal/api/server.go`. Keep
   endpoints read-only unless you also add authentication.
 - **Alternative storage** — implement `store.Store`. The contract is spelled
