@@ -64,6 +64,9 @@ flags:
 	if err != nil {
 		return err
 	}
+	if config.IsSQLite(cfg.DatabaseURL) {
+		return errors.New("replay requires Postgres; SQLite is not supported")
+	}
 	log := newLogger(cfg.LogLevel)
 
 	// Ctrl-C stops between batches rather than killing the process, so the

@@ -8,11 +8,11 @@ dashboards, analytics, audits, notification services — must ingest and store
 events themselves before the RPC drops them.
 
 SoroTrail does exactly that: it polls a Stellar RPC endpoint, stores contract
-events durably in Postgres, and serves them back through a queryable HTTP API
-long after the RPC has forgotten them.
+events durably in Postgres or SQLite, and serves them back through a queryable
+HTTP API long after the RPC has forgotten them.
 
 ```
- Stellar RPC ──getEvents──▶ ingester ──▶ Postgres ◀── HTTP API ◀── you
+ Stellar RPC ──getEvents──▶ ingester ──▶ Postgres/SQLite ◀── HTTP API ◀── you
 ```
 
 ## Quickstart
@@ -41,6 +41,12 @@ set -a; source .env; set +a
 make run
 ```
 
+No Postgres? Use SQLite instead for a zero-dependency run:
+
+```sh
+DATABASE_URL=sqlite:./sorotrail.db make run
+```
+
 Migrations run automatically on startup.
 
 ## Configuration
@@ -50,7 +56,7 @@ All configuration comes from environment variables (see `.env.example`):
 | Variable | Default | Description |
 | --- | --- | --- |
 | `RPC_URL` | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet. |
-| `DATABASE_URL` | — (required) | Postgres connection string. |
+| `DATABASE_URL` | — (required) | Connection string. `postgres://user:pass@host/db` for Postgres, or `sqlite:./sorotrail.db` for SQLite. |
 | `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. |
 | `HTTP_ADDR` | `:8080` | API listen address. |
 | `WATCHED_CONTRACTS` | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. |
@@ -69,6 +75,30 @@ All configuration comes from environment variables (see `.env.example`):
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
 | `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
+
+## Storage backends
+
+SoroTrail supports two storage backends behind the `store.Store` interface:
+
+- **Postgres** — The production backend. Use this for any deployment that needs
+  durability, concurrent writers, or the replay maintenance tool. Postgres is
+  the default and has no limitations.
+
+- **SQLite** — A single-binary, zero-dependency option using `modernc.org/sqlite`
+  (pure Go, CGO-free). Select it by setting `DATABASE_URL=sqlite:./sorotrail.db`.
+
+  **When to use SQLite:** A dapp developer indexing two contracts on a laptop,
+  a hobby project on a $5 VPS, or any scenario where running Postgres is
+  disproportionate. SQLite serializes writes; the ingester is the only writer,
+  so this works, and the API can read during ingestion (WAL mode with a 5-second
+  busy timeout).
+
+  **Known limitations vs Postgres:**
+  - No range partitioning — the `events` table is flat.
+  - The `sorotrail replay` maintenance tool requires Postgres.
+  - Topic filtering uses SQLite's JSON1 functions (`json_each`) instead of
+    Postgres `@>` / GIN indexes. Semantics are identical for the documented
+    filter shapes.
 
 ## Ingestion behavior
 

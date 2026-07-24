@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	_ "modernc.org/sqlite"
 
 	"github.com/khaylebfortune/sorotrail/internal/api"
 	"github.com/khaylebfortune/sorotrail/internal/audit"
@@ -86,16 +88,34 @@ func run() error {
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
-	if err != nil {
-		return fmt.Errorf("connecting to postgres: %w", err)
-	}
-	defer pool.Close()
-	if err := pool.Ping(ctx); err != nil {
-		return fmt.Errorf("pinging postgres: %w", err)
-	}
 
-	st := store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+	var st store.Store
+	if config.IsSQLite(cfg.DatabaseURL) {
+		dsn := cfg.DatabaseURL[7:]
+		sqldb, err := sql.Open("sqlite", dsn)
+		if err != nil {
+			return fmt.Errorf("opening sqlite: %w", err)
+		}
+		defer sqldb.Close()
+
+		if _, err := sqldb.ExecContext(ctx, `PRAGMA journal_mode=WAL`); err != nil {
+			return fmt.Errorf("setting WAL mode: %w", err)
+		}
+		if _, err := sqldb.ExecContext(ctx, `PRAGMA busy_timeout=5000`); err != nil {
+			return fmt.Errorf("setting busy timeout: %w", err)
+		}
+		st = store.NewSQLite(sqldb)
+	} else {
+		pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+		if err != nil {
+			return fmt.Errorf("connecting to postgres: %w", err)
+		}
+		defer pool.Close()
+		if err := pool.Ping(ctx); err != nil {
+			return fmt.Errorf("pinging postgres: %w", err)
+		}
+		st = store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+	}
 	for _, id := range cfg.WatchedContracts {
 		if err := st.AddWatchedContract(ctx, id); err != nil {
 			return err
