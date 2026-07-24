@@ -64,11 +64,17 @@ const (
 )
 
 // legacySchemaMigrationsVersion is the schema_migrations version the
-// legacy test simulates "already applied" by forcing it via UPDATE. It
-// must match the migration that exists *just before* the partition
-// rewire (0008_partition_events in the post-#68 layout — the partition
-// migration in 0004_partition_events in the pre-#68 layout). If you
-// renumber migrations, update this constant.
+// legacy test simulates "already applied" by forcing it via UPDATE.
+// The test hand-ruptures the events table to non-partitioned then
+// re-runs Migrate, which applies every migration whose version is
+// strictly greater than this value. It must therefore be < the
+// partition slot (currently 0008_partition_events). The original
+// value 3 happened to be the just-before-partition migration pre-#68
+// (0003_add_created_at_index); post-#68, `= 3` resolves to
+// 0003_topic_position_indexes, and the re-applied chain
+// (0004…0008) is idempotent enough that 3 still works. If you
+// renumber migrations and the partition slot moves, update this
+// constant so `value < partitionSlot` stays true.
 //
 // Held as a named const (not an inline literal) so it is interpolated
 // via fmt.Sprintf into the SQL below — golangci-lint's `unused` rule
