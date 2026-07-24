@@ -53,8 +53,20 @@ func (o *Options) applyDefaults() {
 	}
 }
 
+// EventNotifier is notified after events are persisted so external
+// systems (webhooks, SSE, etc.) can react without blocking ingestion.
+type EventNotifier interface {
+	NotifyEvents(ctx context.Context, events []store.Event)
+}
+
 // Ingester pages events out of the RPC and into the store.
 type Ingester struct {
+	client   rpc.Client
+	store    store.Store
+	decoder  decode.Decoder
+	log      *slog.Logger
+	opts     Options
+	notifier EventNotifier // optional; nil means no notification
 	client  rpc.Client
 	store   store.Store
 	decoder decode.Decoder
@@ -70,6 +82,11 @@ func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger
 	return &Ingester{client: client, store: st, decoder: dec, log: log, opts: opts}
 }
 
+// SetNotifier attaches an optional EventNotifier that is called after
+// every successful event persistence. When nil (the default) no
+// notification is sent — the ingester behaves exactly as before.
+func (ing *Ingester) SetNotifier(n EventNotifier) {
+	ing.notifier = n
 // WithBroadcaster attaches a live event broadcaster so ingested events are
 // pushed to streaming subscribers.
 func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
@@ -371,6 +388,10 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
 		"latest_ledger", latestLedger)
 
+	// Notify webhooks (or other listeners) after successful persistence.
+	// This is a fire-and-forget call — it must never block ingestion.
+	if ing.notifier != nil {
+		ing.notifier.NotifyEvents(ctx, events)
 	if ing.bcast != nil {
 		ing.bcast.Publish(ctx, events)
 	}
