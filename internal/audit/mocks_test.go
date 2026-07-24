@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
@@ -111,6 +112,10 @@ func (m *mockRPC) GetHealth(context.Context) (rpc.Health, error) {
 
 func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
 	return rpc.GetLedgerEntriesResponse{}, nil
+}
+
+func (m *mockRPC) SimulateTransaction(context.Context, rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error) {
+	return rpc.SimulateTransactionResponse{}, nil
 }
 
 // mockStore is an in-memory implementation of store.Store good enough
@@ -377,6 +382,23 @@ func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 }
 func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
 	return nil, nil
+}
+
+// Contract metadata stubs.
+func (m *mockStore) GetContractMeta(_ context.Context, contractID string) (store.ContractMeta, error) {
+	return store.ContractMeta{}, store.ErrNotFound
+}
+func (m *mockStore) UpsertContractMeta(_ context.Context, _ store.ContractMeta) error {
+	return nil
+}
+func (m *mockStore) ListContractIDs(context.Context) ([]string, error) {
+	return nil, nil
+}
+func (m *mockStore) ListContractsNeedingRefresh(_ context.Context, _ time.Time) ([]string, error) {
+	return nil, nil
+}
+func (m *mockStore) CountContractEvents(context.Context, string) (int64, error) {
+	return 0, nil
 }
 
 // seedLedgers records pre-existing events in m.events so tests can set up

@@ -109,9 +109,36 @@ type GetLedgerEntriesResponse struct {
 
 // LedgerEntryResult is one entry returned by getLedgerEntries.
 type LedgerEntryResult struct {
-	Key                 string `json:"key"`               // base64-encoded LedgerKey XDR
-	XDR                 string `json:"xdr"`               // base64-encoded LedgerEntry XDR
-	LastModifiedLedgerSeq uint32 `json:"lastModifiedLedgerSeq"`
+	Key                  string  `json:"key"` // base64-encoded LedgerKey XDR
+	XDR                  string  `json:"xdr"` // base64-encoded LedgerEntry XDR
+	LastModifiedLedgerSeq uint32  `json:"lastModifiedLedgerSeq"`
 	// LiveUntilLedgerSeq is set for entries with a time-to-live (e.g. temporary entries).
 	LiveUntilLedgerSeq *uint32 `json:"liveUntilLedgerSeq,omitempty"`
+}
+
+// SimulateTransactionRequest is the params for the simulateTransaction method.
+// Transaction is a base64-encoded TransactionEnvelope XDR.
+type SimulateTransactionRequest struct {
+	Transaction string `json:"transaction"`
+}
+
+// SimulateTransactionResponse is the result of simulateTransaction.
+type SimulateTransactionResponse struct {
+	// TransactionData is base64-encoded TransactionMeta XDR.
+	TransactionData string `json:"transactionData"`
+	// Events are the diagnostic events emitted during simulation.
+	Events []Event `json:"events,omitempty"`
+	// Cost describes the resource cost of the simulated transaction.
+	Cost SimulationCost `json:"cost"`
+	// Results are the return values of each host function invocation.
+	// Each result is a base64-encoded ScVal XDR.
+	Results []json.RawMessage `json:"results,omitempty"`
+	// Error is present when the simulation failed (e.g. contract trapped).
+	Error string `json:"error,omitempty"`
+}
+
+// SimulationCost describes the compute resources consumed by a simulation.
+type SimulationCost struct {
+	CPUInstructions uint64 `json:"cpuInsns,string"`
+	MemoryBytes     uint64 `json:"memBytes,string"`
 }

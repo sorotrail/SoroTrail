@@ -115,6 +115,28 @@ func TestRPCErrorSurfaced(t *testing.T) {
 	assert.True(t, IsLedgerOutOfRange(err))
 }
 
+func TestSimulateTransaction(t *testing.T) {
+	srv := jsonRPCServer(t, func(method string, params json.RawMessage) (any, *Error) {
+		require.Equal(t, "simulateTransaction", method)
+		return SimulateTransactionResponse{
+			TransactionData: "AAAAAg==",
+			Cost: SimulationCost{
+				CPUInstructions: 1000,
+				MemoryBytes:     4096,
+			},
+		}, nil
+	})
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, WithMinRequestInterval(0))
+	resp, err := c.SimulateTransaction(context.Background(), SimulateTransactionRequest{
+		Transaction: "AAAAAg...",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "AAAAAg==", resp.TransactionData)
+	assert.Equal(t, uint64(1000), resp.Cost.CPUInstructions)
+}
+
 func TestGetHealthAndLatestLedger(t *testing.T) {
 	srv := jsonRPCServer(t, func(method string, _ json.RawMessage) (any, *Error) {
 		switch method {

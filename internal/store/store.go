@@ -82,6 +82,26 @@ type ReplayState struct {
 	CompletedAt *time.Time
 }
 
+// ContractMeta holds cached token metadata fetched via RPC simulation.
+// Fields are nil when unknown — a row with IsToken=false means the contract
+// was probed and does not implement the SEP-41 token interface (negative
+// cache). A row with IsToken=true and nil fields means the contract IS a
+// token but the RPC call hasn't resolved yet (should be rare).
+type ContractMeta struct {
+	ContractID string    `json:"contract_id"`
+	Name       *string   `json:"name"`
+	Symbol     *string   `json:"symbol"`
+	Decimals   *int      `json:"decimals"`
+	IsToken    bool      `json:"is_token"`
+	FetchedAt  time.Time `json:"fetched_at"`
+}
+
+// HasMetadata reports whether the contract has resolved token metadata
+// (name, symbol, and decimals are all non-nil).
+func (m ContractMeta) HasMetadata() bool {
+	return m.IsToken && m.Name != nil && m.Symbol != nil && m.Decimals != nil
+}
+
 // Done reports whether the recorded run finished its whole range.
 func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 
@@ -434,6 +454,22 @@ type Store interface {
 	// SetContractSpec persists a JSON-serialized spec keyed by wasm_hash
 	// and contract_id so subsequent lookups avoid an RPC round trip.
 	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
+
+	// ContractMeta methods for the token metadata cache.
+	// GetContractMeta returns the cached metadata for a contract, or
+	// ErrNotFound when no row exists for that contract.
+	GetContractMeta(ctx context.Context, contractID string) (ContractMeta, error)
+	// UpsertContractMeta inserts or updates a contract metadata row.
+	UpsertContractMeta(ctx context.Context, m ContractMeta) error
+	// ListContractIDs returns all distinct contract IDs from the events
+	// table. Used by the metadata worker to discover contracts to enrich.
+	ListContractIDs(ctx context.Context) ([]string, error)
+	// ListContractsNeedingRefresh returns contract IDs whose metadata
+	// was fetched before the given cutoff, or that have no metadata row
+	// at all (including contracts never yet probed).
+	ListContractsNeedingRefresh(ctx context.Context, olderThan time.Time) ([]string, error)
+	// CountContractEvents returns the number of events for a given contract.
+	CountContractEvents(ctx context.Context, contractID string) (int64, error)
 
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error

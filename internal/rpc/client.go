@@ -26,6 +26,11 @@ type Client interface {
 	// Keys are base64-encoded LedgerKey XDR, returned entries include the
 	// base64-encoded LedgerEntry XDR.
 	GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error)
+	// SimulateTransaction simulates a transaction (typically a contract
+	// invocation) against the current ledger state. Used by the contract
+	// metadata worker to call SEP-41 token interface functions (name,
+	// symbol, decimals) without submitting a real transaction.
+	SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error)
 }
 
 // Error is a JSON-RPC 2.0 error object returned by the server.
@@ -136,6 +141,12 @@ func (c *HTTPClient) GetHealth(ctx context.Context) (Health, error) {
 func (c *HTTPClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
 	var resp GetLedgerEntriesResponse
 	err := c.call(ctx, "getLedgerEntries", req, &resp)
+	return resp, err
+}
+
+func (c *HTTPClient) SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error) {
+	var resp SimulateTransactionResponse
+	err := c.call(ctx, "simulateTransaction", req, &resp)
 	return resp, err
 }
 

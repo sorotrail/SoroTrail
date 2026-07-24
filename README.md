@@ -69,6 +69,9 @@ All configuration comes from environment variables (see `.env.example`):
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
 | `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
+| `CONTRACT_META_ENABLED` | `true` | Enable the background contract metadata enrichment worker. When `false` the worker is not started and `/contracts` endpoints return null metadata. |
+| `CONTRACT_META_TTL` | `24h` | How long cached token metadata (name/symbol/decimals) is considered fresh before the worker re-fetches it via RPC simulation. Set to `0` to never refresh (one-shot fetch on first encounter). |
+| `CONTRACT_META_INTERVAL` | `60s` | Sleep between metadata enrichment worker passes. |
 
 ## Ingestion behavior
 
@@ -220,6 +223,26 @@ Fetch a single event by its ID (the TOID-based identifier from the RPC).
 curl -s localhost:8080/events/0001099511627776-0000000001
 ```
 
+### `GET /contracts`
+
+Lists every contract the indexer has seen, with cached token metadata
+(name, symbol, decimals) when available. Metadata is `null` for contracts
+that haven't been enriched yet or that don't implement the SEP-41 token
+interface.
+
+```sh
+curl -s localhost:8080/contracts
+```
+
+```json
+{
+  "contracts": [
+    {"contract_id":"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"},
+    {"contract_id":"CCW67...","name":"USD Coin","symbol":"USDC","decimals":6}
+  ]
+}
+```
+
 ### `GET /contracts/{id}/events`
 
 Convenience wrapper for `GET /events?contract_id={id}`; accepts the same
@@ -227,6 +250,25 @@ remaining query parameters.
 
 ```sh
 curl -s localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/events?limit=10
+```
+
+### `GET /contracts/{id}/stats`
+
+Per-contract statistics with cached token metadata. Returns `404` when
+the contract has no events.
+
+```sh
+curl -s localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/stats
+```
+
+```json
+{
+  "contract_id":"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+  "name":"USD Coin",
+  "symbol":"USDC",
+  "decimals":6,
+  "event_count":1423
+}
 ```
 
 ### Webhooks
@@ -573,6 +615,45 @@ Audit behaviour:
 
 Set `AUDIT_ENABLED=false` (the default) to disable the auditor entirely;
 the binary's behavior is identical to a pre-audit build.
+
+## Contract metadata enrichment
+
+SoroTrail runs a background worker that enriches contracts with
+human-readable token metadata (name, symbol, decimals) by calling the
+SEP-41 token interface via RPC simulation.
+
+**How it works:**
+
+1. The worker periodically scans the events table for contracts that don't
+   yet have cached metadata (or whose cached metadata has exceeded the
+   TTL).
+2. For each candidate, it simulates calling `name()`, `symbol()`, and
+   `decimals()` on the contract via the RPC's `simulateTransaction`
+   endpoint.
+3. Results are stored in the `contract_meta` table with a `fetched_at`
+   timestamp.
+4. Contracts that don't implement the SEP-41 token interface (the
+   simulation traps or returns an error) are negatively cached so they're
+   never re-probed.
+5. Metadata surfaces in `/contracts` and `/contracts/{id}/stats` responses;
+   fields are `null` when unknown.
+
+**Design principles:**
+
+- **Never blocks ingestion** — the enrichment worker runs on its own
+  goroutine with its own poll interval.
+- **Rate-limited** — simulation calls go through the same RPC client with
+  the same ~10 req/s limiter, so enrichment doesn't overwhelm the endpoint.
+- **Failures are data, not errors** — failed RPC calls are logged at debug
+  level and the contract is retried on the next pass.
+- **Negative caching is permanent** — non-token contracts are cached with
+  `is_token=false` and never re-fetched, so contracts that emit events but
+  aren't tokens don't cause wasteful RPC calls.
+- **TTL-based refresh** — token metadata is re-fetched after
+  `CONTRACT_META_TTL` (default 24h) so name/symbol changes (e.g. a token
+  upgrade) are eventually picked up.
+
+Disable enrichment entirely with `CONTRACT_META_ENABLED=false`.
 
 ## Caching
 

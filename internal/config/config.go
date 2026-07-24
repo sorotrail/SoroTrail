@@ -55,6 +55,19 @@ type Config struct {
 	// intermediaries cannot. Defaults to false (the deployment does not
 	// need request-scoped caching).
 	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
+
+	// ContractMetaEnabled toggles the background contract metadata
+	// enrichment worker. When false the worker is not started and
+	// /contracts endpoints return null metadata. Defaults to true so
+	// deployments get enrichment out of the box.
+	ContractMetaEnabled bool `env:"CONTRACT_META_ENABLED" envDefault:"true"`
+	// ContractMetaTTL is how long cached token metadata is considered
+	// fresh before the worker re-fetches it. Token name/symbol/decimals
+	// rarely change, so the default is 24h. Set to 0 to never refresh
+	// (one-shot fetch).
+	ContractMetaTTL time.Duration `env:"CONTRACT_META_TTL" envDefault:"24h"`
+	// ContractMetaInterval is the sleep between enrichment worker passes.
+	ContractMetaInterval time.Duration `env:"CONTRACT_META_INTERVAL" envDefault:"60s"`
 }
 
 // Load reads configuration from the environment and validates it.
