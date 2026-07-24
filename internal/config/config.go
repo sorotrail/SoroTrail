@@ -33,6 +33,13 @@ type Config struct {
 	AuditMaxRPS         float64       `env:"AUDIT_MAX_RPS" envDefault:"10"`
 	AuditMaxRepair      int           `env:"AUDIT_MAX_REPAIR_ATTEMPTS" envDefault:"3"`
 	AuditFindingMaxLgrs uint32        `env:"AUDIT_FINDING_MAX_LEDGERS" envDefault:"100"`
+
+	// APIKey, when set, gates the watched-contracts management endpoints
+	// via a constant-time comparison against the X-API-Key request header.
+	// Empty means the watched-contracts surface starts up rejected (every
+	// request gets a 503 with a "no API_KEY configured" message), so
+	// writes are never open even when other auth would be off.
+	APIKey string `env:"API_KEY"`
 }
 
 // Load reads configuration from the environment and validates it.

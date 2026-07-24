@@ -45,14 +45,18 @@ func getAuditor() *audit.Auditor {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store store.Store
-	rpc   rpc.Client
-	log   *slog.Logger
+	store  store.Store
+	rpc    rpc.Client
+	log    *slog.Logger
+	apiKey string
 }
 
 // New builds the API server. rpcClient is only used by /health.
-func New(st store.Store, rpcClient rpc.Client, log *slog.Logger) *Server {
-	return &Server{store: st, rpc: rpcClient, log: log}
+// apiKey gates the watched-contracts management endpoints; pass "" to
+// fail closed (every request gets a 503 with "API_KEY not configured").
+// See apiKeyAuth for the exact contract.
+func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string) *Server {
+	return &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey}
 }
 
 // Router returns the HTTP handler with all routes mounted.
@@ -68,8 +72,18 @@ func (s *Server) Router() http.Handler {
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/stats", s.handleStats)
 
-	// contributors: new read endpoints go here. Anything that writes (e.g.
-	// managing watched contracts at runtime) should come with auth first.
+	// Watched-contracts management: writes and updates to the runtime
+	// filter list. Always auth-gated, even when AUTH_ENABLED would be
+	// false elsewhere — that asymmetry is intentional and part of the
+	// "writes are never open" contract. GET is gated too so an operator
+	// with the key can confirm the current list without touching /stats.
+	// Routes are absolute (no sub-router) so callers don't need a
+	// trailing slash or chi's RedirectSlashes middleware.
+	watchedMW := apiKeyAuth(s.apiKey)
+	r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
+	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
+	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
+
 	return r
 }
 

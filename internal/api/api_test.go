@@ -32,8 +32,16 @@ type stubStore struct {
 	event    store.Event
 	eventErr error
 
-	stats   store.Stats
-	pingErr error
+	stats            store.Stats
+	pingErr          error
+	watchedList      []store.WatchedContract
+	watchedListErr   error
+	added            []string
+	removed          []string
+	addErr           error
+	removeErr        error
+	ingestionState   *store.IngestionState
+	ingestionStateEr error
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -75,6 +83,23 @@ func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
 
 func (s *stubStore) Stats(context.Context) (store.Stats, error) { return s.stats, nil }
 func (s *stubStore) Ping(context.Context) error                 { return s.pingErr }
+func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
+	return s.watchedList, s.watchedListErr
+}
+func (s *stubStore) AddWatchedContract(_ context.Context, id string) error {
+	s.added = append(s.added, id)
+	return s.addErr
+}
+func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
+	s.removed = append(s.removed, id)
+	return s.removeErr
+}
+func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, error) {
+	if s.ingestionState == nil {
+		return store.IngestionState{}, s.ingestionStateEr
+	}
+	return *s.ingestionState, s.ingestionStateEr
+}
 
 type stubRPC struct {
 	rpc.Client
@@ -88,10 +113,14 @@ func (s *stubRPC) GetHealth(context.Context) (rpc.Health, error) {
 }
 
 func newTestServer(st *stubStore, rc *stubRPC) *Server {
+	return newTestServerWithKey(st, rc, "test-key")
+}
+
+func newTestServerWithKey(st *stubStore, rc *stubRPC, apiKey string) *Server {
 	if rc == nil {
 		rc = &stubRPC{health: rpc.Health{Status: "healthy"}}
 	}
-	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), apiKey)
 }
 
 func doGet(t *testing.T, s *Server, path string) (*http.Response, []byte) {

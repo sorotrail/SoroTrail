@@ -103,6 +103,15 @@ type AuditState struct {
 	UpdatedAt             time.Time
 }
 
+// WatchedContract is one entry of the watch list: a contract ID and the
+// time it was added (either by env seeding on startup, or by a runtime
+// POST). The API uses this to render the GET response; the ingester reads
+// only ContractID for its filter batches.
+type WatchedContract struct {
+	ContractID string    `json:"contract_id"`
+	AddedAt    time.Time `json:"added_at"`
+}
+
 // LedgerCensus is one row of a per-ledger census over a contiguous range.
 // IDs is the lexicographically sorted list of stored event IDs in the
 // ledger — empty in a count-only census, populated for ID-level diffs.
@@ -239,8 +248,19 @@ type Store interface {
 	// HWM even if they race.
 	SaveAuditStateIfGreater(ctx context.Context, ledger int64) (AuditState, error)
 
-	ListWatchedContracts(ctx context.Context) ([]string, error)
+	// ListWatchedContracts returns every watched contract in stable
+	// (contract_id) order, with its add timestamp. An empty result means
+	// the watch list is empty, and the ingester interprets that as
+	// "ingest all contract events" — distinct from "ingest nothing".
+	ListWatchedContracts(ctx context.Context) ([]WatchedContract, error)
 	AddWatchedContract(ctx context.Context, contractID string) error
+	// RemoveWatchedContract stops future ingestion for the given contract
+	// by removing its row from watched_contracts. It does NOT delete any
+	// (event) rows already in storage — removal is "stop watching", not
+	// "drop history", so a removed contract's events stay queryable.
+	// ErrNotFound is returned when no row matches the given ID, so the
+	// API can surface 404 for typos.
+	RemoveWatchedContract(ctx context.Context, contractID string) error
 
 	// RecordAuditFinding persists a new finding (status "open") and
 	// returns it with its assigned ID populated.

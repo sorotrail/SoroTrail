@@ -260,7 +260,45 @@ func TestWatchedContracts(t *testing.T) {
 
 	got, err := st.ListWatchedContracts(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, []string{contractA, contractB}, got)
+	require.Len(t, got, 2)
+	assert.Equal(t, contractA, got[0].ContractID)
+	assert.Equal(t, contractB, got[1].ContractID)
+	assert.False(t, got[0].AddedAt.IsZero(), "added_at is set on insert")
+}
+
+// RemoveWatchedContract drops the watch-list row but leaves stored events
+// intact: the contract's history must remain queryable after removal.
+func TestRemoveWatchedContract_PreservesEvents(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// Seed the watch list and ingest two events for that contract.
+	require.NoError(t, st.AddWatchedContract(ctx, contractA))
+	_, err := st.UpsertEvents(ctx, []Event{
+		testEvent(eventID(1), 100, contractA),
+		testEvent(eventID(2), 101, contractA),
+	})
+	require.NoError(t, err)
+
+	// Remove it — the response semantics are "stop future ingestion".
+	require.NoError(t, st.RemoveWatchedContract(ctx, contractA))
+
+	// The watch-list row is gone.
+	remaining, err := st.ListWatchedContracts(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, remaining, "remove must clear the watch list entry")
+
+	// Removing again with no row is a 404-style error: the API uses this
+	// to surface a typo as 404.
+	err = st.RemoveWatchedContract(ctx, contractA)
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	// Stored events for the removed contract are intact and queryable.
+	got, _, err := st.QueryEvents(ctx, EventFilter{ContractID: contractA})
+	require.NoError(t, err)
+	require.Len(t, got, 2, "removal NEVER deletes event rows — history is preserved")
+	assert.Equal(t, int64(100), got[0].Ledger)
+	assert.Equal(t, int64(101), got[1].Ledger)
 }
 
 func TestStats(t *testing.T) {

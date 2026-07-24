@@ -130,8 +130,13 @@ func run() error {
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.New(st, rpcClient, log).Router(),
+		Handler:           api.New(st, rpcClient, log, cfg.APIKey).Router(),
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if cfg.APIKey == "" {
+		log.Warn("API_KEY env is unset; watched-contracts endpoints will reject every request with 503")
+	} else {
+		log.Info("watched-contracts endpoints are auth-gated")
 	}
 
 	errCh := make(chan error, 3)
