@@ -54,6 +54,11 @@ type Config struct {
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
+
+	// CompressMinSize is the response body size, in bytes, at or above which
+	// responses are gzip/deflate encoded for clients that advertise support.
+	// Negative disables compression entirely; 0 uses api.CompressMinSize.
+	CompressMinSize int `env:"COMPRESS_MIN_SIZE" envDefault:"0"`
 }
 
 // Load reads configuration from the environment and validates it.

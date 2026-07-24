@@ -59,6 +59,16 @@ type Server struct {
 	log      *slog.Logger
 	limiter  *RateLimiter
 	bcast    *broadcast.Broadcaster
+	// compressMinSize is the body size at which responses start being
+	// compressed. The zero value means CompressMinSize, so compression is on
+	// by default; negative disables the middleware entirely.
+	compressMinSize int
+}
+
+// SetCompressMinSize overrides the body size at which responses are
+// compressed. Pass a negative value to disable compression.
+func (s *Server) SetCompressMinSize(n int) {
+	s.compressMinSize = n
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -91,6 +101,13 @@ func (s *Server) Router() http.Handler {
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
+	// Compression sits outside the limiter so a 429 is written through the
+	// same encoding path as any other small response (i.e. sent as-is), and
+	// inside Recoverer so a panic mid-body can't leave a truncated gzip
+	// stream as the last thing the client sees.
+	if s.compressMinSize >= 0 {
+		r.Use(Compress(s.compressMinSize))
+	}
 	if s.limiter != nil {
 		// Limiter sits inside Timeout and Recoverer so its instant 429
 		// response always makes it back through the deadline cleanly, and

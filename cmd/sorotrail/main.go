@@ -151,6 +151,7 @@ func run() error {
 
 	apiServer := api.New(st, rpcClient, log, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
+	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,

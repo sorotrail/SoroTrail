@@ -69,6 +69,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
+| `COMPRESS_MIN_SIZE` | `1400` | Response body size (bytes) at or above which responses are gzip/deflate encoded for clients advertising support. Set negative to disable compression. See [Compression](#compression). |
 
 ## Ingestion behavior
 
@@ -109,6 +110,40 @@ continues; a Postgres advisory lock prevents two replays at once.
 
 See [docs/replay.md](docs/replay.md) for flags, the summary output, the
 advisory-lock strategy, and the derivation order for dependent tables.
+
+## Compression
+
+Responses are gzip- or deflate-encoded when the client advertises support via
+`Accept-Encoding`, which matters most for event listings — a 200-event page is
+largely repetitive JSON keys and compresses well.
+
+Compression is applied per response, not per route, and only once the body
+reaches `COMPRESS_MIN_SIZE` (1400 bytes by default — roughly one Ethernet
+MTU). Below that, encoding costs CPU on both ends and can make the body
+*larger* once the gzip header and trailer are counted, so small responses
+(error envelopes, `/health`, a single event) are sent as-is.
+
+Clients that don't advertise an encoding get the original bytes, byte for
+byte. `gzip` is preferred over `deflate` when both are offered, and
+`gzip;q=0` is honored as a refusal rather than a low ranking.
+
+Some things are deliberately left alone:
+
+- **WebSocket upgrades** (`/events/ws`) bypass the middleware entirely — the
+  response is a `101` and the connection is then taken over.
+- **Streaming responses** that flush before reaching the threshold give up on
+  compression rather than holding bytes back, so a live stream never stalls
+  waiting for a buffer to fill.
+- **`204` and `304`** carry no body, and a `304` with `Content-Encoding`
+  misleads caches.
+- **Non-compressible media types** (images, already-compressed payloads) and
+  bodies a handler already encoded itself.
+
+`Vary: Accept-Encoding` is always set, so a shared cache never serves a
+compressed body to a client that can't decode it. Compressing produces a
+different representation of the same resource, so a strong `ETag` is weakened
+(`"v1"` → `W/"v1"`) when a response is encoded; conditional requests still
+match, since `If-None-Match` comparison ignores the `W/` prefix.
 
 ## API reference
 
