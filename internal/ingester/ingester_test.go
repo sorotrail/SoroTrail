@@ -185,6 +185,36 @@ func TestIdempotentReIngest(t *testing.T) {
 	assert.Len(t, st.events, 1, "re-ingesting the same events must not duplicate")
 }
 
+// Raw XDR must be retained at ingest time, otherwise `sorotrail replay` has
+// nothing to re-decode. Events the RPC delivered as JSON have no XDR to keep,
+// and replay skips them.
+func TestPersistEvents_RetainsRawXDR(t *testing.T) {
+	fromXDR := rpc.Event{
+		ID:         "e1",
+		Type:       "contract",
+		Ledger:     100,
+		ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		Topic:      []string{"topic-xdr"},
+		Value:      "value-xdr",
+	}
+	fromJSON := rpcEvent("e2", 100) // TopicJSON/ValueJSON, no XDR
+
+	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{
+		Events:       []rpc.Event{fromXDR, fromJSON},
+		LatestLedger: 500,
+	}}}
+	st := newMockStore()
+	ing := newTestIngester(client, st, Options{StartLedger: 100})
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"topic-xdr"}, st.events["e1"].RawTopicXDR)
+	assert.Equal(t, "value-xdr", st.events["e1"].RawValueXDR)
+	assert.Empty(t, st.events["e2"].RawTopicXDR, "JSON-delivered events have no XDR to retain")
+	assert.Empty(t, st.events["e2"].RawValueXDR)
+}
+
 func TestFilterBatching(t *testing.T) {
 	watch := func(n int) []string {
 		ids := make([]string, n)
