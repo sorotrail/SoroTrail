@@ -64,19 +64,35 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
+	conflict := "ON CONFLICT (id) DO NOTHING"
+	if onUpdate {
+		conflict = `ON CONFLICT (id) DO UPDATE SET
+			contract_id = EXCLUDED.contract_id,
+			ledger = EXCLUDED.ledger,
+			type = EXCLUDED.type,
+			tx_hash = EXCLUDED.tx_hash,
+			tx_index = EXCLUDED.tx_index,
+			op_index = EXCLUDED.op_index,
+			in_successful_call = EXCLUDED.in_successful_call,
+			topics = EXCLUDED.topics,
+			value = EXCLUDED.value,
+			-- Refresh the raw XDR, but never blank it out: a repair fetch
+			-- that came back as JSON (xdrFormat "json") carries no XDR and
+			-- must not destroy what an earlier ingest managed to keep.
+			raw_topic_xdr = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+	}
 	batch := &pgx.Batch{}
-	sql := `
-		INSERT INTO events
-			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-			 in_successful_call, topics, value, created_at,
-			 raw_topic_xdr, raw_value_xdr)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-		` + conflict
 	for _, e := range events {
 		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
 		// into SQL NULL so the column has one representation of "absent"
 		// rather than two.
-		batch.Queue(sql,
+		batch.Queue(`
+			INSERT INTO events
+				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+				 in_successful_call, topics, value, created_at,
+				 raw_topic_xdr, raw_value_xdr)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) `+conflict,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
 			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
@@ -362,6 +378,7 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		// Direct containment — caller controls the shape (object wrapped in
 		// array for element match, multi-element arrays for subset match).
 		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
+	}
 	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
 		if len(topic) == 0 {
 			continue
