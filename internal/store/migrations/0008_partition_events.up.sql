@@ -2,6 +2,23 @@ BEGIN;
 
 ALTER TABLE events RENAME TO events_legacy;
 
+-- The legacy events table (post-rename) keeps its PK constraint
+-- (events_pkey) and the secondary indexes (idx_events_*) the previous
+-- migrations created. Their names are global to the schema. Free them
+-- BEFORE creating the new partitioned events table below — otherwise
+-- this migration cannot run twice in a row on a DB whose events was
+-- hand-de-partitioned: the second run fails with "relation
+-- 'idx_events_contract_id' already exists". events_legacy is dropped at
+-- the end of this BEGIN block, so the loss of its indexes is transient
+-- — the INSERT ... SELECT below reads it sequentially anyway.
+ALTER TABLE events_legacy DROP CONSTRAINT IF EXISTS events_pkey CASCADE;
+DROP INDEX IF EXISTS idx_events_id;
+DROP INDEX IF EXISTS idx_events_contract_id;
+DROP INDEX IF EXISTS idx_events_ledger;
+DROP INDEX IF EXISTS idx_events_contract_ledger;
+DROP INDEX IF EXISTS idx_events_topics;
+DROP INDEX IF EXISTS idx_events_created_at;
+
 CREATE TABLE events (
     id                 text NOT NULL,
     contract_id        text NOT NULL,
@@ -25,6 +42,14 @@ CREATE INDEX idx_events_ledger ON events (ledger);
 CREATE INDEX idx_events_contract_ledger ON events (contract_id, ledger);
 CREATE INDEX idx_events_topics ON events USING gin (topics);
 CREATE INDEX idx_events_created_at ON events (created_at);
+-- Recreate the positional-topic indexes from 0003_topic_position_indexes;
+-- they lived on the events we just renamed to events_legacy and would
+-- otherwise die with it. IF NOT EXISTS keeps this idempotent against
+-- the rupture scenario in TestMigrate_UpgradesLegacyEventsTable.
+CREATE INDEX IF NOT EXISTS idx_events_topic0 ON events ((topics->0));
+CREATE INDEX IF NOT EXISTS idx_events_topic1 ON events ((topics->1));
+CREATE INDEX IF NOT EXISTS idx_events_topic2 ON events ((topics->2));
+CREATE INDEX IF NOT EXISTS idx_events_topic3 ON events ((topics->3));
 
 CREATE OR REPLACE FUNCTION ensure_event_partitions(from_ledger bigint, to_ledger bigint, partition_span bigint)
 RETURNS void
