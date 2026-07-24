@@ -68,6 +68,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
+| `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
 
 ## Ingestion behavior
 
@@ -214,6 +215,46 @@ events have been proven to match a fresh RPC fetch by the auditor. When
 `AUDIT_ENABLED=false` it stays at `0`. See the Data integrity section
 below for the contract the field implies.
 
+### `GET /events/ws` (WebSocket live stream)
+
+Pushes ingested events to the client over a single WebSocket connection
+as soon as they are written to the store. There is no replay — the
+stream starts at "now", and the client only sees events the indexer
+ingests after it connects.
+
+Query parameters share the same `EventFilter` shape as `GET /events`
+(`contract_id`, `type`, `topic`, `from_ledger`, `to_ledger`,
+`from_time`, `to_time`), so any filter that works against the query
+API works against the stream.
+
+Frame format:
+
+- One `store.Event` per WebSocket text frame, JSON-encoded.
+- Server-to-client only — clients do not send messages; the `nhooyr.io/websocket`
+  library handles ping/pong internally.
+- The server pings every 30s so proxies don't idle the connection.
+
+Behavior:
+
+- **Slow-consumer eviction**: each subscriber gets a bounded channel
+  buffer (`broadcast.DefaultBufferSize` = 64). A subscriber whose
+  channel fills is evicted silently: its `Events()` channel is closed,
+  the handler returns, and the WebSocket is closed from the server side.
+  This protects the indexer from one stuck client back-pressuring the
+  broadcaster.
+- **Broadcaster unwired**: returns `501 Not Implemented` (only happens
+  if the binary was built without the broadcaster wired).
+- **Bad filter**: returns `400 Bad Request` before the WebSocket
+  upgrade, with the standard `{"error": "..."}` JSON body.
+
+Example with [`websocat`](https://github.com/vi/websocat):
+
+```sh
+websocat 'ws://localhost:8080/events/ws?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic=mint'
+{"id":"…","contract_id":"…","topics":["mint"], …}
+{"id":"…","contract_id":"…","topics":["mint"], …}
+```
+
 ## Data integrity
 
 A background auditor walks recently-ingested ledger ranges (behind the
@@ -255,6 +296,53 @@ Audit behaviour:
 
 Set `AUDIT_ENABLED=false` (the default) to disable the auditor entirely;
 the binary's behavior is identical to a pre-audit build.
+
+## Caching
+
+Stored events are immutable — a row written by ingest is never rewritten
+in normal operation — so the API serves two distinct cache policies:
+
+- **`GET /events/{id}`** carries a strong `ETag` equal to the event ID
+  and `Cache-Control: public, max-age=31536000, immutable`. Clients
+  and CDNs can cache the response for a year without revalidating.
+  Conditional requests with a matching `If-None-Match` return
+  `304 Not Modified` without re-serializing the row.
+- **List endpoints** (`/events`, `/contracts/{id}/events`) split on a
+  moving ingest frontier: a page whose upper bound (`to_ledger`) sits
+  entirely below the last-ingested ledger cannot gain new rows, so the
+  response is declared immutable with a strong ETag derived from the
+  filter. Pages that are open-ended (`to_ledger` unset) or have bounds
+  at/above the frontier are still growing, so they get
+  `Cache-Control: no-cache` — a deliberate "when in doubt, don't
+  cache" choice rather than a guess with a short max-age.
+- **`GET /health`** and **`GET /stats`** are always
+  `Cache-Control: no-store` so monitoring tooling, dashboards, and
+  alerting see real state rather than a stale replica.
+
+All cacheable responses set `Vary: Accept-Encoding` so a future
+compression middleware (#25) can serve distinct encoded variants
+without reconciling caches that warmed on a non-encoded version.
+
+### Retention/pruning (#8)
+
+Immutability is conditional on the row existing. When pruning deletes an
+event that was previously cached by a client or CDN, that cache will
+hold a stale copy until its `max-age` expires — clients can hit the
+fresh `404` immediately by sending their `If-None-Match` validator, at
+which point SoroTrail's `EventExists` probe correctly returns the
+not-found status. We accept this self-healing delay rather than
+arbitrarily shortening the immutable max-age, because for un-deleted
+rows the long `max-age` is the whole point of the cache.
+
+### Auth'd deployments (#17)
+
+When authentication lands, the spec calls out that caching must "never
+leak across keys". Today the API is unauthenticated, but the
+`CACHE_PRIVATE` config flag flips every cacheable response from
+`Cache-Control: public` to `Cache-Control: private` (with the same
+`max-age` and `immutable` preset), so the same build can serve shared
+caches in one deployment and per-user scenarios in another. Set
+`CACHE_PRIVATE=true` as soon as auth (#17) is in front of the API.
 
 ## Development
 

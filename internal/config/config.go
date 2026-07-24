@@ -46,6 +46,14 @@ type Config struct {
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
+	// CachePrivate flips the cacheable endpoints from Cache-Control: public
+	// to Cache-Control: private. Set this when the deployment serves
+	// per-user data behind an auth layer (#17, not yet merged) so shared
+	// caches (CDN/proxy) cannot leak responses across keys. Browsers can
+	// still cache the response for the same authenticated user; CDNs and
+	// intermediaries cannot. Defaults to false (the deployment does not
+	// need request-scoped caching).
+	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
 }
 
 // Load reads configuration from the environment and validates it.

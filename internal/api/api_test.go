@@ -32,6 +32,14 @@ type stubStore struct {
 	event    store.Event
 	eventErr error
 
+	exists       bool
+	existsErr    error
+	existsCalls  int // count of EventExists calls
+	lastExistsID string
+
+	ingestion    store.IngestionState
+	ingestionErr error
+
 	stats   store.Stats
 	pingErr error
 }
@@ -71,6 +79,21 @@ func (s *stubStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 
 func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
 	return s.event, s.eventErr
+}
+
+// EventExists is the cheap 304 path; tests assert the handler uses it
+// (instead of GetEvent) when If-None-Match matches.
+func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
+	s.existsCalls++
+	s.lastExistsID = id
+	return s.exists, s.existsErr
+}
+
+// GetIngestionState backs the list-cache frontier lookup. Tests stage
+// LastIngestedLedger to drive the boundary decisions (just-below, at,
+// and above the frontier).
+func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, error) {
+	return s.ingestion, s.ingestionErr
 }
 
 func (s *stubStore) Stats(context.Context) (store.Stats, error) { return s.stats, nil }
