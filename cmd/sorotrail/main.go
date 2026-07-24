@@ -99,7 +99,7 @@ func run() error {
 		return fmt.Errorf("pinging postgres: %w", err)
 	}
 
-	st := store.NewPostgres(pool)
+	st := store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
 	for _, id := range cfg.WatchedContracts {
 		if err := st.AddWatchedContract(ctx, id); err != nil {
 			return err
@@ -111,7 +111,6 @@ func run() error {
 	// to the ingester so events flow to subscriber callbacks asynchronously.
 	wh := webhook.NewNotifier(st, log)
 
-
 	// Wire the spec cache and enricher for spec-decoded event views.
 	specCache := spec.NewCache(st)
 	specFetcher := spec.NewFetcher(rpcClient)
@@ -122,9 +121,8 @@ func run() error {
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
 		RetentionLedgers: cfg.RetentionLedgers,
-	})
-	ing.SetNotifier(wh)
 	}).WithBroadcaster(bcast)
+	ing.SetNotifier(wh)
 
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a
@@ -155,14 +153,12 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpcClient, log)
+	apiServer := api.New(st, rpcClient, log, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.New(st, rpcClient, log, specEnricher).Router(),
 		Handler:           apiServer.Router(),
-		Handler:           api.New(st, rpcClient, log).WithBroadcaster(bcast).Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

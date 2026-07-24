@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -56,14 +57,8 @@ type Server struct {
 	rpc      rpc.Client
 	enricher Enricher
 	log      *slog.Logger
-	store   store.Store
-	rpc     rpc.Client
-	log     *slog.Logger
-	limiter *RateLimiter
-	store store.Store
-	rpc   rpc.Client
-	log   *slog.Logger
-	bcast *broadcast.Broadcaster
+	limiter  *RateLimiter
+	bcast    *broadcast.Broadcaster
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -81,6 +76,8 @@ func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enr
 // The limiter's Start/Stop lifecycle is owned by main, not by the Server.
 func (s *Server) SetRateLimiter(l *RateLimiter) {
 	s.limiter = l
+}
+
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
 // (SSE, WebSocket) can deliver events as they arrive.
 func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {

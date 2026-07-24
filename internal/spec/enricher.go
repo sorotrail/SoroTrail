@@ -87,23 +87,20 @@ func (e *Enricher) enrichOne(ctx context.Context, ev store.Event) store.Enriched
 	return store.EnrichedEvent{
 		Event:        ev,
 		Decoded:      true,
-		DecodedEvent: &store.DecodedEvent{Event: eventName, Fields: fields},
+		DecodedEvent: &store.DecodedEventResponse{Event: eventName, Fields: fields},
 	}
 }
 
 // getSpec returns the spec for a contract, trying cache first and
 // falling back to fetching if a fetcher is configured.
 func (e *Enricher) getSpec(ctx context.Context, contractID string) *ContractSpec {
-	// Try cache first.
-	// Since we key by wasm_hash and we don't have the hash yet, we need
-	// to either fetch or look up by contract ID.
-	// For the cache, we maintain a separate contractID→wasmHash mapping
-	// or do a full fetch on miss.
+	// Try the cache first, by contract ID (specs are keyed by wasm hash,
+	// so this is a reverse lookup).
+	if s := e.cache.GetByContractID(contractID); s != nil {
+		return s
+	}
 
-	// For now, we only support specs that are already cached or can be
-	// fetched. We check the cache via the fetcher's fetch (which will
-	// populate the cache on success).
-
+	// Not cached — fetch it if a fetcher is configured.
 	if e.fetcher == nil {
 		return nil
 	}
@@ -139,16 +136,15 @@ func extractEventName(topics json.RawMessage) (string, bool) {
 		return "", false
 	}
 
-	// topic[0] should be the event name symbol.
-	name, err := ScalarValue(topicArr[0])
-	if err != nil {
+	// topic[0] must be a symbol-tagged value: {"symbol":"..."}. Any other
+	// scalar (e.g. an address) is not a valid event name.
+	var tagged struct {
+		Symbol *string `json:"symbol"`
+	}
+	if err := json.Unmarshal(topicArr[0], &tagged); err != nil || tagged.Symbol == nil {
 		return "", false
 	}
-	eventName, ok := name.(string)
-	if !ok {
-		return "", false
-	}
-	return eventName, true
+	return *tagged.Symbol, true
 }
 
 // findEventSpec finds the EventSpec matching the given event name.

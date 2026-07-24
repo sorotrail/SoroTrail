@@ -43,6 +43,20 @@ func (c *Cache) Get(wasmHash string) *ContractSpec {
 	return c.mem[wasmHash]
 }
 
+// GetByContractID returns a cached spec whose ContractID matches, or nil.
+// Specs are keyed by wasm hash, so callers holding only a contract ID need
+// this reverse lookup.
+func (c *Cache) GetByContractID(contractID string) *ContractSpec {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, s := range c.mem {
+		if s.ContractID == contractID {
+			return s
+		}
+	}
+	return nil
+}
+
 // Set stores a spec in both memory and (if configured) database.
 func (c *Cache) Set(ctx context.Context, spec *ContractSpec) error {
 	c.mu.Lock()
@@ -69,7 +83,8 @@ func (c *Cache) LoadFromDB(ctx context.Context, wasmHash string) (*ContractSpec,
 	}
 	data, err := c.dbStore.GetContractSpec(ctx, wasmHash)
 	if err != nil {
-		return nil, err // let the caller decide how to handle (e.g. not found)
+		// Per the Store contract, any error means "not cached".
+		return nil, nil
 	}
 	if data == nil {
 		return nil, nil

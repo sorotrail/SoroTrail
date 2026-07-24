@@ -3,6 +3,7 @@ package spec
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
@@ -170,10 +171,10 @@ func TestCache_WithDBBacking(t *testing.T) {
 
 func TestExtractEventName(t *testing.T) {
 	tests := []struct {
-		name     string
-		topics   json.RawMessage
-		want     string
-		wantOK   bool
+		name   string
+		topics json.RawMessage
+		want   string
+		wantOK bool
 	}{
 		{"symbol event", json.RawMessage(`[{"symbol":"transfer"}]`), "transfer", true},
 		{"two symbols", json.RawMessage(`[{"symbol":"transfer"},{"symbol":"extra"}]`), "transfer", true},
