@@ -80,28 +80,6 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			created_at         = COALESCE(EXCLUDED.created_at,         events.created_at),
 			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr,      events.raw_topic_xdr),
 			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr,      events.raw_value_xdr)`
-	conflict := "ON CONFLICT DO NOTHING"
-	if onUpdate {
-		conflict = `
-		ON CONFLICT (ledger, id) DO UPDATE SET
-			contract_id        = EXCLUDED.contract_id,
-	conflict := "ON CONFLICT (id) DO NOTHING"
-	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
-			contract_id        = EXCLUDED.contract_id,
-			ledger             = EXCLUDED.ledger,
-			type               = EXCLUDED.type,
-			tx_hash            = EXCLUDED.tx_hash,
-			tx_index           = EXCLUDED.tx_index,
-			op_index           = EXCLUDED.op_index,
-			in_successful_call = EXCLUDED.in_successful_call,
-			topics             = EXCLUDED.topics,
-			value              = EXCLUDED.value,
-			created_at         = EXCLUDED.created_at,
-			topics_xdr         = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
-			value_xdr          = coalesce(EXCLUDED.value_xdr, events.value_xdr)`
-			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
-			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
 	sql := `
 		INSERT INTO events
@@ -386,10 +364,14 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
-	if f.ContractID != "" {
+	if len(f.ContractIDs) > 0 {
+		where = append(where, "contract_id = ANY("+arg(f.ContractIDs)+")")
+	} else if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
-	if f.Type != "" {
+	if len(f.Types) > 0 {
+		where = append(where, "type = ANY("+arg(f.Types)+")")
+	} else if f.Type != "" {
 		where = append(where, "type = "+arg(f.Type))
 	}
 	if len(f.Topic) > 0 {
@@ -400,6 +382,7 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		// Direct containment — caller controls the shape (object wrapped in
 		// array for element match, multi-element arrays for subset match).
 		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
+	}
 	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
 		if len(topic) == 0 {
 			continue

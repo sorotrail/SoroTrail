@@ -87,8 +87,10 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
-	ContractID string
-	Type       string
+	ContractIDs []string
+	ContractID  string
+	Types       []string
+	Type        string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic      json.RawMessage
@@ -98,7 +100,6 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	Topic json.RawMessage
 	// Topic0-Topic3 match the exact JSON value at that specific topic array
 	// position. Unspecified positions are wildcards.
 	Topic0     json.RawMessage

@@ -137,8 +137,8 @@ Query parameters (all optional, combinable):
 
 | Param | Example | Meaning |
 | --- | --- | --- |
-| `contract_id` | `CDLZ...CYSC` | Only events from this contract. |
-| `type` | `contract` | `contract` \| `system` \| `diagnostic`. |
+| `contract_id` | `C1&contract_id=C2` | Events for any of the listed contracts. Use repeated `contract_id` params; comma-separated lists are rejected. |
+| `type` | `contract&type=system` | Events for any of the listed types. Use repeated `type` params; comma-separated lists are rejected. |
 | `topic` | `{"symbol":"transfer"}` | Exact match against any topic position. A bare word is treated as a JSON string. |
 | `topic_contains` | `[{"address":"G..."}]` | Postgres jsonb containment (`@>`) against the topics array. Pass an array to match one or more topic elements: `[{"address":"G..."}]` matches any event where a topic contains that address; `[{"symbol":"transfer"},{"address":"G..."}]` requires both. Must be parseable JSON (400 otherwise). Uses the GIN index on `topics`. |
 | `topic0` | `{"symbol":"transfer"}` | Exact match against topic position 0. |
@@ -159,6 +159,10 @@ Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` f
 
 ```sh
 curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic={"symbol":"transfer"}&limit=2'
+
+```sh
+curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&contract_id=CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&type=contract&type=system&limit=2'
+```
 ```
 
 Containment search (`topic_contains`) lets you filter by partial topic
@@ -235,7 +239,8 @@ curl -s localhost:8080/events/0001099511627776-0000000001
 ### `GET /contracts/{id}/events`
 
 Convenience wrapper for `GET /events?contract_id={id}`; accepts the same
-remaining query parameters.
+remaining query parameters. It rejects an explicit `contract_id` query
+parameter to avoid conflicting filters.
 
 ```sh
 curl -s localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/events?limit=10
