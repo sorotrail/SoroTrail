@@ -48,3 +48,16 @@ jobs:
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.12.2
+
+  openapi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run OpenAPI spec tests
+        run: go test ./internal/api/ -run 'TestOpenAPI' -v -count=1
+      - name: Validate OpenAPI spec with Redocly
+        run: |
+          npx --yes @redocly/cli@1 lint internal/api/openapi.json --format=stylish

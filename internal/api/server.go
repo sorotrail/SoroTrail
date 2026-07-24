@@ -1,9 +1,10 @@
 // Package api serves stored events over HTTP. Endpoints are documented in
-// the README's API reference.
+// the README's API reference and machine-readable at /openapi.json.
 package api
 
 import (
 	"context"
+	_ "embed"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -17,6 +18,28 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
+
+//go:embed openapi.json
+var openapiSpec []byte
+
+// swaggerUI is the minimal HTML page that renders the Swagger UI for the
+// embedded OpenAPI spec. It loads swagger-ui-dist from jsdelivr CDN.
+const swaggerUI = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SoroTrail API – Swagger UI</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js" crossorigin></script>
+  <script>
+    SwaggerUIBundle({ url: '/openapi.json', dom_id: '#swagger-ui' });
+  </script>
+</body>
+</html>`
 
 // SetAuditor registers the binary's Auditor so /stats can surface its
 // Metrics counters. There is exactly one Auditor per process; its
@@ -87,6 +110,13 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
+	return s.router()
+}
+
+// router builds the chi router with middleware and all routes. Returned
+// as chi.Router (not http.Handler) so tests can walk the route tree with
+// chi.Walk to verify spec coverage.
+func (s *Server) router() chi.Router {
 	r := chi.NewRouter()
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
@@ -105,6 +135,10 @@ func (s *Server) Router() http.Handler {
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
+	// OpenAPI spec and Swagger UI.
+	r.Get("/openapi.json", s.handleOpenAPI)
+	r.Get("/docs", s.handleDocs)
+
 	// contributors: new read endpoints go here. Anything that writes (e.g.
 	// managing watched contracts at runtime) should come with auth first.
 
@@ -117,6 +151,22 @@ func (s *Server) Router() http.Handler {
 	r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
 
 	return r
+}
+
+// handleOpenAPI serves the embedded OpenAPI 3.1 specification.
+func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(openapiSpec)
+}
+
+// handleDocs serves the Swagger UI page that renders /openapi.json.
+func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(swaggerUI))
 }
 
 func (s *Server) requestLogger(next http.Handler) http.Handler {
