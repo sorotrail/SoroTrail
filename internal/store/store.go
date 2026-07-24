@@ -91,9 +91,20 @@ type EventFilter struct {
 	Type       string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
-	Topic      json.RawMessage
+	Topic json.RawMessage
+	// Topic0-Topic3 match the exact JSON value at that specific topic array
+	// position. Unspecified positions are wildcards.
+	Topic0     json.RawMessage
+	Topic1     json.RawMessage
+	Topic2     json.RawMessage
+	Topic3     json.RawMessage
 	FromLedger int64 // inclusive
 	ToLedger   int64 // inclusive
+	Topic      json.RawMessage
+	FromLedger int64     // inclusive
+	ToLedger   int64     // inclusive
+	FromTime   time.Time // inclusive, zero = no constraint
+	ToTime     time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int
@@ -230,6 +241,13 @@ type Store interface {
 	ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error
 	// GetEvent returns the event with the given ID, or ErrNotFound.
 	GetEvent(ctx context.Context, id string) (Event, error)
+	// EventExists reports whether an event with the given ID is in the
+	// store. It is the cheap 304 path used by the API when a conditional
+	// GET carries an If-None-Match whose validator matches the request
+	// URL: we want to confirm "still here" without re-serializing the
+	// full row, so retention/pruning (when it lands, see #8) can't leave
+	// cached clients believing a deleted event is still available.
+	EventExists(ctx context.Context, id string) (bool, error)
 	// QueryEvents returns a page of events in ascending ID order, plus a
 	// cursor for the next page ("" when there are no more results).
 	// Default order is ascending (oldest-first) for backward compatibility.
