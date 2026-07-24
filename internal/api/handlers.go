@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
 	"github.com/khaylebfortune/sorotrail/internal/config"
@@ -529,6 +530,81 @@ func parseTimeParam(raw, name string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("%s sub-second precision is not supported", name)
 	}
 	return t, nil
+}
+
+func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
+	if s.bcast == nil {
+		http.Error(w, "streaming not configured", http.StatusNotImplemented)
+		return
+	}
+
+	filter, err := filterFromQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// InsecureSkipVerify disables WebSocket Origin checking: the WS endpoint
+	// is server-to-client only (no client messages are read), so a forged
+	// Origin header cannot influence what the client sees.
+	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		s.log.Error("websocket accept", "error", err)
+		return
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	sub := s.bcast.Subscribe(filter)
+	defer sub.Close()
+
+	ctx := r.Context()
+
+	// Use CloseRead to get a context cancelled when the client disconnects
+	// and to ensure the library processes control frames (ping/pong/close).
+	ctx = c.CloseRead(ctx)
+
+	// Periodic ping to detect stale connections.
+	pingCtx, pingCancel := context.WithCancel(ctx)
+	defer pingCancel()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pingCtx.Done():
+				return
+			case <-ticker.C:
+				pCtx, cancel := context.WithTimeout(pingCtx, 5*time.Second)
+				err := c.Ping(pCtx)
+				cancel()
+				if err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-sub.Events():
+			if !ok {
+				return
+			}
+			data, err := json.Marshal(ev)
+			if err != nil {
+				s.log.Error("marshal event for ws", "error", err)
+				continue
+			}
+			err = c.Write(ctx, websocket.MessageText, data)
+			if err != nil {
+				return
+			}
+		}
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

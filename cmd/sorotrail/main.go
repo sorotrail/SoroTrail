@@ -22,6 +22,7 @@ import (
 
 	"github.com/khaylebfortune/sorotrail/internal/api"
 	"github.com/khaylebfortune/sorotrail/internal/audit"
+	"github.com/khaylebfortune/sorotrail/internal/broadcast"
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/ingester"
@@ -100,11 +101,12 @@ func run() error {
 	}
 
 	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
+	bcast := broadcast.New(broadcast.DefaultBufferSize)
 	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
 		RetentionLedgers: cfg.RetentionLedgers,
-	})
+	}).WithBroadcaster(bcast)
 
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a
@@ -130,7 +132,7 @@ func run() error {
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.New(st, rpcClient, log).Router(),
+		Handler:           api.New(st, rpcClient, log).WithBroadcaster(bcast).Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

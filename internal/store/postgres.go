@@ -82,6 +82,7 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 				 in_successful_call, topics, value, created_at,
 				 raw_topic_xdr, raw_value_xdr)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) `+conflict,
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`+conflict,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,

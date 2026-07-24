@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/khaylebfortune/sorotrail/internal/audit"
+	"github.com/khaylebfortune/sorotrail/internal/broadcast"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -48,11 +49,19 @@ type Server struct {
 	store store.Store
 	rpc   rpc.Client
 	log   *slog.Logger
+	bcast *broadcast.Broadcaster
 }
 
 // New builds the API server. rpcClient is only used by /health.
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger) *Server {
 	return &Server{store: st, rpc: rpcClient, log: log}
+}
+
+// WithBroadcaster attaches the live event broadcaster so streaming endpoints
+// (SSE, WebSocket) can deliver events as they arrive.
+func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
+	s.bcast = b
+	return s
 }
 
 // Router returns the HTTP handler with all routes mounted.
@@ -67,6 +76,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/stats", s.handleStats)
+	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// contributors: new read endpoints go here. Anything that writes (e.g.
 	// managing watched contracts at runtime) should come with auth first.
