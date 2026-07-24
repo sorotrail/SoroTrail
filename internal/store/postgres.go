@@ -24,6 +24,7 @@ const (
 )
 
 // Postgres implements Store on a pgx connection pool.
+//
 type Postgres struct {
 	pool          *pgxpool.Pool
 	partitionSpan int64

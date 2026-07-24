@@ -94,5 +94,3 @@ func (s *Server) handleContractStats(w http.ResponseWriter, r *http.Request) {
 	writeCacheHeaders(w, cacheNoCache, 0, "")
 	writeJSON(w, http.StatusOK, resp)
 }
-
-

@@ -96,7 +96,7 @@ func (s *stubStore) SaveAuditStateIfGreater(context.Context, int64) (store.Audit
 	return store.AuditState{}, nil
 }
 func (s *stubStore) ListWatchedContracts(context.Context) ([]string, error) { return nil, nil }
-func (s *stubStore) AddWatchedContract(context.Context, string) error        { return nil }
+func (s *stubStore) AddWatchedContract(context.Context, string) error       { return nil }
 func (s *stubStore) RecordAuditFinding(context.Context, store.AuditFinding) (store.AuditFinding, error) {
 	return store.AuditFinding{}, nil
 }
@@ -216,9 +216,9 @@ const testContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 func TestFetchTokenMeta_Success(t *testing.T) {
 	rpc := &mockRPC{
 		simResps: []rpc.SimulateTransactionResponse{
-			makeSymbolResult(t, "USD Coin"),  // name()
-			makeSymbolResult(t, "USDC"),       // symbol()
-			makeU32Result(t, 6),               // decimals()
+			makeSymbolResult(t, "USD Coin"), // name()
+			makeSymbolResult(t, "USDC"),     // symbol()
+			makeU32Result(t, 6),             // decimals()
 		},
 	}
 	st := newStubStore()

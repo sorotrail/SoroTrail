@@ -23,11 +23,11 @@ import (
 // Results are cached in the contract_meta table; non-token contracts are
 // negatively cached so they're never re-probed.
 type Worker struct {
-	rpc    rpc.Client
-	store  store.Store
-	log    *slog.Logger
-	ttl    time.Duration
-	poll   time.Duration
+	rpc   rpc.Client
+	store store.Store
+	log   *slog.Logger
+	ttl   time.Duration
+	poll  time.Duration
 }
 
 // New creates a metadata enrichment worker.
@@ -220,8 +220,8 @@ func (w *Worker) simulateContractCall(ctx context.Context, contractID, functionN
 	}
 
 	hostFn := xdr.HostFunction{
-		Type:            xdr.HostFunctionTypeHostFunctionTypeInvokeContract,
-		InvokeContract:  &invokeArgs,
+		Type:           xdr.HostFunctionTypeHostFunctionTypeInvokeContract,
+		InvokeContract: &invokeArgs,
 	}
 
 	// Build a minimal transaction envelope for simulation.
@@ -230,12 +230,12 @@ func (w *Worker) simulateContractCall(ctx context.Context, contractID, functionN
 	var sourceAccount xdr.MuxedAccount
 	sourceAccount.Type = xdr.CryptoKeyTypeKeyTypeEd25519
 	var zeroKey xdr.Uint256
-	sourceAccount.Ed25519 = (*xdr.Uint256)(&zeroKey)
+	sourceAccount.Ed25519 = &zeroKey
 
 	op := xdr.Operation{
 		SourceAccount: nil,
 		Body: xdr.OperationBody{
-			Type:              xdr.OperationTypeInvokeHostFunction,
+			Type: xdr.OperationTypeInvokeHostFunction,
 			InvokeHostFunctionOp: &xdr.InvokeHostFunctionOp{
 				HostFunction: hostFn,
 				Auth:         nil, // no auth needed for simulation
