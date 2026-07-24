@@ -343,6 +343,7 @@ func (m *mockStore) Stats(context.Context) (store.Stats, error) {
 }
 
 func (m *mockStore) Ping(context.Context) error { return nil }
+func (m *mockStore) PoolHealthy() bool          { return true }
 
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound

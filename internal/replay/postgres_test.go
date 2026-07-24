@@ -15,7 +15,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stellar/go/xdr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -42,13 +41,14 @@ func testStore(t *testing.T) *store.Postgres {
 	}
 	require.NoError(t, store.Migrate(dbURL))
 
-	pool, err := pgxpool.New(context.Background(), dbURL)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pm, err := store.NewPoolManager(context.Background(), dbURL, log, store.DefaultPoolOptions)
 	require.NoError(t, err)
-	t.Cleanup(pool.Close)
+	t.Cleanup(pm.Close)
 
-	_, err = pool.Exec(context.Background(), `TRUNCATE events, replay_state`)
+	_, err = pm.Pool().Exec(context.Background(), `TRUNCATE events, replay_state`)
 	require.NoError(t, err)
-	return store.NewPostgres(pool)
+	return store.NewPostgres(pm)
 }
 
 func mustBase64(t *testing.T, val xdr.ScVal) string {

@@ -105,6 +105,7 @@ func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, er
 
 func (s *stubStore) Stats(context.Context) (store.Stats, error) { return s.stats, nil }
 func (s *stubStore) Ping(context.Context) error                 { return s.pingErr }
+func (s *stubStore) PoolHealthy() bool                          { return s.pingErr == nil }
 
 // Subscription stubs for the webhook feature.
 func (s *stubStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {

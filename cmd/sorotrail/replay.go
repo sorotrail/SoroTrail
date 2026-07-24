@@ -9,8 +9,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/replay"
@@ -74,13 +72,13 @@ flags:
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	poolMgr, err := store.NewPoolManager(ctx, cfg.DatabaseURL, log, store.DefaultPoolOptions)
 	if err != nil {
 		return fmt.Errorf("connecting to postgres: %w", err)
 	}
-	defer pool.Close()
+	defer poolMgr.Close()
 
-	r := replay.New(store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan)), decode.XDRDecoder{}, log, replay.Options{
+	r := replay.New(store.NewPostgres(poolMgr, int64(cfg.PartitionLedgerSpan)), decode.XDRDecoder{}, log, replay.Options{
 		FromLedger: *fromLedger,
 		ToLedger:   *toLedger,
 		BatchSize:  *batchSize,

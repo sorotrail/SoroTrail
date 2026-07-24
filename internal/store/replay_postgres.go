@@ -55,7 +55,7 @@ func (l *pgReplayLock) Release() {
 // dedicated pooled connection that the caller must Release; ingestion and
 // API queries continue to use the rest of the pool untouched.
 func (p *Postgres) AcquireReplayLock(ctx context.Context) (ReplayLock, error) {
-	conn, err := p.pool.Acquire(ctx)
+	conn, err := p.pool().Acquire(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("acquiring connection for replay lock: %w", err)
 	}
@@ -75,7 +75,7 @@ func (p *Postgres) AcquireReplayLock(ctx context.Context) (ReplayLock, error) {
 // no replay has ever run.
 func (p *Postgres) GetReplayState(ctx context.Context) (ReplayState, error) {
 	var s ReplayState
-	err := p.pool.QueryRow(ctx, `
+	err := p.pool().QueryRow(ctx, `
 		SELECT from_ledger, to_ledger, last_event_id, processed, changed,
 		       skipped, started_at, updated_at, completed_at
 		FROM replay_state WHERE id = 1`,
@@ -93,7 +93,7 @@ func (p *Postgres) GetReplayState(ctx context.Context) (ReplayState, error) {
 // StartReplayState (re)initializes the progress row for a fresh run over
 // [fromLedger, toLedger], discarding any previous run's progress.
 func (p *Postgres) StartReplayState(ctx context.Context, fromLedger, toLedger int64) error {
-	_, err := p.pool.Exec(ctx, `
+	_, err := p.pool().Exec(ctx, `
 		INSERT INTO replay_state
 			(id, from_ledger, to_ledger, last_event_id, processed, changed,
 			 skipped, started_at, updated_at, completed_at)
@@ -119,7 +119,7 @@ func (p *Postgres) StartReplayState(ctx context.Context, fromLedger, toLedger in
 // ordered by ID, starting after afterID. Events are returned whether or not
 // they carry raw XDR — the caller counts the ones it has to skip.
 func (p *Postgres) NextReplayBatch(ctx context.Context, fromLedger, toLedger int64, afterID string, limit int) ([]DecodedEvent, error) {
-	rows, err := p.pool.Query(ctx, `
+	rows, err := p.pool().Query(ctx, `
 		SELECT id, contract_id, ledger, topics_xdr, value_xdr, topics, value
 		FROM events
 		WHERE ledger >= $1 AND ledger <= $2 AND id > $3
@@ -170,7 +170,7 @@ func (p *Postgres) NextReplayBatch(ctx context.Context, fromLedger, toLedger int
 // The transaction touches only the batch's own rows and holds no table-level
 // locks, so concurrent ingestion is never blocked for longer than one batch.
 func (p *Postgres) CommitReplayBatch(ctx context.Context, b ReplayBatch) error {
-	tx, err := p.pool.Begin(ctx)
+	tx, err := p.pool().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning replay batch: %w", err)
 	}

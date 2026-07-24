@@ -13,11 +13,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -35,14 +36,15 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	}
 	require.NoError(t, Migrate(dbURL))
 
-	pool, err := pgxpool.New(context.Background(), dbURL)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pm, err := NewPoolManager(context.Background(), dbURL, log, DefaultPoolOptions)
 	require.NoError(t, err)
-	t.Cleanup(pool.Close)
+	t.Cleanup(pm.Close)
 
-	_, err = pool.Exec(context.Background(),
+	_, err = pm.Pool().Exec(context.Background(),
 		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
 	require.NoError(t, err)
-	return NewPostgres(pool, span)
+	return NewPostgres(pm, span)
 }
 
 func testEvent(id string, ledger int64, contractID string) Event {
@@ -105,7 +107,7 @@ func TestUpsertEvents_CreatesPartitionsAndIsIdempotent(t *testing.T) {
 	assert.Zero(t, inserted, "duplicate IDs are ignored across partitions")
 
 	var plan string
-	rows, err := st.pool.Query(ctx, `EXPLAIN (COSTS OFF) SELECT id FROM events WHERE ledger BETWEEN $1 AND $2 ORDER BY id`, 10, 19)
+	rows, err := st.pool().Query(ctx, `EXPLAIN (COSTS OFF) SELECT id FROM events WHERE ledger BETWEEN $1 AND $2 ORDER BY id`, 10, 19)
 	require.NoError(t, err)
 	defer rows.Close()
 	for rows.Next() {
@@ -333,11 +335,12 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	}
 	require.NoError(t, Migrate(dbURL))
 
-	pool, err := pgxpool.New(context.Background(), dbURL)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pm, err := NewPoolManager(context.Background(), dbURL, log, DefaultPoolOptions)
 	require.NoError(t, err)
-	t.Cleanup(pool.Close)
+	t.Cleanup(pm.Close)
 
-	st := NewPostgres(pool, 10)
+	st := NewPostgres(pm, 10)
 	ctx := context.Background()
 
 	original := testEvent(eventID(1), 100, contractA)
@@ -346,7 +349,7 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	_, err = st.UpsertEvents(ctx, []Event{original})
 	require.NoError(t, err)
 
-	_, err = pool.Exec(ctx, `
+	_, err = pm.Pool().Exec(ctx, `
 		ALTER TABLE events RENAME TO events_partitioned;
 		CREATE TABLE events (
 			id                 text PRIMARY KEY,
@@ -391,7 +394,7 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	assert.Equal(t, original.RawTopicXDR, got.RawTopicXDR)
 	assert.Equal(t, original.RawValueXDR, got.RawValueXDR)
 
-	partitions, err := pool.Query(ctx, `SELECT to_regclass('events_100_109'), to_regclass('events_110_119')`)
+	partitions, err := pm.Pool().Query(ctx, `SELECT to_regclass('events_100_109'), to_regclass('events_110_119')`)
 	require.NoError(t, err)
 	defer partitions.Close()
 	require.True(t, partitions.Next())
@@ -451,7 +454,7 @@ func TestStats(t *testing.T) {
 	assert.Equal(t, int64(1), stats.WatchedContracts)
 
 	var plan string
-	rows, err := st.pool.Query(ctx, `EXPLAIN (COSTS OFF) SELECT coalesce(min(ledger), 0) FROM events`)
+	rows, err := st.pool().Query(ctx, `EXPLAIN (COSTS OFF) SELECT coalesce(min(ledger), 0) FROM events`)
 	require.NoError(t, err)
 	defer rows.Close()
 	for rows.Next() {

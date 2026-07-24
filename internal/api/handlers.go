@@ -115,7 +115,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok", "rpc": "ok"}}
 	status := http.StatusOK
 
-	if err := s.store.Ping(ctx); err != nil {
+	// Fast path: if the background health check reports the pool unhealthy,
+	// skip the actual Ping and report degraded immediately. This avoids
+	// blocking on a dead connection and keeps readiness probes snappy.
+	if !s.store.PoolHealthy() {
+		resp.Status, resp.Checks["database"] = "degraded", "pool unhealthy"
+		status = http.StatusServiceUnavailable
+	} else if err := s.store.Ping(ctx); err != nil {
 		resp.Status, resp.Checks["database"] = "degraded", err.Error()
 		status = http.StatusServiceUnavailable
 	}

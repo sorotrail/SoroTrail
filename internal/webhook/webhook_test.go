@@ -194,6 +194,8 @@ func (s *stubSubscriptionStore) ResetSubscriptionFailures(_ context.Context, id 
 	return nil
 }
 
+func (s *stubSubscriptionStore) PoolHealthy() bool { return true }
+
 const (
 	contractA = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	contractB = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"

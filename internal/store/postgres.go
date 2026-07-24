@@ -23,23 +23,31 @@ const (
 	DefaultEventPartitionSpan = 120960
 )
 
-// Postgres implements Store on a pgx connection pool.
+// Postgres implements Store on a pgx connection pool managed by PoolManager.
 type Postgres struct {
-	pool          *pgxpool.Pool
+	pm            *PoolManager
 	partitionSpan int64
 }
 
 var _ Store = (*Postgres)(nil)
 
-// NewPostgres wraps an existing pool. The caller owns the pool's lifecycle.
+func (p *Postgres) pool() *pgxpool.Pool {
+	return p.pm.Pool()
+}
+
+// NewPostgres wraps a PoolManager. The caller owns the PoolManager lifecycle.
 // partitionSpan is optional; when unset or non-positive, the production
 // default is used.
-func NewPostgres(pool *pgxpool.Pool, partitionSpan ...int64) *Postgres {
+func NewPostgres(pm *PoolManager, partitionSpan ...int64) *Postgres {
 	span := int64(DefaultEventPartitionSpan)
 	if len(partitionSpan) > 0 && partitionSpan[0] > 0 {
 		span = partitionSpan[0]
 	}
-	return &Postgres{pool: pool, partitionSpan: span}
+	return &Postgres{pm: pm, partitionSpan: span}
+}
+
+func (p *Postgres) PoolHealthy() bool {
+	return p.pm.Healthy()
 }
 
 func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
@@ -78,30 +86,8 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			topics             = COALESCE(EXCLUDED.topics,             events.topics),
 			value              = COALESCE(EXCLUDED.value,              events.value),
 			created_at         = COALESCE(EXCLUDED.created_at,         events.created_at),
-			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr,      events.raw_topic_xdr),
-			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr,      events.raw_value_xdr)`
-	conflict := "ON CONFLICT DO NOTHING"
-	if onUpdate {
-		conflict = `
-		ON CONFLICT (ledger, id) DO UPDATE SET
-			contract_id        = EXCLUDED.contract_id,
-	conflict := "ON CONFLICT (id) DO NOTHING"
-	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
-			contract_id        = EXCLUDED.contract_id,
-			ledger             = EXCLUDED.ledger,
-			type               = EXCLUDED.type,
-			tx_hash            = EXCLUDED.tx_hash,
-			tx_index           = EXCLUDED.tx_index,
-			op_index           = EXCLUDED.op_index,
-			in_successful_call = EXCLUDED.in_successful_call,
-			topics             = EXCLUDED.topics,
-			value              = EXCLUDED.value,
-			created_at         = EXCLUDED.created_at,
-			topics_xdr         = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
-			value_xdr          = coalesce(EXCLUDED.value_xdr, events.value_xdr)`
-			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
-			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+			topics_xdr         = COALESCE(EXCLUDED.topics_xdr,         events.topics_xdr),
+			value_xdr          = COALESCE(EXCLUDED.value_xdr,          events.value_xdr)`
 	}
 	sql := `
 		INSERT INTO events
@@ -111,9 +97,6 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		` + conflict
 	for _, e := range events {
-		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
-		// into SQL NULL so the column has one representation of "absent"
-		// rather than two.
 		batch.Queue(sql,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
@@ -136,7 +119,7 @@ func (p *Postgres) ensureEventPartitions(ctx context.Context, events []Event) er
 			maxLedger = e.Ledger
 		}
 	}
-	_, err := p.pool.Exec(ctx, `SELECT ensure_event_partitions($1, $2, $3)`, minLedger, maxLedger, p.partitionSpan)
+	_, err := p.pool().Exec(ctx, `SELECT ensure_event_partitions($1, $2, $3)`, minLedger, maxLedger, p.partitionSpan)
 	if err != nil {
 		return fmt.Errorf("ensuring event partitions for ledger range [%d,%d]: %w", minLedger, maxLedger, err)
 	}
@@ -154,7 +137,7 @@ func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bo
 	if err := p.ensureEventPartitions(ctx, events); err != nil {
 		return 0, err
 	}
-	results := p.pool.SendBatch(ctx, insertEventsBatch(events, onUpdate))
+	results := p.pool().SendBatch(ctx, insertEventsBatch(events, onUpdate))
 	defer results.Close()
 
 	var affected int64
@@ -180,7 +163,7 @@ func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fro
 	if err := p.ensureEventPartitions(ctx, events); err != nil {
 		return err
 	}
-	tx, err := p.pool.Begin(ctx)
+	tx, err := p.pool().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
@@ -293,7 +276,7 @@ func restoreRawXDR(events []Event, kept map[string]rawXDR) []Event {
 // → per-ledger sorted ID list (used to diff a ledger whose count
 // disagrees with the RPC).
 func (p *Postgres) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error) {
-	rows, err := p.pool.Query(ctx, `
+	rows, err := p.pool().Query(ctx, `
 		SELECT ledger, count(*)::int, array_agg(id ORDER BY id)
 		FROM events
 		WHERE ledger BETWEEN $1 AND $2
@@ -341,7 +324,7 @@ func nullableStringSlice(s []string) any {
 }
 
 func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
-	row := p.pool.QueryRow(ctx, `SELECT `+eventColumns+` FROM events WHERE id = $1`, id)
+	row := p.pool().QueryRow(ctx, `SELECT `+eventColumns+` FROM events WHERE id = $1`, id)
 	e, err := scanEvent(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Event{}, ErrNotFound
@@ -359,7 +342,7 @@ func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
 // loaded on a real cache miss via GetEvent.
 func (p *Postgres) EventExists(ctx context.Context, id string) (bool, error) {
 	var one int
-	err := p.pool.QueryRow(ctx, `SELECT 1 FROM events WHERE id = $1`, id).Scan(&one)
+	err := p.pool().QueryRow(ctx, `SELECT 1 FROM events WHERE id = $1`, id).Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -400,6 +383,7 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		// Direct containment — caller controls the shape (object wrapped in
 		// array for element match, multi-element arrays for subset match).
 		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
+	}
 	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
 		if len(topic) == 0 {
 			continue
@@ -442,7 +426,7 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	// query += " ORDER BY id ASC LIMIT " + arg(limit+1)
 	query += " ORDER BY id " + orderDir + " LIMIT " + arg(limit+1)
 
-	rows, err := p.pool.Query(ctx, query, args...)
+	rows, err := p.pool().Query(ctx, query, args...)
 	if err != nil {
 		return nil, "", fmt.Errorf("querying events: %w", err)
 	}
@@ -470,7 +454,7 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 
 func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error) {
 	var s IngestionState
-	err := p.pool.QueryRow(ctx,
+	err := p.pool().QueryRow(ctx,
 		`SELECT last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE id = 1`,
 	).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -483,7 +467,7 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 }
 
 func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) error {
-	_, err := p.pool.Exec(ctx, `
+	_, err := p.pool().Exec(ctx, `
 		INSERT INTO ingestion_state (id, last_ingested_ledger, last_cursor, updated_at)
 		VALUES (1, $1, $2, now())
 		ON CONFLICT (id) DO UPDATE SET
@@ -500,7 +484,7 @@ func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) err
 
 func (p *Postgres) GetAuditState(ctx context.Context) (AuditState, error) {
 	var s AuditState
-	err := p.pool.QueryRow(ctx,
+	err := p.pool().QueryRow(ctx,
 		`SELECT verified_through_ledger, updated_at FROM audit_state WHERE id = 1`,
 	).Scan(&s.VerifiedThroughLedger, &s.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -513,7 +497,7 @@ func (p *Postgres) GetAuditState(ctx context.Context) (AuditState, error) {
 }
 
 func (p *Postgres) SaveAuditState(ctx context.Context, s AuditState) error {
-	_, err := p.pool.Exec(ctx, `
+	_, err := p.pool().Exec(ctx, `
 		INSERT INTO audit_state (id, verified_through_ledger, updated_at)
 		VALUES (1, $1, now())
 		ON CONFLICT (id) DO UPDATE SET
@@ -530,7 +514,7 @@ func (p *Postgres) SaveAuditState(ctx context.Context, s AuditState) error {
 func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (AuditState, error) {
 	// Single round trip — the WHERE on the singleton row makes the
 	// upsert no-op when the candidate is not greater than what's stored.
-	row := p.pool.QueryRow(ctx, `
+	row := p.pool().QueryRow(ctx, `
 		INSERT INTO audit_state (id, verified_through_ledger, updated_at)
 		VALUES (1, $1, now())
 		ON CONFLICT (id) DO UPDATE SET
@@ -552,7 +536,7 @@ func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (A
 }
 
 func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]string, error) {
-	rows, err := p.pool.Query(ctx,
+	rows, err := p.pool().Query(ctx,
 		`SELECT contract_id FROM watched_contracts ORDER BY contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
@@ -571,7 +555,7 @@ func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]string, error) {
 }
 
 func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) error {
-	_, err := p.pool.Exec(ctx, `
+	_, err := p.pool().Exec(ctx, `
 		INSERT INTO watched_contracts (contract_id) VALUES ($1)
 		ON CONFLICT (contract_id) DO NOTHING`, contractID)
 	if err != nil {
@@ -585,7 +569,7 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 	// COUNT(DISTINCT contract_id) scans the contract_id index; fine at MVP
 	// scale. contributors: replace with a maintained summary table if it
 	// becomes a bottleneck on large datasets.
-	err := p.pool.QueryRow(ctx, `
+	err := p.pool().QueryRow(ctx, `
 		SELECT
 			(SELECT count(*) FROM events),
 			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
@@ -601,12 +585,16 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 }
 
 func (p *Postgres) Ping(ctx context.Context) error {
-	return p.pool.Ping(ctx)
+	pool := p.pool()
+	if pool == nil {
+		return errors.New("pool is closed")
+	}
+	return pool.Ping(ctx)
 }
 
 func (p *Postgres) GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error) {
 	var specJSON []byte
-	err := p.pool.QueryRow(ctx,
+	err := p.pool().QueryRow(ctx,
 		`SELECT spec_json FROM contract_specs WHERE wasm_hash = $1`, wasmHash,
 	).Scan(&specJSON)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -619,7 +607,7 @@ func (p *Postgres) GetContractSpec(ctx context.Context, wasmHash string) ([]byte
 }
 
 func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error {
-	_, err := p.pool.Exec(ctx, `
+	_, err := p.pool().Exec(ctx, `
 		INSERT INTO contract_specs (wasm_hash, contract_id, spec_json, fetched_at)
 		VALUES ($1, $2, $3, now())
 		ON CONFLICT (wasm_hash) DO UPDATE SET
@@ -634,7 +622,7 @@ func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID str
 }
 
 func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
-	err := p.pool.QueryRow(ctx, `
+	err := p.pool().QueryRow(ctx, `
 		INSERT INTO audit_findings
 			(from_ledger, to_ledger, expected_count, actual_count,
 			 missing_ids, status, attempts)
@@ -658,7 +646,7 @@ func (p *Postgres) UpdateAuditFinding(ctx context.Context, f AuditFinding) error
 	} else {
 		lastAttempted = nil
 	}
-	_, err := p.pool.Exec(ctx, `
+	_, err := p.pool().Exec(ctx, `
 		UPDATE audit_findings SET
 			status            = $2,
 			attempts          = $3,
@@ -678,7 +666,7 @@ func (p *Postgres) UpdateAuditFinding(ctx context.Context, f AuditFinding) error
 // overlaps [fromLedger, toLedger] and is still in a working state (open
 // or unrecoverable). ErrNotFound means no live finding spans the range.
 func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error) {
-	row := p.pool.QueryRow(ctx, `
+	row := p.pool().QueryRow(ctx, `
 		SELECT id, from_ledger, to_ledger, expected_count, actual_count,
 		       missing_ids, status, attempts, last_attempted_at, last_error, created_at
 		FROM audit_findings

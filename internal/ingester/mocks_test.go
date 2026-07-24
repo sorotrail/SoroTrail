@@ -169,6 +169,7 @@ func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
 
 func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
 func (m *mockStore) Ping(context.Context) error                 { return nil }
+func (m *mockStore) PoolHealthy() bool                          { return true }
 
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound

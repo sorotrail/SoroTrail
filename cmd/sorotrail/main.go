@@ -18,8 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/khaylebfortune/sorotrail/internal/api"
 	"github.com/khaylebfortune/sorotrail/internal/audit"
 	"github.com/khaylebfortune/sorotrail/internal/broadcast"
@@ -86,16 +84,14 @@ func run() error {
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	poolMgr, err := store.NewPoolManager(ctx, cfg.DatabaseURL, log, store.DefaultPoolOptions)
 	if err != nil {
 		return fmt.Errorf("connecting to postgres: %w", err)
 	}
-	defer pool.Close()
-	if err := pool.Ping(ctx); err != nil {
-		return fmt.Errorf("pinging postgres: %w", err)
-	}
+	defer poolMgr.Close()
+	go poolMgr.Run(ctx)
 
-	st := store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+	st := store.NewPostgres(poolMgr, int64(cfg.PartitionLedgerSpan))
 	for _, id := range cfg.WatchedContracts {
 		if err := st.AddWatchedContract(ctx, id); err != nil {
 			return err
