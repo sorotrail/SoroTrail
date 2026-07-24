@@ -44,13 +44,15 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 	return rows, nil
 }
 
-// insertEventsBatch builds the event INSERT used by every write path, so
-// the column list can't drift between them — notably raw_topic_xdr /
-// raw_value_xdr, which `sorotrail replay` depends on: a path that forgot
-// them would quietly make its rows unreplayable.
+// insertEventsBatch builds the single batch used by upsertEvents (idempotent
+// ingest, DO NOTHING) and ReplaceEventsInRange (auditor repair, DO UPDATE).
+// Both paths write all 13 columns of the events table so raw_topic_xdr /
+// raw_value_xdr are never silently dropped on the way in; a repair that
+// arrives without XDR preserves what was already stored via the coalesce()
+// clauses in the UPDATE branch (`sorotrail replay` relies on that).
 //
 // onUpdate=false → ON CONFLICT DO NOTHING (idempotent ingest);
-// onUpdate=true → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
+// onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	conflict := "ON CONFLICT (id) DO NOTHING"
@@ -72,7 +74,18 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			raw_value_xdr = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
 	batch := &pgx.Batch{}
+	sql := `
+		INSERT INTO events
+			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+			 in_successful_call, topics, value, created_at,
+			 raw_topic_xdr, raw_value_xdr)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		` + conflict
 	for _, e := range events {
+		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
+		// into SQL NULL so the column has one representation of "absent"
+		// rather than two.
+		batch.Queue(sql,
 		// Column list deliberately mirrors the eventColumns constant
 		// (13 fields including raw_topic_xdr / raw_value_xdr) so a
 		// row kept by replay never loses its raw XDR just because the
