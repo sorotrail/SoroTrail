@@ -42,16 +42,13 @@ type stubStore struct {
 	removeErr        error
 	ingestionState   *store.IngestionState
 	ingestionStateEr error
-	exists       bool
-	existsErr    error
-	existsCalls  int // count of EventExists calls
-	lastExistsID string
+	exists           bool
+	existsErr        error
+	existsCalls      int // count of EventExists calls
+	lastExistsID     string
 
 	ingestion    store.IngestionState
 	ingestionErr error
-
-	stats   store.Stats
-	pingErr error
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -103,6 +100,9 @@ func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
 // LastIngestedLedger to drive the boundary decisions (just-below, at,
 // and above the frontier).
 func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, error) {
+	if s.ingestionState != nil {
+		return *s.ingestionState, s.ingestionStateEr
+	}
 	return s.ingestion, s.ingestionErr
 }
 
@@ -118,12 +118,6 @@ func (s *stubStore) AddWatchedContract(_ context.Context, id string) error {
 func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
 	s.removed = append(s.removed, id)
 	return s.removeErr
-}
-func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, error) {
-	if s.ingestionState == nil {
-		return store.IngestionState{}, s.ingestionStateEr
-	}
-	return *s.ingestionState, s.ingestionStateEr
 }
 
 type stubRPC struct {

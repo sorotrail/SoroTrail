@@ -46,18 +46,12 @@ func getAuditor() *audit.Auditor {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store  store.Store
-	rpc    rpc.Client
-	log    *slog.Logger
-	apiKey string
 	store   store.Store
 	rpc     rpc.Client
 	log     *slog.Logger
+	apiKey  string
 	limiter *RateLimiter
-	store store.Store
-	rpc   rpc.Client
-	log   *slog.Logger
-	bcast *broadcast.Broadcaster
+	bcast   *broadcast.Broadcaster
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -73,6 +67,8 @@ func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string) 
 // The limiter's Start/Stop lifecycle is owned by main, not by the Server.
 func (s *Server) SetRateLimiter(l *RateLimiter) {
 	s.limiter = l
+}
+
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
 // (SSE, WebSocket) can deliver events as they arrive.
 func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {

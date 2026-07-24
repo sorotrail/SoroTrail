@@ -35,6 +35,7 @@ func decodeJSONBody(r *http.Request, dst any) error {
 	}
 	return nil
 }
+
 // cachePrivate is the package-wide override that flips Cache-Control
 // directives from `public` to `private`. Production code sets it once at
 // startup via SetCachePrivate (mirrors SetAuditor's "set before serve"
@@ -410,6 +411,8 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 		HistoryPreserved: true,
 		ModeTransition:   modeTransition,
 	})
+}
+
 // listCachePolicy decides whether a list page is cacheable as immutable
 // based on the ingest frontier. The whole point of this function is
 // correctness against a moving frontier: a 1-ledger mistake either

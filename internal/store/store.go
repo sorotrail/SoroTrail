@@ -82,9 +82,6 @@ type EventFilter struct {
 	Topic1     json.RawMessage
 	Topic2     json.RawMessage
 	Topic3     json.RawMessage
-	FromLedger int64 // inclusive
-	ToLedger   int64 // inclusive
-	Topic      json.RawMessage
 	FromLedger int64     // inclusive
 	ToLedger   int64     // inclusive
 	FromTime   time.Time // inclusive, zero = no constraint

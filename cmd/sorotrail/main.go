@@ -137,14 +137,12 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpcClient, log)
+	apiServer := api.New(st, rpcClient, log, cfg.APIKey).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.New(st, rpcClient, log, cfg.APIKey).Router(),
 		Handler:           apiServer.Router(),
-		Handler:           api.New(st, rpcClient, log).WithBroadcaster(bcast).Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	if cfg.APIKey == "" {
