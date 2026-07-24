@@ -40,6 +40,14 @@ type Config struct {
 	// request gets a 503 with a "no API_KEY configured" message), so
 	// writes are never open even when other auth would be off.
 	APIKey string `env:"API_KEY"`
+	// CachePrivate flips the cacheable endpoints from Cache-Control: public
+	// to Cache-Control: private. Set this when the deployment serves
+	// per-user data behind an auth layer (#17, not yet merged) so shared
+	// caches (CDN/proxy) cannot leak responses across keys. Browsers can
+	// still cache the response for the same authenticated user; CDNs and
+	// intermediaries cannot. Defaults to false (the deployment does not
+	// need request-scoped caching).
+	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
 }
 
 // Load reads configuration from the environment and validates it.
