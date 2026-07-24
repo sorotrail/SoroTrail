@@ -26,6 +26,7 @@ func TestLoad(t *testing.T) {
 				assert.Equal(t, 5*time.Second, c.PollInterval)
 				assert.Equal(t, ":8080", c.HTTPAddr)
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
+				assert.Equal(t, uint32(120960), c.PartitionLedgerSpan)
 				assert.Empty(t, c.WatchedContracts)
 			},
 		},
@@ -83,7 +84,8 @@ func TestLoad(t *testing.T) {
 			// Clear the variables Load reads, then apply the case's env.
 			// t.Setenv registers restoration; Unsetenv makes defaults apply.
 			for _, key := range []string{"RPC_URL", "DATABASE_URL", "POLL_INTERVAL",
-				"HTTP_ADDR", "WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL"} {
+				"HTTP_ADDR", "WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS",
+				"PARTITION_LEDGER_SPAN", "LOG_LEVEL"} {
 				t.Setenv(key, "")
 				os.Unsetenv(key)
 			}
