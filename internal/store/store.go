@@ -33,6 +33,22 @@ type Event struct {
 	RawValueXDR string   `json:"-"`
 }
 
+// EnrichedEvent wraps an Event with decoded field information derived from
+// the contract's spec. The original Event is preserved in full; DecodedEvent
+// carries the enriched view when decoding succeeded.
+type EnrichedEvent struct {
+	Event        `json:",inline"`      // embed all Event fields
+	DecodedEvent *DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                  `json:"decoded"`
+}
+
+// DecodedEventResponse is the JSON shape returned when an event is successfully
+// enriched with spec-driven field names.
+type DecodedEventResponse struct {
+	Event  string         `json:"event"`
+	Fields map[string]any `json:"fields,omitempty"`
+}
+
 // DecodedEvent is one event's replayable payload: the raw XDR inputs plus the
 // decoded columns currently stored for it.
 type DecodedEvent struct {
@@ -75,7 +91,13 @@ type EventFilter struct {
 	Type       string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
-	Topic      json.RawMessage
+	Topic json.RawMessage
+	// Topic0-Topic3 match the exact JSON value at that specific topic array
+	// position. Unspecified positions are wildcards.
+	Topic0     json.RawMessage
+	Topic1     json.RawMessage
+	Topic2     json.RawMessage
+	Topic3     json.RawMessage
 	FromLedger int64     // inclusive
 	ToLedger   int64     // inclusive
 	FromTime   time.Time // inclusive, zero = no constraint
@@ -136,6 +158,78 @@ type AuditFinding struct {
 	LastAttemptedAt time.Time
 	LastError       string
 	CreatedAt       time.Time
+}
+
+// SubscriptionFilter is a JSON-serializable filter that subscription
+// callbacks use to select which events to deliver. Same semantics as
+// GET /events query parameters. An empty (zero-value) filter matches
+// every event.
+type SubscriptionFilter struct {
+	ContractID string          `json:"contract_id,omitempty"`
+	Type       string          `json:"type,omitempty"`
+	Topic      json.RawMessage `json:"topic,omitempty"`
+	FromLedger int64           `json:"from_ledger,omitempty"`
+	ToLedger   int64           `json:"to_ledger,omitempty"`
+}
+
+// MatchesEvent reports whether an event passes this filter. Zero fields
+// mean "no constraint" — the filter is applied per-field, so an empty
+// filter matches everything.
+func (f SubscriptionFilter) MatchesEvent(e Event) bool {
+	if f.ContractID != "" && e.ContractID != f.ContractID {
+		return false
+	}
+	if f.Type != "" && e.Type != f.Type {
+		return false
+	}
+	if f.FromLedger > 0 && e.Ledger < f.FromLedger {
+		return false
+	}
+	if f.ToLedger > 0 && e.Ledger > f.ToLedger {
+		return false
+	}
+	if len(f.Topic) > 0 && len(e.Topics) > 0 {
+		// Match if any event topic equals the filter topic.
+		var topics []json.RawMessage
+		if err := json.Unmarshal(e.Topics, &topics); err != nil {
+			return false
+		}
+		matched := false
+		for _, t := range topics {
+			if string(t) == string(f.Topic) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
+// Subscription is one registered webhook callback.
+type Subscription struct {
+	ID           int64              `json:"id"`
+	URL          string             `json:"url"`
+	Filters      SubscriptionFilter `json:"filters"`
+	Secret       string             `json:"secret"`
+	Enabled      bool               `json:"enabled"`
+	FailureCount int                `json:"failure_count"`
+	CreatedAt    time.Time          `json:"created_at"`
+}
+
+// DeliveryAttempt records one attempt to POST an event to a subscriber's
+// callback URL.
+type DeliveryAttempt struct {
+	ID             int64     `json:"id"`
+	SubscriptionID int64     `json:"subscription_id"`
+	EventID        string    `json:"event_id"`
+	Status         string    `json:"status"`
+	ResponseCode   int       `json:"response_code"`
+	DurationMs     int       `json:"duration_ms"`
+	Error          string    `json:"error,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // Stats summarizes what the indexer has stored so far. VerifiedThroughLedger
@@ -216,6 +310,13 @@ type Store interface {
 	ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error
 	// GetEvent returns the event with the given ID, or ErrNotFound.
 	GetEvent(ctx context.Context, id string) (Event, error)
+	// EventExists reports whether an event with the given ID is in the
+	// store. It is the cheap 304 path used by the API when a conditional
+	// GET carries an If-None-Match whose validator matches the request
+	// URL: we want to confirm "still here" without re-serializing the
+	// full row, so retention/pruning (when it lands, see #8) can't leave
+	// cached clients believing a deleted event is still available.
+	EventExists(ctx context.Context, id string) (bool, error)
 	// QueryEvents returns a page of events in ascending ID order, plus a
 	// cursor for the next page ("" when there are no more results).
 	// Default order is ascending (oldest-first) for backward compatibility.
@@ -252,6 +353,35 @@ type Store interface {
 	// range contains a single ledger, or ErrNotFound if none. The auditor
 	// uses this to keep working while a finding is being repaired.
 	ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error)
+
+	// Subscription CRUD.
+	CreateSubscription(ctx context.Context, s Subscription) (Subscription, error)
+	GetSubscription(ctx context.Context, id int64) (Subscription, error)
+	ListSubscriptions(ctx context.Context) ([]Subscription, error)
+	UpdateSubscription(ctx context.Context, s Subscription) (Subscription, error)
+	DeleteSubscription(ctx context.Context, id int64) error
+
+	// ListEnabledSubscriptions returns all subscriptions with enabled=true.
+	ListEnabledSubscriptions(ctx context.Context) ([]Subscription, error)
+
+	// IncrementSubscriptionFailures atomically increments failure_count
+	// and returns the new value. When newCount >= maxFailures the
+	// subscription is also disabled.
+	IncrementSubscriptionFailures(ctx context.Context, id int64, maxFailures int) (newCount int, disabled bool, err error)
+	// ResetSubscriptionFailures sets failure_count to 0.
+	ResetSubscriptionFailures(ctx context.Context, id int64) error
+
+	// RecordDeliveryAttempt persists one delivery attempt.
+	RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (DeliveryAttempt, error)
+	// ListDeliveryAttempts returns delivery attempts for a subscription,
+	// newest first.
+	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
+	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
+	// or ErrNotFound when no spec is cached for that hash.
+	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
+	// SetContractSpec persists a JSON-serialized spec keyed by wasm_hash
+	// and contract_id so subsequent lookups avoid an RPC round trip.
+	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
 
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error
