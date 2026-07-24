@@ -63,6 +63,20 @@ const (
 	contractB = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 )
 
+// legacySchemaMigrationsVersion is the schema_migrations version the
+// legacy test simulates "already applied" by forcing it via UPDATE. It
+// must match the migration that exists *just before* the partition
+// rewire (0008_partition_events in the post-#68 layout — the partition
+// migration in 0004_partition_events in the pre-#68 layout). If you
+// renumber migrations, update this constant.
+//
+// Held as a named const (not an inline literal) so it is interpolated
+// via fmt.Sprintf into the SQL below — golangci-lint's `unused` rule
+// would otherwise flag it as unused because the SQL body is one opaque
+// string literal to Go's analyzer. The const is a compile-time int, so
+// `%d` interpolation here carries no SQL-injection surface.
+const legacySchemaMigrationsVersion = 3
+
 // eventID builds IDs whose lexicographic order matches insertion order, like
 // real TOIDs.
 func eventID(n int) string { return fmt.Sprintf("%020d-%010d", n, 0) }
@@ -308,7 +322,7 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	_, err = st.UpsertEvents(ctx, []Event{original})
 	require.NoError(t, err)
 
-	_, err = pool.Exec(ctx, `
+	sqlRerun := fmt.Sprintf(`
 		ALTER TABLE events RENAME TO events_partitioned;
 		CREATE TABLE events (
 			id                 text PRIMARY KEY,
@@ -341,8 +355,9 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		ORDER BY ledger, id;
 		DROP TABLE events_partitioned CASCADE;
 		DROP FUNCTION IF EXISTS ensure_event_partitions(bigint, bigint, bigint);
-		UPDATE schema_migrations SET version = 3, dirty = false;
-	`)
+		UPDATE schema_migrations SET version = %d, dirty = false;
+	`, legacySchemaMigrationsVersion)
+	_, err = pool.Exec(ctx, sqlRerun)
 	require.NoError(t, err)
 
 	require.NoError(t, Migrate(dbURL))
