@@ -33,6 +33,15 @@ type Config struct {
 	AuditMaxRPS         float64       `env:"AUDIT_MAX_RPS" envDefault:"10"`
 	AuditMaxRepair      int           `env:"AUDIT_MAX_REPAIR_ATTEMPTS" envDefault:"3"`
 	AuditFindingMaxLgrs uint32        `env:"AUDIT_FINDING_MAX_LEDGERS" envDefault:"100"`
+
+	// CachePrivate flips the cacheable endpoints from Cache-Control: public
+	// to Cache-Control: private. Set this when the deployment serves
+	// per-user data behind an auth layer (#17, not yet merged) so shared
+	// caches (CDN/proxy) cannot leak responses across keys. Browsers can
+	// still cache the response for the same authenticated user; CDNs and
+	// intermediaries cannot. Defaults to false (the deployment does not
+	// need request-scoped caching).
+	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
 }
 
 // Load reads configuration from the environment and validates it.
