@@ -230,6 +230,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
 	}
+	s.addStatsFreshness(r.Context(), &stats)
 	if a := getAuditor(); a != nil {
 		m := a.Metrics()
 		stats.Auditor = store.AuditStats{
@@ -244,6 +245,28 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
+}
+
+func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
+	if s.rpc == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	health, err := s.rpc.GetHealth(ctx)
+	if err != nil {
+		s.log.Warn("loading RPC health for stats", "error", err)
+		return
+	}
+	head := int64(health.LatestLedger)
+	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
+	stats.ChainHeadLedger = &head
+	stats.IngestLagLedgers = &lag
+}
+
+func ingestLagLedgers(chainHead, lastIngested int64) int64 {
+	return chainHead - lastIngested
 }
 
 // listCachePolicy decides whether a list page is cacheable as immutable

@@ -466,8 +466,15 @@ curl -s localhost:8080/stats
 ```
 
 ```json
-{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
+{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"oldest_stored_ledger":242001,"chain_head_ledger":260130,"ingest_lag_ledgers":7,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
 ```
+
+`oldest_stored_ledger` is the lowest ledger currently present in the
+store. `chain_head_ledger` is read from Stellar RPC `getHealth`, and
+`ingest_lag_ledgers` is `chain_head_ledger - last_ingested_ledger`. If
+the RPC is temporarily unreachable, `/stats` still returns HTTP 200 with
+the stored fields populated and the RPC-derived freshness fields
+(`chain_head_ledger`, `ingest_lag_ledgers`) set to `null`.
 
 `verified_through_ledger` is the inclusive highest ledger whose stored
 events have been proven to match a fresh RPC fetch by the auditor. When

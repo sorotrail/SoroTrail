@@ -408,6 +408,22 @@ func TestStats(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), stats.TotalEvents)
 	assert.Equal(t, int64(101), stats.LastIngestedLedger)
+	assert.Equal(t, int64(100), stats.OldestStoredLedger)
 	assert.Equal(t, int64(2), stats.ContractCount)
 	assert.Equal(t, int64(1), stats.WatchedContracts)
+
+	var plan string
+	rows, err := st.pool.Query(ctx, `EXPLAIN (COSTS OFF) SELECT coalesce(min(ledger), 0) FROM events`)
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var line string
+		require.NoError(t, rows.Scan(&line))
+		plan += line + "\n"
+	}
+	require.NoError(t, rows.Err())
+	// The exact partition index name is Postgres-generated; the important
+	// property is that min(ledger) stays index-backed.
+	assert.Contains(t, plan, "Index")
+	assert.Contains(t, plan, "ledger")
 }
