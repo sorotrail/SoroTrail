@@ -33,6 +33,22 @@ type Event struct {
 	RawValueXDR string   `json:"-"`
 }
 
+// EnrichedEvent wraps an Event with decoded field information derived from
+// the contract's spec. The original Event is preserved in full; DecodedEvent
+// carries the enriched view when decoding succeeded.
+type EnrichedEvent struct {
+	Event        `json:",inline"` // embed all Event fields
+	DecodedEvent *DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                   `json:"decoded"`
+}
+
+// DecodedEventResponse is the JSON shape returned when an event is successfully
+// enriched with spec-driven field names.
+type DecodedEventResponse struct {
+	Event  string         `json:"event"`
+	Fields map[string]any `json:"fields,omitempty"`
+}
+
 // DecodedEvent is one event's replayable payload: the raw XDR inputs plus the
 // decoded columns currently stored for it.
 type DecodedEvent struct {
@@ -75,6 +91,15 @@ type EventFilter struct {
 	Type       string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
+	Topic json.RawMessage
+	// Topic0-Topic3 match the exact JSON value at that specific topic array
+	// position. Unspecified positions are wildcards.
+	Topic0     json.RawMessage
+	Topic1     json.RawMessage
+	Topic2     json.RawMessage
+	Topic3     json.RawMessage
+	FromLedger int64 // inclusive
+	ToLedger   int64 // inclusive
 	Topic      json.RawMessage
 	FromLedger int64     // inclusive
 	ToLedger   int64     // inclusive
@@ -354,6 +379,12 @@ type Store interface {
 	// ListDeliveryAttempts returns delivery attempts for a subscription,
 	// newest first.
 	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
+	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
+	// or ErrNotFound when no spec is cached for that hash.
+	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
+	// SetContractSpec persists a JSON-serialized spec keyed by wasm_hash
+	// and contract_id so subsequent lookups avoid an RPC round trip.
+	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
 
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error
