@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
 	"github.com/khaylebfortune/sorotrail/internal/config"
@@ -69,6 +70,12 @@ type errorResponse struct {
 type eventsResponse struct {
 	Events []store.Event `json:"events"`
 	// Cursor is non-empty when another page exists; pass it back as ?cursor=.
+	Cursor string `json:"cursor,omitempty"`
+}
+
+type enrichedEventsResponse struct {
+	Events []store.EnrichedEvent `json:"events"`
+	// Cursor is non-empty when another page exists.
 	Cursor string `json:"cursor,omitempty"`
 }
 
@@ -146,6 +153,13 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
+
+	decoded := r.URL.Query().Get("decoded") == "true"
+	if decoded && s.enricher != nil {
+		enriched := s.enricher.EnrichEvents(r.Context(), events)
+		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
+		return
+	}
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
 	writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
 }
@@ -194,6 +208,15 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
+
+	decoded := r.URL.Query().Get("decoded") == "true"
+	if decoded && s.enricher != nil {
+		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
+		if len(enriched) > 0 {
+			writeJSON(w, http.StatusOK, enriched[0])
+			return
+		}
+	}
 	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
 	writeJSON(w, http.StatusOK, event)
 }
@@ -207,6 +230,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
 	}
+	s.addStatsFreshness(r.Context(), &stats)
 	if a := getAuditor(); a != nil {
 		m := a.Metrics()
 		stats.Auditor = store.AuditStats{
@@ -221,6 +245,28 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
+}
+
+func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
+	if s.rpc == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	health, err := s.rpc.GetHealth(ctx)
+	if err != nil {
+		s.log.Warn("loading RPC health for stats", "error", err)
+		return
+	}
+	head := int64(health.LatestLedger)
+	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
+	stats.ChainHeadLedger = &head
+	stats.IngestLagLedgers = &lag
+}
+
+func ingestLagLedgers(chainHead, lastIngested int64) int64 {
+	return chainHead - lastIngested
 }
 
 // listCachePolicy decides whether a list page is cacheable as immutable
@@ -448,19 +494,28 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
 	}
 
-	// topic accepts any JSON value; a bare word like `transfer` is treated
-	// as the JSON string "transfer". Matching is exact against the stored
-	// topic entries, e.g. topic={"symbol":"transfer"} for XDR-decoded rows.
-	if topic := q.Get("topic"); topic != "" {
-		if json.Valid([]byte(topic)) {
-			f.Topic = json.RawMessage(topic)
-		} else {
-			quoted, err := json.Marshal(topic)
-			if err != nil {
-				return f, fmt.Errorf("invalid topic: %w", err)
-			}
-			f.Topic = quoted
+	parseTopic := func(name, raw string) (json.RawMessage, error) {
+		if raw == "" {
+			return nil, nil
 		}
+		if json.Valid([]byte(raw)) {
+			return json.RawMessage(raw), nil
+		}
+		quoted, err := json.Marshal(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s: %w", name, err)
+		}
+		return quoted, nil
+	}
+
+	// topic_contains accepts any valid JSON value and uses @> containment
+	// directly (no automatic array-wrapping). Unlike topic, bare words are
+	// not allowed — the input must be parseable JSON.
+	if raw := q.Get("topic_contains"); raw != "" {
+		if !json.Valid([]byte(raw)) {
+			return f, fmt.Errorf("topic_contains must be valid JSON")
+		}
+		f.TopicContains = json.RawMessage(raw)
 	}
 
 	// order controls sort direction for paginated results.
@@ -473,6 +528,31 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 
 	var err error
+	if topic := q.Get("topic"); topic != "" {
+		parsed, err := parseTopic("topic", topic)
+		if err != nil {
+			return f, err
+		}
+		f.Topic = parsed
+	}
+
+	if f.Topic0, err = parseTopic("topic0", q.Get("topic0")); err != nil {
+		return f, err
+	}
+	if f.Topic1, err = parseTopic("topic1", q.Get("topic1")); err != nil {
+		return f, err
+	}
+	if f.Topic2, err = parseTopic("topic2", q.Get("topic2")); err != nil {
+		return f, err
+	}
+	if f.Topic3, err = parseTopic("topic3", q.Get("topic3")); err != nil {
+		return f, err
+	}
+
+	if len(f.Topic) > 0 && (len(f.Topic0) > 0 || len(f.Topic1) > 0 || len(f.Topic2) > 0 || len(f.Topic3) > 0) {
+		return f, fmt.Errorf("topic and topic0..topic3 filters cannot be combined")
+	}
+
 	if f.FromLedger, err = parseLedgerParam(q.Get("from_ledger"), "from_ledger"); err != nil {
 		return f, err
 	}
@@ -529,6 +609,81 @@ func parseTimeParam(raw, name string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("%s sub-second precision is not supported", name)
 	}
 	return t, nil
+}
+
+func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
+	if s.bcast == nil {
+		http.Error(w, "streaming not configured", http.StatusNotImplemented)
+		return
+	}
+
+	filter, err := filterFromQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// InsecureSkipVerify disables WebSocket Origin checking: the WS endpoint
+	// is server-to-client only (no client messages are read), so a forged
+	// Origin header cannot influence what the client sees.
+	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		s.log.Error("websocket accept", "error", err)
+		return
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	sub := s.bcast.Subscribe(filter)
+	defer sub.Close()
+
+	ctx := r.Context()
+
+	// Use CloseRead to get a context cancelled when the client disconnects
+	// and to ensure the library processes control frames (ping/pong/close).
+	ctx = c.CloseRead(ctx)
+
+	// Periodic ping to detect stale connections.
+	pingCtx, pingCancel := context.WithCancel(ctx)
+	defer pingCancel()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pingCtx.Done():
+				return
+			case <-ticker.C:
+				pCtx, cancel := context.WithTimeout(pingCtx, 5*time.Second)
+				err := c.Ping(pCtx)
+				cancel()
+				if err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-sub.Events():
+			if !ok {
+				return
+			}
+			data, err := json.Marshal(ev)
+			if err != nil {
+				s.log.Error("marshal event for ws", "error", err)
+				continue
+			}
+			err = c.Write(ctx, websocket.MessageText, data)
+			if err != nil {
+				return
+			}
+		}
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

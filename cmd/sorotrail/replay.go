@@ -80,7 +80,7 @@ flags:
 	}
 	defer pool.Close()
 
-	r := replay.New(store.NewPostgres(pool), decode.XDRDecoder{}, log, replay.Options{
+	r := replay.New(store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan)), decode.XDRDecoder{}, log, replay.Options{
 		FromLedger: *fromLedger,
 		ToLedger:   *toLedger,
 		BatchSize:  *batchSize,
