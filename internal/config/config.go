@@ -24,6 +24,17 @@ type Config struct {
 	PartitionLedgerSpan uint32        `env:"PARTITION_LEDGER_SPAN" envDefault:"120960"`
 	LogLevel            string        `env:"LOG_LEVEL" envDefault:"info"`
 
+	// Horizon backfill configuration. HORIZON_URL is the REST endpoint
+	// the backfill command reads; BACKFILL_RATE_RPS controls how many
+	// requests per second the backfill command issues (env/v11 parses
+	// the float directly). Both are used only by `sorotrail backfill`,
+	// not by the live indexer. The defaults match the documented
+	// public-testnet target and a safe ~10 req/s pace; private
+	// deployments can point HORIZON_URL at themselves and allow a
+	// tighter rate via the flag or env override.
+	HorizonURL      string  `env:"HORIZON_URL" envDefault:"https://horizon-testnet.stellar.org"`
+	BackfillRateRPS float64 `env:"BACKFILL_RATE_RPS" envDefault:"10"`
+
 	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
 	// entirely; the binary behaves exactly like the pre-audit build.
 	AuditEnabled        bool          `env:"AUDIT_ENABLED" envDefault:"false"`
@@ -80,6 +91,9 @@ func (c Config) Validate() error {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return fmt.Errorf("RPC_URL %q is not a valid URL", c.RPCURL)
 	}
+	if u, err := url.Parse(c.HorizonURL); err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("HORIZON_URL %q is not a valid URL", c.HorizonURL)
+	}
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("POLL_INTERVAL must be positive, got %s", c.PollInterval)
 	}
@@ -119,6 +133,9 @@ func (c Config) Validate() error {
 	}
 	if c.AuditFindingMaxLgrs == 0 {
 		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
+	}
+	if c.BackfillRateRPS <= 0 {
+		return fmt.Errorf("BACKFILL_RATE_RPS must be positive, got %v", c.BackfillRateRPS)
 	}
 	if c.RateLimitRPS < 0 {
 		return fmt.Errorf("RATE_LIMIT_RPS must be non-negative")
