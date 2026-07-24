@@ -79,42 +79,16 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			-- Refresh the raw XDR, but never blank it out: a repair fetch
 			-- that came back as JSON (xdrFormat "json") carries no XDR and
 			-- must not destroy what an earlier ingest managed to keep.
-			raw_topic_xdr = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
-			raw_value_xdr = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+			topics_xdr = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
+			value_xdr  = coalesce(EXCLUDED.value_xdr,  events.value_xdr)`
 	}
 	batch := &pgx.Batch{}
-	conflict := "ON CONFLICT (id) DO NOTHING"
-	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
-			contract_id        = COALESCE(EXCLUDED.contract_id,        events.contract_id),
-			ledger             = COALESCE(EXCLUDED.ledger,             events.ledger),
-			type               = COALESCE(EXCLUDED.type,               events.type),
-			tx_hash            = COALESCE(EXCLUDED.tx_hash,            events.tx_hash),
-			tx_index           = COALESCE(EXCLUDED.tx_index,           events.tx_index),
-			op_index           = COALESCE(EXCLUDED.op_index,           events.op_index),
-			in_successful_call = COALESCE(EXCLUDED.in_successful_call, events.in_successful_call),
-			topics             = COALESCE(EXCLUDED.topics,             events.topics),
-			value              = COALESCE(EXCLUDED.value,              events.value),
-			created_at         = COALESCE(EXCLUDED.created_at,         events.created_at),
-			topics_xdr         = COALESCE(EXCLUDED.topics_xdr,         events.topics_xdr),
-			value_xdr          = COALESCE(EXCLUDED.value_xdr,          events.value_xdr)`
-	}
-	sql := `
-		INSERT INTO events
-			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-			 in_successful_call, topics, value, created_at,
-			 topics_xdr, value_xdr)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-		` + conflict
 	for _, e := range events {
-		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
-		// into SQL NULL so the column has one representation of "absent"
-		// rather than two.
 		batch.Queue(`
 			INSERT INTO events
 				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 				 in_successful_call, topics, value, created_at,
-				 raw_topic_xdr, raw_value_xdr)
+				 topics_xdr, value_xdr)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) `+conflict,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,

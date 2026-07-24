@@ -112,9 +112,6 @@ type LedgerEntryResult struct {
 	Key                  string  `json:"key"` // base64-encoded LedgerKey XDR
 	XDR                  string  `json:"xdr"` // base64-encoded LedgerEntry XDR
 	LastModifiedLedgerSeq uint32  `json:"lastModifiedLedgerSeq"`
-	Key                   string `json:"key"` // base64-encoded LedgerKey XDR
-	XDR                   string `json:"xdr"` // base64-encoded LedgerEntry XDR
-	LastModifiedLedgerSeq uint32 `json:"lastModifiedLedgerSeq"`
 	// LiveUntilLedgerSeq is set for entries with a time-to-live (e.g. temporary entries).
 	LiveUntilLedgerSeq *uint32 `json:"liveUntilLedgerSeq,omitempty"`
 }
