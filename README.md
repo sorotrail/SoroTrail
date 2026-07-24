@@ -65,6 +65,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `AUDIT_MAX_RPS` | `10` | Total request budget (split between ingest and audit). |
 | `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
 | `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
+| `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
 
 ## Ingestion behavior
 
@@ -292,6 +293,53 @@ Audit behaviour:
 
 Set `AUDIT_ENABLED=false` (the default) to disable the auditor entirely;
 the binary's behavior is identical to a pre-audit build.
+
+## Caching
+
+Stored events are immutable — a row written by ingest is never rewritten
+in normal operation — so the API serves two distinct cache policies:
+
+- **`GET /events/{id}`** carries a strong `ETag` equal to the event ID
+  and `Cache-Control: public, max-age=31536000, immutable`. Clients
+  and CDNs can cache the response for a year without revalidating.
+  Conditional requests with a matching `If-None-Match` return
+  `304 Not Modified` without re-serializing the row.
+- **List endpoints** (`/events`, `/contracts/{id}/events`) split on a
+  moving ingest frontier: a page whose upper bound (`to_ledger`) sits
+  entirely below the last-ingested ledger cannot gain new rows, so the
+  response is declared immutable with a strong ETag derived from the
+  filter. Pages that are open-ended (`to_ledger` unset) or have bounds
+  at/above the frontier are still growing, so they get
+  `Cache-Control: no-cache` — a deliberate "when in doubt, don't
+  cache" choice rather than a guess with a short max-age.
+- **`GET /health`** and **`GET /stats`** are always
+  `Cache-Control: no-store` so monitoring tooling, dashboards, and
+  alerting see real state rather than a stale replica.
+
+All cacheable responses set `Vary: Accept-Encoding` so a future
+compression middleware (#25) can serve distinct encoded variants
+without reconciling caches that warmed on a non-encoded version.
+
+### Retention/pruning (#8)
+
+Immutability is conditional on the row existing. When pruning deletes an
+event that was previously cached by a client or CDN, that cache will
+hold a stale copy until its `max-age` expires — clients can hit the
+fresh `404` immediately by sending their `If-None-Match` validator, at
+which point SoroTrail's `EventExists` probe correctly returns the
+not-found status. We accept this self-healing delay rather than
+arbitrarily shortening the immutable max-age, because for un-deleted
+rows the long `max-age` is the whole point of the cache.
+
+### Auth'd deployments (#17)
+
+When authentication lands, the spec calls out that caching must "never
+leak across keys". Today the API is unauthenticated, but the
+`CACHE_PRIVATE` config flag flips every cacheable response from
+`Cache-Control: public` to `Cache-Control: private` (with the same
+`max-age` and `immutable` preset), so the same build can serve shared
+caches in one deployment and per-user scenarios in another. Set
+`CACHE_PRIVATE=true` as soon as auth (#17) is in front of the API.
 
 ## Development
 
