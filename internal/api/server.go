@@ -11,9 +11,11 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	chiCors "github.com/go-chi/cors"
 
 	"github.com/khaylebfortune/sorotrail/internal/audit"
 	"github.com/khaylebfortune/sorotrail/internal/broadcast"
+	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -59,12 +61,13 @@ type Server struct {
 	log      *slog.Logger
 	limiter  *RateLimiter
 	bcast    *broadcast.Broadcaster
+	cfg      config.Config
 }
 
 // New builds the API server. rpcClient is only used by /health.
 // enricher is optional — pass nil to disable spec decoding.
-func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log}
+func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, cfg config.Config, enricher ...Enricher) *Server {
+	s := &Server{store: st, rpc: rpcClient, log: log, cfg: cfg}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
@@ -88,6 +91,18 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
+	// Mount CORS middleware before the other middleware so it can handle
+	// preflight requests and set headers early in the chain.
+	if len(s.cfg.CORSAllowedOrigins) > 0 {
+		opts := chiCors.Options{
+			AllowedOrigins:   s.cfg.CORSAllowedOrigins,
+			AllowedMethods:   []string{"GET", "OPTIONS"},
+			AllowedHeaders:   []string{"Accept", "Content-Type", "X-Request-ID"},
+			ExposedHeaders:   []string{"X-Request-ID"},
+			AllowCredentials: false,
+		}
+		r.Use(chiCors.New(opts).Handler)
+	}
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))

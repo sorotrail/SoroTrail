@@ -55,6 +55,11 @@ type Config struct {
 	// intermediaries cannot. Defaults to false (the deployment does not
 	// need request-scoped caching).
 	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
+
+	// CORS_ALLOWED_ORIGINS is a comma-separated list of origins browsers are
+	// allowed to call from. Empty = no CORS headers (current behavior).
+	// Use `*` to allow any origin (for public read-only instances).
+	CORSAllowedOrigins []string `env:"CORS_ALLOWED_ORIGINS"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -65,6 +70,7 @@ func Load() (Config, error) {
 	}
 	// env/v11 splits on "," but keeps empty entries and whitespace.
 	cfg.WatchedContracts = cleanContractList(cfg.WatchedContracts)
+	cfg.CORSAllowedOrigins = cleanOriginList(cfg.CORSAllowedOrigins)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -133,6 +139,24 @@ func (c Config) Validate() error {
 	if (c.RateLimitRPS > 0) != (c.RateLimitBurst > 0) {
 		return fmt.Errorf("RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
 	}
+
+	// Validate CORS origins if present. Allowed values: literal "*" or
+	// origin URLs with scheme (http/https) and host. Paths are rejected.
+	for _, o := range c.CORSAllowedOrigins {
+		if o == "*" {
+			continue
+		}
+		u, err := url.Parse(o)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q is not a valid origin (scheme://host[:port])", o)
+		}
+		if u.Path != "" && u.Path != "/" {
+			return fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q must not contain a path", o)
+		}
+		if strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https" {
+			return fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q must use http or https scheme", o)
+		}
+	}
 	return nil
 }
 
@@ -151,6 +175,16 @@ func ValidContractID(s string) bool {
 }
 
 func cleanContractList(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func cleanOriginList(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
 		if s = strings.TrimSpace(s); s != "" {

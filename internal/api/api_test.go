@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -151,7 +152,7 @@ func newTestServer(st *stubStore, rc *stubRPC) *Server {
 	if rc == nil {
 		rc = &stubRPC{health: rpc.Health{Status: "healthy"}}
 	}
-	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), config.Config{})
 }
 
 func doGet(t *testing.T, s *Server, path string) (*http.Response, []byte) {
