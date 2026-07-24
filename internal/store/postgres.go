@@ -18,20 +18,28 @@ var ErrNotFound = errors.New("not found")
 // DefaultQueryLimit applies when EventFilter.Limit is unset; MaxQueryLimit
 // caps requested page sizes.
 const (
-	DefaultQueryLimit = 50
-	MaxQueryLimit     = 200
+	DefaultQueryLimit         = 50
+	MaxQueryLimit             = 200
+	DefaultEventPartitionSpan = 120960
 )
 
 // Postgres implements Store on a pgx connection pool.
 type Postgres struct {
-	pool *pgxpool.Pool
+	pool          *pgxpool.Pool
+	partitionSpan int64
 }
 
 var _ Store = (*Postgres)(nil)
 
 // NewPostgres wraps an existing pool. The caller owns the pool's lifecycle.
-func NewPostgres(pool *pgxpool.Pool) *Postgres {
-	return &Postgres{pool: pool}
+// partitionSpan is optional; when unset or non-positive, the production
+// default is used.
+func NewPostgres(pool *pgxpool.Pool, partitionSpan ...int64) *Postgres {
+	span := int64(DefaultEventPartitionSpan)
+	if len(partitionSpan) > 0 && partitionSpan[0] > 0 {
+		span = partitionSpan[0]
+	}
+	return &Postgres{pool: pool, partitionSpan: span}
 }
 
 func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
@@ -47,8 +55,8 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
 // ingest, DO NOTHING) and ReplaceEventsInRange (auditor repair, DO UPDATE).
-// Both paths write all 13 columns of the events table so raw_topic_xdr /
-// raw_value_xdr are never silently dropped on the way in; a repair that
+// Both paths write all 13 columns of the events table so topics_xdr /
+// value_xdr are never silently dropped on the way in; a repair that
 // arrives without XDR preserves what was already stored via the coalesce()
 // clauses in the UPDATE branch (`sorotrail replay` relies on that).
 //
@@ -56,30 +64,50 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
+	batch := &pgx.Batch{}
+	conflict := `ON CONFLICT (id) DO NOTHING`
+	if onUpdate {
+		conflict = `ON CONFLICT (id) DO UPDATE SET
+			contract_id        = COALESCE(EXCLUDED.contract_id,        events.contract_id),
+			ledger             = COALESCE(EXCLUDED.ledger,             events.ledger),
+			type               = COALESCE(EXCLUDED.type,               events.type),
+			tx_hash            = COALESCE(EXCLUDED.tx_hash,            events.tx_hash),
+			tx_index           = COALESCE(EXCLUDED.tx_index,           events.tx_index),
+			op_index           = COALESCE(EXCLUDED.op_index,           events.op_index),
+			in_successful_call = COALESCE(EXCLUDED.in_successful_call, events.in_successful_call),
+			topics             = COALESCE(EXCLUDED.topics,             events.topics),
+			value              = COALESCE(EXCLUDED.value,              events.value),
+			created_at         = COALESCE(EXCLUDED.created_at,         events.created_at),
+			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr,      events.raw_topic_xdr),
+			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr,      events.raw_value_xdr)`
+	conflict := "ON CONFLICT DO NOTHING"
+	if onUpdate {
+		conflict = `
+		ON CONFLICT (ledger, id) DO UPDATE SET
+			contract_id        = EXCLUDED.contract_id,
 	conflict := "ON CONFLICT (id) DO NOTHING"
 	if onUpdate {
 		conflict = `ON CONFLICT (id) DO UPDATE SET
-			contract_id = EXCLUDED.contract_id,
-			ledger = EXCLUDED.ledger,
-			type = EXCLUDED.type,
-			tx_hash = EXCLUDED.tx_hash,
-			tx_index = EXCLUDED.tx_index,
-			op_index = EXCLUDED.op_index,
+			contract_id        = EXCLUDED.contract_id,
+			ledger             = EXCLUDED.ledger,
+			type               = EXCLUDED.type,
+			tx_hash            = EXCLUDED.tx_hash,
+			tx_index           = EXCLUDED.tx_index,
+			op_index           = EXCLUDED.op_index,
 			in_successful_call = EXCLUDED.in_successful_call,
-			topics = EXCLUDED.topics,
-			value = EXCLUDED.value,
-			-- Refresh the raw XDR, but never blank it out: a repair fetch
-			-- that came back as JSON (xdrFormat "json") carries no XDR and
-			-- must not destroy what an earlier ingest managed to keep.
-			raw_topic_xdr = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
-			raw_value_xdr = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+			topics             = EXCLUDED.topics,
+			value              = EXCLUDED.value,
+			created_at         = EXCLUDED.created_at,
+			topics_xdr         = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
+			value_xdr          = coalesce(EXCLUDED.value_xdr, events.value_xdr)`
+			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
-	batch := &pgx.Batch{}
 	sql := `
 		INSERT INTO events
 			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 			 in_successful_call, topics, value, created_at,
-			 raw_topic_xdr, raw_value_xdr)
+			 topics_xdr, value_xdr)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		` + conflict
 	for _, e := range events {
@@ -87,23 +115,32 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 		// into SQL NULL so the column has one representation of "absent"
 		// rather than two.
 		batch.Queue(sql,
-		// Column list deliberately mirrors the eventColumns constant
-		// (13 fields including raw_topic_xdr / raw_value_xdr) so a
-		// row kept by replay never loses its raw XDR just because the
-		// INSERT forgot the columns.
-		batch.Queue(`
-			INSERT INTO events
-				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-				 in_successful_call, topics, value, created_at,
-				 raw_topic_xdr, raw_value_xdr)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) `+conflict,
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`+conflict,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
-			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
+			nullableStringSlice(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
 	}
 	return batch
+}
+
+func (p *Postgres) ensureEventPartitions(ctx context.Context, events []Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+	minLedger, maxLedger := events[0].Ledger, events[0].Ledger
+	for _, e := range events[1:] {
+		if e.Ledger < minLedger {
+			minLedger = e.Ledger
+		}
+		if e.Ledger > maxLedger {
+			maxLedger = e.Ledger
+		}
+	}
+	_, err := p.pool.Exec(ctx, `SELECT ensure_event_partitions($1, $2, $3)`, minLedger, maxLedger, p.partitionSpan)
+	if err != nil {
+		return fmt.Errorf("ensuring event partitions for ledger range [%d,%d]: %w", minLedger, maxLedger, err)
+	}
+	return nil
 }
 
 // upsertEvents is shared by UpsertEvents (idempotent insert) and
@@ -113,6 +150,9 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bool) (int64, error) {
 	if len(events) == 0 {
 		return 0, nil
+	}
+	if err := p.ensureEventPartitions(ctx, events); err != nil {
+		return 0, err
 	}
 	results := p.pool.SendBatch(ctx, insertEventsBatch(events, onUpdate))
 	defer results.Close()
@@ -137,6 +177,9 @@ func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bo
 // that arrives without any keeps whatever was already stored, so repairing
 // a range never makes its rows unreplayable.
 func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error {
+	if err := p.ensureEventPartitions(ctx, events); err != nil {
+		return err
+	}
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -188,10 +231,10 @@ type rawXDR struct {
 // keyed by event ID, so a delete-and-reinsert repair can put it back.
 func rawXDRInRange(ctx context.Context, tx pgx.Tx, fromLedger, toLedger int64) (map[string]rawXDR, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT id, raw_topic_xdr, raw_value_xdr
+		SELECT id, topics_xdr, value_xdr
 		FROM events
 		WHERE ledger BETWEEN $1 AND $2
-		  AND (raw_topic_xdr IS NOT NULL OR raw_value_xdr IS NOT NULL)`,
+		  AND (topics_xdr IS NOT NULL OR value_xdr IS NOT NULL)`,
 		fromLedger, toLedger)
 	if err != nil {
 		return nil, fmt.Errorf("reading raw XDR in ledger range [%d,%d]: %w", fromLedger, toLedger, err)
@@ -279,9 +322,9 @@ func (p *Postgres) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger i
 }
 
 const eventColumns = `id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-	in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr`
+	in_successful_call, topics, value, created_at, topics_xdr, value_xdr`
 
-// nullableText and nullableTextArray store empty raw-XDR values as SQL NULL
+// nullableText and nullableStringSlice store empty raw-XDR values as SQL NULL
 // so "no raw XDR" is one representation, not two.
 func nullableText(s string) any {
 	if s == "" {
@@ -290,7 +333,7 @@ func nullableText(s string) any {
 	return s
 }
 
-func nullableTextArray(s []string) any {
+func nullableStringSlice(s []string) any {
 	if len(s) == 0 {
 		return nil
 	}
@@ -356,6 +399,11 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if len(f.Topic) > 0 {
 		// Containment on the array matches the topic at any position.
 		where = append(where, "topics @> "+arg(fmt.Sprintf("[%s]", f.Topic))+"::jsonb")
+	}
+	if len(f.TopicContains) > 0 {
+		// Direct containment — caller controls the shape (object wrapped in
+		// array for element match, multi-element arrays for subset match).
+		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
 	}
 	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
 		if len(topic) == 0 {
@@ -547,9 +595,10 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 			(SELECT count(*) FROM events),
 			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
 			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
+			(SELECT coalesce(min(ledger), 0) FROM events),
 			(SELECT count(DISTINCT contract_id) FROM events),
 			(SELECT count(*) FROM watched_contracts)`,
-	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.ContractCount, &s.WatchedContracts)
+	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
 	}
@@ -558,6 +607,35 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 
 func (p *Postgres) Ping(ctx context.Context) error {
 	return p.pool.Ping(ctx)
+}
+
+func (p *Postgres) GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error) {
+	var specJSON []byte
+	err := p.pool.QueryRow(ctx,
+		`SELECT spec_json FROM contract_specs WHERE wasm_hash = $1`, wasmHash,
+	).Scan(&specJSON)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading contract spec for wasm_hash %s: %w", wasmHash, err)
+	}
+	return specJSON, nil
+}
+
+func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO contract_specs (wasm_hash, contract_id, spec_json, fetched_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (wasm_hash) DO UPDATE SET
+			spec_json  = EXCLUDED.spec_json,
+			fetched_at = now()`,
+		wasmHash, contractID, specJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("saving contract spec for %s: %w", wasmHash, err)
+	}
+	return nil
 }
 
 func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {

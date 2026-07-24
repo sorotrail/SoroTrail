@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -44,21 +45,30 @@ func getAuditor() *audit.Auditor {
 	return auditor
 }
 
+// Enricher is the spec-based event enrichment interface used by the API.
+// Defined here so the API package doesn't import internal/spec directly.
+type Enricher interface {
+	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
+}
+
 // Server holds the API's dependencies.
 type Server struct {
-	store   store.Store
-	rpc     rpc.Client
-	log     *slog.Logger
-	limiter *RateLimiter
-	store store.Store
-	rpc   rpc.Client
-	log   *slog.Logger
-	bcast *broadcast.Broadcaster
+	store    store.Store
+	rpc      rpc.Client
+	enricher Enricher
+	log      *slog.Logger
+	limiter  *RateLimiter
+	bcast    *broadcast.Broadcaster
 }
 
 // New builds the API server. rpcClient is only used by /health.
-func New(st store.Store, rpcClient rpc.Client, log *slog.Logger) *Server {
-	return &Server{store: st, rpc: rpcClient, log: log}
+// enricher is optional — pass nil to disable spec decoding.
+func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enricher) *Server {
+	s := &Server{store: st, rpc: rpcClient, log: log}
+	if len(enricher) > 0 {
+		s.enricher = enricher[0]
+	}
+	return s
 }
 
 // SetRateLimiter wires a per-client rate limiter into the router. Pass
@@ -66,6 +76,8 @@ func New(st store.Store, rpcClient rpc.Client, log *slog.Logger) *Server {
 // The limiter's Start/Stop lifecycle is owned by main, not by the Server.
 func (s *Server) SetRateLimiter(l *RateLimiter) {
 	s.limiter = l
+}
+
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
 // (SSE, WebSocket) can deliver events as they arrive.
 func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
@@ -95,6 +107,15 @@ func (s *Server) Router() http.Handler {
 
 	// contributors: new read endpoints go here. Anything that writes (e.g.
 	// managing watched contracts at runtime) should come with auth first.
+
+	// Subscription CRUD and delivery history.
+	r.Post("/subscriptions", s.handleCreateSubscription)
+	r.Get("/subscriptions", s.handleListSubscriptions)
+	r.Get("/subscriptions/{id}", s.handleGetSubscription)
+	r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
+	r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
+	r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+
 	return r
 }
 

@@ -90,7 +90,9 @@ All configuration comes from environment variables (see `.env.example`):
   `{"address":"C..."}`.
 - The raw base64 XDR is stored alongside the decoded JSON, so an improved
   decoder can be applied to already-indexed events — see
-  [decoder replay](#decoder-replay).
+  [decoder replay](#decoder-replay). This intentionally duplicates payload
+  data in `events.topics_xdr` and `events.value_xdr`; budget extra event-table
+  storage for deployments that retain large event histories.
 
 ## Decoder replay
 
@@ -138,6 +140,7 @@ Query parameters (all optional, combinable):
 | `contract_id` | `C1&contract_id=C2` | Events for any of the listed contracts. Use repeated `contract_id` params; comma-separated lists are rejected. |
 | `type` | `contract&type=system` | Events for any of the listed types. Use repeated `type` params; comma-separated lists are rejected. |
 | `topic` | `{"symbol":"transfer"}` | Exact match against any topic position. A bare word is treated as a JSON string. |
+| `topic_contains` | `[{"address":"G..."}]` | Postgres jsonb containment (`@>`) against the topics array. Pass an array to match one or more topic elements: `[{"address":"G..."}]` matches any event where a topic contains that address; `[{"symbol":"transfer"},{"address":"G..."}]` requires both. Must be parseable JSON (400 otherwise). Uses the GIN index on `topics`. |
 | `topic0` | `{"symbol":"transfer"}` | Exact match against topic position 0. |
 | `topic1` | `{"address":"G..."}` | Exact match against topic position 1. |
 | `topic2` | `{"address":"G..."}` | Exact match against topic position 2. |
@@ -149,6 +152,8 @@ Query parameters (all optional, combinable):
 | `limit` | `50` | Page size, 1–200 (default 50). |
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
 | `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
+| `decoded` | `true` | When `true`, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with `"decoded": false`. |
+| `include_xdr` | `true` | When `true`, includes raw base64 `topics_xdr` and `value_xdr` on each event. Omitted by default to keep responses small. |
 
 Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
 
@@ -159,6 +164,23 @@ curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47Z
 curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&contract_id=CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&type=contract&type=system&limit=2'
 ```
 ```
+
+Containment search (`topic_contains`) lets you filter by partial topic
+structure — e.g. any event involving a specific address, even when you
+don't know the full topic shape:
+
+```sh
+# Events whose topics include a specific address
+curl -s 'localhost:8080/events?topic_contains=[{"address":"GA...5WI"}]&limit=5'
+# Events with both a transfer symbol and a specific address
+curl -s 'localhost:8080/events?topic_contains=[{"symbol":"transfer"},{"address":"GA...5WI"}]&limit=5'
+```
+
+**Semantics**: `topic_contains` uses Postgres jsonb containment (`@>`),
+not substring matching. `topic_contains=[{"address":"G..."}]` means
+"the topics array contains an element that itself jsonb-contains
+`{"address":"G..."}`", so `{"address":"G...","symbol":"transfer"}`
+matches. For exact element equality use `topic` instead.
 
 ```sh
 curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"GABC..."}&topic2={"address":"GDEF..."}'
@@ -188,6 +210,15 @@ curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"G
 `cursor` is present when more results exist; pass it back as `?cursor=` for
 the next page.
 
+When `include_xdr=true`, events also include the original base64 XDR payload:
+
+```json
+{
+  "topics_xdr": ["AAAADwAAAAh0cmFuc2Zlcg=="],
+  "value_xdr": "AAAACgAAAAAAAAAB"
+}
+```
+
 Time filtering narrows results and does not change ordering (events remain in
 ascending event-ID order, which agrees with `created_at` order because both
 follow ledger sequence).
@@ -215,6 +246,254 @@ parameter to avoid conflicting filters.
 curl -s localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/events?limit=10
 ```
 
+### Webhooks
+
+Consumers can register callback URLs that receive matching events as they are
+ingested. Delivery is asynchronous — it never blocks ingestion — and includes
+HMAC-SHA256 signatures so subscribers can verify payload authenticity.
+
+#### `POST /subscriptions`
+
+Register a new webhook subscription.
+
+```sh
+curl -s -X POST localhost:8080/subscriptions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com/webhook",
+    "secret": "whsec_z8eP5qL3vR2xK9yB4w",
+    "filters": {
+      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "type": "contract",
+      "topic": {"symbol":"transfer"}
+    }
+  }'
+```
+
+Response (`201 Created`):
+
+```json
+{
+  "id": 1,
+  "url": "https://example.com/webhook",
+  "filters": {
+    "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+    "type": "contract",
+    "topic": {"symbol":"transfer"}
+  },
+  "secret": "whsec_z8eP5qL3vR2xK9yB4w",
+  "enabled": true,
+  "failure_count": 0,
+  "created_at": "2026-07-24T12:00:00Z"
+}
+```
+
+`filters` has the same shape as `GET /events` query parameters — an empty
+object `{}` matches every event. `enabled` defaults to `true`.
+
+#### `GET /subscriptions`
+
+List all subscriptions.
+
+```sh
+curl -s localhost:8080/subscriptions
+```
+
+#### `GET /subscriptions/{id}`
+
+Fetch a single subscription by ID. `404` if unknown.
+
+```sh
+curl -s localhost:8080/subscriptions/1
+```
+
+#### `PUT /subscriptions/{id}`
+
+Update a subscription. Only fields present in the body are changed; omit a
+field to leave it unchanged.
+
+```sh
+curl -s -X PUT localhost:8080/subscriptions/1 \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": false}'
+```
+
+#### `DELETE /subscriptions/{id}`
+
+Delete a subscription and its delivery history. `204 No Content` on success.
+
+```sh
+curl -s -X DELETE localhost:8080/subscriptions/1
+```
+
+#### `GET /subscriptions/{id}/deliveries`
+
+List delivery attempts for a subscription, newest first. Optional `?limit=`
+(default 50, max 200).
+
+```sh
+curl -s localhost:8080/subscriptions/1/deliveries?limit=10
+```
+
+```json
+[
+  {
+    "id": 42,
+    "subscription_id": 1,
+    "event_id": "0001099511627776-0000000001",
+    "status": "success",
+    "response_code": 200,
+    "duration_ms": 87,
+    "created_at": "2026-07-24T12:01:00Z"
+  },
+  {
+    "id": 41,
+    "subscription_id": 1,
+    "event_id": "0001099511627776-0000000000",
+    "status": "failed",
+    "response_code": 500,
+    "duration_ms": 1024,
+    "error": "HTTP 500",
+    "created_at": "2026-07-24T12:00:55Z"
+  }
+]
+```
+
+#### Webhook payload
+
+When an ingested event matches a subscription's filters, SoroTrail POSTs the
+event to the subscription's URL with this body:
+
+```json
+{
+  "event": {
+    "id": "0001099511627776-0000000001",
+    "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+    "ledger": 256000,
+    "type": "contract",
+    "tx_hash": "9f5c...",
+    "tx_index": 1,
+    "op_index": 0,
+    "in_successful_call": true,
+    "topics": [{"symbol":"transfer"},{"address":"G..."},{"address":"G..."}],
+    "value": {"i128":"10000000"},
+    "created_at": "2026-07-24T12:00:00Z"
+  }
+}
+```
+
+Every request includes an `X-SoroTrail-Signature` header holding the
+hex-encoded HMAC-SHA256 digest of the request body, keyed with the
+subscription's secret. Subscribers **must verify** this signature to
+confirm the payload came from SoroTrail and has not been tampered with.
+
+**Verifying signatures — code samples:**
+
+<details>
+<summary>Go</summary>
+
+```go
+import (
+    "crypto/hmac"
+    "crypto/sha256"
+    "encoding/hex"
+    "io"
+    "net/http"
+)
+
+func verifySignature(r *http.Request, secret string) ([]byte, bool) {
+    body, _ := io.ReadAll(r.Body)
+    mac := hmac.New(sha256.New, []byte(secret))
+    mac.Write(body)
+    expected := hex.EncodeToString(mac.Sum(nil))
+    if !hmac.Equal([]byte(r.Header.Get("X-SoroTrail-Signature")), []byte(expected)) {
+        return nil, false
+    }
+    return body, true
+}
+```
+
+</details>
+
+<details>
+<summary>Python</summary>
+
+```python
+import hmac
+import hashlib
+
+def verify_signature(request_body: bytes, signature_header: str, secret: str) -> bool:
+    expected = hmac.new(secret.encode(), request_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+
+# Example Flask endpoint:
+# @app.route("/webhook", methods=["POST"])
+# def webhook():
+#     body = request.get_data()
+#     if not verify_signature(body, request.headers.get("X-SoroTrail-Signature", ""), SECRET):
+#         return "bad signature", 401
+#     payload = json.loads(body)
+#     # process payload["event"]
+```
+
+</details>
+
+<details>
+<summary>JavaScript (Node.js)</summary>
+
+```js
+const crypto = require('crypto');
+
+function verifySignature(body, signatureHeader, secret) {
+  const expected = crypto.createHmac('sha256', secret).update(body).digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signatureHeader));
+}
+
+// Example Express endpoint:
+// app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+//   const sig = req.headers['x-sorotrail-signature'] || '';
+//   if (!verifySignature(req.body, sig, SECRET)) return res.status(401).end();
+//   const { event } = JSON.parse(req.body);
+//   // process event
+// });
+```
+
+</details>
+
+<details>
+<summary>TypeScript (Bun / Deno)</summary>
+
+```ts
+async function verifySignature(req: Request, secret: string): Promise<boolean> {
+  const body = await req.arrayBuffer();
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const expected = await crypto.subtle.sign('HMAC', key, body);
+  const expectedHex = Array.from(new Uint8Array(expected))
+    .map(b => b.toString(16).padStart(2, '0')).join('');
+  const sigHeader = req.headers.get('X-SoroTrail-Signature') || '';
+  return crypto.subtle.timingSafeEqual(
+    new TextEncoder().encode(expectedHex),
+    new TextEncoder().encode(sigHeader)
+  );
+}
+```
+
+</details>
+
+#### Delivery semantics
+
+- Delivery is **at-least-once**: a subscriber may receive the same event more
+  than once. Deduplicate by event `id`.
+- Failed deliveries are retried up to **5 times** with exponential backoff
+  (1s → 2s → 4s → 8s → 16s).
+- After **5 consecutive failures** the subscription is **auto-disabled**. A
+  successful delivery resets the failure counter to 0.
+- Delivery attempts are recorded in `delivery_attempts` and queryable via
+  `GET /subscriptions/{id}/deliveries`.
+- Subscribers should return a **2xx status code** to acknowledge receipt.
+  Non-2xx responses are treated as failures and retried.
+
 ### `GET /stats`
 
 ```sh
@@ -222,8 +501,15 @@ curl -s localhost:8080/stats
 ```
 
 ```json
-{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
+{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"oldest_stored_ledger":242001,"chain_head_ledger":260130,"ingest_lag_ledgers":7,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
 ```
+
+`oldest_stored_ledger` is the lowest ledger currently present in the
+store. `chain_head_ledger` is read from Stellar RPC `getHealth`, and
+`ingest_lag_ledgers` is `chain_head_ledger - last_ingested_ledger`. If
+the RPC is temporarily unreachable, `/stats` still returns HTTP 200 with
+the stored fields populated and the RPC-derived freshness fields
+(`chain_head_ledger`, `ingest_lag_ledgers`) set to `null`.
 
 `verified_through_ledger` is the inclusive highest ledger whose stored
 events have been proven to match a fresh RPC fetch by the auditor. When
