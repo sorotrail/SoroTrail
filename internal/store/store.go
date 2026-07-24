@@ -288,6 +288,13 @@ type Store interface {
 	ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error
 	// GetEvent returns the event with the given ID, or ErrNotFound.
 	GetEvent(ctx context.Context, id string) (Event, error)
+	// EventExists reports whether an event with the given ID is in the
+	// store. It is the cheap 304 path used by the API when a conditional
+	// GET carries an If-None-Match whose validator matches the request
+	// URL: we want to confirm "still here" without re-serializing the
+	// full row, so retention/pruning (when it lands, see #8) can't leave
+	// cached clients believing a deleted event is still available.
+	EventExists(ctx context.Context, id string) (bool, error)
 	// QueryEvents returns a page of events in ascending ID order, plus a
 	// cursor for the next page ("" when there are no more results).
 	// Default order is ascending (oldest-first) for backward compatibility.
