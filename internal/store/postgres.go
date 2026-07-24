@@ -64,8 +64,25 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
-	batch := &pgx.Batch{}
-	sql := `
+	conflict := `ON CONFLICT (id) DO NOTHING`
+	if onUpdate {
+		// Refresh every column, but never blank out raw XDR: a repair
+		// fetch that came back as JSON (xdrFormat "json") carries no XDR
+		// and must not destroy what an earlier ingest managed to keep.
+		conflict = `ON CONFLICT (id) DO UPDATE SET
+			contract_id        = EXCLUDED.contract_id,
+			ledger             = EXCLUDED.ledger,
+			type               = EXCLUDED.type,
+			tx_hash            = EXCLUDED.tx_hash,
+			tx_index           = EXCLUDED.tx_index,
+			op_index           = EXCLUDED.op_index,
+			in_successful_call = EXCLUDED.in_successful_call,
+			topics             = EXCLUDED.topics,
+			value              = EXCLUDED.value,
+			raw_topic_xdr      = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+	}
+	stmt := `
 		INSERT INTO events
 			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 			 in_successful_call, topics, value, created_at,
@@ -77,7 +94,7 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
 		// into SQL NULL so the column has one representation of "absent"
 		// rather than two.
-		batch.Queue(sql,
+		batch.Queue(stmt,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
 			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
