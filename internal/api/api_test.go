@@ -205,12 +205,25 @@ func TestListEvents_PositionalTopicFiltersParse(t *testing.T) {
 	assert.JSONEq(t, `{"x":123}`, string(st.lastFilter.Topic2))
 }
 
+// parseErrorBody unmarshals the new structured error envelope.
+func parseErrorBody(t *testing.T, body []byte) (string, string) {
+	t.Helper()
+	var env struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(body, &env))
+	return env.Error.Code, env.Error.Message
+}
+
 func TestListEvents_TopicAndPositionalFiltersConflict(t *testing.T) {
 	resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/events?topic=transfer&topic0=GABC")
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	var e map[string]string
-	require.NoError(t, json.Unmarshal(body, &e))
-	assert.Contains(t, e["error"], "cannot be combined")
+	code, msg := parseErrorBody(t, body)
+	assert.Equal(t, ErrorCodeBadRequest, code)
+	assert.Contains(t, msg, "cannot be combined")
 }
 
 func TestListEvents_BadParams(t *testing.T) {
@@ -229,9 +242,9 @@ func TestListEvents_BadParams(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			resp, body := doGet(t, newTestServer(&stubStore{}, nil), path)
 			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-			var e map[string]string
-			require.NoError(t, json.Unmarshal(body, &e))
-			assert.NotEmpty(t, e["error"])
+			code, msg := parseErrorBody(t, body)
+			assert.Equal(t, ErrorCodeBadRequest, code)
+			assert.NotEmpty(t, msg)
 		})
 	}
 }
@@ -257,6 +270,23 @@ func TestGetEvent_NotFound(t *testing.T) {
 	st := &stubStore{eventErr: store.ErrNotFound}
 	resp, _ := doGet(t, newTestServer(st, nil), "/events/0000000000-0000000000")
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestListEvents_RejectsUnknownParams(t *testing.T) {
+	resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/events?unknown_param=true")
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	code, msg := parseErrorBody(t, body)
+	assert.Equal(t, ErrorCodeBadRequest, code)
+	assert.Contains(t, msg, "unknown query parameter")
+	assert.Contains(t, msg, "unknown_param")
+}
+
+func TestListEvents_RejectsBadCursor(t *testing.T) {
+	resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/events?cursor=not-a-valid-cursor")
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	code, msg := parseErrorBody(t, body)
+	assert.Equal(t, ErrorCodeBadRequest, code)
+	assert.Contains(t, msg, "invalid cursor")
 }
 
 func TestContractEvents_ForcesContractFilter(t *testing.T) {

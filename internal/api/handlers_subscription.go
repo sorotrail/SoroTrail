@@ -57,7 +57,7 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleGetSubscription(w http.ResponseWriter, r *http.Request) {
-	id, err := parseSubscriptionID(r)
+	id, err := parseSubscriptionID(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -93,7 +93,7 @@ type updateSubscriptionRequest struct {
 }
 
 func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request) {
-	id, err := parseSubscriptionID(r)
+	id, err := parseSubscriptionID(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -143,7 +143,7 @@ func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request) {
-	id, err := parseSubscriptionID(r)
+	id, err := parseSubscriptionID(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -163,7 +163,7 @@ func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request
 // --- Delivery attempts ---
 
 func (s *Server) handleListDeliveries(w http.ResponseWriter, r *http.Request) {
-	id, err := parseSubscriptionID(r)
+	id, err := parseSubscriptionID(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -194,11 +194,4 @@ func (s *Server) handleListDeliveries(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, attempts)
 }
 
-func parseSubscriptionID(r *http.Request) (int64, error) {
-	raw := chi.URLParam(r, "id")
-	id, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || id <= 0 {
-		return 0, fmt.Errorf("subscription id must be a positive integer, got %q", raw)
-	}
-	return id, nil
-}
+// parseSubscriptionID moved to errors.go

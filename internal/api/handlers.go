@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -15,7 +14,6 @@ import (
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
-	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
 
@@ -62,10 +60,6 @@ const (
 	// shareable across users or even across requests on the same box.
 	cacheNoStore
 )
-
-type errorResponse struct {
-	Error string `json:"error"`
-}
 
 type eventsResponse struct {
 	Events []store.Event `json:"events"`
@@ -122,8 +116,8 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contractID := chi.URLParam(r, "id")
-	if !config.ValidContractID(contractID) {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid contract ID %q", contractID))
+	if err := ValidateContractID(contractID); err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	filter.ContractID = contractID
@@ -451,136 +445,12 @@ func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 	w.WriteHeader(http.StatusNotModified)
 }
 
-// filterFromQuery parses the shared event-filter query params:
-// contract_id, type, topic, from_ledger, to_ledger, from_time, to_time, cursor, limit.
-func filterFromQuery(r *http.Request) (store.EventFilter, error) {
-	q := r.URL.Query()
-	f := store.EventFilter{
-		ContractID: q.Get("contract_id"),
-		Cursor:     q.Get("cursor"),
-	}
-
-	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
-		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
-	}
-
-	switch t := q.Get("type"); t {
-	case "", "contract", "system", "diagnostic":
-		f.Type = t
-	default:
-		return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
-	}
-
-	parseTopic := func(name, raw string) (json.RawMessage, error) {
-		if raw == "" {
-			return nil, nil
-		}
-		if json.Valid([]byte(raw)) {
-			return json.RawMessage(raw), nil
-		}
-		quoted, err := json.Marshal(raw)
-		if err != nil {
-			return nil, fmt.Errorf("invalid %s: %w", name, err)
-		}
-		return quoted, nil
-	}
-
-	// order controls sort direction for paginated results.
-	order := q.Get("order")
-	switch order {
-	case "", "asc", "desc":
-		f.Order = order
-	default:
-		return f, fmt.Errorf("invalid order %q (want asc or desc)", order)
-	}
-
-	var err error
-	if topic := q.Get("topic"); topic != "" {
-		parsed, err := parseTopic("topic", topic)
-		if err != nil {
-			return f, err
-		}
-		f.Topic = parsed
-	}
-
-	if f.Topic0, err = parseTopic("topic0", q.Get("topic0")); err != nil {
-		return f, err
-	}
-	if f.Topic1, err = parseTopic("topic1", q.Get("topic1")); err != nil {
-		return f, err
-	}
-	if f.Topic2, err = parseTopic("topic2", q.Get("topic2")); err != nil {
-		return f, err
-	}
-	if f.Topic3, err = parseTopic("topic3", q.Get("topic3")); err != nil {
-		return f, err
-	}
-
-	if len(f.Topic) > 0 && (len(f.Topic0) > 0 || len(f.Topic1) > 0 || len(f.Topic2) > 0 || len(f.Topic3) > 0) {
-		return f, fmt.Errorf("topic and topic0..topic3 filters cannot be combined")
-	}
-
-	if f.FromLedger, err = parseLedgerParam(q.Get("from_ledger"), "from_ledger"); err != nil {
-		return f, err
-	}
-	if f.ToLedger, err = parseLedgerParam(q.Get("to_ledger"), "to_ledger"); err != nil {
-		return f, err
-	}
-	if f.FromLedger > 0 && f.ToLedger > 0 && f.FromLedger > f.ToLedger {
-		return f, fmt.Errorf("from_ledger %d is after to_ledger %d", f.FromLedger, f.ToLedger)
-	}
-
-	if f.FromTime, err = parseTimeParam(q.Get("from_time"), "from_time"); err != nil {
-		return f, err
-	}
-	if f.ToTime, err = parseTimeParam(q.Get("to_time"), "to_time"); err != nil {
-		return f, err
-	}
-	if !f.FromTime.IsZero() && !f.ToTime.IsZero() && f.FromTime.After(f.ToTime) {
-		return f, fmt.Errorf("from_time %s is after to_time %s",
-			f.FromTime.Format(time.RFC3339), f.ToTime.Format(time.RFC3339))
-	}
-
-	if raw := q.Get("limit"); raw != "" {
-		limit, err := strconv.Atoi(raw)
-		if err != nil || limit <= 0 || limit > store.MaxQueryLimit {
-			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
-		}
-		f.Limit = limit
-	}
-	return f, nil
-}
-
-func parseLedgerParam(raw, name string) (int64, error) {
-	if raw == "" {
-		return 0, nil
-	}
-	n, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("%s must be a positive integer", name)
-	}
-	return n, nil
-}
-
-// parseTimeParam parses an RFC 3339 timestamp query parameter.
-// Sub-second precision and missing timezone offset are rejected.
-func parseTimeParam(raw, name string) (time.Time, error) {
-	if raw == "" {
-		return time.Time{}, nil
-	}
-	t, err := time.Parse(time.RFC3339, raw)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("%s must be an RFC 3339 timestamp (e.g. 2026-07-21T00:00:00Z)", name)
-	}
-	if t.Nanosecond() != 0 {
-		return time.Time{}, fmt.Errorf("%s sub-second precision is not supported", name)
-	}
-	return t, nil
-}
+// filterFromQuery, writeError and validators are in errors.go to keep all
+// input-validation and error-envelope logic in one file.
 
 func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	if s.bcast == nil {
-		http.Error(w, "streaming not configured", http.StatusNotImplemented)
+		writeErrorString(w, http.StatusNotImplemented, "streaming not configured")
 		return
 	}
 
@@ -657,14 +527,4 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
-}
-
-func writeError(w http.ResponseWriter, status int, err error) {
-	// Every error response is marked no-store so neither CDNs nor
-	// browsers can pool a 4xx/5xx behind a success response's
-	// validator. The prime motivator is the 404-on-eviction path in
-	// handleGetEvent: a stale cache otherwise keeps returning "not
-	// found" for an event that briefly aged out but never came back.
-	writeCacheHeaders(w, cacheNoStore, 0, "")
-	writeJSON(w, status, errorResponse{Error: err.Error()})
 }
