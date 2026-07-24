@@ -115,9 +115,11 @@ func ExtractContractEvents(dx decode.Decoder, contractID string, tx TxHint) (Ext
 	switch meta.V {
 	case 3:
 		if meta.V3 != nil {
-			for i, ev := range meta.V3.Events {
-				if row, ok := buildEvent(dx, contractID, tx, createdAt, ev, 0, int32(i)); ok {
-					out.Events = append(out.Events, row)
+			if meta.V3.SorobanMeta != nil {
+				for i, ev := range meta.V3.SorobanMeta.Events {
+					if row, ok := buildEvent(dx, contractID, tx, createdAt, ev, 0, int32(i)); ok {
+						out.Events = append(out.Events, row)
+					}
 				}
 			}
 		}
@@ -130,18 +132,9 @@ func ExtractContractEvents(dx decode.Decoder, contractID string, tx TxHint) (Ext
 					}
 				}
 			}
-			// Soroban fee-bumps wrap one inner tx; events emitted by
-			// its ops use inner op indices, which is what we want.
-			for _, inner := range meta.V4.InnerTransactions {
-				if inner == nil {
-					continue
-				}
-				for opIdx, op := range inner.Operations {
-					for evIdx, ev := range op.Events {
-						if row, ok := buildEvent(dx, contractID, tx, createdAt, ev, int32(opIdx), int32(evIdx)); ok {
-							out.Events = append(out.Events, row)
-						}
-					}
+			for _, te := range meta.V4.Events {
+				if row, ok := buildEvent(dx, contractID, tx, createdAt, te.Event, 0, 0); ok {
+					out.Events = append(out.Events, row)
 				}
 			}
 		}
@@ -165,11 +158,10 @@ func buildEvent(
 	if ev.ContractId == nil {
 		return store.Event{}, false
 	}
-	hashBytes, err := ev.ContractId.Hash()
-	if err != nil || hashBytes == nil {
+	if len(ev.ContractId) == 0 {
 		return store.Event{}, false
 	}
-	candidate := xdr.NewContractIdFromHash(hashBytes).String()
+	candidate := xdr.Hash(*ev.ContractId).HexString()
 	if contractID != "" && candidate != contractID {
 		return store.Event{}, false
 	}
@@ -215,9 +207,14 @@ func eventKind(t xdr.ContractEventType) string {
 // all leading elements as topics (decoded individually) and the last
 // element as the value.
 func eventPayloads(dx decode.Decoder, ev xdr.ContractEvent) (json.RawMessage, json.RawMessage, []string, string, bool) {
-	if ev.Data.Type != xdr.ScValTypeScvVec || ev.Data.Vec == nil {
+	body, ok := ev.Body.GetV0()
+	if !ok {
+		return nil, nil, nil, "", false
+	}
+	vec, ok := body.Data.GetVec()
+	if !ok || vec == nil {
 		// Edge: data isn't a Vec. Treat as zero topics, value=data.
-		valB64, ok := encodeScVal(ev.Data)
+		valB64, ok := encodeScVal(body.Data)
 		if !ok {
 			return nil, nil, nil, "", false
 		}
@@ -227,14 +224,13 @@ func eventPayloads(dx decode.Decoder, ev xdr.ContractEvent) (json.RawMessage, js
 		}
 		return json.RawMessage("[]"), val, nil, valB64, true
 	}
-	vec := *ev.Data.Vec
-	if len(vec) == 0 {
+	if len(*vec) == 0 {
 		return json.RawMessage("[]"), json.RawMessage("null"), nil, "", true
 	}
-	topics := make([]json.RawMessage, 0, len(vec)-1)
-	rawTopicXDR := make([]string, 0, len(vec)-1)
-	for i := 0; i < len(vec)-1; i++ {
-		base64Topic, _ := encodeScVal(vec[i]) // empty on encode failure → raw stored as empty
+	topics := make([]json.RawMessage, 0, len(*vec)-1)
+	rawTopicXDR := make([]string, 0, len(*vec)-1)
+	for i := 0; i < len(*vec)-1; i++ {
+		base64Topic, _ := encodeScVal((*vec)[i]) // empty on encode failure → raw stored as empty
 		t, ok := decodeOne(dx, base64Topic)
 		if !ok {
 			return nil, nil, nil, "", false
@@ -244,7 +240,7 @@ func eventPayloads(dx decode.Decoder, ev xdr.ContractEvent) (json.RawMessage, js
 			rawTopicXDR = append(rawTopicXDR, base64Topic)
 		}
 	}
-	valB64, _ := encodeScVal(vec[len(vec)-1])
+	valB64, _ := encodeScVal((*vec)[len(*vec)-1])
 	val, ok := decodeOne(dx, valB64)
 	if !ok {
 		return nil, nil, nil, "", false

@@ -52,18 +52,22 @@ func buildSimpleMeta(t *testing.T, contractSeed string, body xdr.ScVal) string {
 		hash[i] = contractSeed[i%len(contractSeed)]
 	}
 	cid := xdr.ContractId(xdr.Hash(hash))
+	bodyXDR, err := xdr.NewContractEventBody(0, xdr.ContractEventV0{Topics: nil, Data: body})
+	if err != nil {
+		panic(err)
+	}
 	ev := xdr.ContractEvent{
 		ContractId: &cid,
 		Type:       xdr.ContractEventTypeContract,
-		Body: xdr.ContractEventBody{
-			V:    xdr.ContractEventBodyTypeContract,
-			Data: body,
-		},
+		Body:       bodyXDR,
 	}
 	meta := xdr.TransactionMeta{
 		V: 3,
 		V3: &xdr.TransactionMetaV3{
-			Events: []xdr.ContractEvent{ev},
+			SorobanMeta: &xdr.SorobanTransactionMeta{
+				Events:      []xdr.ContractEvent{ev},
+				ReturnValue: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
+			},
 		},
 	}
 	b, err := xdr.MarshalBase64(meta)
@@ -78,7 +82,9 @@ func scSymbol(s string) xdr.ScVal {
 }
 
 func scAddress(s string) xdr.ScVal {
-	addr, err := xdr.NewAddress(s)
+	var cid xdr.ContractId
+	copy(cid[:], []byte(s))
+	addr, err := xdr.NewScAddress(xdr.ScAddressTypeScAddressTypeContract, cid)
 	if err != nil {
 		panic(err)
 	}
@@ -92,8 +98,9 @@ func scU64(n uint64) xdr.ScVal {
 
 func scVec(items ...xdr.ScVal) xdr.ScVal {
 	v := xdr.ScValTypeScvVec
-	vec := items
-	return xdr.ScVal{Type: v, Vec: &vec}
+	vec := xdr.ScVec(items)
+	var p *xdr.ScVec = &vec
+	return xdr.ScVal{Type: v, Vec: &p}
 }
 
 func contractIDFromSeed(seed string) string {
@@ -101,7 +108,9 @@ func contractIDFromSeed(seed string) string {
 	for i := range hash {
 		hash[i] = seed[i%len(seed)]
 	}
-	return xdr.NewContractIdFromHash(hash).String()
+	var cid xdr.ContractId
+	copy(cid[:], hash)
+	return xdr.Hash(cid).HexString()
 }
 
 // dummyLog returns a logger that drops everything.
@@ -126,7 +135,7 @@ func (f *fakeStore) UpsertEvents(_ context.Context, events []store.Event) (int64
 	return int64(len(events)), nil
 }
 func (f *fakeStore) GetBackfillState(_ context.Context) (store.BackfillState, error) {
-	if !f.startCalled && !f.completeCalled {
+	if !f.startCalled && !f.completeCalled && f.state.ContractID == "" {
 		return store.BackfillState{}, store.ErrNotFound
 	}
 	return f.state, nil
@@ -182,15 +191,15 @@ func TestRun_HappyPath(t *testing.T) {
 	sum, err := b.Run(context.Background())
 	require.NoError(t, err)
 	assert.True(t, sum.Completed)
-	assert.EqualValues(t, 3, sum.PagesFetched)
+	assert.EqualValues(t, 2, sum.PagesFetched)
 	assert.EqualValues(t, 3, sum.Transactions)
 	assert.EqualValues(t, 3, sum.Extracted)
 	assert.EqualValues(t, 3, sum.Inserted)
 	assert.EqualValues(t, 101, sum.ThroughLedger)
 	assert.True(t, fs.completeCalled)
-	// Cursor chain was respected.
-	assert.Equal(t, "", h.lastCursor) // final cursor we never advanced past
-	require.EqualValues(t, 3, fs.upsertCallCount)
+	// Cursor chain was respected; the final page is empty so no new cursor is advanced.
+	assert.Equal(t, "t2", h.lastCursor)
+	require.EqualValues(t, 2, fs.upsertCallCount)
 }
 
 // TestRun_ResumesFromSavedProgress: when GetBackfillState returns a

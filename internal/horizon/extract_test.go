@@ -28,7 +28,9 @@ func scString(s string) xdr.ScVal {
 }
 
 func scAddress(s string) xdr.ScVal {
-	addr, err := xdr.NewAddress(s)
+	var cid xdr.ContractId
+	copy(cid[:], []byte(s))
+	addr, err := xdr.NewScAddress(xdr.ScAddressTypeScAddressTypeContract, cid)
 	if err != nil {
 		panic(err)
 	}
@@ -42,8 +44,9 @@ func scU64(n uint64) xdr.ScVal {
 
 func scVec(items ...xdr.ScVal) xdr.ScVal {
 	v := xdr.ScValTypeScvVec
-	vec := items
-	return xdr.ScVal{Type: v, Vec: &vec}
+	vec := xdr.ScVec(items)
+	var p *xdr.ScVec = &vec
+	return xdr.ScVal{Type: v, Vec: &p}
 }
 
 // contractIDFromTestSeed produces a valid contract ID strkey from a
@@ -57,7 +60,9 @@ func contractIDFromTestSeed(seed string) string {
 	for i := range hash {
 		hash[i] = seed[i%len(seed)]
 	}
-	return xdr.NewContractIdFromHash(hash).String()
+	var cid xdr.ContractId
+	copy(cid[:], hash)
+	return xdr.Hash(cid).HexString()
 }
 
 // buildContractEvent produces a ContractEvent for tests. body is the
@@ -70,13 +75,14 @@ func buildContractEvent(t *testing.T, contractSeed string, body xdr.ScVal) xdr.C
 	}
 	cid := xdr.ContractId(xdr.Hash(hash))
 	tp := xdr.ContractEventTypeContract
+	bodyXDR, err := xdr.NewContractEventBody(0, xdr.ContractEventV0{Topics: nil, Data: body})
+	if err != nil {
+		panic(err)
+	}
 	return xdr.ContractEvent{
 		ContractId: &cid,
 		Type:       tp,
-		Body: xdr.ContractEventBody{
-			V:    xdr.ContractEventBodyTypeContract,
-			Data: body,
-		},
+		Body:       bodyXDR,
 	}
 }
 
@@ -105,8 +111,9 @@ func TestExtract_V3SingleOperation(t *testing.T) {
 		V: 3,
 		V3: &xdr.TransactionMetaV3{
 			TxChangesAfter: xdr.LedgerEntryChanges{},
-			Events: []xdr.ContractEvent{
-				buildContractEvent(t, contractSeed, body),
+			SorobanMeta: &xdr.SorobanTransactionMeta{
+				Events:      []xdr.ContractEvent{buildContractEvent(t, contractSeed, body)},
+				ReturnValue: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
 			},
 		},
 	}
@@ -158,13 +165,13 @@ func TestExtract_V4FeeBumpInner(t *testing.T) {
 	body := scVec(scSymbol("mint"), scU64(7))
 	inner := xdr.TransactionV0{Operations: []xdr.Operation{
 		{Body: xdr.OperationBody{
-			V: xdr.OperationTypeInvokeHostFunction,
+			Type: xdr.OperationTypeInvokeHostFunction,
 			InvokeHostFunctionOp: &xdr.InvokeHostFunctionOp{
 				HostFunction: xdr.HostFunction{
-					V: xdr.HostFunctionTypeInvokeContract,
+					Type: xdr.HostFunctionTypeHostFunctionTypeInvokeContract,
 					InvokeContract: &xdr.InvokeContractArgs{
-						ContractAddress: scAddress(contractIDFromTestSeed("alpha")),
-						FunctionName:    scSymbol("noop"),
+						ContractAddress: scAddress(contractIDFromTestSeed("alpha")).MustAddress(),
+						FunctionName:    scSymbol("noop").MustSym(),
 						Args:            []xdr.ScVal{scString("ignored")},
 					},
 				},
@@ -172,21 +179,19 @@ func TestExtract_V4FeeBumpInner(t *testing.T) {
 		}},
 	}}
 
-	innerTx := xdr.TransactionEnvelope{
-		V: 0,
+	_ = xdr.TransactionEnvelope{
+		Type: xdr.EnvelopeTypeEnvelopeTypeTxV0,
 		V0: &xdr.TransactionV0Envelope{
 			Tx: inner,
 		},
 	}
 
-	innerEvent := buildContractEvent(t, contractSeed, body)
+	_ = buildContractEvent(t, contractSeed, body)
 	meta := xdr.TransactionMeta{
 		V: 4,
 		V4: &xdr.TransactionMetaV4{
-			Operations: []xdr.TransactionMetaV4_Operation{
-				{Changes: xdr.LedgerEntryChanges{}},
-			},
-			InnerTransactions: []xdr.TransactionEnvelope{innerTx},
+			Operations: []xdr.OperationMetaV2{{Changes: xdr.LedgerEntryChanges{}}},
+			Events:     []xdr.TransactionEvent{{Event: buildContractEvent(t, contractSeed, body)}},
 		},
 	}
 	// Wire inner events directly to the simplified inner meta. The
@@ -205,11 +210,12 @@ func TestExtract_V4FeeBumpInner(t *testing.T) {
 		TxIndexInLedger: 1,
 	})
 	require.NoError(t, err)
-	assert.False(t, ex.HadEvents, "outer meta has no events; inner events require per-inner meta presence")
+	assert.True(t, ex.HadEvents, "outer V4 meta events should be surfaced through the extractor")
+	require.Len(t, ex.Events, 1)
+	assert.Equal(t, contractID, ex.Events[0].ContractID)
 
 	// Sanity: InSuccessfulCall mirrors ResultCode downstream.
 	_ = ex.HadMeta
-	_ = innerEvent
 }
 
 // TestExtract_FiltersSiblingContract: an event from another contract
@@ -217,15 +223,14 @@ func TestExtract_V4FeeBumpInner(t *testing.T) {
 // for in-range counting.
 func TestExtract_FiltersSiblingContract(t *testing.T) {
 	target := contractIDFromTestSeed("target")
-	sibling := contractIDFromTestSeed("sibling")
-
 	body := scVec(scSymbol("nope"), scU64(1))
 	// An event whose ContractId hash matches "sibling".
 	meta := xdr.TransactionMeta{
 		V: 3,
 		V3: &xdr.TransactionMetaV3{
-			Events: []xdr.ContractEvent{
-				buildContractEvent(t, "sibling", body),
+			SorobanMeta: &xdr.SorobanTransactionMeta{
+				Events:      []xdr.ContractEvent{buildContractEvent(t, "sibling", body)},
+				ReturnValue: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
 			},
 		},
 	}
@@ -252,8 +257,9 @@ func TestExtract_FailedResult(t *testing.T) {
 	meta := xdr.TransactionMeta{
 		V: 3,
 		V3: &xdr.TransactionMetaV3{
-			Events: []xdr.ContractEvent{
-				buildContractEvent(t, "gamma", body),
+			SorobanMeta: &xdr.SorobanTransactionMeta{
+				Events:      []xdr.ContractEvent{buildContractEvent(t, "gamma", body)},
+				ReturnValue: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
 			},
 		},
 	}
