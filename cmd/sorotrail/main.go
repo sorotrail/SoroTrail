@@ -102,7 +102,16 @@ func run() error {
 		}
 	}
 
-	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
+	httpClient := rpc.NewHTTPClient(cfg.RPCURL)
+
+	// Wrap the RPC client with a circuit breaker that opens after
+	// CB_FAILURE_THRESHOLD consecutive failures and probes on a timer.
+	cb := rpc.NewCircuitBreaker(rpc.CircuitBreakerConfig{
+		FailureThreshold: cfg.CBFailureThreshold,
+		ProbeTimeout:     cfg.CBProbeTimeout,
+	}, log)
+	rpcClient := rpc.NewCircuitBreakerClient(httpClient, cb)
+
 	// Webhook delivery runs alongside ingestion — the notifier is attached
 	// to the ingester so events flow to subscriber callbacks asynchronously.
 	wh := webhook.NewNotifier(st, log)

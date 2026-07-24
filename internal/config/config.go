@@ -55,6 +55,12 @@ type Config struct {
 	// intermediaries cannot. Defaults to false (the deployment does not
 	// need request-scoped caching).
 	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
+
+	// Circuit breaker config. Prevents tight retry loops during sustained
+	// RPC outages by opening the breaker after N consecutive failures and
+	// probing on a timer.
+	CBFailureThreshold int           `env:"CB_FAILURE_THRESHOLD" envDefault:"5"`
+	CBProbeTimeout     time.Duration `env:"CB_PROBE_TIMEOUT" envDefault:"30s"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -119,6 +125,12 @@ func (c Config) Validate() error {
 	}
 	if c.AuditFindingMaxLgrs == 0 {
 		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
+	}
+	if c.CBFailureThreshold <= 0 {
+		return fmt.Errorf("CB_FAILURE_THRESHOLD must be positive, got %d", c.CBFailureThreshold)
+	}
+	if c.CBProbeTimeout <= 0 {
+		return fmt.Errorf("CB_PROBE_TIMEOUT must be positive, got %s", c.CBProbeTimeout)
 	}
 	if c.RateLimitRPS < 0 {
 		return fmt.Errorf("RATE_LIMIT_RPS must be non-negative")

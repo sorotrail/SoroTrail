@@ -101,9 +101,12 @@ func (ing *Ingester) Run(ctx context.Context) error {
 		case ctx.Err() != nil:
 			return ctx.Err()
 		case err != nil:
-			// Jittered exponential backoff so restarts don't thundering-herd
-			// a shared endpoint.
+			// When the circuit breaker is open we know the RPC is down;
+			// sleep for the full backoff window instead of hammering.
 			sleep := backoff/2 + rand.N(backoff/2)
+			if errors.Is(err, rpc.ErrCircuitOpen) {
+				sleep = backoff
+			}
 			ing.log.Error("ingestion pass failed", "error", err, "retry_in", sleep)
 			if !sleepCtx(ctx, sleep) {
 				return ctx.Err()
