@@ -70,6 +70,11 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 		conflict = `
 		ON CONFLICT (ledger, id) DO UPDATE SET
 			contract_id        = EXCLUDED.contract_id,
+	conflict := "ON CONFLICT (id) DO NOTHING"
+	if onUpdate {
+		conflict = `ON CONFLICT (id) DO UPDATE SET
+			contract_id        = EXCLUDED.contract_id,
+			ledger             = EXCLUDED.ledger,
 			type               = EXCLUDED.type,
 			tx_hash            = EXCLUDED.tx_hash,
 			tx_index           = EXCLUDED.tx_index,
@@ -80,6 +85,8 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			created_at         = EXCLUDED.created_at,
 			topics_xdr         = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
 			value_xdr          = coalesce(EXCLUDED.value_xdr, events.value_xdr)`
+			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
 	sql := `
 		INSERT INTO events

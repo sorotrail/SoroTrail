@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sorotrail.fullname" . }}
+  labels:
+    {{- include "sorotrail.labels" . | nindent 4 }}
+data:
+  RPC_URL: {{ .Values.config.rpcUrl | quote }}
+  POLL_INTERVAL: {{ .Values.config.pollInterval | quote }}
+  HTTP_ADDR: {{ .Values.config.httpAddr | quote }}
+  WATCHED_CONTRACTS: {{ .Values.config.watchedContracts | quote }}
+  START_LEDGER: {{ .Values.config.startLedger | quote }}
+  RETENTION_LEDGERS: {{ .Values.config.retentionLedgers | quote }}
+  PARTITION_LEDGER_SPAN: {{ .Values.config.partitionLedgerSpan | quote }}
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  {{- if .Values.config.rateLimitRps }}
+  RATE_LIMIT_RPS: {{ .Values.config.rateLimitRps | quote }}
+  {{- end }}
+  {{- if .Values.config.rateLimitBurst }}
+  RATE_LIMIT_BURST: {{ .Values.config.rateLimitBurst | quote }}
+  {{- end }}
+  {{- if .Values.config.rateLimitTrustedProxy }}
+  RATE_LIMIT_TRUSTED_PROXY: {{ .Values.config.rateLimitTrustedProxy | quote }}
+  {{- end }}
