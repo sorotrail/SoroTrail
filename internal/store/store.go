@@ -33,6 +33,22 @@ type Event struct {
 	RawValueXDR string   `json:"-"`
 }
 
+// EnrichedEvent wraps an Event with decoded field information derived from
+// the contract's spec. The original Event is preserved in full; DecodedEvent
+// carries the enriched view when decoding succeeded.
+type EnrichedEvent struct {
+	Event        `json:",inline"` // embed all Event fields
+	DecodedEvent *DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                   `json:"decoded"`
+}
+
+// DecodedEventResponse is the JSON shape returned when an event is successfully
+// enriched with spec-driven field names.
+type DecodedEventResponse struct {
+	Event  string         `json:"event"`
+	Fields map[string]any `json:"fields,omitempty"`
+}
+
 // DecodedEvent is one event's replayable payload: the raw XDR inputs plus the
 // decoded columns currently stored for it.
 type DecodedEvent struct {
@@ -268,6 +284,13 @@ type Store interface {
 	// range contains a single ledger, or ErrNotFound if none. The auditor
 	// uses this to keep working while a finding is being repaired.
 	ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error)
+
+	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
+	// or ErrNotFound when no spec is cached for that hash.
+	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
+	// SetContractSpec persists a JSON-serialized spec keyed by wasm_hash
+	// and contract_id so subsequent lookups avoid an RPC round trip.
+	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
 
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error

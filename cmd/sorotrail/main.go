@@ -27,6 +27,7 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/ingester"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
+	"github.com/khaylebfortune/sorotrail/internal/spec"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
 
@@ -101,6 +102,12 @@ func run() error {
 	}
 
 	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
+
+	// Wire the spec cache and enricher for spec-decoded event views.
+	specCache := spec.NewCache(st)
+	specFetcher := spec.NewFetcher(rpcClient)
+	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
+
 	bcast := broadcast.New(broadcast.DefaultBufferSize)
 	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:     cfg.PollInterval,
@@ -142,6 +149,7 @@ func run() error {
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
+		Handler:           api.New(st, rpcClient, log, specEnricher).Router(),
 		Handler:           apiServer.Router(),
 		Handler:           api.New(st, rpcClient, log).WithBroadcaster(bcast).Router(),
 		ReadHeaderTimeout: 10 * time.Second,
