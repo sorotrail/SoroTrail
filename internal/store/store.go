@@ -191,6 +191,36 @@ type EventDecoding struct {
 	Value  json.RawMessage
 }
 
+// AnalyticsEventBucket is one time-bucketed event count returned by the
+// analytics endpoints. BucketStart is a UTC timestamp truncated to the
+// requested granularity (hour or day).
+type AnalyticsEventBucket struct {
+	BucketStart time.Time `json:"bucket_start"`
+	ContractID  string    `json:"contract_id"`
+	Type        string    `json:"type"`
+	Count       int64     `json:"count"`
+}
+
+// AnalyticsTokenVolume is one time-bucketed transfer volume row.
+// Volume is a decimal string (i128-safe). UniqueAddressCount is the number
+// of distinct addresses appearing in transfer topics for the bucket.
+type AnalyticsTokenVolume struct {
+	BucketStart        time.Time `json:"bucket_start"`
+	ContractID         string    `json:"contract_id"`
+	Volume             string    `json:"volume"`
+	UniqueAddressCount int64     `json:"unique_address_count"`
+}
+
+// AnalyticsFilter narrows analytics queries. From/To are UTC timestamps;
+// zero means unbounded. Bucket is "hour" or "day".
+type AnalyticsFilter struct {
+	ContractID string
+	Type       string
+	From       time.Time
+	To         time.Time
+	Bucket     string // "hour" or "day"
+}
+
 // Store is the persistence boundary. The ingester, auditor, and API depend
 // on this interface, never on Postgres directly, so alternative backends can
 // be contributed by implementing it.
@@ -250,6 +280,15 @@ type Store interface {
 	// range contains a single ledger, or ErrNotFound if none. The auditor
 	// uses this to keep working while a finding is being repaired.
 	ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error)
+
+	// QueryAnalyticsEvents returns time-bucketed event counts from the
+	// rollup_events table. Bucket="day" aggregates hourly buckets to daily.
+	// Empty buckets in the range are omitted (not zero-filled).
+	QueryAnalyticsEvents(ctx context.Context, f AnalyticsFilter) ([]AnalyticsEventBucket, error)
+	// QueryAnalyticsTokenVolume returns time-bucketed transfer volume from
+	// the rollup_token_volume table. Populated only when the ingester
+	// recognizes SEP-41 transfer-shaped events (#1).
+	QueryAnalyticsTokenVolume(ctx context.Context, f AnalyticsFilter) ([]AnalyticsTokenVolume, error)
 
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error

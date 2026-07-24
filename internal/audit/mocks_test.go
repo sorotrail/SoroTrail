@@ -329,6 +329,13 @@ func (m *mockStore) Stats(context.Context) (store.Stats, error) {
 
 func (m *mockStore) Ping(context.Context) error { return nil }
 
+func (m *mockStore) QueryAnalyticsEvents(context.Context, store.AnalyticsFilter) ([]store.AnalyticsEventBucket, error) {
+	return nil, nil
+}
+func (m *mockStore) QueryAnalyticsTokenVolume(context.Context, store.AnalyticsFilter) ([]store.AnalyticsTokenVolume, error) {
+	return nil, nil
+}
+
 // seedLedgers records pre-existing events in m.events so tests can set up
 // "stored state that diverges from the RPC" without a database. IDs use
 // the same %020d-%05d format as mkEvents, so seeded events and RPC

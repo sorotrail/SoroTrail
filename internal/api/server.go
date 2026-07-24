@@ -67,6 +67,8 @@ func (s *Server) Router() http.Handler {
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/stats", s.handleStats)
+	r.Get("/analytics/events", s.handleAnalyticsEvents)
+	r.Get("/analytics/token-volume", s.handleAnalyticsTokenVolume)
 
 	// contributors: new read endpoints go here. Anything that writes (e.g.
 	// managing watched contracts at runtime) should come with auth first.

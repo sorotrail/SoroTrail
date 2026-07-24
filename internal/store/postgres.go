@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
@@ -33,15 +35,236 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres {
 	return &Postgres{pool: pool}
 }
 
+// bucketHour returns the UTC hour bucket for a ledger using the
+// approximation that each Stellar ledger is ~5 seconds. Exact values
+// don't matter for bucketing — the only requirement is consistency.
+// The same ledger always maps to the same bucket.
+func bucketHour(ledger int64) time.Time {
+	// Reference: Soroban Protocol 20 launch ~2024-01-30 near ledger 53M.
+	const refLedger = 53_000_000
+	const refUnix = 1706572800 // 2024-01-30 00:00:00 UTC
+	sec := refUnix + (ledger-refLedger)*5
+	return time.Unix(sec, 0).UTC().Truncate(time.Hour)
+}
+
+// bucketKey is the compound key for rollup delta accumulation.
+type bucketKey struct {
+	bucketStart time.Time
+	contractID  string
+	eventType   string
+}
+
+// volDelta accumulates token transfer volume and unique addresses for one
+// rollup bucket from newly inserted events.
+type volDelta struct {
+	volume    *big.Int
+	addresses map[string]struct{}
+}
+
 func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
 	if len(events) == 0 {
 		return 0, nil
 	}
-	rows, err := p.upsertEvents(ctx, events, false)
+
+	tx, err := p.pool.Begin(ctx)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("begin upsert tx: %w", err)
 	}
-	return rows, nil
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Batch INSERT with RETURNING so only newly inserted rows (not
+	// duplicate-ID skipped rows) are visible for rollup deltas.
+	batch := &pgx.Batch{}
+	for _, e := range events {
+		batch.Queue(`
+			INSERT INTO events
+				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+				 in_successful_call, topics, value, raw_topic_xdr, raw_value_xdr)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			ON CONFLICT (id) DO NOTHING
+			RETURNING contract_id, type, ledger, topics, value`,
+			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value,
+			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
+		)
+	}
+
+	results := tx.SendBatch(ctx, batch)
+	defer results.Close()
+
+	// Aggregate deltas from newly inserted rows.
+	eventDeltas := make(map[bucketKey]int64)
+	volumeDeltas := make(map[bucketKey]*volDelta)
+
+	var inserted int64
+	for range events {
+		var (
+			contractID, eventType string
+			ledger                int64
+			topics, value         json.RawMessage
+		)
+		err := results.QueryRow().Scan(&contractID, &eventType, &ledger, &topics, &value)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue // ON CONFLICT DO NOTHING — duplicate, not inserted
+		}
+		if err != nil {
+			return inserted, fmt.Errorf("upserting events: %w", err)
+		}
+		inserted++
+
+		key := bucketKey{
+			bucketStart: bucketHour(ledger),
+			contractID:  contractID,
+			eventType:   eventType,
+		}
+		eventDeltas[key]++
+
+		// Detect token transfer events for rollup_token_volume (#1).
+		if amt, addrs, ok := tryExtractTransfer(topics, value); ok {
+			vd, exists := volumeDeltas[key]
+			if !exists {
+				vd = &volDelta{volume: new(big.Int), addresses: make(map[string]struct{})}
+				volumeDeltas[key] = vd
+			}
+			vd.volume.Add(vd.volume, amt)
+			for _, a := range addrs {
+				vd.addresses[a] = struct{}{}
+			}
+		}
+	}
+
+	if err := results.Close(); err != nil {
+		return inserted, fmt.Errorf("closing insert batch: %w", err)
+	}
+
+	// Apply rollup_events deltas.
+	if len(eventDeltas) > 0 {
+		if err := applyEventRollups(ctx, tx, eventDeltas); err != nil {
+			return inserted, err
+		}
+	}
+
+	// Apply rollup_token_volume deltas.
+	if len(volumeDeltas) > 0 {
+		if err := applyVolumeRollups(ctx, tx, volumeDeltas); err != nil {
+			return inserted, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return inserted, fmt.Errorf("committing upsert tx: %w", err)
+	}
+
+	return inserted, nil
+}
+
+// applyEventRollups upserts rollup_events deltas from newly inserted events.
+func applyEventRollups(ctx context.Context, tx pgx.Tx, deltas map[bucketKey]int64) error {
+	batch := &pgx.Batch{}
+	for key, delta := range deltas {
+		batch.Queue(`
+			INSERT INTO rollup_events (bucket_start, contract_id, type, count)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (bucket_start, contract_id, type)
+			DO UPDATE SET count = rollup_events.count + EXCLUDED.count`,
+			key.bucketStart, key.contractID, key.eventType, delta,
+		)
+	}
+	results := tx.SendBatch(ctx, batch)
+	defer results.Close()
+	for range deltas {
+		if _, err := results.Exec(); err != nil {
+			return fmt.Errorf("applying rollup deltas: %w", err)
+		}
+	}
+	return results.Close()
+}
+
+// applyVolumeRollups upserts rollup_token_volume deltas from newly inserted
+// transfer events.
+//
+// contributors: unique_address_count is additive per-batch (COALESCE + COALESCE)
+// rather than truly distinct across batches. Replace with a proper address-tracking
+// table (e.g. rollup_addresses keyed by (bucket_start, contract_id, address)) when
+// #1 lands so the count is an actual COUNT(DISTINCT).
+func applyVolumeRollups(ctx context.Context, tx pgx.Tx, deltas map[bucketKey]*volDelta) error {
+	batch := &pgx.Batch{}
+	for key, vd := range deltas {
+		batch.Queue(`
+			INSERT INTO rollup_token_volume
+				(bucket_start, contract_id, volume, unique_address_count)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (bucket_start, contract_id) DO UPDATE SET
+				volume = rollup_token_volume.volume + EXCLUDED.volume,
+				unique_address_count =
+					rollup_token_volume.unique_address_count + EXCLUDED.unique_address_count`,
+			key.bucketStart, key.contractID,
+			vd.volume.String(), int64(len(vd.addresses)),
+		)
+	}
+	results := tx.SendBatch(ctx, batch)
+	defer results.Close()
+	for range deltas {
+		if _, err := results.Exec(); err != nil {
+			return fmt.Errorf("applying volume rollup deltas: %w", err)
+		}
+	}
+	return results.Close()
+}
+
+// tryExtractTransfer inspects the decoded topics/value of an event to
+// detect SEP-41-style transfer events. Returns (amount, addresses, true)
+// when the event looks like a transfer, or (nil, nil, false) otherwise.
+//
+// Transfers are recognized by topics[0] == {"symbol":"transfer"} and
+// value containing an i128 amount. Topics[1] and [2] carry address entries
+// for the sender and receiver.
+func tryExtractTransfer(topics, value json.RawMessage) (*big.Int, []string, bool) {
+	var topicList []json.RawMessage
+	if err := json.Unmarshal(topics, &topicList); err != nil || len(topicList) < 3 {
+		return nil, nil, false
+	}
+
+	// First topic must be {"symbol":"transfer"}.
+	var firstTopic map[string]string
+	if err := json.Unmarshal(topicList[0], &firstTopic); err != nil || firstTopic["symbol"] != "transfer" {
+		return nil, nil, false
+	}
+
+	// Value must carry an i128 amount.
+	var valMap map[string]json.RawMessage
+	if err := json.Unmarshal(value, &valMap); err != nil {
+		return nil, nil, false
+	}
+	amountRaw, ok := valMap["i128"]
+	if !ok {
+		return nil, nil, false
+	}
+	var amountStr string
+	if err := json.Unmarshal(amountRaw, &amountStr); err != nil {
+		return nil, nil, false
+	}
+	amt, ok := new(big.Int).SetString(amountStr, 10)
+	if !ok {
+		return nil, nil, false
+	}
+
+	// Extract addresses from topics[1] and [2] (SEP-41 transfer has
+	// exactly 3 topics: symbol, from, to). Limit to the first two
+	// positions after the symbol to avoid picking up non-address
+	// topics that happen to carry an "address" key.
+	var addrs []string
+	for _, t := range topicList[1:min(len(topicList), 3)] {
+		var m map[string]string
+		if err := json.Unmarshal(t, &m); err != nil {
+			continue
+		}
+		if a, ok := m["address"]; ok && a != "" {
+			addrs = append(addrs, a)
+		}
+	}
+
+	return amt, addrs, true
 }
 
 // insertEventsBatch builds the event INSERT used by every write path, so
@@ -84,28 +307,6 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 		)
 	}
 	return batch
-}
-
-// upsertEvents is shared by UpsertEvents (idempotent insert) and
-// ReplaceEventsInRange (insert-or-update, so topic/value drift on the RPC
-// side is corrected). onUpdate=false → ON CONFLICT DO NOTHING;
-// onUpdate=true → ON CONFLICT DO UPDATE SET ….
-func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bool) (int64, error) {
-	if len(events) == 0 {
-		return 0, nil
-	}
-	results := p.pool.SendBatch(ctx, insertEventsBatch(events, onUpdate))
-	defer results.Close()
-
-	var affected int64
-	for range events {
-		tag, err := results.Exec()
-		if err != nil {
-			return affected, fmt.Errorf("upserting events: %w", err)
-		}
-		affected += tag.RowsAffected()
-	}
-	return affected, nil
 }
 
 // ReplaceEventsInRange makes [fromLedger, toLedger] match `events` exactly:
@@ -478,6 +679,118 @@ func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) er
 		return fmt.Errorf("adding watched contract: %w", err)
 	}
 	return nil
+}
+
+// QueryAnalyticsEvents returns time-bucketed event counts from the
+// rollup_events table. Bucket="day" aggregates hourly buckets to daily
+// at query time. Empty buckets are omitted (not zero-filled).
+func (p *Postgres) QueryAnalyticsEvents(ctx context.Context, f AnalyticsFilter) ([]AnalyticsEventBucket, error) {
+	trunc := "hour"
+	if f.Bucket == "day" {
+		trunc = "day"
+	}
+
+	var (
+		where []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	if f.ContractID != "" {
+		where = append(where, "contract_id = "+arg(f.ContractID))
+	}
+	if f.Type != "" {
+		where = append(where, "type = "+arg(f.Type))
+	}
+	if !f.From.IsZero() {
+		where = append(where, "bucket_start >= "+arg(f.From.UTC()))
+	}
+	if !f.To.IsZero() {
+		where = append(where, "bucket_start < "+arg(f.To.UTC()))
+	}
+
+	query := fmt.Sprintf(`
+		SELECT date_trunc('%s', bucket_start) AS bucket,
+		       contract_id, type,
+		       sum(count)::bigint AS count
+		FROM rollup_events`, trunc)
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY bucket, contract_id, type ORDER BY bucket ASC"
+
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying analytics events: %w", err)
+	}
+	defer rows.Close()
+
+	var out []AnalyticsEventBucket
+	for rows.Next() {
+		var b AnalyticsEventBucket
+		if err := rows.Scan(&b.BucketStart, &b.ContractID, &b.Type, &b.Count); err != nil {
+			return nil, fmt.Errorf("scanning analytics event bucket: %w", err)
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// QueryAnalyticsTokenVolume returns time-bucketed transfer volume from the
+// rollup_token_volume table. Populated only when the ingester recognizes
+// SEP-41 transfer-shaped events (#1). Bucket="day" aggregates hourly.
+func (p *Postgres) QueryAnalyticsTokenVolume(ctx context.Context, f AnalyticsFilter) ([]AnalyticsTokenVolume, error) {
+	trunc := "hour"
+	if f.Bucket == "day" {
+		trunc = "day"
+	}
+
+	var (
+		where []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	if f.ContractID != "" {
+		where = append(where, "contract_id = "+arg(f.ContractID))
+	}
+	if !f.From.IsZero() {
+		where = append(where, "bucket_start >= "+arg(f.From.UTC()))
+	}
+	if !f.To.IsZero() {
+		where = append(where, "bucket_start < "+arg(f.To.UTC()))
+	}
+
+	query := fmt.Sprintf(`
+		SELECT date_trunc('%s', bucket_start) AS bucket,
+		       contract_id,
+		       sum(volume)::text AS volume,
+		       sum(unique_address_count)::bigint AS unique_address_count
+		FROM rollup_token_volume`, trunc)
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY bucket, contract_id ORDER BY bucket ASC"
+
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying analytics token volume: %w", err)
+	}
+	defer rows.Close()
+
+	var out []AnalyticsTokenVolume
+	for rows.Next() {
+		var v AnalyticsTokenVolume
+		if err := rows.Scan(&v.BucketStart, &v.ContractID, &v.Volume, &v.UniqueAddressCount); err != nil {
+			return nil, fmt.Errorf("scanning analytics token volume: %w", err)
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
 }
 
 func (p *Postgres) Stats(ctx context.Context) (Stats, error) {

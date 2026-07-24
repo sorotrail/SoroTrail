@@ -50,6 +50,8 @@ func dispatch(args []string) error {
 	switch args[0] {
 	case "replay":
 		return runReplay(args[1:])
+	case "rollup-rebuild":
+		return runRollupRebuild(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -65,8 +67,10 @@ func usage() {
 With no subcommand, runs the indexer (ingester + HTTP API).
 
 subcommands:
-  replay    re-decode stored events with the current decoder
-            (sorotrail replay --help)
+  replay           re-decode stored events with the current decoder
+                   (sorotrail replay --help)
+  rollup-rebuild   reconstruct analytics rollup tables from stored events
+                   (sorotrail rollup-rebuild --help)
 `)
 }
 

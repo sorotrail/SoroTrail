@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,6 +34,12 @@ type stubStore struct {
 
 	stats   store.Stats
 	pingErr error
+
+	// Analytics stubs.
+	analyticsEvents []store.AnalyticsEventBucket
+	analyticsVolume []store.AnalyticsTokenVolume
+	analyticsErr    error
+	lastAnalyticsF  store.AnalyticsFilter
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -74,6 +81,15 @@ func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
 
 func (s *stubStore) Stats(context.Context) (store.Stats, error) { return s.stats, nil }
 func (s *stubStore) Ping(context.Context) error                 { return s.pingErr }
+
+func (s *stubStore) QueryAnalyticsEvents(_ context.Context, f store.AnalyticsFilter) ([]store.AnalyticsEventBucket, error) {
+	s.lastAnalyticsF = f
+	return s.analyticsEvents, s.analyticsErr
+}
+func (s *stubStore) QueryAnalyticsTokenVolume(_ context.Context, f store.AnalyticsFilter) ([]store.AnalyticsTokenVolume, error) {
+	s.lastAnalyticsF = f
+	return s.analyticsVolume, s.analyticsErr
+}
 
 type stubRPC struct {
 	rpc.Client
@@ -209,4 +225,67 @@ func TestStats(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &got))
 	assert.Equal(t, int64(42), got.TotalEvents)
 	assert.Equal(t, int64(999), got.LastIngestedLedger)
+}
+
+func TestAnalyticsEvents_ParsesFilters(t *testing.T) {
+	st := &stubStore{
+		analyticsEvents: []store.AnalyticsEventBucket{
+			{BucketStart: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), ContractID: testContract, Type: "contract", Count: 42},
+		},
+	}
+	s := newTestServer(st, nil)
+
+	resp, body := doGet(t, s, "/analytics/events?bucket=day&contract_id="+testContract+
+		"&type=contract&from=2025-01-01T00:00:00Z&to=2025-01-02T00:00:00Z")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	assert.Equal(t, "day", st.lastAnalyticsF.Bucket)
+	assert.Equal(t, testContract, st.lastAnalyticsF.ContractID)
+	assert.Equal(t, "contract", st.lastAnalyticsF.Type)
+	assert.False(t, st.lastAnalyticsF.From.IsZero())
+	assert.False(t, st.lastAnalyticsF.To.IsZero())
+
+	var out struct {
+		Buckets []store.AnalyticsEventBucket `json:"buckets"`
+	}
+	require.NoError(t, json.Unmarshal(body, &out))
+	assert.Len(t, out.Buckets, 1)
+	assert.Equal(t, int64(42), out.Buckets[0].Count)
+}
+
+func TestAnalyticsEvents_BadParams(t *testing.T) {
+	for _, path := range []string{
+		"/analytics/events?bucket=week",
+		"/analytics/events?type=bogus",
+		"/analytics/events?contract_id=nope",
+		"/analytics/events?from=not-a-date",
+		"/analytics/events?from=2025-01-02T00:00:00Z&to=2025-01-01T00:00:00Z",
+	} {
+		t.Run(path, func(t *testing.T) {
+			resp, body := doGet(t, newTestServer(&stubStore{}, nil), path)
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode, string(body))
+			var e map[string]string
+			require.NoError(t, json.Unmarshal(body, &e))
+			assert.NotEmpty(t, e["error"])
+		})
+	}
+}
+
+func TestAnalyticsTokenVolume_Success(t *testing.T) {
+	st := &stubStore{
+		analyticsVolume: []store.AnalyticsTokenVolume{
+			{BucketStart: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), ContractID: testContract, Volume: "1000000000", UniqueAddressCount: 3},
+		},
+	}
+	s := newTestServer(st, nil)
+
+	resp, body := doGet(t, s, "/analytics/token-volume?contract_id="+testContract)
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	var out struct {
+		Buckets []store.AnalyticsTokenVolume `json:"buckets"`
+	}
+	require.NoError(t, json.Unmarshal(body, &out))
+	assert.Len(t, out.Buckets, 1)
+	assert.Equal(t, "1000000000", out.Buckets[0].Volume)
 }

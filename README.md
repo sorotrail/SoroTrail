@@ -88,6 +88,21 @@ All configuration comes from environment variables (see `.env.example`):
   decoder can be applied to already-indexed events — see
   [decoder replay](#decoder-replay).
 
+### `sorotrail rollup-rebuild`
+
+Reconstructs the rollup tables from stored events. Useful after backfills
+or replays, or when a decoder improvement changes which events are classified
+as transfers.
+
+```sh
+sorotrail rollup-rebuild --from-ledger N [--to-ledger M]
+```
+
+Only one rebuild may run at a time (advisory lock). Safe to run against a
+live database; targets historical ledger ranges — running it at the live
+ingestion frontier may transiently overcount events ingested during the
+rebuild.
+
 ## Decoder replay
 
 Decoders improve over time. `sorotrail replay` re-runs the current decoder
@@ -200,6 +215,63 @@ curl -s localhost:8080/stats
 events have been proven to match a fresh RPC fetch by the auditor. When
 `AUDIT_ENABLED=false` it stays at `0`. See the Data integrity section
 below for the contract the field implies.
+
+### `GET /analytics/events`
+
+Returns time-bucketed event counts from incrementally maintained rollups.
+O(1) per bucket instead of scanning the raw events table.
+
+Query parameters:
+
+| Param | Example | Meaning |
+| --- | --- | --- |
+| `bucket` | `hour` | `day` | Bucket granularity (default `hour`). `day` aggregates hourly buckets at query time. |
+| `contract_id` | `CDLZ...CYSC` | Only events from this contract. |
+| `type` | `contract` | `contract` \| `system` \| `diagnostic`. |
+| `from` | `2025-01-01T00:00:00Z` | Inclusive lower time bound (RFC 3339 UTC). |
+| `to` | `2025-01-02T00:00:00Z` | Exclusive upper time bound (RFC 3339 UTC). |
+
+Buckets are half-open `[bucket_start, bucket_start + 1h)` (or `+1d` for daily)
+in UTC. Empty buckets are omitted from the response (not zero-filled).
+
+Rollups are incrementally maintained as part of ingestion — each `UpsertEvents`
+batch updates the affected buckets transactionally with the event insert, so
+analytics are never stale. Rollup tables outlive pruned raw events by design:
+even after retention policies archive old event rows, the aggregate history
+remains cheaply queryable.
+
+```sh
+curl -s 'localhost:8080/analytics/events?bucket=day&contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&from=2025-06-01T00:00:00Z&to=2025-07-01T00:00:00Z'
+```
+
+```json
+{
+  "buckets": [
+    {"bucket_start":"2025-06-15T00:00:00Z","contract_id":"CDLZ...CYSC","type":"contract","count":142},
+    {"bucket_start":"2025-06-16T00:00:00Z","contract_id":"CDLZ...CYSC","type":"contract","count":208}
+  ]
+}
+```
+
+### `GET /analytics/token-volume`
+
+Returns time-bucketed transfer volume and unique-address counts. Populated
+when the ingester recognizes SEP-41 transfer-shaped events (gated on #1).
+Volume is an i128-safe decimal string.
+
+Query parameters: same as `/analytics/events` (except `type` does not apply).
+
+```sh
+curl -s 'localhost:8080/analytics/token-volume?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&bucket=day'
+```
+
+```json
+{
+  "buckets": [
+    {"bucket_start":"2025-06-15T00:00:00Z","contract_id":"CDLZ...CYSC","volume":"15000000000","unique_address_count":34}
+  ]
+}
+```
 
 ## Data integrity
 

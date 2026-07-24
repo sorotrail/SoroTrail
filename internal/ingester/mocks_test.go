@@ -156,6 +156,13 @@ func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
 func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
 func (m *mockStore) Ping(context.Context) error                 { return nil }
 
+func (m *mockStore) QueryAnalyticsEvents(context.Context, store.AnalyticsFilter) ([]store.AnalyticsEventBucket, error) {
+	return nil, nil
+}
+func (m *mockStore) QueryAnalyticsTokenVolume(context.Context, store.AnalyticsFilter) ([]store.AnalyticsTokenVolume, error) {
+	return nil, nil
+}
+
 // passthroughDecoder avoids XDR fixtures in ingester tests.
 type passthroughDecoder struct{}
 
