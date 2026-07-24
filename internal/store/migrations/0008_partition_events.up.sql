@@ -97,15 +97,27 @@ $$;
 -- span any more.
 --
 -- Mid-flight idempotency: the migration isn't always followed by a
--- rupture before being applied again (e.g. a partially-applied run
--- followed by m.Up() finds events_default still attached to
--- events_legacy). PostgreSQL's CREATE TABLE PARTITION OF refuses
--- IF NOT EXISTS, but DROP TABLE IF EXISTS does drop a child
--- partition (auto-detaching it first), so this single line is
--- safe across all three scenarios — fresh DB (no-op), post-rupture
--- (no-op since the rupture already dropped events_default via
--- CASCADE), and no-rupture re-apply (drops the stale partition,
--- and the bulk INSERT below repopulates from events_legacy).
+-- rupture before being applied again. PostgreSQL's CREATE TABLE
+-- PARTITION OF refuses IF NOT EXISTS, but DROP TABLE IF EXISTS does
+-- drop a child partition (auto-detaching it first), so this single
+-- line is safe across the common scenarios:
+--
+--   fresh DB              — events_default doesn't exist → no-op
+--   post-rupture re-apply — rupture's DROP TABLE events_partitioned
+--                           CASCADE already dropped events_default → no-op
+--   no-rupture re-apply   — drops a stale events_default so the new
+--                           CREATE TABLE PARTITION OF below can attach
+--                           the same name to the new events parent
+--
+-- The no-rupture re-apply path is a known data-loss corner: prior 0008
+-- data was stored as rows inside events_default (parent events is empty
+-- in PostgreSQL partitioning), DROP TABLE drops those rows, and the
+-- subsequent INSERT INTO events SELECT FROM events_legacy inserts 0 rows
+-- because the renamed parent itself holds no rows (only its children do).
+-- This is reachable only via deliberate operator intervention (a manual
+-- schema_migrations rollback, since golang-migrate itself sits at
+-- version=8 after a clean run) — the operator should `pg_dump` events
+-- before re-running 0008 if recovery matters.
 DROP TABLE IF EXISTS events_default;
 
 CREATE TABLE events_default PARTITION OF events DEFAULT;
