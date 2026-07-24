@@ -90,9 +90,7 @@ All configuration comes from environment variables (see `.env.example`):
   `{"address":"C..."}`.
 - The raw base64 XDR is stored alongside the decoded JSON, so an improved
   decoder can be applied to already-indexed events — see
-  [decoder replay](#decoder-replay). This intentionally duplicates payload
-  data in `events.topics_xdr` and `events.value_xdr`; budget extra event-table
-  storage for deployments that retain large event histories.
+  [decoder replay](#decoder-replay).
 
 ## Decoder replay
 
@@ -153,7 +151,6 @@ Query parameters (all optional, combinable):
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
 | `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
 | `decoded` | `true` | When `true`, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with `"decoded": false`. |
-| `include_xdr` | `true` | When `true`, includes raw base64 `topics_xdr` and `value_xdr` on each event. Omitted by default to keep responses small. |
 
 Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
 
@@ -205,15 +202,6 @@ curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"G
 
 `cursor` is present when more results exist; pass it back as `?cursor=` for
 the next page.
-
-When `include_xdr=true`, events also include the original base64 XDR payload:
-
-```json
-{
-  "topics_xdr": ["AAAADwAAAAh0cmFuc2Zlcg=="],
-  "value_xdr": "AAAACgAAAAAAAAAB"
-}
-```
 
 Time filtering narrows results and does not change ordering (events remain in
 ascending event-ID order, which agrees with `created_at` order because both

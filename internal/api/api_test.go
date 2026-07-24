@@ -255,66 +255,10 @@ func TestListEvents_ReturnsCursor(t *testing.T) {
 	assert.Equal(t, "e2", out.Cursor)
 }
 
-func TestListEvents_IncludeXDR(t *testing.T) {
-	event := store.Event{
-		ID:          "e1",
-		RawTopicXDR: []string{"topic-xdr"},
-		RawValueXDR: "value-xdr",
-	}
-	st := &stubStore{events: []store.Event{event}}
-	s := newTestServer(st, nil)
-
-	resp, body := doGet(t, s, "/events")
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.NotContains(t, string(body), "topics_xdr")
-	assert.NotContains(t, string(body), "value_xdr")
-
-	resp, body = doGet(t, s, "/events?include_xdr=true")
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var out struct {
-		Events []struct {
-			TopicsXDR []string `json:"topics_xdr"`
-			ValueXDR  *string  `json:"value_xdr"`
-		} `json:"events"`
-	}
-	require.NoError(t, json.Unmarshal(body, &out))
-	require.Len(t, out.Events, 1)
-	assert.Equal(t, []string{"topic-xdr"}, out.Events[0].TopicsXDR)
-	require.NotNil(t, out.Events[0].ValueXDR)
-	assert.Equal(t, "value-xdr", *out.Events[0].ValueXDR)
-}
-
 func TestGetEvent_NotFound(t *testing.T) {
 	st := &stubStore{eventErr: store.ErrNotFound}
 	resp, _ := doGet(t, newTestServer(st, nil), "/events/0000000000-0000000000")
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
-}
-
-func TestGetEvent_IncludeXDR(t *testing.T) {
-	st := &stubStore{event: store.Event{
-		ID:          "0000000000-0000000001",
-		RawTopicXDR: []string{"topic-xdr"},
-		RawValueXDR: "value-xdr",
-	}}
-	s := newTestServer(st, nil)
-
-	resp, body := doGet(t, s, "/events/0000000000-0000000001")
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.NotContains(t, string(body), "topics_xdr")
-	assert.NotContains(t, string(body), "value_xdr")
-
-	resp, body = doGet(t, s, "/events/0000000000-0000000001?include_xdr=true")
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var out struct {
-		TopicsXDR []string `json:"topics_xdr"`
-		ValueXDR  *string  `json:"value_xdr"`
-	}
-	require.NoError(t, json.Unmarshal(body, &out))
-	assert.Equal(t, []string{"topic-xdr"}, out.TopicsXDR)
-	require.NotNil(t, out.ValueXDR)
-	assert.Equal(t, "value-xdr", *out.ValueXDR)
 }
 
 func TestContractEvents_ForcesContractFilter(t *testing.T) {
