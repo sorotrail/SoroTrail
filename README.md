@@ -225,6 +225,46 @@ events have been proven to match a fresh RPC fetch by the auditor. When
 `AUDIT_ENABLED=false` it stays at `0`. See the Data integrity section
 below for the contract the field implies.
 
+### `GET /events/ws` (WebSocket live stream)
+
+Pushes ingested events to the client over a single WebSocket connection
+as soon as they are written to the store. There is no replay — the
+stream starts at "now", and the client only sees events the indexer
+ingests after it connects.
+
+Query parameters share the same `EventFilter` shape as `GET /events`
+(`contract_id`, `type`, `topic`, `from_ledger`, `to_ledger`,
+`from_time`, `to_time`), so any filter that works against the query
+API works against the stream.
+
+Frame format:
+
+- One `store.Event` per WebSocket text frame, JSON-encoded.
+- Server-to-client only — clients do not send messages; the `nhooyr.io/websocket`
+  library handles ping/pong internally.
+- The server pings every 30s so proxies don't idle the connection.
+
+Behavior:
+
+- **Slow-consumer eviction**: each subscriber gets a bounded channel
+  buffer (`broadcast.DefaultBufferSize` = 64). A subscriber whose
+  channel fills is evicted silently: its `Events()` channel is closed,
+  the handler returns, and the WebSocket is closed from the server side.
+  This protects the indexer from one stuck client back-pressuring the
+  broadcaster.
+- **Broadcaster unwired**: returns `501 Not Implemented` (only happens
+  if the binary was built without the broadcaster wired).
+- **Bad filter**: returns `400 Bad Request` before the WebSocket
+  upgrade, with the standard `{"error": "..."}` JSON body.
+
+Example with [`websocat`](https://github.com/vi/websocat):
+
+```sh
+websocat 'ws://localhost:8080/events/ws?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic=mint'
+{"id":"…","contract_id":"…","topics":["mint"], …}
+{"id":"…","contract_id":"…","topics":["mint"], …}
+```
+
 ## Data integrity
 
 A background auditor walks recently-ingested ledger ranges (behind the
