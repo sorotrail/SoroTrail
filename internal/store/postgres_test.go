@@ -39,6 +39,31 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
+	// Range partitions created by ensure_event_partitions are DDL, not
+	// data — TRUNCATE below clears rows but leaves them behind. Since
+	// different tests in this package use different partition spans over
+	// overlapping ledger ranges (e.g. span=10 vs the production default
+	// 120960), a partition a prior test left in place can collide with
+	// the one this test's span is about to create ("partition would
+	// overlap partition"). Drop every non-default events_* child first so
+	// each test starts from a clean partition layout.
+	_, err = pool.Exec(context.Background(), `
+		DO $$
+		DECLARE
+		    child text;
+		BEGIN
+		    FOR child IN
+		        SELECT c.relname
+		        FROM pg_inherits i
+		        JOIN pg_class c ON c.oid = i.inhrelid
+		        JOIN pg_class p ON p.oid = i.inhparent
+		        WHERE p.relname = 'events' AND c.relname <> 'events_default'
+		    LOOP
+		        EXECUTE format('DROP TABLE IF EXISTS %I', child);
+		    END LOOP;
+		END $$;`)
+	require.NoError(t, err)
+
 	_, err = pool.Exec(context.Background(),
 		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
 	require.NoError(t, err)
@@ -214,7 +239,10 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		var all []Event
 		cursor := ""
 		for {
-			page, next, err := st.QueryEvents(ctx, EventFilter{Limit: 3, Cursor: cursor})
+			// Bounded to the original 10 events' ledger range so the extra
+			// rows the "topic0 and topic1 positionally" subtest inserts
+			// above (ledgers 200/201) don't inflate this count.
+			page, next, err := st.QueryEvents(ctx, EventFilter{Limit: 3, Cursor: cursor, FromLedger: 101, ToLedger: 110})
 			require.NoError(t, err)
 			all = append(all, page...)
 			if next == "" {
@@ -233,9 +261,11 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		cursor := ""
 		for {
 			page, next, err := st.QueryEvents(ctx, EventFilter{
-				Limit:  3,
-				Cursor: cursor,
-				Order:  "desc",
+				Limit:      3,
+				Cursor:     cursor,
+				Order:      "desc",
+				FromLedger: 101,
+				ToLedger:   110,
 			})
 			require.NoError(t, err)
 			all = append(all, page...)
@@ -319,6 +349,26 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
+	// See testStoreWithPartitionSpan: drop non-default events_* children
+	// left by earlier tests' partition spans before creating our own, or
+	// the narrow span=10 partition below can collide with one of theirs.
+	_, err = pool.Exec(context.Background(), `
+		DO $$
+		DECLARE
+		    child text;
+		BEGIN
+		    FOR child IN
+		        SELECT c.relname
+		        FROM pg_inherits i
+		        JOIN pg_class c ON c.oid = i.inhrelid
+		        JOIN pg_class p ON p.oid = i.inhparent
+		        WHERE p.relname = 'events' AND c.relname <> 'events_default'
+		    LOOP
+		        EXECUTE format('DROP TABLE IF EXISTS %I', child);
+		    END LOOP;
+		END $$;`)
+	require.NoError(t, err)
+
 	st := NewPostgres(pool, 10)
 	ctx := context.Background()
 
@@ -330,6 +380,22 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 
 	sqlRerun := fmt.Sprintf(`
 		ALTER TABLE events RENAME TO events_partitioned;
+		-- Renaming the table doesn't rename its indexes/constraints — their
+		-- names (events_pkey, idx_events_*) are global to the schema and
+		-- still point at events_partitioned. Free them before the plain
+		-- replacement events table below recreates the same names, exactly
+		-- as 0008_partition_events.up.sql does for events_legacy.
+		ALTER TABLE events_partitioned DROP CONSTRAINT IF EXISTS events_pkey CASCADE;
+		DROP INDEX IF EXISTS idx_events_id;
+		DROP INDEX IF EXISTS idx_events_contract_id;
+		DROP INDEX IF EXISTS idx_events_ledger;
+		DROP INDEX IF EXISTS idx_events_contract_ledger;
+		DROP INDEX IF EXISTS idx_events_topics;
+		DROP INDEX IF EXISTS idx_events_created_at;
+		DROP INDEX IF EXISTS idx_events_topic0;
+		DROP INDEX IF EXISTS idx_events_topic1;
+		DROP INDEX IF EXISTS idx_events_topic2;
+		DROP INDEX IF EXISTS idx_events_topic3;
 		CREATE TABLE events (
 			id                 text PRIMARY KEY,
 			contract_id        text NOT NULL,
@@ -374,17 +440,20 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	assert.Equal(t, original.RawTopicXDR, got.RawTopicXDR)
 	assert.Equal(t, original.RawValueXDR, got.RawValueXDR)
 
-	// 0008's events_default catch-all now holds the row post-re-migrate.
-	// Re-trigger the runtime partition router (this test was created with
-	// st = NewPostgres(pool, 10), so partitionSpan=10) so events_100_109
-	// exists for the to_regclass assertion below. ON CONFLICT
-	// (ledger, id) DO NOTHING leaves the existing events_default row in
-	// place — this is purely about recreating the narrow partition for
-	// the partition-existence check.
-	_, err = st.UpsertEvents(ctx, []Event{original})
+	// 0008's events_default catch-all now holds the migrated row (ledger
+	// 100). Exercise the runtime partition router (this test was created
+	// with st = NewPostgres(pool, 10), so partitionSpan=10) on a ledger
+	// events_default has no rows for yet. Postgres refuses to attach a new
+	// range partition whose bounds already contain rows sitting in the
+	// DEFAULT partition ("updated partition constraint for default
+	// partition would be violated"), so this must be a fresh ledger, not
+	// the just-migrated one — this is purely about proving the narrow
+	// partition gets created post-migration.
+	fresh := testEvent(eventID(2), 150, contractA)
+	_, err = st.UpsertEvents(ctx, []Event{fresh})
 	require.NoError(t, err)
 
-	partitions, err := pool.Query(ctx, `SELECT to_regclass('events_100_109'), to_regclass('events_110_119')`)
+	partitions, err := pool.Query(ctx, `SELECT to_regclass('events_150_159'), to_regclass('events_160_169')`)
 	require.NoError(t, err)
 	defer partitions.Close()
 	require.True(t, partitions.Next())
