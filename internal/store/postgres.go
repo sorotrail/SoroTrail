@@ -65,9 +65,9 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	batch := &pgx.Batch{}
-	conflict := "ON CONFLICT (id) DO NOTHING"
+	conflict := "ON CONFLICT (ledger, id) DO NOTHING"
 	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
+		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
 			contract_id        = COALESCE(EXCLUDED.contract_id,        events.contract_id),
 			ledger             = COALESCE(EXCLUDED.ledger,             events.ledger),
 			type               = COALESCE(EXCLUDED.type,               events.type),
@@ -78,28 +78,6 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			topics             = COALESCE(EXCLUDED.topics,             events.topics),
 			value              = COALESCE(EXCLUDED.value,              events.value),
 			created_at         = COALESCE(EXCLUDED.created_at,         events.created_at),
-			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr,      events.raw_topic_xdr),
-			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr,      events.raw_value_xdr)`
-	conflict := "ON CONFLICT DO NOTHING"
-	if onUpdate {
-		conflict = `
-		ON CONFLICT (ledger, id) DO UPDATE SET
-			contract_id        = EXCLUDED.contract_id,
-	conflict := "ON CONFLICT (id) DO NOTHING"
-	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
-			contract_id        = EXCLUDED.contract_id,
-			ledger             = EXCLUDED.ledger,
-			type               = EXCLUDED.type,
-			tx_hash            = EXCLUDED.tx_hash,
-			tx_index           = EXCLUDED.tx_index,
-			op_index           = EXCLUDED.op_index,
-			in_successful_call = EXCLUDED.in_successful_call,
-			topics             = EXCLUDED.topics,
-			value              = EXCLUDED.value,
-			created_at         = EXCLUDED.created_at,
-			topics_xdr         = COALESCE(EXCLUDED.topics_xdr, events.topics_xdr),
-			value_xdr          = COALESCE(EXCLUDED.value_xdr, events.value_xdr)`
 			topics_xdr         = COALESCE(EXCLUDED.topics_xdr,         events.topics_xdr),
 			value_xdr          = COALESCE(EXCLUDED.value_xdr,          events.value_xdr)`
 	}
