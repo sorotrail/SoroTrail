@@ -537,23 +537,39 @@ func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (A
 	return s, nil
 }
 
-func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]string, error) {
+func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT contract_id FROM watched_contracts ORDER BY contract_id`)
+		`SELECT contract_id, added_at FROM watched_contracts ORDER BY contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
 	defer rows.Close()
 
-	var ids []string
+	var out []WatchedContract
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var wc WatchedContract
+		if err := rows.Scan(&wc.ContractID, &wc.AddedAt); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		out = append(out, wc)
 	}
-	return ids, rows.Err()
+	return out, rows.Err()
+}
+
+// RemoveWatchedContract stops future ingestion for the given contract by
+// removing its row from watched_contracts. It does NOT delete any event
+// rows already in storage — those remain queryable. ErrNotFound signals a
+// typo so the API can respond 404.
+func (p *Postgres) RemoveWatchedContract(ctx context.Context, contractID string) error {
+	tag, err := p.pool.Exec(ctx,
+		`DELETE FROM watched_contracts WHERE contract_id = $1`, contractID)
+	if err != nil {
+		return fmt.Errorf("removing watched contract: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) error {
