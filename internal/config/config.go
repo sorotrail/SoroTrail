@@ -11,10 +11,23 @@ import (
 	"github.com/caarlos0/env/v11"
 )
 
+// NetworkConfig holds the name and RPC endpoint for one network.
+type NetworkConfig struct {
+	Name   string
+	RPCURL string
+}
+
 // Config holds all runtime configuration. Every field is settable via the
 // environment variable named in its `env` tag; see .env.example for docs.
 type Config struct {
+	// NETWORKS is a comma-separated list of name=url pairs, e.g.
+	// "testnet=https://soroban-testnet.stellar.org,mainnet=https://mainnet.soroban.org".
+	// When set, it takes precedence over RPC_URL.
+	// Backward compat: when NETWORKS is empty, RPC_URL + NETWORK_NAME (default "default")
+	// produce a single-network config.
+	NetworksRaw         string        `env:"NETWORKS"`
 	RPCURL              string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
+	NetworkName         string        `env:"NETWORK_NAME" envDefault:"default"`
 	DatabaseURL         string        `env:"DATABASE_URL"`
 	PollInterval        time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
 	HTTPAddr            string        `env:"HTTP_ADDR" envDefault:":8080"`
@@ -55,6 +68,9 @@ type Config struct {
 	// intermediaries cannot. Defaults to false (the deployment does not
 	// need request-scoped caching).
 	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
+
+	// Networks is the parsed network list, populated by Load. Not read from env.
+	Networks []NetworkConfig
 }
 
 // Load reads configuration from the environment and validates it.
@@ -65,10 +81,83 @@ func Load() (Config, error) {
 	}
 	// env/v11 splits on "," but keeps empty entries and whitespace.
 	cfg.WatchedContracts = cleanContractList(cfg.WatchedContracts)
+
+	// Parse networks: NETWORKS takes precedence, else single network from RPC_URL.
+	if cfg.NetworksRaw != "" {
+		nets, err := parseNetworks(cfg.NetworksRaw)
+		if err != nil {
+			return Config{}, fmt.Errorf("parsing NETWORKS: %w", err)
+		}
+		cfg.Networks = nets
+	} else {
+		cfg.Networks = []NetworkConfig{{Name: cfg.NetworkName, RPCURL: cfg.RPCURL}}
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// parseNetworks parses a comma-separated list of name=url pairs.
+// Splits each pair on the FIRST '=' so URLs containing '=' in query params work.
+func parseNetworks(raw string) ([]NetworkConfig, error) {
+	parts := strings.Split(raw, ",")
+	nets := make([]NetworkConfig, 0, len(parts))
+	seen := map[string]bool{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(part, "=")
+		if idx < 1 {
+			return nil, fmt.Errorf("invalid network entry %q (want name=url)", part)
+		}
+		name := strings.TrimSpace(part[:idx])
+		rpcURL := strings.TrimSpace(part[idx+1:])
+		if name == "" || rpcURL == "" {
+			return nil, fmt.Errorf("invalid network entry %q (name and url required)", part)
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("duplicate network name %q", name)
+		}
+		seen[name] = true
+		nets = append(nets, NetworkConfig{Name: name, RPCURL: rpcURL})
+	}
+	if len(nets) == 0 {
+		return nil, fmt.Errorf("NETWORKS is set but parsed to zero networks")
+	}
+	return nets, nil
+}
+
+// DefaultNetwork returns the sole network name when exactly one is configured,
+// or empty string when multiple are configured (caller must require explicit
+// selection). When zero networks (shouldn't happen after validation) returns "".
+func (c Config) DefaultNetwork() string {
+	if len(c.Networks) == 1 {
+		return c.Networks[0].Name
+	}
+	return ""
+}
+
+// NetworkNames returns all configured network names in order.
+func (c Config) NetworkNames() []string {
+	names := make([]string, len(c.Networks))
+	for i, n := range c.Networks {
+		names[i] = n.Name
+	}
+	return names
+}
+
+// NetworkByURL returns the network name for the given RPC URL, or empty string.
+func (c Config) NetworkByURL(rpcURL string) string {
+	for _, n := range c.Networks {
+		if n.RPCURL == rpcURL {
+			return n.Name
+		}
+	}
+	return ""
 }
 
 // Validate checks the configuration for values that would fail at runtime.
@@ -76,9 +165,14 @@ func (c Config) Validate() error {
 	if c.DatabaseURL == "" {
 		return fmt.Errorf("DATABASE_URL is required")
 	}
-	u, err := url.Parse(c.RPCURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("RPC_URL %q is not a valid URL", c.RPCURL)
+	if len(c.Networks) == 0 {
+		return fmt.Errorf("at least one network must be configured")
+	}
+	for _, n := range c.Networks {
+		u, err := url.Parse(n.RPCURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("network %q RPC URL %q is not a valid URL", n.Name, n.RPCURL)
+		}
 	}
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("POLL_INTERVAL must be positive, got %s", c.PollInterval)

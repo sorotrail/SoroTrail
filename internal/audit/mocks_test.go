@@ -232,7 +232,7 @@ func (m *mockStore) LedgerRangeCensus(_ context.Context, from, to int64, idsOnly
 	return out, nil
 }
 
-func (m *mockStore) GetIngestionState(context.Context) (store.IngestionState, error) {
+func (m *mockStore) GetIngestionState(_ context.Context, _ string) (store.IngestionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.ingestionState == nil {
@@ -249,7 +249,7 @@ func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState
 	return nil
 }
 
-func (m *mockStore) GetAuditState(context.Context) (store.AuditState, error) {
+func (m *mockStore) GetAuditState(_ context.Context, _ string) (store.AuditState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.auditState == nil {
@@ -266,7 +266,7 @@ func (m *mockStore) SaveAuditState(_ context.Context, s store.AuditState) error 
 	return nil
 }
 
-func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, ledger int64) (store.AuditState, error) {
+func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, _ string, ledger int64) (store.AuditState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.auditState == nil {
@@ -278,11 +278,11 @@ func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, ledger int64) (st
 	return *m.auditState, nil
 }
 
-func (m *mockStore) ListWatchedContracts(context.Context) ([]string, error) {
+func (m *mockStore) ListWatchedContracts(_ context.Context, _ string) ([]string, error) {
 	return m.watched, nil
 }
 
-func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
+func (m *mockStore) AddWatchedContract(_ context.Context, _ string, id string) error {
 	m.watched = append(m.watched, id)
 	return nil
 }
@@ -311,7 +311,7 @@ func (m *mockStore) UpdateAuditFinding(_ context.Context, f store.AuditFinding) 
 	return store.ErrNotFound
 }
 
-func (m *mockStore) ListOpenFindingsByRange(_ context.Context, from, to int64) (store.AuditFinding, error) {
+func (m *mockStore) ListOpenFindingsByRange(_ context.Context, _ string, from, to int64) (store.AuditFinding, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i := len(m.findings) - 1; i >= 0; i-- {
@@ -326,7 +326,7 @@ func (m *mockStore) ListOpenFindingsByRange(_ context.Context, from, to int64) (
 	return store.AuditFinding{}, store.ErrNotFound
 }
 
-func (m *mockStore) Stats(context.Context) (store.Stats, error) {
+func (m *mockStore) Stats(_ context.Context, _ string) (store.Stats, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var s store.Stats

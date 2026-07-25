@@ -33,6 +33,10 @@ type Options struct {
 	// list needs more than one getEvents request (see buildFilterBatches).
 	// Default 1000 ledgers.
 	SweepWindow uint32
+	// Network is the logical network name this ingester is responsible for
+	// (e.g. "testnet", "mainnet"). Every stored event and state row is
+	// tagged with this value.
+	Network string
 }
 
 func (o *Options) applyDefaults() {
@@ -77,6 +81,9 @@ func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger
 	return &Ingester{client: client, store: st, decoder: dec, log: log, opts: opts}
 }
 
+// Network returns the network name this ingester is responsible for.
+func (ing *Ingester) Network() string { return ing.opts.Network }
+
 // SetNotifier attaches an optional EventNotifier that is called after
 // every successful event persistence. When nil (the default) no
 // notification is sent — the ingester behaves exactly as before.
@@ -104,7 +111,7 @@ func (ing *Ingester) Run(ctx context.Context) error {
 			// Jittered exponential backoff so restarts don't thundering-herd
 			// a shared endpoint.
 			sleep := backoff/2 + rand.N(backoff/2)
-			ing.log.Error("ingestion pass failed", "error", err, "retry_in", sleep)
+			ing.log.Error("ingestion pass failed", "network", ing.opts.Network, "error", err, "retry_in", sleep)
 			if !sleepCtx(ctx, sleep) {
 				return ctx.Err()
 			}
@@ -167,6 +174,7 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 		// hold position rather than regressing to a cold start.
 		state.LastIngestedLedger = int64(startLedger) - 1
 	}
+	state.Network = ing.opts.Network
 	if err := ing.store.SaveIngestionState(ctx, state); err != nil {
 		return false, err
 	}
@@ -187,7 +195,7 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 // may legitimately spill past the requested end.
 func (ing *Ingester) ReingestRange(ctx context.Context, client rpc.Client, fromLedger, toLedger uint32) (int, error) {
 	if fromLedger > toLedger {
-		return 0, fmt.Errorf("ReingestRange: from %d > to %d", fromLedger, toLedger)
+		return 0, fmt.Errorf("ReingestRange: from %d > %d", fromLedger, toLedger)
 	}
 	if client == nil {
 		client = ing.client
@@ -357,7 +365,10 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	if end >= health.LatestLedger {
 		lastIngested = int64(end) - 1
 	}
-	err = ing.store.SaveIngestionState(ctx, store.IngestionState{LastIngestedLedger: lastIngested})
+	err = ing.store.SaveIngestionState(ctx, store.IngestionState{
+		Network:            ing.opts.Network,
+		LastIngestedLedger: lastIngested,
+	})
 	if err != nil {
 		return false, err
 	}
@@ -381,6 +392,7 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		return err
 	}
 	ing.log.Info("ingested events",
+		"network", ing.opts.Network,
 		"count", len(events), "new", inserted,
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
 		"latest_ledger", latestLedger)
@@ -400,7 +412,7 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 // (mid-pagination), the ledger after the last ingested one (warm start), or
 // latest-minus-retention (cold start).
 func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, cursor string, err error) {
-	state, err := ing.store.GetIngestionState(ctx)
+	state, err := ing.store.GetIngestionState(ctx, ing.opts.Network)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return 0, "", err
 	}
@@ -426,7 +438,7 @@ func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, c
 	if start < 2 {
 		start = 2 // ledger 1 predates any events; the RPC rejects 0
 	}
-	ing.log.Info("cold start", "start_ledger", start, "latest_ledger", health.LatestLedger)
+	ing.log.Info("cold start", "network", ing.opts.Network, "start_ledger", start, "latest_ledger", health.LatestLedger)
 	return uint32(start), "", nil
 }
 
@@ -439,8 +451,9 @@ func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) erro
 		return fmt.Errorf("getHealth while re-clamping: %w", err)
 	}
 	ing.log.Warn("resume ledger fell outside RPC retention window; skipping ahead — events in the gap are lost",
-		"requested_ledger", requested, "oldest_retained", health.OldestLedger)
+		"network", ing.opts.Network, "requested_ledger", requested, "oldest_retained", health.OldestLedger)
 	return ing.store.SaveIngestionState(ctx, store.IngestionState{
+		Network:            ing.opts.Network,
 		LastIngestedLedger: int64(health.OldestLedger) - 1,
 	})
 }
@@ -451,7 +464,7 @@ func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) erro
 // lists spill into additional batches, each requiring its own request chain.
 // An empty watch list means one type-only filter, i.e. all contract events.
 func (ing *Ingester) buildFilterBatches(ctx context.Context) ([][]rpc.EventFilter, error) {
-	watched, err := ing.store.ListWatchedContracts(ctx)
+	watched, err := ing.store.ListWatchedContracts(ctx, ing.opts.Network)
 	if err != nil {
 		return nil, err
 	}
@@ -492,6 +505,7 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 		Topics:           topics,
 		Value:            value,
 		CreatedAt:        createdAt,
+		Network:          ing.opts.Network,
 		// Keep the raw XDR so `sorotrail replay` can re-decode this event
 		// with a future decoder. Empty when the RPC delivered JSON directly
 		// (xdrFormat "json") — there is no XDR to keep in that case, and

@@ -99,9 +99,6 @@ func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) 
 	return e, nil
 }
 
-// EventExists is the cheap existence probe added to the Store interface
-// for the API's 304 path. Unused by ingester tests but needed to
-// satisfy the interface.
 func (m *mockStore) EventExists(_ context.Context, id string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -113,24 +110,20 @@ func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Eve
 	return nil, "", nil
 }
 
-// LedgerRangeCensus is unused by ingester tests but needed to satisfy
-// the expanded store.Store interface.
 func (m *mockStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]store.LedgerCensus, error) {
 	return nil, nil
 }
 
-// GetAuditState / SaveAuditState are unused by ingester tests.
-func (m *mockStore) GetAuditState(context.Context) (store.AuditState, error) {
+func (m *mockStore) GetAuditState(_ context.Context, _ string) (store.AuditState, error) {
 	return store.AuditState{}, store.ErrNotFound
 }
-func (m *mockStore) SaveAuditState(_ context.Context, s store.AuditState) error {
+func (m *mockStore) SaveAuditState(_ context.Context, _ store.AuditState) error {
 	return nil
 }
-func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, ledger int64) (store.AuditState, error) {
+func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, _ string, ledger int64) (store.AuditState, error) {
 	return store.AuditState{VerifiedThroughLedger: ledger}, nil
 }
 
-// Record/Update/ListOpenFindings are unused by ingester tests.
 func (m *mockStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) (store.AuditFinding, error) {
 	f.ID = 1
 	return f, nil
@@ -138,11 +131,11 @@ func (m *mockStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) 
 func (m *mockStore) UpdateAuditFinding(context.Context, store.AuditFinding) error {
 	return nil
 }
-func (m *mockStore) ListOpenFindingsByRange(context.Context, int64, int64) (store.AuditFinding, error) {
+func (m *mockStore) ListOpenFindingsByRange(_ context.Context, _ string, _, _ int64) (store.AuditFinding, error) {
 	return store.AuditFinding{}, store.ErrNotFound
 }
 
-func (m *mockStore) GetIngestionState(context.Context) (store.IngestionState, error) {
+func (m *mockStore) GetIngestionState(_ context.Context, _ string) (store.IngestionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.state == nil {
@@ -158,17 +151,19 @@ func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState
 	return nil
 }
 
-func (m *mockStore) ListWatchedContracts(context.Context) ([]string, error) {
+func (m *mockStore) ListWatchedContracts(_ context.Context, _ string) ([]string, error) {
 	return m.watched, nil
 }
 
-func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
+func (m *mockStore) AddWatchedContract(_ context.Context, _ string, id string) error {
 	m.watched = append(m.watched, id)
 	return nil
 }
 
-func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
-func (m *mockStore) Ping(context.Context) error                 { return nil }
+func (m *mockStore) Stats(_ context.Context, _ string) (store.Stats, error) {
+	return store.Stats{}, nil
+}
+func (m *mockStore) Ping(context.Context) error { return nil }
 
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound

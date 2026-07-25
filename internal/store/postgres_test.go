@@ -45,6 +45,8 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	return NewPostgres(pool, span)
 }
 
+const defaultNetwork = "default"
+
 func testEvent(id string, ledger int64, contractID string) Event {
 	return Event{
 		ID:               id,
@@ -55,6 +57,7 @@ func testEvent(id string, ledger int64, contractID string) Event {
 		InSuccessfulCall: true,
 		Topics:           json.RawMessage(`[{"symbol":"transfer"},{"u64":7}]`),
 		Value:            json.RawMessage(`{"i128":"1000"}`),
+		Network:          defaultNetwork,
 	}
 }
 
@@ -367,13 +370,13 @@ func TestIngestionStateRoundTrip(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 
-	_, err := st.GetIngestionState(ctx)
+	_, err := st.GetIngestionState(ctx, defaultNetwork)
 	assert.ErrorIs(t, err, ErrNotFound, "fresh database has no state")
 
-	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 42, LastCursor: "c1"}))
-	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 43}))
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{Network: defaultNetwork, LastIngestedLedger: 42, LastCursor: "c1"}))
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{Network: defaultNetwork, LastIngestedLedger: 43}))
 
-	got, err := st.GetIngestionState(ctx)
+	got, err := st.GetIngestionState(ctx, defaultNetwork)
 	require.NoError(t, err)
 	assert.Equal(t, int64(43), got.LastIngestedLedger)
 	assert.Empty(t, got.LastCursor, "state is a single row, fully replaced")
@@ -383,11 +386,11 @@ func TestWatchedContracts(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 
-	require.NoError(t, st.AddWatchedContract(ctx, contractA))
-	require.NoError(t, st.AddWatchedContract(ctx, contractA), "re-adding is a no-op")
-	require.NoError(t, st.AddWatchedContract(ctx, contractB))
+	require.NoError(t, st.AddWatchedContract(ctx, defaultNetwork, contractA))
+	require.NoError(t, st.AddWatchedContract(ctx, defaultNetwork, contractA), "re-adding is a no-op")
+	require.NoError(t, st.AddWatchedContract(ctx, defaultNetwork, contractB))
 
-	got, err := st.ListWatchedContracts(ctx)
+	got, err := st.ListWatchedContracts(ctx, defaultNetwork)
 	require.NoError(t, err)
 	assert.Equal(t, []string{contractA, contractB}, got)
 }
@@ -401,10 +404,10 @@ func TestStats(t *testing.T) {
 		testEvent(eventID(2), 101, contractB),
 	})
 	require.NoError(t, err)
-	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 101}))
-	require.NoError(t, st.AddWatchedContract(ctx, contractA))
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{Network: defaultNetwork, LastIngestedLedger: 101}))
+	require.NoError(t, st.AddWatchedContract(ctx, defaultNetwork, contractA))
 
-	stats, err := st.Stats(ctx)
+	stats, err := st.Stats(ctx, defaultNetwork)
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), stats.TotalEvents)
 	assert.Equal(t, int64(101), stats.LastIngestedLedger)

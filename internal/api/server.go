@@ -53,18 +53,30 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store    store.Store
-	rpc      rpc.Client
-	enricher Enricher
-	log      *slog.Logger
-	limiter  *RateLimiter
-	bcast    *broadcast.Broadcaster
+	store          store.Store
+	rpc            rpc.Client
+	enricher       Enricher
+	log            *slog.Logger
+	limiter        *RateLimiter
+	bcast          *broadcast.Broadcaster
+	defaultNetwork string   // empty when multiple networks configured
+	networkNames   []string // all configured network names
 }
 
 // New builds the API server. rpcClient is only used by /health.
 // enricher is optional — pass nil to disable spec decoding.
-func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log}
+// defaultNetwork is the sole network name when exactly one is configured;
+// when empty, the ?network= query param is required on scoped endpoints.
+func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, networkNames []string, enricher ...Enricher) *Server {
+	s := &Server{
+		store:        st,
+		rpc:          rpcClient,
+		log:          log,
+		networkNames: networkNames,
+	}
+	if len(networkNames) == 1 {
+		s.defaultNetwork = networkNames[0]
+	}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}

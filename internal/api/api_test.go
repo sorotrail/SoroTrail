@@ -57,13 +57,13 @@ func (s *stubStore) ReplaceEventsInRange(context.Context, []store.Event, int64, 
 func (s *stubStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]store.LedgerCensus, error) {
 	return nil, nil
 }
-func (s *stubStore) GetAuditState(context.Context) (store.AuditState, error) {
+func (s *stubStore) GetAuditState(_ context.Context, _ string) (store.AuditState, error) {
 	return store.AuditState{}, store.ErrNotFound
 }
-func (s *stubStore) SaveAuditState(context.Context, store.AuditState) error {
+func (s *stubStore) SaveAuditState(_ context.Context, _ store.AuditState) error {
 	return nil
 }
-func (s *stubStore) SaveAuditStateIfGreater(_ context.Context, ledger int64) (store.AuditState, error) {
+func (s *stubStore) SaveAuditStateIfGreater(_ context.Context, _ string, ledger int64) (store.AuditState, error) {
 	return store.AuditState{VerifiedThroughLedger: ledger}, nil
 }
 func (s *stubStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) (store.AuditFinding, error) {
@@ -73,7 +73,7 @@ func (s *stubStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) 
 func (s *stubStore) UpdateAuditFinding(context.Context, store.AuditFinding) error {
 	return nil
 }
-func (s *stubStore) ListOpenFindingsByRange(context.Context, int64, int64) (store.AuditFinding, error) {
+func (s *stubStore) ListOpenFindingsByRange(_ context.Context, _ string, _, _ int64) (store.AuditFinding, error) {
 	return store.AuditFinding{}, store.ErrNotFound
 }
 
@@ -99,12 +99,12 @@ func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
 // GetIngestionState backs the list-cache frontier lookup. Tests stage
 // LastIngestedLedger to drive the boundary decisions (just-below, at,
 // and above the frontier).
-func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, error) {
+func (s *stubStore) GetIngestionState(_ context.Context, _ string) (store.IngestionState, error) {
 	return s.ingestion, s.ingestionErr
 }
 
-func (s *stubStore) Stats(context.Context) (store.Stats, error) { return s.stats, nil }
-func (s *stubStore) Ping(context.Context) error                 { return s.pingErr }
+func (s *stubStore) Stats(_ context.Context, _ string) (store.Stats, error) { return s.stats, nil }
+func (s *stubStore) Ping(context.Context) error                             { return s.pingErr }
 
 // Subscription stubs for the webhook feature.
 func (s *stubStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
@@ -135,6 +135,12 @@ func (s *stubStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
+func (s *stubStore) ListWatchedContracts(_ context.Context, _ string) ([]string, error) {
+	return nil, nil
+}
+func (s *stubStore) AddWatchedContract(_ context.Context, _ string, _ string) error {
+	return nil
+}
 
 type stubRPC struct {
 	rpc.Client
@@ -151,7 +157,7 @@ func newTestServer(st *stubStore, rc *stubRPC) *Server {
 	if rc == nil {
 		rc = &stubRPC{health: rpc.Health{Status: "healthy"}}
 	}
-	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), []string{"testnet"})
 }
 
 func doGet(t *testing.T, s *Server, path string) (*http.Response, []byte) {
@@ -182,6 +188,8 @@ func TestListEvents_ParsesFilters(t *testing.T) {
 	assert.JSONEq(t, `{"symbol":"transfer"}`, string(st.lastFilter.Topic))
 	assert.Equal(t, "2026-07-21T00:00:00Z", st.lastFilter.FromTime.Format(time.RFC3339))
 	assert.Equal(t, "2026-07-22T00:00:00Z", st.lastFilter.ToTime.Format(time.RFC3339))
+	// Default network is set when only one network configured.
+	assert.Equal(t, "testnet", st.lastFilter.Network)
 }
 
 func TestListEvents_BareTopicBecomesJSONString(t *testing.T) {

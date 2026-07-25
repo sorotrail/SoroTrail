@@ -107,7 +107,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
-	filter, err := filterFromQuery(r)
+	filter, err := s.filterFromQuery(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -116,7 +116,7 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
-	filter, err := filterFromQuery(r)
+	filter, err := s.filterFromQuery(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -224,9 +224,14 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 // Stats summarizes what the indexer has stored plus, when the auditor is
 // running, the post-processing counters it has accumulated.
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.store.Stats(r.Context())
+	network, err := s.resolveNetwork(r)
 	if err != nil {
-		s.log.Error("loading stats", "error", err)
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	stats, err := s.store.Stats(r.Context(), network)
+	if err != nil {
+		s.log.Error("loading stats", "network", network, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
 	}
@@ -268,7 +273,7 @@ func (s *Server) listCachePolicy(ctx context.Context, filter store.EventFilter) 
 	if filter.ToLedger <= 0 {
 		return cacheNoCache, "", nil
 	}
-	frontier, err := s.lastIngestedLedger(ctx)
+	frontier, err := s.lastIngestedLedger(ctx, filter.Network)
 	if err != nil {
 		return cacheNoCache, "", err
 	}
@@ -289,8 +294,8 @@ func (s *Server) listCachePolicy(ctx context.Context, filter store.EventFilter) 
 // to_ledger is "not strictly below" and the caller returns no-cache.
 // This is conservative on the safe side: nothing gets the immutable
 // header until at least one ledger is ingested.
-func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
-	state, err := s.store.GetIngestionState(ctx)
+func (s *Server) lastIngestedLedger(ctx context.Context, network string) (int64, error) {
+	state, err := s.store.GetIngestionState(ctx, network)
 	if errors.Is(err, store.ErrNotFound) {
 		return 0, nil
 	}
@@ -298,6 +303,26 @@ func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	return state.LastIngestedLedger, nil
+}
+
+// resolveNetwork returns the network to use for the current request.
+// When exactly one network is configured, it's used as the default.
+// When multiple networks are configured, the ?network= query param
+// is required and must match a configured network.
+func (s *Server) resolveNetwork(r *http.Request) (string, error) {
+	q := r.URL.Query().Get("network")
+	if q == "" {
+		if s.defaultNetwork != "" {
+			return s.defaultNetwork, nil
+		}
+		return "", fmt.Errorf("network query parameter is required when multiple networks are configured; available: %s", strings.Join(s.networkNames, ", "))
+	}
+	for _, n := range s.networkNames {
+		if n == q {
+			return q, nil
+		}
+	}
+	return "", fmt.Errorf("unknown network %q; available: %s", q, strings.Join(s.networkNames, ", "))
 }
 
 // listETag is the strong validator for a list call. The frontier is
@@ -319,9 +344,14 @@ func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
 // store's pagination rules and we re-verify by test.
 func listETag(f store.EventFilter) string {
 	key := struct {
+		Network    string          `json:"n,omitempty"`
 		ContractID string          `json:"c"`
 		Type       string          `json:"t"`
 		Topic      json.RawMessage `json:"p,omitempty"`
+		Topic0     json.RawMessage `json:"p0,omitempty"`
+		Topic1     json.RawMessage `json:"p1,omitempty"`
+		Topic2     json.RawMessage `json:"p2,omitempty"`
+		Topic3     json.RawMessage `json:"p3,omitempty"`
 		FromLedger int64           `json:"fl"`
 		ToLedger   int64           `json:"tl"`
 		FromTime   string          `json:"ft,omitempty"`
@@ -330,9 +360,14 @@ func listETag(f store.EventFilter) string {
 		Limit      int             `json:"l"`
 		Order      string          `json:"o,omitempty"`
 	}{
+		Network:    f.Network,
 		ContractID: f.ContractID,
 		Type:       f.Type,
 		Topic:      f.Topic,
+		Topic0:     f.Topic0,
+		Topic1:     f.Topic1,
+		Topic2:     f.Topic2,
+		Topic3:     f.Topic3,
 		FromLedger: f.FromLedger,
 		ToLedger:   f.ToLedger,
 		FromTime:   timeOrEmpty(f.FromTime),
@@ -452,10 +487,17 @@ func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 }
 
 // filterFromQuery parses the shared event-filter query params:
-// contract_id, type, topic, from_ledger, to_ledger, from_time, to_time, cursor, limit.
-func filterFromQuery(r *http.Request) (store.EventFilter, error) {
+// network, contract_id, type, topic, from_ledger, to_ledger, from_time, to_time, cursor, limit.
+func (s *Server) filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	q := r.URL.Query()
+
+	network, err := s.resolveNetwork(r)
+	if err != nil {
+		return store.EventFilter{}, err
+	}
+
 	f := store.EventFilter{
+		Network:    network,
 		ContractID: q.Get("contract_id"),
 		Cursor:     q.Get("cursor"),
 	}
@@ -494,47 +536,49 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("invalid order %q (want asc or desc)", order)
 	}
 
-	var err error
+	var err2 error
 	if topic := q.Get("topic"); topic != "" {
-		parsed, err := parseTopic("topic", topic)
-		if err != nil {
-			return f, err
+		parsed, parseErr := parseTopic("topic", topic)
+		if parseErr != nil {
+			return f, parseErr
 		}
 		f.Topic = parsed
 	}
 
-	if f.Topic0, err = parseTopic("topic0", q.Get("topic0")); err != nil {
-		return f, err
+	if f.Topic0, err2 = parseTopic("topic0", q.Get("topic0")); err2 != nil {
+		return f, err2
 	}
-	if f.Topic1, err = parseTopic("topic1", q.Get("topic1")); err != nil {
-		return f, err
+	if f.Topic1, err2 = parseTopic("topic1", q.Get("topic1")); err2 != nil {
+		return f, err2
 	}
-	if f.Topic2, err = parseTopic("topic2", q.Get("topic2")); err != nil {
-		return f, err
+	if f.Topic2, err2 = parseTopic("topic2", q.Get("topic2")); err2 != nil {
+		return f, err2
 	}
-	if f.Topic3, err = parseTopic("topic3", q.Get("topic3")); err != nil {
-		return f, err
+	if f.Topic3, err2 = parseTopic("topic3", q.Get("topic3")); err2 != nil {
+		return f, err2
 	}
 
 	if len(f.Topic) > 0 && (len(f.Topic0) > 0 || len(f.Topic1) > 0 || len(f.Topic2) > 0 || len(f.Topic3) > 0) {
 		return f, fmt.Errorf("topic and topic0..topic3 filters cannot be combined")
 	}
 
-	if f.FromLedger, err = parseLedgerParam(q.Get("from_ledger"), "from_ledger"); err != nil {
-		return f, err
+	var ledgerErr error
+	if f.FromLedger, ledgerErr = parseLedgerParam(q.Get("from_ledger"), "from_ledger"); ledgerErr != nil {
+		return f, ledgerErr
 	}
-	if f.ToLedger, err = parseLedgerParam(q.Get("to_ledger"), "to_ledger"); err != nil {
-		return f, err
+	if f.ToLedger, ledgerErr = parseLedgerParam(q.Get("to_ledger"), "to_ledger"); ledgerErr != nil {
+		return f, ledgerErr
 	}
 	if f.FromLedger > 0 && f.ToLedger > 0 && f.FromLedger > f.ToLedger {
 		return f, fmt.Errorf("from_ledger %d is after to_ledger %d", f.FromLedger, f.ToLedger)
 	}
 
-	if f.FromTime, err = parseTimeParam(q.Get("from_time"), "from_time"); err != nil {
-		return f, err
+	var timeErr error
+	if f.FromTime, timeErr = parseTimeParam(q.Get("from_time"), "from_time"); timeErr != nil {
+		return f, timeErr
 	}
-	if f.ToTime, err = parseTimeParam(q.Get("to_time"), "to_time"); err != nil {
-		return f, err
+	if f.ToTime, timeErr = parseTimeParam(q.Get("to_time"), "to_time"); timeErr != nil {
+		return f, timeErr
 	}
 	if !f.FromTime.IsZero() && !f.ToTime.IsZero() && f.FromTime.After(f.ToTime) {
 		return f, fmt.Errorf("from_time %s is after to_time %s",
@@ -584,7 +628,7 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filter, err := filterFromQuery(r)
+	filter, err := s.filterFromQuery(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return

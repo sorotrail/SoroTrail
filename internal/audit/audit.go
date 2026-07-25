@@ -65,6 +65,8 @@ type Options struct {
 	// giant finding — instead the auditor logs and refuses to advance
 	// the high-water mark past them until they resolve. Default 100.
 	FindingMaxLedgers uint32
+	// Network is the logical network name the auditor is responsible for.
+	Network string
 }
 
 // DefaultValues exposes the documented defaults for documentation/tests.
@@ -138,6 +140,9 @@ func New(client rpc.Client, st store.Store, reingest Reingester, log *slog.Logge
 	}
 }
 
+// Network returns the network this auditor is responsible for.
+func (a *Auditor) Network() string { return a.opts.Network }
+
 // Run polls the auditor's pass loop until ctx is canceled. Like the
 // ingester, errors are logged and retried with jittered exponential
 // backoff; the only terminal condition is context cancellation.
@@ -150,7 +155,7 @@ func (a *Auditor) Run(ctx context.Context) error {
 			return ctx.Err()
 		case err != nil:
 			sleep := backoff/2 + rand.N(backoff/2)
-			a.log.Error("audit pass failed", "error", err, "retry_in", sleep)
+			a.log.Error("audit pass failed", "network", a.opts.Network, "error", err, "retry_in", sleep)
 			if !sleepCtx(ctx, sleep) {
 				return ctx.Err()
 			}
@@ -172,11 +177,11 @@ func (a *Auditor) Run(ctx context.Context) error {
 // drive the auditor deterministically without sleeping.
 func (a *Auditor) PassOnce(ctx context.Context) (worked bool, err error) {
 	// 1. Pull state.
-	state, err := a.store.GetAuditState(ctx)
+	state, err := a.store.GetAuditState(ctx, a.opts.Network)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return false, fmt.Errorf("loading audit state: %w", err)
 	}
-	ing, err := a.store.GetIngestionState(ctx)
+	ing, err := a.store.GetIngestionState(ctx, a.opts.Network)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return false, fmt.Errorf("loading ingestion state: %w", err)
 	}
@@ -190,12 +195,13 @@ func (a *Auditor) PassOnce(ctx context.Context) (worked bool, err error) {
 	// LagThreshold ledgers past the verified mark, and the range still
 	// lies within the RPC's retention.
 	if ing.LastIngestedLedger <= 0 {
-		a.log.Debug("audit idle: nothing ingested yet")
+		a.log.Debug("audit idle: nothing ingested yet", "network", a.opts.Network)
 		return false, nil
 	}
 	lag := uint32(ing.LastIngestedLedger - state.VerifiedThroughLedger)
 	if lag < a.opts.LagThreshold {
-		a.log.Debug("audit idle: ingest not far enough ahead", "lag", lag, "threshold", a.opts.LagThreshold)
+		a.log.Debug("audit idle: ingest not far enough ahead",
+			"network", a.opts.Network, "lag", lag, "threshold", a.opts.LagThreshold)
 		return false, nil
 	}
 
@@ -215,7 +221,7 @@ func (a *Auditor) PassOnce(ctx context.Context) (worked bool, err error) {
 			// events from the RPC, which would flag every stored row
 			// as an orphan. Stay paused until ingest catches up.
 			a.log.Debug("audit window below RPC retention; sleeping",
-				"from", from, "oldest_retained", health.OldestLedger)
+				"network", a.opts.Network, "from", from, "oldest_retained", health.OldestLedger)
 			return false, nil
 		}
 		if to > health.OldestLedger+a.opts.LagThreshold {
@@ -224,13 +230,14 @@ func (a *Auditor) PassOnce(ctx context.Context) (worked bool, err error) {
 			to = health.OldestLedger + a.opts.LagThreshold
 			if to < from {
 				a.log.Debug("audit window below RPC retention; sleeping",
-					"from", from, "oldest_retained", health.OldestLedger)
+					"network", a.opts.Network, "from", from, "oldest_retained", health.OldestLedger)
 				return false, nil
 			}
 		}
 	}
 
 	a.log.Info("audit pass starting",
+		"network", a.opts.Network,
 		"from_ledger", from, "to_ledger", to,
 		"ingested_through", ing.LastIngestedLedger,
 		"verified_through", state.VerifiedThroughLedger,
@@ -373,7 +380,7 @@ func (a *Auditor) handleMismatch(ctx context.Context, rpcByLedger map[uint32][]s
 	if mismatchTo-mismatchFrom+1 == a.opts.FindingMaxLedgers &&
 		rangeTo > mismatchTo {
 		a.log.Warn("audit found wide-spread mismatch; bounding finding and holding HWM",
-			"from", mismatchFrom, "to", mismatchTo, "remaining", rangeTo-mismatchTo)
+			"network", a.opts.Network, "from", mismatchFrom, "to", mismatchTo, "remaining", rangeTo-mismatchTo)
 	}
 
 	// Skip opening a finding for a cluster where the RPC and the store
@@ -385,6 +392,7 @@ func (a *Auditor) handleMismatch(ctx context.Context, rpcByLedger map[uint32][]s
 	}
 
 	finding, err := a.store.RecordAuditFinding(ctx, store.AuditFinding{
+		Network:       a.opts.Network,
 		FromLedger:    int64(mismatchFrom),
 		ToLedger:      int64(mismatchTo),
 		ExpectedCount: expected,
@@ -397,6 +405,7 @@ func (a *Auditor) handleMismatch(ctx context.Context, rpcByLedger map[uint32][]s
 	}
 	a.metrics.FindingsOpened++
 	a.log.Warn("audit finding opened",
+		"network", a.opts.Network,
 		"finding_id", finding.ID,
 		"from", mismatchFrom, "to", mismatchTo,
 		"expected", expected, "actual", actual,
@@ -447,6 +456,7 @@ func (a *Auditor) repairFinding(ctx context.Context, f *store.AuditFinding) {
 				f.LastError = ""
 				a.metrics.FindingsRepaired++
 				a.log.Info("audit finding repaired",
+					"network", a.opts.Network,
 					"finding_id", f.ID, "from", f.FromLedger, "to", f.ToLedger,
 					"attempts", f.Attempts)
 				if uerr := a.store.UpdateAuditFinding(ctx, *f); uerr != nil {
@@ -469,6 +479,7 @@ func (a *Auditor) repairFinding(ctx context.Context, f *store.AuditFinding) {
 				f.LastError = err.Error()
 				a.metrics.FindingsUnverifiable++
 				a.log.Warn("audit finding unverifiable (range aged out of RPC retention)",
+					"network", a.opts.Network,
 					"finding_id", f.ID, "from", f.FromLedger, "to", f.ToLedger)
 				if uerr := a.store.UpdateAuditFinding(ctx, *f); uerr != nil {
 					a.log.Error("updating finding", "finding_id", f.ID, "error", uerr)
@@ -482,6 +493,7 @@ func (a *Auditor) repairFinding(ctx context.Context, f *store.AuditFinding) {
 			f.Status = store.FindingUnrecoverable
 			a.metrics.FindingsUnrecoverable++
 			a.log.Error("audit finding unrecoverable after max attempts",
+				"network", a.opts.Network,
 				"finding_id", f.ID, "from", f.FromLedger, "to", f.ToLedger,
 				"attempts", f.Attempts, "last_error", f.LastError)
 			if uerr := a.store.UpdateAuditFinding(ctx, *f); uerr != nil {
@@ -602,7 +614,7 @@ func (a *Auditor) fetchRange(ctx context.Context, from, to uint32) ([]rpc.Event,
 // what's already recorded; the conditional UPDATE on the singleton row
 // makes the operation race-free even if two auditors ever run.
 func (a *Auditor) advanceHWM(ctx context.Context, ledger uint32) error {
-	_, err := a.store.SaveAuditStateIfGreater(ctx, int64(ledger))
+	_, err := a.store.SaveAuditStateIfGreater(ctx, a.opts.Network, int64(ledger))
 	return err
 }
 

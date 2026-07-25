@@ -97,59 +97,96 @@ func run() error {
 
 	st := store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
 	for _, id := range cfg.WatchedContracts {
-		if err := st.AddWatchedContract(ctx, id); err != nil {
-			return err
+		// In multi-network mode, watched contracts apply to all networks.
+		// Contributors: per-network contract lists via WATCHED_CONTRACTS_NETWORKNAME.
+		for _, n := range cfg.Networks {
+			if err := st.AddWatchedContract(ctx, n.Name, id); err != nil {
+				return err
+			}
 		}
 	}
 
-	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
 	// Webhook delivery runs alongside ingestion — the notifier is attached
 	// to the ingester so events flow to subscriber callbacks asynchronously.
 	wh := webhook.NewNotifier(st, log)
 
 	// Wire the spec cache and enricher for spec-decoded event views.
 	specCache := spec.NewCache(st)
-	specFetcher := spec.NewFetcher(rpcClient)
+	// Use the first network's RPC for spec fetching (specs are WASM-hash-keyed
+	// and shared across networks).
+	specFetcher := spec.NewFetcher(rpc.NewHTTPClient(cfg.Networks[0].RPCURL))
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
 	bcast := broadcast.New(broadcast.DefaultBufferSize)
-	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
-		PollInterval:     cfg.PollInterval,
-		StartLedger:      cfg.StartLedger,
-		RetentionLedgers: cfg.RetentionLedgers,
-	}).WithBroadcaster(bcast)
-	ing.SetNotifier(wh)
 
-	// The auditor and its request-rate budget are constructed lazily:
-	// AUDIT_ENABLED=false (the default) means a binary identical to a
-	// pre-audit build, so we skip every allocation.
-	var aud *audit.Auditor
-	if cfg.AuditEnabled {
-		budget, err := rpc.NewBudget(cfg.AuditMaxRPS, cfg.AuditBudgetShare)
-		if err != nil {
-			return err
+	// Fan out: one ingester goroutine per network, each with its own RPC
+	// client and independent state.
+	networkNames := cfg.NetworkNames()
+	errCh := make(chan error, 3+len(cfg.Networks)*2) // generous capacity for all goroutines
+
+	// Start webhook worker pool.
+	go wh.Run(ctx)
+
+	for _, netCfg := range cfg.Networks {
+		netCfg := netCfg // capture for goroutine
+		rpcClient := rpc.NewHTTPClient(netCfg.RPCURL)
+		ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log.With("network", netCfg.Name), ingester.Options{
+			PollInterval:     cfg.PollInterval,
+			StartLedger:      cfg.StartLedger,
+			RetentionLedgers: cfg.RetentionLedgers,
+			Network:          netCfg.Name,
+		}).WithBroadcaster(bcast)
+		ing.SetNotifier(wh)
+
+		go func() {
+			log.Info("ingester starting", "network", netCfg.Name, "rpc_url", netCfg.RPCURL, "poll_interval", cfg.PollInterval)
+			if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("ingester[%s]: %w", netCfg.Name, err)
+			} else {
+				errCh <- nil
+			}
+		}()
+
+		// Per-network auditor.
+		if cfg.AuditEnabled {
+			budget, err := rpc.NewBudget(cfg.AuditMaxRPS, cfg.AuditBudgetShare)
+			if err != nil {
+				return err
+			}
+			auditClient := audit.NewBudgetedClient(rpcClient, budget)
+			aud := audit.New(auditClient, st, ing, log.With("network", netCfg.Name), audit.Options{
+				PollInterval:      cfg.AuditPollInterval,
+				BatchLedgers:      cfg.AuditBatchLedgers,
+				LagThreshold:      cfg.AuditLagThreshold,
+				MaxRepairAttempts: cfg.AuditMaxRepair,
+				FindingMaxLedgers: cfg.AuditFindingMaxLgrs,
+				Network:           netCfg.Name,
+			})
+			// APIs see the first auditor for /stats compatibility.
+			api.SetAuditor(aud)
+
+			go func() {
+				log.Info("auditor starting",
+					"network", netCfg.Name,
+					"budget_share", cfg.AuditBudgetShare,
+					"batch_ledgers", cfg.AuditBatchLedgers,
+					"lag_threshold", cfg.AuditLagThreshold,
+					"max_repair_attempts", cfg.AuditMaxRepair)
+				if err := aud.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					errCh <- fmt.Errorf("auditor[%s]: %w", netCfg.Name, err)
+				} else {
+					errCh <- nil
+				}
+			}()
 		}
-		auditClient := audit.NewBudgetedClient(rpcClient, budget)
-		aud = audit.New(auditClient, st, ing, log, audit.Options{
-			PollInterval:      cfg.AuditPollInterval,
-			BatchLedgers:      cfg.AuditBatchLedgers,
-			LagThreshold:      cfg.AuditLagThreshold,
-			MaxRepairAttempts: cfg.AuditMaxRepair,
-			FindingMaxLedgers: cfg.AuditFindingMaxLgrs,
-		})
-		// Expose the auditor's counters via /stats so operators don't need
-		// to parse logs to see pass/finding rates.
-		api.SetAuditor(aud)
 	}
 
-	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
-	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
-	// its cleanup goroutine is never started.
+	// Per-client HTTP rate limiter.
 	limiter := api.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.RateLimitTrustedProxy)
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpcClient, log, specEnricher).WithBroadcaster(bcast)
+	apiServer := api.New(st, rpc.NewHTTPClient(cfg.Networks[0].RPCURL), log, networkNames, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{
@@ -158,18 +195,6 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	errCh := make(chan error, 4)
-	go func() {
-		go wh.Run(ctx)
-	}()
-	go func() {
-		log.Info("ingester starting", "rpc_url", cfg.RPCURL, "poll_interval", cfg.PollInterval)
-		if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			errCh <- fmt.Errorf("ingester: %w", err)
-		} else {
-			errCh <- nil
-		}
-	}()
 	go func() {
 		log.Info("http api listening", "addr", cfg.HTTPAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -178,26 +203,14 @@ func run() error {
 			errCh <- nil
 		}
 	}()
-	if aud != nil {
-		go func() {
-			log.Info("auditor starting",
-				"budget_share", cfg.AuditBudgetShare,
-				"batch_ledgers", cfg.AuditBatchLedgers,
-				"lag_threshold", cfg.AuditLagThreshold,
-				"max_repair_attempts", cfg.AuditMaxRepair)
-			if err := aud.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				errCh <- fmt.Errorf("auditor: %w", err)
-			} else {
-				errCh <- nil
-			}
-		}()
+
+	// Count expected goroutines that send to errCh.
+	remaining := 1 + len(cfg.Networks) // http server + N ingesters
+	if cfg.AuditEnabled {
+		remaining += len(cfg.Networks) // N auditors
 	}
 
 	var firstErr error
-	remaining := 3 // ingester + http server + webhook
-	if aud != nil {
-		remaining = 4
-	}
 	select {
 	case <-ctx.Done():
 		log.Info("shutdown signal received")

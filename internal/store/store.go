@@ -24,6 +24,10 @@ type Event struct {
 	Value            json.RawMessage `json:"value"`
 	CreatedAt        time.Time       `json:"created_at"`
 
+	// Network is the logical network this event belongs to (e.g. "testnet", "mainnet").
+	// Populated by the ingester; must be set before persistence.
+	Network string `json:"network,omitempty"`
+
 	// RawTopicXDR and RawValueXDR keep the base64 XDR the RPC delivered, so
 	// an improved decoder can re-derive Topics/Value later without the RPC
 	// (see internal/replay). Both are empty when the RPC returned
@@ -87,6 +91,9 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
+	// Network scopes the query to a single network. Required when multiple
+	// networks are configured; defaults to the sole network in single-network mode.
+	Network    string
 	ContractID string
 	Type       string
 	// Topic matches events whose topics array contains this JSON value at any
@@ -109,18 +116,18 @@ type EventFilter struct {
 	Order string
 }
 
-// IngestionState tracks how far ingestion has progressed.
+// IngestionState tracks how far ingestion has progressed for one network.
 type IngestionState struct {
+	Network            string
 	LastIngestedLedger int64
 	LastCursor         string
 	UpdatedAt          time.Time
 }
 
 // AuditState tracks how far the background auditor has verified stored
-// ranges against the RPC. VerifiedThroughLedger is the inclusive highest
-// ledger whose stored events have been proven to match a fresh getEvents
-// fetch.
+// ranges against the RPC for one network.
 type AuditState struct {
+	Network               string
 	VerifiedThroughLedger int64
 	UpdatedAt             time.Time
 }
@@ -148,6 +155,7 @@ const (
 // finding is a tractable repair target.
 type AuditFinding struct {
 	ID              int64
+	Network         string
 	FromLedger      int64
 	ToLedger        int64
 	ExpectedCount   int // RPC event count for [FromLedger, ToLedger]
@@ -237,11 +245,12 @@ type DeliveryAttempt struct {
 // to match a fresh RPC fetch; 0 means no ledger has been verified yet.
 // Auditor counters are filled in by the API layer when an auditor is wired.
 type Stats struct {
-	TotalEvents           int64 `json:"total_events"`
-	LastIngestedLedger    int64 `json:"last_ingested_ledger"`
-	VerifiedThroughLedger int64 `json:"verified_through_ledger"`
-	ContractCount         int64 `json:"contract_count"`
-	WatchedContracts      int64 `json:"watched_contracts"`
+	Network               string `json:"network,omitempty"`
+	TotalEvents           int64  `json:"total_events"`
+	LastIngestedLedger    int64  `json:"last_ingested_ledger"`
+	VerifiedThroughLedger int64  `json:"verified_through_ledger"`
+	ContractCount         int64  `json:"contract_count"`
+	WatchedContracts      int64  `json:"watched_contracts"`
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
@@ -320,6 +329,7 @@ type Store interface {
 	// QueryEvents returns a page of events in ascending ID order, plus a
 	// cursor for the next page ("" when there are no more results).
 	// Default order is ascending (oldest-first) for backward compatibility.
+	// The query is scoped to f.Network when set.
 	QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error)
 	// LedgerRangeCensus returns one LedgerCensus row per ledger in the
 	// inclusive [fromLedger, toLedger] range that contains at least one
@@ -328,20 +338,20 @@ type Store interface {
 	// the cheap path used for the common "all good" verify sweep.
 	LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error)
 
-	GetIngestionState(ctx context.Context) (IngestionState, error)
+	GetIngestionState(ctx context.Context, network string) (IngestionState, error)
 	SaveIngestionState(ctx context.Context, s IngestionState) error
 
-	GetAuditState(ctx context.Context) (AuditState, error)
+	GetAuditState(ctx context.Context, network string) (AuditState, error)
 	SaveAuditState(ctx context.Context, s AuditState) error
 	// SaveAuditStateIfGreater atomically sets verified_through_ledger
 	// only when it is strictly greater than the stored value. Returns the
 	// post-write AuditState (whether or not it was modified). It's an
 	// UPDATE ... WHERE clause, so concurrent auditors can't regress the
 	// HWM even if they race.
-	SaveAuditStateIfGreater(ctx context.Context, ledger int64) (AuditState, error)
+	SaveAuditStateIfGreater(ctx context.Context, network string, ledger int64) (AuditState, error)
 
-	ListWatchedContracts(ctx context.Context) ([]string, error)
-	AddWatchedContract(ctx context.Context, contractID string) error
+	ListWatchedContracts(ctx context.Context, network string) ([]string, error)
+	AddWatchedContract(ctx context.Context, network, contractID string) error
 
 	// RecordAuditFinding persists a new finding (status "open") and
 	// returns it with its assigned ID populated.
@@ -352,7 +362,7 @@ type Store interface {
 	// ListOpenFindingsByRange returns the most recent open finding whose
 	// range contains a single ledger, or ErrNotFound if none. The auditor
 	// uses this to keep working while a finding is being repaired.
-	ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error)
+	ListOpenFindingsByRange(ctx context.Context, network string, fromLedger, toLedger int64) (AuditFinding, error)
 
 	// Subscription CRUD.
 	CreateSubscription(ctx context.Context, s Subscription) (Subscription, error)
@@ -383,6 +393,6 @@ type Store interface {
 	// and contract_id so subsequent lookups avoid an RPC round trip.
 	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
 
-	Stats(ctx context.Context) (Stats, error)
+	Stats(ctx context.Context, network string) (Stats, error)
 	Ping(ctx context.Context) error
 }

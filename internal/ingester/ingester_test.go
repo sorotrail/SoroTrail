@@ -81,7 +81,7 @@ func TestWarmStart_ResumesAfterLastIngestedLedger(t *testing.T) {
 	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{LatestLedger: 1_000}}}
 	st := newMockStore()
 	require.NoError(t, st.SaveIngestionState(context.Background(),
-		store.IngestionState{LastIngestedLedger: 500}))
+		store.IngestionState{Network: "", LastIngestedLedger: 500}))
 	ing := newTestIngester(client, st, Options{})
 
 	_, err := ing.runOnce(context.Background())
@@ -93,7 +93,7 @@ func TestWarmStart_ResumesFromCursor(t *testing.T) {
 	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{LatestLedger: 1_000}}}
 	st := newMockStore()
 	require.NoError(t, st.SaveIngestionState(context.Background(),
-		store.IngestionState{LastIngestedLedger: 500, LastCursor: "cursor-42"}))
+		store.IngestionState{Network: "", LastIngestedLedger: 500, LastCursor: "cursor-42"}))
 	ing := newTestIngester(client, st, Options{})
 
 	_, err := ing.runOnce(context.Background())
@@ -127,7 +127,7 @@ func TestPagination_FullPageKeepsCursorAndContinues(t *testing.T) {
 	caughtUp, err := ing.runOnce(context.Background())
 	require.NoError(t, err)
 	assert.False(t, caughtUp)
-	state, err := st.GetIngestionState(context.Background())
+	state, err := st.GetIngestionState(context.Background(), "")
 	require.NoError(t, err)
 	assert.Equal(t, "cursor-e2", state.LastCursor)
 	assert.Equal(t, int64(101), state.LastIngestedLedger)
@@ -138,7 +138,7 @@ func TestPagination_FullPageKeepsCursorAndContinues(t *testing.T) {
 	assert.Equal(t, "cursor-e2", client.eventsRequests[1].Pagination.Cursor)
 	assert.Len(t, st.events, 3)
 
-	state, err = st.GetIngestionState(context.Background())
+	state, err = st.GetIngestionState(context.Background(), "")
 	require.NoError(t, err)
 	assert.Equal(t, "cursor-e3", state.LastCursor, "caught-up resume prefers the cursor")
 }
@@ -161,7 +161,7 @@ func TestPagination_LegacyPagingTokenFallback(t *testing.T) {
 	caughtUp, err := ing.runOnce(context.Background())
 	require.NoError(t, err)
 	assert.False(t, caughtUp)
-	state, _ := st.GetIngestionState(context.Background())
+	state, _ := st.GetIngestionState(context.Background(), "")
 	assert.Equal(t, "pt-2", state.LastCursor)
 }
 
@@ -178,7 +178,7 @@ func TestIdempotentReIngest(t *testing.T) {
 	require.NoError(t, err)
 	// Reset position so the same page is fetched again.
 	require.NoError(t, st.SaveIngestionState(context.Background(),
-		store.IngestionState{LastIngestedLedger: 99}))
+		store.IngestionState{Network: "", LastIngestedLedger: 99}))
 	_, err = ing.runOnce(context.Background())
 	require.NoError(t, err)
 
@@ -284,7 +284,7 @@ func TestWindowSweep_MultiBatch(t *testing.T) {
 	}
 	assert.Len(t, st.events, 2)
 
-	state, _ := st.GetIngestionState(context.Background())
+	state, _ := st.GetIngestionState(context.Background(), "")
 	assert.Equal(t, int64(1_099), state.LastIngestedLedger)
 	assert.Empty(t, state.LastCursor)
 }
@@ -296,13 +296,13 @@ func TestReclamp_WhenResumePointAgedOut(t *testing.T) {
 	}
 	st := newMockStore()
 	require.NoError(t, st.SaveIngestionState(context.Background(),
-		store.IngestionState{LastIngestedLedger: 100}))
+		store.IngestionState{Network: "", LastIngestedLedger: 100}))
 	ing := newTestIngester(client, st, Options{})
 
 	_, err := ing.runOnce(context.Background())
 	require.NoError(t, err, "aged-out resume point is handled, not fatal")
 
-	state, _ := st.GetIngestionState(context.Background())
+	state, _ := st.GetIngestionState(context.Background(), "")
 	assert.Equal(t, int64(39_999), state.LastIngestedLedger,
 		"next pass resumes from the oldest retained ledger")
 	assert.Empty(t, state.LastCursor)

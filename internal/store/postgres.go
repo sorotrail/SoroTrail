@@ -55,7 +55,7 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
 // ingest, DO NOTHING) and ReplaceEventsInRange (auditor repair, DO UPDATE).
-// Both paths write all 13 columns of the events table so raw_topic_xdr /
+// Both paths write all 14 columns of the events table so raw_topic_xdr /
 // raw_value_xdr are never silently dropped on the way in; a repair that
 // arrives without XDR preserves what was already stored via the coalesce()
 // clauses in the UPDATE branch (`sorotrail replay` relies on that).
@@ -65,19 +65,35 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	batch := &pgx.Batch{}
+	// Build conflict clause based on mode.
+	conflict := `ON CONFLICT (network, ledger, id) DO NOTHING`
+	if onUpdate {
+		conflict = `ON CONFLICT (network, ledger, id) DO UPDATE SET
+			contract_id        = EXCLUDED.contract_id,
+			type               = EXCLUDED.type,
+			tx_hash            = EXCLUDED.tx_hash,
+			tx_index           = EXCLUDED.tx_index,
+			op_index           = EXCLUDED.op_index,
+			in_successful_call  = EXCLUDED.in_successful_call,
+			topics             = EXCLUDED.topics,
+			value              = EXCLUDED.value,
+			created_at         = EXCLUDED.created_at,
+			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+	}
 	sql := `
 		INSERT INTO events
-			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+			(network, id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 			 in_successful_call, topics, value, created_at,
 			 raw_topic_xdr, raw_value_xdr)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		` + conflict
 	for _, e := range events {
-		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
+		// 14 placeholders → 14 args. nullable helpers turn empty raw XDR
 		// into SQL NULL so the column has one representation of "absent"
 		// rather than two.
 		batch.Queue(sql,
-			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+			e.Network, e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
 			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
@@ -139,9 +155,14 @@ func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bo
 // that arrives without any keeps whatever was already stored, so repairing
 // a range never makes its rows unreplayable.
 func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error {
+	if len(events) == 0 {
+		return nil
+	}
 	if err := p.ensureEventPartitions(ctx, events); err != nil {
 		return err
 	}
+	// Need a network for the delete — all events in a batch share the same network.
+	network := events[0].Network
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -152,13 +173,13 @@ func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fro
 	// have preserved raw XDR from, so snapshot it first. A repair fetch that
 	// came back without XDR must not cost surviving events their
 	// replayability (see internal/replay).
-	kept, err := rawXDRInRange(ctx, tx, fromLedger, toLedger)
+	kept, err := rawXDRInRange(ctx, tx, network, fromLedger, toLedger)
 	if err != nil {
 		return err
 	}
 
-	if _, err := tx.Exec(ctx, `DELETE FROM events WHERE ledger BETWEEN $1 AND $2`, fromLedger, toLedger); err != nil {
-		return fmt.Errorf("deleting events in ledger range [%d,%d]: %w", fromLedger, toLedger, err)
+	if _, err := tx.Exec(ctx, `DELETE FROM events WHERE network = $1 AND ledger BETWEEN $2 AND $3`, network, fromLedger, toLedger); err != nil {
+		return fmt.Errorf("deleting events in ledger range [%d,%d] for network %s: %w", fromLedger, toLedger, network, err)
 	}
 
 	if len(events) > 0 {
@@ -191,13 +212,13 @@ type rawXDR struct {
 
 // rawXDRInRange reads the raw XDR currently stored for a ledger range,
 // keyed by event ID, so a delete-and-reinsert repair can put it back.
-func rawXDRInRange(ctx context.Context, tx pgx.Tx, fromLedger, toLedger int64) (map[string]rawXDR, error) {
+func rawXDRInRange(ctx context.Context, tx pgx.Tx, network string, fromLedger, toLedger int64) (map[string]rawXDR, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT id, raw_topic_xdr, raw_value_xdr
 		FROM events
-		WHERE ledger BETWEEN $1 AND $2
+		WHERE network = $1 AND ledger BETWEEN $2 AND $3
 		  AND (raw_topic_xdr IS NOT NULL OR raw_value_xdr IS NOT NULL)`,
-		fromLedger, toLedger)
+		network, fromLedger, toLedger)
 	if err != nil {
 		return nil, fmt.Errorf("reading raw XDR in ledger range [%d,%d]: %w", fromLedger, toLedger, err)
 	}
@@ -283,7 +304,7 @@ func (p *Postgres) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger i
 	return out, rows.Err()
 }
 
-const eventColumns = `id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+const eventColumns = `network, id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 	in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr`
 
 // nullableText and nullableTextArray store empty raw-XDR values as SQL NULL
@@ -348,6 +369,9 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
+	if f.Network != "" {
+		where = append(where, "network = "+arg(f.Network))
+	}
 	if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
@@ -378,9 +402,6 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		where = append(where, "created_at <= "+arg(f.ToTime))
 	}
 
-	// if f.Cursor != "" {
-	// 	where = append(where, "id > "+arg(f.Cursor))
-	// }
 	orderDir := "ASC"
 	cursorOp := ">"
 	if f.Order == "desc" {
@@ -397,7 +418,6 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
 	// Fetch one extra row to know whether a next page exists.
-	// query += " ORDER BY id ASC LIMIT " + arg(limit+1)
 	query += " ORDER BY id " + orderDir + " LIMIT " + arg(limit+1)
 
 	rows, err := p.pool.Query(ctx, query, args...)
@@ -426,29 +446,30 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	return events, next, nil
 }
 
-func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error) {
+func (p *Postgres) GetIngestionState(ctx context.Context, network string) (IngestionState, error) {
 	var s IngestionState
 	err := p.pool.QueryRow(ctx,
-		`SELECT last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE id = 1`,
-	).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.UpdatedAt)
+		`SELECT network, last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE network = $1 AND id = 1`,
+		network,
+	).Scan(&s.Network, &s.LastIngestedLedger, &s.LastCursor, &s.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return IngestionState{}, ErrNotFound
 	}
 	if err != nil {
-		return IngestionState{}, fmt.Errorf("loading ingestion state: %w", err)
+		return IngestionState{}, fmt.Errorf("loading ingestion state for network %s: %w", network, err)
 	}
 	return s, nil
 }
 
 func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) error {
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO ingestion_state (id, last_ingested_ledger, last_cursor, updated_at)
-		VALUES (1, $1, $2, now())
-		ON CONFLICT (id) DO UPDATE SET
+		INSERT INTO ingestion_state (network, id, last_ingested_ledger, last_cursor, updated_at)
+		VALUES ($1, 1, $2, $3, now())
+		ON CONFLICT (network, id) DO UPDATE SET
 			last_ingested_ledger = EXCLUDED.last_ingested_ledger,
 			last_cursor          = EXCLUDED.last_cursor,
 			updated_at           = now()`,
-		s.LastIngestedLedger, s.LastCursor,
+		s.Network, s.LastIngestedLedger, s.LastCursor,
 	)
 	if err != nil {
 		return fmt.Errorf("saving ingestion state: %w", err)
@@ -456,28 +477,29 @@ func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) err
 	return nil
 }
 
-func (p *Postgres) GetAuditState(ctx context.Context) (AuditState, error) {
+func (p *Postgres) GetAuditState(ctx context.Context, network string) (AuditState, error) {
 	var s AuditState
 	err := p.pool.QueryRow(ctx,
-		`SELECT verified_through_ledger, updated_at FROM audit_state WHERE id = 1`,
-	).Scan(&s.VerifiedThroughLedger, &s.UpdatedAt)
+		`SELECT network, verified_through_ledger, updated_at FROM audit_state WHERE network = $1 AND id = 1`,
+		network,
+	).Scan(&s.Network, &s.VerifiedThroughLedger, &s.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuditState{}, ErrNotFound
 	}
 	if err != nil {
-		return AuditState{}, fmt.Errorf("loading audit state: %w", err)
+		return AuditState{}, fmt.Errorf("loading audit state for network %s: %w", network, err)
 	}
 	return s, nil
 }
 
 func (p *Postgres) SaveAuditState(ctx context.Context, s AuditState) error {
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO audit_state (id, verified_through_ledger, updated_at)
-		VALUES (1, $1, now())
-		ON CONFLICT (id) DO UPDATE SET
+		INSERT INTO audit_state (network, id, verified_through_ledger, updated_at)
+		VALUES ($1, 1, $2, now())
+		ON CONFLICT (network, id) DO UPDATE SET
 			verified_through_ledger = EXCLUDED.verified_through_ledger,
 			updated_at              = now()`,
-		s.VerifiedThroughLedger,
+		s.Network, s.VerifiedThroughLedger,
 	)
 	if err != nil {
 		return fmt.Errorf("saving audit state: %w", err)
@@ -485,33 +507,33 @@ func (p *Postgres) SaveAuditState(ctx context.Context, s AuditState) error {
 	return nil
 }
 
-func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (AuditState, error) {
+func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, network string, ledger int64) (AuditState, error) {
 	// Single round trip — the WHERE on the singleton row makes the
 	// upsert no-op when the candidate is not greater than what's stored.
 	row := p.pool.QueryRow(ctx, `
-		INSERT INTO audit_state (id, verified_through_ledger, updated_at)
-		VALUES (1, $1, now())
-		ON CONFLICT (id) DO UPDATE SET
+		INSERT INTO audit_state (network, id, verified_through_ledger, updated_at)
+		VALUES ($1, 1, $2, now())
+		ON CONFLICT (network, id) DO UPDATE SET
 			verified_through_ledger = EXCLUDED.verified_through_ledger,
 			updated_at              = now()
 		WHERE EXCLUDED.verified_through_ledger > audit_state.verified_through_ledger
-		RETURNING verified_through_ledger, updated_at`,
-		ledger,
+		RETURNING network, verified_through_ledger, updated_at`,
+		network, ledger,
 	)
 	var s AuditState
-	if err := row.Scan(&s.VerifiedThroughLedger, &s.UpdatedAt); err != nil {
+	if err := row.Scan(&s.Network, &s.VerifiedThroughLedger, &s.UpdatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Candidate was not greater — return the existing state.
-			return p.GetAuditState(ctx)
+			return p.GetAuditState(ctx, network)
 		}
 		return AuditState{}, fmt.Errorf("saving audit state: %w", err)
 	}
 	return s, nil
 }
 
-func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]string, error) {
+func (p *Postgres) ListWatchedContracts(ctx context.Context, network string) ([]string, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT contract_id FROM watched_contracts ORDER BY contract_id`)
+		`SELECT contract_id FROM watched_contracts WHERE network = $1 ORDER BY contract_id`, network)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
@@ -528,31 +550,33 @@ func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]string, error) {
 	return ids, rows.Err()
 }
 
-func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) error {
+func (p *Postgres) AddWatchedContract(ctx context.Context, network, contractID string) error {
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO watched_contracts (contract_id) VALUES ($1)
-		ON CONFLICT (contract_id) DO NOTHING`, contractID)
+		INSERT INTO watched_contracts (network, contract_id) VALUES ($1, $2)
+		ON CONFLICT (network, contract_id) DO NOTHING`, network, contractID)
 	if err != nil {
 		return fmt.Errorf("adding watched contract: %w", err)
 	}
 	return nil
 }
 
-func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
+func (p *Postgres) Stats(ctx context.Context, network string) (Stats, error) {
 	var s Stats
+	s.Network = network
 	// COUNT(DISTINCT contract_id) scans the contract_id index; fine at MVP
 	// scale. contributors: replace with a maintained summary table if it
 	// becomes a bottleneck on large datasets.
 	err := p.pool.QueryRow(ctx, `
 		SELECT
-			(SELECT count(*) FROM events),
-			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
-			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
-			(SELECT count(DISTINCT contract_id) FROM events),
-			(SELECT count(*) FROM watched_contracts)`,
+			(SELECT count(*) FROM events WHERE network = $1),
+			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state WHERE network = $1),
+			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state WHERE network = $1),
+			(SELECT count(DISTINCT contract_id) FROM events WHERE network = $1),
+			(SELECT count(*) FROM watched_contracts WHERE network = $1)`,
+		network,
 	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.ContractCount, &s.WatchedContracts)
 	if err != nil {
-		return Stats{}, fmt.Errorf("loading stats: %w", err)
+		return Stats{}, fmt.Errorf("loading stats for network %s: %w", network, err)
 	}
 	return s, nil
 }
@@ -593,11 +617,11 @@ func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID str
 func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
 	err := p.pool.QueryRow(ctx, `
 		INSERT INTO audit_findings
-			(from_ledger, to_ledger, expected_count, actual_count,
+			(network, from_ledger, to_ledger, expected_count, actual_count,
 			 missing_ids, status, attempts)
-		VALUES ($1, $2, $3, $4, $5, $6, 0)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 0)
 		RETURNING id, created_at`,
-		f.FromLedger, f.ToLedger, f.ExpectedCount, f.ActualCount,
+		f.Network, f.FromLedger, f.ToLedger, f.ExpectedCount, f.ActualCount,
 		f.MissingIDs, f.Status,
 	).Scan(&f.ID, &f.CreatedAt)
 	if err != nil {
@@ -634,21 +658,22 @@ func (p *Postgres) UpdateAuditFinding(ctx context.Context, f AuditFinding) error
 // ListOpenFindingsByRange returns the most recent finding whose range
 // overlaps [fromLedger, toLedger] and is still in a working state (open
 // or unrecoverable). ErrNotFound means no live finding spans the range.
-func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error) {
+func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, network string, fromLedger, toLedger int64) (AuditFinding, error) {
 	row := p.pool.QueryRow(ctx, `
-		SELECT id, from_ledger, to_ledger, expected_count, actual_count,
+		SELECT id, network, from_ledger, to_ledger, expected_count, actual_count,
 		       missing_ids, status, attempts, last_attempted_at, last_error, created_at
 		FROM audit_findings
-		WHERE status IN ('open', 'unrecoverable')
-		  AND from_ledger <= $2
-		  AND to_ledger   >= $1
+		WHERE network = $1
+		  AND status IN ('open', 'unrecoverable')
+		  AND from_ledger <= $3
+		  AND to_ledger   >= $2
 		ORDER BY id DESC
 		LIMIT 1`,
-		fromLedger, toLedger,
+		network, fromLedger, toLedger,
 	)
 	var f AuditFinding
 	var lastAttempted *time.Time
-	err := row.Scan(&f.ID, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
+	err := row.Scan(&f.ID, &f.Network, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
 		&f.MissingIDs, &f.Status, &f.Attempts, &lastAttempted, &f.LastError, &f.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuditFinding{}, ErrNotFound
@@ -675,7 +700,7 @@ func scanEvent(row pgx.Row) (Event, error) {
 		rawTopics []string
 		rawValue  *string
 	)
-	err := row.Scan(&e.ID, &e.ContractID, &e.Ledger, &e.Type, &e.TxHash,
+	err := row.Scan(&e.Network, &e.ID, &e.ContractID, &e.Ledger, &e.Type, &e.TxHash,
 		&e.TxIndex, &e.OpIndex, &e.InSuccessfulCall, &e.Topics, &e.Value,
 		&e.CreatedAt, &rawTopics, &rawValue)
 	if err != nil {
