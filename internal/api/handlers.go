@@ -73,6 +73,23 @@ type eventsResponse struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
+type eventWithXDR struct {
+	store.Event `json:",inline"`
+	TopicsXDR   []string `json:"topics_xdr,omitempty"`
+	ValueXDR    *string  `json:"value_xdr,omitempty"`
+}
+
+type eventsWithXDRResponse struct {
+	Events []eventWithXDR `json:"events"`
+	Cursor string         `json:"cursor,omitempty"`
+}
+
+type enrichedEventWithXDR struct {
+	eventWithXDR
+	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                        `json:"decoded"`
+}
+
 type enrichedEventsResponse struct {
 	Events []store.EnrichedEvent `json:"events"`
 	// Cursor is non-empty when another page exists.
@@ -160,6 +177,7 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		return
 	}
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
+	includeXDR := r.URL.Query().Get("xdr") == "true"
 	if includeXDR {
 		writeJSON(w, http.StatusOK, eventsWithXDRResponse{
 			Events: eventsWithXDR(events),
@@ -223,6 +241,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+	includeXDR := r.URL.Query().Get("xdr") == "true"
 	if includeXDR {
 		writeJSON(w, http.StatusOK, eventToXDRResponse(event))
 		return

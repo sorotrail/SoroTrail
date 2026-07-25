@@ -114,7 +114,23 @@ func run() error {
 	specFetcher := spec.NewFetcher(rpcClient)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
-	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
+	// Load decoder plugins when a directory is configured.
+	var pluginMgr *plugins.Manager
+	if cfg.DecoderPluginsDir != "" {
+		mgr, err := plugins.NewManager(ctx, cfg.DecoderPluginsDir, plugins.Limits{
+			Timeout:       int64(cfg.PluginTimeoutMS),
+			MemoryMiB:     cfg.PluginMemoryMiB,
+			OutputCap:     cfg.PluginOutputMaxBytes,
+			FailThreshold: cfg.PluginFailThreshold,
+		}, log)
+		if err != nil {
+			return err
+		}
+		defer mgr.Close(ctx)
+		pluginMgr = mgr
+	}
+
+	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, pluginMgr, log, ingester.Options{
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
 		RetentionLedgers: cfg.RetentionLedgers,

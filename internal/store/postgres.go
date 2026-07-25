@@ -55,10 +55,10 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
 // ingest, DO NOTHING) and ReplaceEventsInRange (auditor repair, DO UPDATE).
-// Both paths write all 13 columns of the events table so topics_xdr /
-// value_xdr are never silently dropped on the way in; a repair that
-// arrives without XDR preserves what was already stored via the coalesce()
-// clauses in the UPDATE branch (`sorotrail replay` relies on that).
+// Both paths write all 15 columns of the events table so decoded_payload /
+// decoded_by are never silently dropped on the way in and topics_xdr /
+// value_xdr are preserved via the COALESCE clauses in the UPDATE branch
+// (`sorotrail replay` relies on that).
 //
 // onUpdate=false → ON CONFLICT DO NOTHING (idempotent ingest);
 // onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
@@ -77,38 +77,18 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			in_successful_call = COALESCE(EXCLUDED.in_successful_call, events.in_successful_call),
 			topics             = COALESCE(EXCLUDED.topics,             events.topics),
 			value              = COALESCE(EXCLUDED.value,              events.value),
+			decoded_payload    = COALESCE(EXCLUDED.decoded_payload,    events.decoded_payload),
+			decoded_by         = COALESCE(EXCLUDED.decoded_by,         events.decoded_by),
 			created_at         = COALESCE(EXCLUDED.created_at,         events.created_at),
-			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr,      events.raw_topic_xdr),
-			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr,      events.raw_value_xdr)`
-	conflict := "ON CONFLICT DO NOTHING"
-	if onUpdate {
-		conflict = `
-		ON CONFLICT (ledger, id) DO UPDATE SET
-			contract_id        = EXCLUDED.contract_id,
-	conflict := "ON CONFLICT (id) DO NOTHING"
-	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
-			contract_id        = EXCLUDED.contract_id,
-			ledger             = EXCLUDED.ledger,
-			type               = EXCLUDED.type,
-			tx_hash            = EXCLUDED.tx_hash,
-			tx_index           = EXCLUDED.tx_index,
-			op_index           = EXCLUDED.op_index,
-			in_successful_call = EXCLUDED.in_successful_call,
-			topics             = EXCLUDED.topics,
-			value              = EXCLUDED.value,
-			created_at         = EXCLUDED.created_at,
-			topics_xdr         = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
-			value_xdr          = coalesce(EXCLUDED.value_xdr, events.value_xdr)`
-			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
-			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+			topics_xdr         = COALESCE(EXCLUDED.topics_xdr,         events.topics_xdr),
+			value_xdr          = COALESCE(EXCLUDED.value_xdr,          events.value_xdr)`
 	}
 	sql := `
 		INSERT INTO events
 			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-			 in_successful_call, topics, value, created_at,
-			 topics_xdr, value_xdr)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			 in_successful_call, topics, value, decoded_payload, decoded_by,
+			 created_at, topics_xdr, value_xdr)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		` + conflict
 	for _, e := range events {
 		// decoded_payload and decoded_by are written NULL when the plugin
@@ -116,14 +96,11 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 		// re-ingest that picked up a plugin will not retroactively fill
 		// historical rows — that's expected for v1 (operators run a
 		// backfill script when upgrading).
-		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
-		// into SQL NULL so the column has one representation of "absent"
-		// rather than two.
 		batch.Queue(sql,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value,
 			nullableJSON(e.DecodedPayload), nullableText(e.DecodedBy),
-			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
+			e.CreatedAt,
 			nullableStringSlice(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
 	}
@@ -329,9 +306,8 @@ func (p *Postgres) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger i
 }
 
 const eventColumns = `id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-	in_successful_call, topics, value, decoded_payload, decoded_by, created_at`
-	in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr`
-	in_successful_call, topics, value, created_at, topics_xdr, value_xdr`
+	in_successful_call, topics, value, decoded_payload, decoded_by, created_at,
+	topics_xdr, value_xdr`
 
 // nullableText and nullableStringSlice store empty raw-XDR values as SQL NULL
 // so "no raw XDR" is one representation, not two.
@@ -602,9 +578,6 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
 			(SELECT coalesce(min(ledger), 0) FROM events),
 			(SELECT count(DISTINCT contract_id) FROM events),
-			(SELECT count(*) FROM watched_contracts),
-			(SELECT count(*) FROM events WHERE decoded_payload IS NOT NULL)`,
-	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.ContractCount, &s.WatchedContracts, &s.DecodedEvents)
 			(SELECT count(*) FROM watched_contracts)`,
 	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
 	if err != nil {
@@ -733,8 +706,7 @@ func scanEvent(row pgx.Row) (Event, error) {
 	)
 	err := row.Scan(&e.ID, &e.ContractID, &e.Ledger, &e.Type, &e.TxHash,
 		&e.TxIndex, &e.OpIndex, &e.InSuccessfulCall, &e.Topics, &e.Value,
-		&e.DecodedPayload, &e.DecodedBy, &e.CreatedAt)
-		&e.CreatedAt, &rawTopics, &rawValue)
+		&e.DecodedPayload, &e.DecodedBy, &e.CreatedAt, &rawTopics, &rawValue)
 	if err != nil {
 		return Event{}, err
 	}
@@ -753,11 +725,4 @@ func nullableJSON(b json.RawMessage) any {
 		return nil
 	}
 	return []byte(b)
-}
-
-func nullableText(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
 }

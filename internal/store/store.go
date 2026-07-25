@@ -30,7 +30,6 @@ type Event struct {
 	// DecodedPayload. "" when DecodedPayload is nil.
 	DecodedBy string `json:"decoded_by,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
-	CreatedAt        time.Time       `json:"created_at"`
 
 	// RawTopicXDR and RawValueXDR keep the base64 XDR the RPC delivered, so
 	// an improved decoder can re-derive Topics/Value later without the RPC

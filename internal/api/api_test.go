@@ -96,13 +96,6 @@ func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
 	return s.exists, s.existsErr
 }
 
-func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
-	return nil, store.ErrNotFound
-}
-func (s *stubStore) SetContractSpec(context.Context, string, string, []byte) error {
-	return nil
-}
-
 // GetIngestionState backs the list-cache frontier lookup. Tests stage
 // LastIngestedLedger to drive the boundary decisions (just-below, at,
 // and above the frontier).
