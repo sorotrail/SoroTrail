@@ -577,7 +577,9 @@ in normal operation — so the API serves two distinct cache policies:
   moving ingest frontier: a page whose upper bound (`to_ledger`) sits
   entirely below the last-ingested ledger cannot gain new rows, so the
   response is declared immutable with a strong ETag derived from the
-  filter. Pages that are open-ended (`to_ledger` unset) or have bounds
+  filter — every filter parameter that narrows the result set, so two
+  different queries can never share a validator. Pages that are
+  open-ended (`to_ledger` unset) or have bounds
   at/above the frontier are still growing, so they get
   `Cache-Control: no-cache` — a deliberate "when in doubt, don't
   cache" choice rather than a guess with a short max-age.
