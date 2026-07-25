@@ -6,17 +6,35 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
+
+// decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
+// unknown fields so a typo like {"contractID": "..."} doesn't fall
+// through with an empty contract_id and a confusing 400 from a later
+// check. Returns a typed error string the handler can surface directly.
+func decodeJSONBody(r *http.Request, dst any) error {
+	if r.Body == nil {
+		return errors.New("request body is empty")
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	return nil
+}
 
 // cachePrivate is the package-wide override that flips Cache-Control
 // directives from `public` to `private`. Production code sets it once at
@@ -69,6 +87,12 @@ type errorResponse struct {
 type eventsResponse struct {
 	Events []store.Event `json:"events"`
 	// Cursor is non-empty when another page exists; pass it back as ?cursor=.
+	Cursor string `json:"cursor,omitempty"`
+}
+
+type enrichedEventsResponse struct {
+	Events []store.EnrichedEvent `json:"events"`
+	// Cursor is non-empty when another page exists.
 	Cursor string `json:"cursor,omitempty"`
 }
 
@@ -146,6 +170,12 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
+	decoded := r.URL.Query().Get("decoded") == "true"
+	if decoded && s.enricher != nil {
+		enriched := s.enricher.EnrichEvents(r.Context(), events)
+		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
+		return
+	}
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
 	writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
 }
@@ -194,6 +224,14 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
+	decoded := r.URL.Query().Get("decoded") == "true"
+	if decoded && s.enricher != nil {
+		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
+		if len(enriched) > 0 {
+			writeJSON(w, http.StatusOK, enriched[0])
+			return
+		}
+	}
 	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
 	writeJSON(w, http.StatusOK, event)
 }
@@ -207,6 +245,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
 	}
+	s.addStatsFreshness(r.Context(), &stats)
 	if a := getAuditor(); a != nil {
 		m := a.Metrics()
 		stats.Auditor = store.AuditStats{
@@ -228,6 +267,200 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
+}
+
+// addWatchedRequest is the body for POST /watched-contracts: a single
+// contract ID to add to the runtime watch list.
+type addWatchedRequest struct {
+	ContractID string `json:"contract_id"`
+}
+
+// addWatchedResponse includes the current ingestion cursor so callers
+// know exactly where historical replay starts — events before this ledger
+// are not backfilled by the runtime add (a separate replay tool covers them).
+type addWatchedResponse struct {
+	ContractID        string `json:"contract_id"`
+	AddedAt           string `json:"added_at"`
+	HistoryFromLedger int64  `json:"history_from_ledger"`
+	// ModeTransition is "all_to_specific" when the list was empty before
+	// this add, surfacing the same semantic change the confirm guard
+	// guards. Useful to post-run auditors even when the caller already
+	// confirmed.
+	ModeTransition string `json:"mode_transition,omitempty"`
+}
+
+// removeWatchedResponse explains what removal actually did: stored events
+// are NOT deleted; only future ingestion stops. The message is part of
+// the contract so callers don't have to read the README to find out.
+type removeWatchedResponse struct {
+	ContractID       string `json:"contract_id"`
+	RemovedAt        string `json:"removed_at"`
+	HistoryPreserved bool   `json:"history_preserved"`
+	ModeTransition   string `json:"mode_transition,omitempty"`
+}
+
+// watchedListResponse wraps the GET response in an envelope so the route
+// is easy to extend without breaking JSON shape.
+type watchedListResponse struct {
+	Contracts []store.WatchedContract `json:"contracts"`
+	Count     int                     `json:"count"`
+}
+
+// handleListWatchedChains returns the current watch list in stable
+// (contract_id) order.
+func (s *Server) handleListWatchedChains(w http.ResponseWriter, r *http.Request) {
+	contracts, err := s.store.ListWatchedContracts(r.Context())
+	if err != nil {
+		s.log.Error("listing watched contracts", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
+		return
+	}
+	writeJSON(w, http.StatusOK, watchedListResponse{Contracts: contracts, Count: len(contracts)})
+}
+
+// handleAddWatchedChain adds a contract to the runtime watch list and
+// returns where historical replay for it starts (= the current cursor).
+//
+// Guarded by ?confirm=true when the add would switch the ingester from
+// "all contract events" (empty list) to a specific contract list, since
+// that silently narrows what gets stored going forward.
+//
+// TOCTOU note: the confirm check reads the list and then mutates it
+// without holding a row lock. Two concurrent empty→non-empty POSTs can
+// both pass the guard before either mutates — acceptable because
+// ON CONFLICT DO NOTHING makes a duplicate Add a no-op, and only the
+// first response carries the genuine transition; the second reports one
+// too, but no row state diverges.
+func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
+	var req addWatchedRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if !config.ValidContractID(req.ContractID) {
+		writeError(w, http.StatusBadRequest,
+			fmt.Errorf("invalid contract_id %q (want 56-char C... strkey)", req.ContractID))
+		return
+	}
+
+	current, err := s.store.ListWatchedContracts(r.Context())
+	if err != nil {
+		s.log.Error("listing watched contracts for add", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
+		return
+	}
+
+	modeTransition := ""
+	if len(current) == 0 {
+		// Empty -> non-empty switches the ingester from "all contract
+		// events" to a specific list. The guard exists because the new
+		// filter silently narrows what's indexed going forward — exactly
+		// the kind of change an operator should make on purpose, not by
+		// typo.
+		if r.URL.Query().Get("confirm") != "true" {
+			writeError(w, http.StatusBadRequest, errors.New(
+				"adding the first watched contract would switch ingestion from "+
+					"'all contract events' to a specific list — pass ?confirm=true to acknowledge"))
+			return
+		}
+		modeTransition = "all_to_specific"
+	}
+
+	state, err := s.store.GetIngestionState(r.Context())
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.log.Error("loading ingestion state for add", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading ingestion state failed"))
+		return
+	}
+
+	if err := s.store.AddWatchedContract(r.Context(), req.ContractID); err != nil {
+		s.log.Error("adding watched contract", "contract_id", req.ContractID, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("adding watched contract failed"))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, addWatchedResponse{
+		ContractID:        req.ContractID,
+		AddedAt:           time.Now().UTC().Format(time.RFC3339),
+		HistoryFromLedger: state.LastIngestedLedger,
+		ModeTransition:    modeTransition,
+	})
+}
+
+// handleRemoveWatchedChain stops future ingestion for the named contract
+// without deleting any events already stored. The same empty<->non-empty
+// guard fires when removing the last contract on the list (specific -> all).
+//
+// TOCTOU note: same read-then-write shape as POST — see the comment on
+// handleAddWatchedChain. Two concurrent DELETE/s of the last contract
+// could both pass the guard; only the first actually transitions the
+// list (the second returns ErrNotFound → 404), so no mode claim is wrong.
+func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if !config.ValidContractID(id) {
+		writeError(w, http.StatusBadRequest,
+			fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", id))
+		return
+	}
+
+	current, err := s.store.ListWatchedContracts(r.Context())
+	if err != nil {
+		s.log.Error("listing watched contracts for remove", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
+		return
+	}
+
+	modeTransition := ""
+	if len(current) == 1 && current[0].ContractID == id {
+		// Last contract on the list: removing it flips ingestion from
+		// "specific list" back to "all contract events".
+		if r.URL.Query().Get("confirm") != "true" {
+			writeError(w, http.StatusBadRequest, errors.New(
+				"removing the last watched contract would switch ingestion from "+
+					"'a specific list' back to 'all contract events' — pass ?confirm=true to acknowledge"))
+			return
+		}
+		modeTransition = "specific_to_all"
+	}
+
+	if err := s.store.RemoveWatchedContract(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("contract %q is not in the watch list", id))
+			return
+		}
+		s.log.Error("removing watched contract", "contract_id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("removing watched contract failed"))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, removeWatchedResponse{
+		ContractID:       id,
+		RemovedAt:        time.Now().UTC().Format(time.RFC3339),
+		HistoryPreserved: true,
+		ModeTransition:   modeTransition,
+	})
+}
+
+func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
+	if s.rpc == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	health, err := s.rpc.GetHealth(ctx)
+	if err != nil {
+		s.log.Warn("loading RPC health for stats", "error", err)
+		return
+	}
+	head := int64(health.LatestLedger)
+	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
+	stats.ChainHeadLedger = &head
+	stats.IngestLagLedgers = &lag
+}
+
+func ingestLagLedgers(chainHead, lastIngested int64) int64 {
+	return chainHead - lastIngested
 }
 
 // listCachePolicy decides whether a list page is cacheable as immutable
@@ -448,6 +681,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
 	}
 
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
+	}
+
 	switch t := q.Get("type"); t {
 	case "", "contract", "system", "diagnostic":
 		f.Type = t
@@ -455,19 +692,28 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
 	}
 
-	// topic accepts any JSON value; a bare word like `transfer` is treated
-	// as the JSON string "transfer". Matching is exact against the stored
-	// topic entries, e.g. topic={"symbol":"transfer"} for XDR-decoded rows.
-	if topic := q.Get("topic"); topic != "" {
-		if json.Valid([]byte(topic)) {
-			f.Topic = json.RawMessage(topic)
-		} else {
-			quoted, err := json.Marshal(topic)
-			if err != nil {
-				return f, fmt.Errorf("invalid topic: %w", err)
-			}
-			f.Topic = quoted
+	parseTopic := func(name, raw string) (json.RawMessage, error) {
+		if raw == "" {
+			return nil, nil
 		}
+		if json.Valid([]byte(raw)) {
+			return json.RawMessage(raw), nil
+		}
+		quoted, err := json.Marshal(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s: %w", name, err)
+		}
+		return quoted, nil
+	}
+
+	// topic_contains accepts any valid JSON value and uses @> containment
+	// directly (no automatic array-wrapping). Unlike topic, bare words are
+	// not allowed — the input must be parseable JSON.
+	if raw := q.Get("topic_contains"); raw != "" {
+		if !json.Valid([]byte(raw)) {
+			return f, fmt.Errorf("topic_contains must be valid JSON")
+		}
+		f.TopicContains = json.RawMessage(raw)
 	}
 
 	// order controls sort direction for paginated results.
@@ -480,6 +726,31 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 
 	var err error
+	if topic := q.Get("topic"); topic != "" {
+		parsed, err := parseTopic("topic", topic)
+		if err != nil {
+			return f, err
+		}
+		f.Topic = parsed
+	}
+
+	if f.Topic0, err = parseTopic("topic0", q.Get("topic0")); err != nil {
+		return f, err
+	}
+	if f.Topic1, err = parseTopic("topic1", q.Get("topic1")); err != nil {
+		return f, err
+	}
+	if f.Topic2, err = parseTopic("topic2", q.Get("topic2")); err != nil {
+		return f, err
+	}
+	if f.Topic3, err = parseTopic("topic3", q.Get("topic3")); err != nil {
+		return f, err
+	}
+
+	if len(f.Topic) > 0 && (len(f.Topic0) > 0 || len(f.Topic1) > 0 || len(f.Topic2) > 0 || len(f.Topic3) > 0) {
+		return f, fmt.Errorf("topic and topic0..topic3 filters cannot be combined")
+	}
+
 	if f.FromLedger, err = parseLedgerParam(q.Get("from_ledger"), "from_ledger"); err != nil {
 		return f, err
 	}
@@ -503,10 +774,12 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if raw := q.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
-		if err != nil || limit <= 0 || limit > store.MaxQueryLimit {
+		if err != nil || limit < 1 || limit > store.MaxQueryLimit {
 			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
 		}
 		f.Limit = limit
+	} else {
+		f.Limit = store.DefaultQueryLimit
 	}
 	return f, nil
 }
@@ -536,6 +809,81 @@ func parseTimeParam(raw, name string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("%s sub-second precision is not supported", name)
 	}
 	return t, nil
+}
+
+func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
+	if s.bcast == nil {
+		http.Error(w, "streaming not configured", http.StatusNotImplemented)
+		return
+	}
+
+	filter, err := filterFromQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// InsecureSkipVerify disables WebSocket Origin checking: the WS endpoint
+	// is server-to-client only (no client messages are read), so a forged
+	// Origin header cannot influence what the client sees.
+	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		s.log.Error("websocket accept", "error", err)
+		return
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	sub := s.bcast.Subscribe(filter)
+	defer sub.Close()
+
+	ctx := r.Context()
+
+	// Use CloseRead to get a context cancelled when the client disconnects
+	// and to ensure the library processes control frames (ping/pong/close).
+	ctx = c.CloseRead(ctx)
+
+	// Periodic ping to detect stale connections.
+	pingCtx, pingCancel := context.WithCancel(ctx)
+	defer pingCancel()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pingCtx.Done():
+				return
+			case <-ticker.C:
+				pCtx, cancel := context.WithTimeout(pingCtx, 5*time.Second)
+				err := c.Ping(pCtx)
+				cancel()
+				if err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-sub.Events():
+			if !ok {
+				return
+			}
+			data, err := json.Marshal(ev)
+			if err != nil {
+				s.log.Error("marshal event for ws", "error", err)
+				continue
+			}
+			err = c.Write(ctx, websocket.MessageText, data)
+			if err != nil {
+				return
+			}
+		}
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

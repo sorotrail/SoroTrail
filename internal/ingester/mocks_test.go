@@ -45,12 +45,16 @@ func (m *mockRPC) GetHealth(context.Context) (rpc.Health, error) {
 	return m.health, m.healthErr
 }
 
+func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+	return rpc.GetLedgerEntriesResponse{}, nil
+}
+
 // mockStore is an in-memory Store.
 type mockStore struct {
 	mu       sync.Mutex
 	events   map[string]store.Event
 	state    *store.IngestionState
-	watched  []string
+	watched  []store.WatchedContract
 	upserted [][]store.Event
 }
 
@@ -155,22 +159,61 @@ func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState
 	return nil
 }
 
-func (m *mockStore) ListWatchedContracts(context.Context) ([]string, error) {
+func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return m.watched, nil
 }
 
 func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
-	m.watched = append(m.watched, id)
+	m.watched = append(m.watched, store.WatchedContract{ContractID: id})
 	return nil
+}
+
+func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
+	for i, wc := range m.watched {
+		if wc.ContractID == id {
+			m.watched = append(m.watched[:i], m.watched[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrNotFound
 }
 
 func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
 func (m *mockStore) Ping(context.Context) error                 { return nil }
 
-// DeleteEventsBefore is unused by ingester tests but the pruner extends
-// the store.Store interface, so the mock has to satisfy the contract.
-func (m *mockStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
-	return 0, nil
+func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
+	return nil, store.ErrNotFound
+}
+func (m *mockStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
+
+// Subscription stubs for the webhook feature.
+func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+	sub.ID = 1
+	return sub, nil
+}
+func (m *mockStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
+	return store.Subscription{}, store.ErrNotFound
+}
+func (m *mockStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
+	return nil, nil
+}
+func (m *mockStore) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+	return sub, nil
+}
+func (m *mockStore) DeleteSubscription(context.Context, int64) error { return nil }
+func (m *mockStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
+	return nil, nil
+}
+func (m *mockStore) IncrementSubscriptionFailures(context.Context, int64, int) (int, bool, error) {
+	return 0, false, nil
+}
+func (m *mockStore) ResetSubscriptionFailures(context.Context, int64) error { return nil }
+func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAttempt) (store.DeliveryAttempt, error) {
+	a.ID = 1
+	return a, nil
+}
+func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
+	return nil, nil
 }
 
 // passthroughDecoder avoids XDR fixtures in ingester tests.
