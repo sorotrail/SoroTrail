@@ -14,16 +14,16 @@ import (
 // Config holds all runtime configuration. Every field is settable via the
 // environment variable named in its `env` tag; see .env.example for docs.
 type Config struct {
-	RPCURL              string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
-	RPCURLS             []string      `env:"RPC_URLS"`
-	RPCRateLimitRPS     float64       `env:"RPC_RATE_LIMIT_RPS" envDefault:"10"`
-	DatabaseURL         string        `env:"DATABASE_URL"`
-	PollInterval        time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
-	HTTPAddr            string        `env:"HTTP_ADDR" envDefault:":8080"`
-	WatchedContracts    []string      `env:"WATCHED_CONTRACTS"`
-	StartLedger         uint32        `env:"START_LEDGER"`
-	RetentionLedgers    uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
-	LogLevel            string        `env:"LOG_LEVEL" envDefault:"info"`
+	RPCURL           string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
+	RPCURLS          []string      `env:"RPC_URLS"`
+	RPCRateLimitRPS  float64       `env:"RPC_RATE_LIMIT_RPS" envDefault:"10"`
+	DatabaseURL      string        `env:"DATABASE_URL"`
+	PollInterval     time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
+	HTTPAddr         string        `env:"HTTP_ADDR" envDefault:":8080"`
+	WatchedContracts []string      `env:"WATCHED_CONTRACTS"`
+	StartLedger      uint32        `env:"START_LEDGER"`
+	RetentionLedgers uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
+	LogLevel         string        `env:"LOG_LEVEL" envDefault:"info"`
 
 	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
 	// entirely; the binary behaves exactly like the pre-audit build.

@@ -22,6 +22,8 @@ type Client interface {
 	GetEvents(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error)
 	GetLatestLedger(ctx context.Context) (LatestLedger, error)
 	GetHealth(ctx context.Context) (Health, error)
+	GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error)
+	SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error)
 }
 
 // Error is a JSON-RPC 2.0 error object returned by the server.
@@ -126,6 +128,18 @@ func (c *HTTPClient) GetLatestLedger(ctx context.Context) (LatestLedger, error) 
 func (c *HTTPClient) GetHealth(ctx context.Context) (Health, error) {
 	var resp Health
 	err := c.call(ctx, "getHealth", nil, &resp)
+	return resp, err
+}
+
+func (c *HTTPClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
+	var resp GetLedgerEntriesResponse
+	err := c.call(ctx, "getLedgerEntries", req, &resp)
+	return resp, err
+}
+
+func (c *HTTPClient) SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error) {
+	var resp SimulateTransactionResponse
+	err := c.call(ctx, "simulateTransaction", req, &resp)
 	return resp, err
 }
 

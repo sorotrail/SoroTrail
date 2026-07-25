@@ -96,3 +96,41 @@ type Health struct {
 	OldestLedger          uint32 `json:"oldestLedger"`
 	LedgerRetentionWindow uint32 `json:"ledgerRetentionWindow"`
 }
+
+// GetLedgerEntriesRequest is the params for getLedgerEntries.
+type GetLedgerEntriesRequest struct {
+	Keys []string `json:"keys"` // base64-encoded LedgerKey XDR
+}
+
+// GetLedgerEntriesResponse is the result of getLedgerEntries.
+type GetLedgerEntriesResponse struct {
+	Entries []LedgerEntryResult `json:"entries"`
+}
+
+// LedgerEntryResult is one entry returned by getLedgerEntries.
+type LedgerEntryResult struct {
+	Key                   string  `json:"key"` // base64-encoded LedgerKey XDR
+	XDR                   string  `json:"xdr"` // base64-encoded LedgerEntry XDR
+	LastModifiedLedgerSeq uint32  `json:"lastModifiedLedgerSeq"`
+	LiveUntilLedgerSeq    *uint32 `json:"liveUntilLedgerSeq,omitempty"`
+}
+
+// SimulateTransactionRequest is the params for the simulateTransaction method.
+type SimulateTransactionRequest struct {
+	Transaction string `json:"transaction"`
+}
+
+// SimulateTransactionResponse is the result of simulateTransaction.
+type SimulateTransactionResponse struct {
+	TransactionData string            `json:"transactionData"`
+	Events          []Event           `json:"events,omitempty"`
+	Cost            SimulationCost    `json:"cost"`
+	Results         []json.RawMessage `json:"results,omitempty"`
+	Error           string            `json:"error,omitempty"`
+}
+
+// SimulationCost describes the compute resources consumed by a simulation.
+type SimulationCost struct {
+	CPUInstructions uint64 `json:"cpuInsns,string"`
+	MemoryBytes     uint64 `json:"memBytes,string"`
+}

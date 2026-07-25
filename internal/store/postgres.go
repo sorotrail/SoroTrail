@@ -64,12 +64,7 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			op_index = EXCLUDED.op_index,
 			in_successful_call = EXCLUDED.in_successful_call,
 			topics = EXCLUDED.topics,
-			value = EXCLUDED.value,
-			-- Refresh the raw XDR, but never blank it out: a repair fetch
-			-- that came back as JSON (xdrFormat "json") carries no XDR and
-			-- must not destroy what an earlier ingest managed to keep.
-			raw_topic_xdr = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
-			raw_value_xdr = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+			value = EXCLUDED.value`
 	}
 	batch := &pgx.Batch{}
 	for _, e := range events {
@@ -77,15 +72,9 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			INSERT INTO events
 				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 				 in_successful_call, topics, value, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-			ON CONFLICT (id) DO NOTHING`,
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) `+conflict,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
-				 in_successful_call, topics, value, raw_topic_xdr, raw_value_xdr)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) `+conflict,
-			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
-			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value,
-			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
 	}
 	return batch
@@ -264,23 +253,7 @@ func (p *Postgres) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger i
 }
 
 const eventColumns = `id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-	in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr`
-
-// nullableText and nullableTextArray store empty raw-XDR values as SQL NULL
-// so "no raw XDR" is one representation, not two.
-func nullableText(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
-}
-
-func nullableTextArray(s []string) any {
-	if len(s) == 0 {
-		return nil
-	}
-	return s
-}
+	in_successful_call, topics, value, created_at`
 
 func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
 	row := p.pool.QueryRow(ctx, `SELECT `+eventColumns+` FROM events WHERE id = $1`, id)
@@ -595,19 +568,13 @@ func nullableString(s string) any {
 
 func scanEvent(row pgx.Row) (Event, error) {
 	var (
-		e         Event
-		rawTopics []string
-		rawValue  *string
+		e Event
 	)
 	err := row.Scan(&e.ID, &e.ContractID, &e.Ledger, &e.Type, &e.TxHash,
 		&e.TxIndex, &e.OpIndex, &e.InSuccessfulCall, &e.Topics, &e.Value,
-		&e.CreatedAt, &rawTopics, &rawValue)
+		&e.CreatedAt)
 	if err != nil {
 		return Event{}, err
-	}
-	e.RawTopicXDR = rawTopics
-	if rawValue != nil {
-		e.RawValueXDR = *rawValue
 	}
 	return e, nil
 }

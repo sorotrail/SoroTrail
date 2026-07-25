@@ -109,6 +109,14 @@ func (m *mockRPC) GetHealth(context.Context) (rpc.Health, error) {
 	return m.health, nil
 }
 
+func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+	return rpc.GetLedgerEntriesResponse{}, nil
+}
+
+func (m *mockRPC) SimulateTransaction(context.Context, rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error) {
+	return rpc.SimulateTransactionResponse{}, nil
+}
+
 // mockStore is an in-memory implementation of store.Store good enough
 // for the auditor. It mirrors and extends the ingester test mock so we
 // don't import the ingester test package.
