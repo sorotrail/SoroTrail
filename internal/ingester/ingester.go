@@ -54,12 +54,13 @@ func (o *Options) applyDefaults() {
 
 // Ingester pages events out of the RPC and into the store.
 type Ingester struct {
-	client  rpc.Client
-	store   store.Store
-	decoder decode.Decoder
-	log     *slog.Logger
-	opts    Options
-	metrics IngestObserver
+	client   rpc.Client
+	store    store.Store
+	decoder  decode.Decoder
+	log      *slog.Logger
+	opts     Options
+	metrics  IngestObserver
+	onEvents func([]store.Event)
 }
 
 // IngestObserver is called at points where the ingester wants to record
@@ -75,6 +76,15 @@ type IngestObserver interface {
 func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, obs IngestObserver, opts Options) *Ingester {
 	opts.applyDefaults()
 	return &Ingester{client: client, store: st, decoder: dec, log: log, metrics: obs, opts: opts}
+}
+
+// SetOnEvents registers a hook that is called after events are persisted,
+// receiving only the newly inserted events (duplicates are excluded). The
+// hook runs synchronously in the ingest goroutine and must not block; a slow
+// consumer should enqueue and return immediately. SetOnEvents is not
+// concurrency-safe; call it before ingester.Run.
+func (ing *Ingester) SetOnEvents(fn func([]store.Event)) {
+	ing.onEvents = fn
 }
 
 // Run polls until ctx is canceled. Errors are logged and retried with
@@ -375,11 +385,14 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		return err
 	}
 	ing.log.Info("ingested events",
-		"count", len(events), "new", inserted,
+		"count", len(events), "new", len(inserted),
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
 		"latest_ledger", latestLedger)
 	if ing.metrics != nil {
 		ing.metrics.RecordEventsIngested(len(events))
+	}
+	if ing.onEvents != nil && len(inserted) > 0 {
+		ing.onEvents(inserted)
 	}
 	return nil
 }

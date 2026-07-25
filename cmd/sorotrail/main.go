@@ -101,6 +101,7 @@ func run() error {
 	}
 
 	m := metrics.New()
+	broker := api.NewBroker()
 
 	rpcClient := rpc.NewHTTPClient(cfg.RPCURL, rpc.WithRequestObserver(m))
 	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, m, ingester.Options{
@@ -131,9 +132,13 @@ func run() error {
 		api.SetAuditor(aud)
 	}
 
+	ing.SetOnEvents(func(events []store.Event) {
+		broker.Publish(events)
+	})
+
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.New(st, rpcClient, log, m).Router(),
+		Handler:           api.New(st, rpcClient, log, m, broker).Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -184,6 +189,7 @@ func run() error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	broker.Shutdown()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Error("http shutdown", "error", err)
 	}

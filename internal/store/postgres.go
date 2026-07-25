@@ -33,15 +33,11 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres {
 	return &Postgres{pool: pool}
 }
 
-func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
+func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) ([]Event, error) {
 	if len(events) == 0 {
-		return 0, nil
+		return nil, nil
 	}
-	rows, err := p.upsertEvents(ctx, events, false)
-	if err != nil {
-		return 0, err
-	}
-	return rows, nil
+	return p.upsertEvents(ctx, events, false)
 }
 
 // insertEventsBatch builds the event INSERT used by every write path, so
@@ -90,22 +86,28 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 // ReplaceEventsInRange (insert-or-update, so topic/value drift on the RPC
 // side is corrected). onUpdate=false → ON CONFLICT DO NOTHING;
 // onUpdate=true → ON CONFLICT DO UPDATE SET ….
-func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bool) (int64, error) {
+//
+// When onUpdate=false, returns only the newly inserted events (duplicates
+// filtered out). When onUpdate=true, returns all events (all rows were
+// affected by the upsert).
+func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bool) ([]Event, error) {
 	if len(events) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	results := p.pool.SendBatch(ctx, insertEventsBatch(events, onUpdate))
 	defer results.Close()
 
-	var affected int64
-	for range events {
+	var inserted []Event
+	for i := range events {
 		tag, err := results.Exec()
 		if err != nil {
-			return affected, fmt.Errorf("upserting events: %w", err)
+			return nil, fmt.Errorf("upserting events: %w", err)
 		}
-		affected += tag.RowsAffected()
+		if tag.RowsAffected() > 0 {
+			inserted = append(inserted, events[i])
+		}
 	}
-	return affected, nil
+	return inserted, nil
 }
 
 // ReplaceEventsInRange makes [fromLedger, toLedger] match `events` exactly:

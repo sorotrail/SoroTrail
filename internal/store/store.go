@@ -201,8 +201,8 @@ type EventDecoding struct {
 // aren't forced to implement one.
 type Store interface {
 	// UpsertEvents inserts events idempotently (duplicates by ID are ignored)
-	// and returns the number of newly inserted rows.
-	UpsertEvents(ctx context.Context, events []Event) (int64, error)
+	// and returns only the newly inserted events (duplicates are omitted).
+	UpsertEvents(ctx context.Context, events []Event) ([]Event, error)
 	// ReplaceEventsInRange atomically makes [fromLedger, toLedger] in the
 	// store exactly match `events`: orphans (rows in that ledger range that
 	// no longer appear in `events`) are deleted, missing events are

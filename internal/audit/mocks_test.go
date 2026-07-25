@@ -140,14 +140,14 @@ func newMockStore() *mockStore {
 	return &mockStore{events: map[string]store.Event{}}
 }
 
-func (m *mockStore) UpsertEvents(_ context.Context, events []store.Event) (int64, error) {
+func (m *mockStore) UpsertEvents(_ context.Context, events []store.Event) ([]store.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var inserted int64
+	var inserted []store.Event
 	for _, e := range events {
 		if _, dup := m.events[e.ID]; !dup {
 			m.events[e.ID] = e
-			inserted++
+			inserted = append(inserted, e)
 		}
 	}
 	return inserted, nil

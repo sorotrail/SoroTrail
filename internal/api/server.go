@@ -3,6 +3,8 @@
 package api
 
 import (
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -50,11 +52,12 @@ type Server struct {
 	rpc     rpc.Client
 	log     *slog.Logger
 	metrics *metrics.Metrics
+	broker  *Broker
 }
 
 // New builds the API server. rpcClient is only used by /health.
-func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, m *metrics.Metrics) *Server {
-	return &Server{store: st, rpc: rpcClient, log: log, metrics: m}
+func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, m *metrics.Metrics, b *Broker) *Server {
+	return &Server{store: st, rpc: rpcClient, log: log, metrics: m, broker: b}
 }
 
 // Router returns the HTTP handler with all routes mounted.
@@ -62,14 +65,20 @@ func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(30 * time.Second))
 
-	r.Get("/health", s.handleHealth)
-	r.Get("/events", s.handleListEvents)
-	r.Get("/events/{id}", s.handleGetEvent)
-	r.Get("/contracts/{id}/events", s.handleContractEvents)
-	r.Get("/stats", s.handleStats)
-	r.Get("/metrics", s.handleMetrics)
+	// Long-lived SSE connection — no timeout, registered before /events/{id}
+	// so the literal "subscribe" path wins over the {id} parameter.
+	r.Get("/events/subscribe", s.handleSubscribe)
+
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.Timeout(30 * time.Second))
+		r.Get("/health", s.handleHealth)
+		r.Get("/events", s.handleListEvents)
+		r.Get("/events/{id}", s.handleGetEvent)
+		r.Get("/contracts/{id}/events", s.handleContractEvents)
+		r.Get("/stats", s.handleStats)
+		r.Get("/metrics", s.handleMetrics)
+	})
 
 	// contributors: new read endpoints go here. Anything that writes (e.g.
 	// managing watched contracts at runtime) should come with auth first.
@@ -100,4 +109,54 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	s.metrics.Handler().ServeHTTP(w, r)
+}
+
+// handleSubscribe streams newly ingested events to the client via
+// Server-Sent Events (text/event-stream). Same filter semantics as GET
+// /events: contract_id, type, topic, from_ledger, to_ledger.
+//
+// Delivery is best-effort: events are pushed after the store upsert
+// succeeds, but a reconnecting client should catch up via the REST cursor.
+// The per-subscriber buffer is bounded; when it overflows the connection
+// is closed with an error event so the client knows to reconnect.
+func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
+	filter, err := filterFromQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	ch, cancel := s.broker.Subscribe(filter)
+	defer cancel()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		s.log.Error("streaming not supported")
+		return
+	}
+
+	enc := json.NewEncoder(w)
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event, ok := <-ch:
+			if !ok {
+				// Buffer overflow: the broker closed the channel.
+				errData, _ := json.Marshal(map[string]string{"message": "buffer overflow, please reconnect"})
+				fmt.Fprintf(w, "event: error\ndata: %s\n\n", errData)
+				flusher.Flush()
+				return
+			}
+			fmt.Fprint(w, "event: event\ndata: ")
+			_ = enc.Encode(event)
+			fmt.Fprint(w, "\n")
+			flusher.Flush()
+		}
+	}
 }

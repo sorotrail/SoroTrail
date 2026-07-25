@@ -186,6 +186,29 @@ remaining query parameters.
 curl -s localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/events?limit=10
 ```
 
+### `GET /events/subscribe`
+
+Subscribe to a real-time stream of newly ingested events via Server-Sent Events
+(`text/event-stream`). Accepts the same filter parameters as `GET /events`:
+`contract_id`, `type`, `topic`, `from_ledger`, `to_ledger`.
+
+Delivery is best-effort: events are pushed after the store upsert succeeds,
+but a reconnecting client should catch up via the REST cursor (polling
+`GET /events`) since pushes are not guaranteed. The per-subscriber buffer is
+bounded; when it overflows the connection is closed with an `error` event.
+
+```sh
+curl -N -s 'localhost:8080/events/subscribe?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic={"symbol":"transfer"}'
+```
+
+```
+event: event
+data: {"id":"0001099511627776-0000000001","contract_id":"CDLZ...CYSC","ledger":256000,"type":"contract",...}
+
+event: event
+data: {"id":"0001099511627776-0000000002",...}
+```
+
 ### `GET /stats`
 
 ```sh
