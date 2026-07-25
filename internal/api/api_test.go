@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -636,21 +638,38 @@ func TestVersion(t *testing.T) {
 }
 
 func TestRequestID(t *testing.T) {
-	t.Run("generated ID in response header", func(t *testing.T) {
-		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/health")
-		requestID := resp.Header.Get("X-Request-ID")
-		require.NotEmpty(t, requestID)
-	})
+	tests := []struct {
+		name       string
+		incomingID string
+		wantEcho   bool
+	}{
+		{name: "generated when absent", incomingID: "", wantEcho: false},
+		{name: "echoes incoming ID", incomingID: "test-request-id-123", wantEcho: true},
+		{name: "echoes long ID", incomingID: strings.Repeat("a", 100), wantEcho: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			s := New(&stubStore{}, nil, log, "test-key")
+			srv := httptest.NewServer(s.Router())
+			defer srv.Close()
 
-	t.Run("echoes incoming X-Request-ID", func(t *testing.T) {
-		srv := httptest.NewServer(newTestServer(&stubStore{}, nil).Router())
-		defer srv.Close()
-		req, err := http.NewRequest("GET", srv.URL+"/health", nil)
-		require.NoError(t, err)
-		req.Header.Set("X-Request-ID", "test-request-id-123")
-		resp, err := http.DefaultTransport.RoundTrip(req)
-		require.NoError(t, err)
-		defer resp.Body.Close()
-		assert.Equal(t, "test-request-id-123", resp.Header.Get("X-Request-ID"))
-	})
+			req, err := http.NewRequest("GET", srv.URL+"/health", nil)
+			require.NoError(t, err)
+			if tt.incomingID != "" {
+				req.Header.Set("X-Request-ID", tt.incomingID)
+			}
+			resp, err := http.DefaultTransport.RoundTrip(req)
+			require.NoError(t, err)
+			resp.Body.Close()
+
+			got := resp.Header.Get("X-Request-ID")
+			require.NotEmpty(t, got)
+			if tt.wantEcho {
+				assert.Equal(t, tt.incomingID, got)
+			}
+			assert.Contains(t, buf.String(), got)
+		})
+	}
 }
