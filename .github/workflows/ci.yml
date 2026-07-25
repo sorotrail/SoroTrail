@@ -32,7 +32,9 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test (with Postgres integration tests)
-        run: go test ./... -count=1
+        # -p 1 serializes packages: the integration tests in internal/store
+        # and internal/replay share one database and truncate the same tables.
+        run: go test -p 1 ./... -count=1
         env:
           TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
 
@@ -46,3 +48,15 @@ jobs:
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.12.2
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.15.0
+      - name: Helm lint
+        run: helm lint deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db
+      - name: Helm template render
+        run: helm template sorotrail deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db > /dev/null

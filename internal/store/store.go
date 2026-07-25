@@ -23,7 +23,67 @@ type Event struct {
 	Topics           json.RawMessage `json:"topics"`
 	Value            json.RawMessage `json:"value"`
 	CreatedAt        time.Time       `json:"created_at"`
+
+	// RawTopicXDR and RawValueXDR keep the base64 XDR the RPC delivered, so
+	// an improved decoder can re-derive Topics/Value later without the RPC
+	// (see internal/replay). Both are empty when the RPC returned
+	// already-decoded JSON, or for rows ingested before raw XDR was stored.
+	// They are not part of the API representation.
+	RawTopicXDR []string `json:"-"`
+	RawValueXDR string   `json:"-"`
 }
+
+// EnrichedEvent wraps an Event with decoded field information derived from
+// the contract's spec. The original Event is preserved in full; DecodedEvent
+// carries the enriched view when decoding succeeded.
+type EnrichedEvent struct {
+	Event        `json:",inline"`      // embed all Event fields
+	DecodedEvent *DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                  `json:"decoded"`
+}
+
+// DecodedEventResponse is the JSON shape returned when an event is successfully
+// enriched with spec-driven field names.
+type DecodedEventResponse struct {
+	Event  string         `json:"event"`
+	Fields map[string]any `json:"fields,omitempty"`
+}
+
+// DecodedEvent is one event's replayable payload: the raw XDR inputs plus the
+// decoded columns currently stored for it.
+type DecodedEvent struct {
+	ID          string
+	ContractID  string
+	Ledger      int64
+	RawTopicXDR []string
+	RawValueXDR string
+	Topics      json.RawMessage
+	Value       json.RawMessage
+}
+
+// HasRawXDR reports whether the event carries enough raw XDR to be replayed.
+// Rows without it are skipped (and counted) rather than treated as errors.
+func (d DecodedEvent) HasRawXDR() bool {
+	return len(d.RawTopicXDR) > 0 || d.RawValueXDR != ""
+}
+
+// ReplayState is the single persisted progress row for the replay tool.
+// LastEventID is the last event whose rewrite committed; replay resumes at
+// the first event after it.
+type ReplayState struct {
+	FromLedger  int64
+	ToLedger    int64
+	LastEventID string
+	Processed   int64
+	Changed     int64
+	Skipped     int64
+	StartedAt   time.Time
+	UpdatedAt   time.Time
+	CompletedAt *time.Time
+}
+
+// Done reports whether the recorded run finished its whole range.
+func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
@@ -31,9 +91,23 @@ type EventFilter struct {
 	Type       string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
-	Topic      json.RawMessage
-	FromLedger int64 // inclusive
-	ToLedger   int64 // inclusive
+	Topic json.RawMessage
+	// Topic0-Topic3 match the exact JSON value at that specific topic array
+	// position. Unspecified positions are wildcards.
+	Topic0 json.RawMessage
+	Topic1 json.RawMessage
+	Topic2 json.RawMessage
+	Topic3 json.RawMessage
+	// TopicContains matches events whose topics array jsonb-contains this
+	// value (Postgres @> operator). Unlike Topic, the value is passed
+	// directly without array-wrapping, so callers can use multi-element
+	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
+	// Uses the GIN index on events.topics.
+	TopicContains json.RawMessage
+	FromLedger    int64     // inclusive
+	ToLedger      int64     // inclusive
+	FromTime      time.Time // inclusive, zero = no constraint
+	ToTime        time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int
@@ -92,16 +166,137 @@ type AuditFinding struct {
 	CreatedAt       time.Time
 }
 
+// SubscriptionFilter is a JSON-serializable filter that subscription
+// callbacks use to select which events to deliver. Same semantics as
+// GET /events query parameters. An empty (zero-value) filter matches
+// every event.
+type SubscriptionFilter struct {
+	ContractID    string          `json:"contract_id,omitempty"`
+	Type          string          `json:"type,omitempty"`
+	Topic         json.RawMessage `json:"topic,omitempty"`
+	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
+	FromLedger    int64           `json:"from_ledger,omitempty"`
+	ToLedger      int64           `json:"to_ledger,omitempty"`
+}
+
+// MatchesEvent reports whether an event passes this filter. Zero fields
+// mean "no constraint" — the filter is applied per-field, so an empty
+// filter matches everything.
+func (f SubscriptionFilter) MatchesEvent(e Event) bool {
+	if f.ContractID != "" && e.ContractID != f.ContractID {
+		return false
+	}
+	if f.Type != "" && e.Type != f.Type {
+		return false
+	}
+	if f.FromLedger > 0 && e.Ledger < f.FromLedger {
+		return false
+	}
+	if f.ToLedger > 0 && e.Ledger > f.ToLedger {
+		return false
+	}
+	if len(f.Topic) > 0 && len(e.Topics) > 0 {
+		// Match if any event topic equals the filter topic.
+		var topics []json.RawMessage
+		if err := json.Unmarshal(e.Topics, &topics); err != nil {
+			return false
+		}
+		matched := false
+		for _, t := range topics {
+			if string(t) == string(f.Topic) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	if len(f.TopicContains) > 0 && len(e.Topics) > 0 {
+		var topics []json.RawMessage
+		if err := json.Unmarshal(e.Topics, &topics); err != nil {
+			return false
+		}
+		// Unwrap a single-element array so topic_contains=[{...}] works
+		// the same way in-memory as it does in Postgres @> containment.
+		needle := f.TopicContains
+		var arr []json.RawMessage
+		if err := json.Unmarshal(f.TopicContains, &arr); err == nil && len(arr) == 1 {
+			needle = arr[0]
+		}
+		matched := false
+		for _, t := range topics {
+			if jsonbContains(t, needle) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
+// jsonbContains reports whether the container jsonb-contains the contained
+// value. For objects it checks that every key in contained exists with the
+// same raw JSON value in container; for scalars/arrays it falls back to
+// direct byte comparison (JSON string equality). This mirrors the Postgres
+// @> operator's semantics for the topic-matching use case.
+func jsonbContains(container, contained json.RawMessage) bool {
+	// If both are objects, check key-value subset.
+	var cMap, dMap map[string]json.RawMessage
+	if json.Unmarshal(container, &cMap) == nil && json.Unmarshal(contained, &dMap) == nil {
+		for k, v := range dMap {
+			cv, ok := cMap[k]
+			if !ok || string(cv) != string(v) {
+				return false
+			}
+		}
+		return true
+	}
+	// Fallback: exact JSON string match (handles strings, numbers, and
+	// cases where unmarshalling into map failed — e.g. arrays).
+	return string(container) == string(contained)
+}
+
+// Subscription is one registered webhook callback.
+type Subscription struct {
+	ID           int64              `json:"id"`
+	URL          string             `json:"url"`
+	Filters      SubscriptionFilter `json:"filters"`
+	Secret       string             `json:"secret"`
+	Enabled      bool               `json:"enabled"`
+	FailureCount int                `json:"failure_count"`
+	CreatedAt    time.Time          `json:"created_at"`
+}
+
+// DeliveryAttempt records one attempt to POST an event to a subscriber's
+// callback URL.
+type DeliveryAttempt struct {
+	ID             int64     `json:"id"`
+	SubscriptionID int64     `json:"subscription_id"`
+	EventID        string    `json:"event_id"`
+	Status         string    `json:"status"`
+	ResponseCode   int       `json:"response_code"`
+	DurationMs     int       `json:"duration_ms"`
+	Error          string    `json:"error,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
 // Stats summarizes what the indexer has stored so far. VerifiedThroughLedger
 // is the inclusive highest ledger whose stored events have been confirmed
 // to match a fresh RPC fetch; 0 means no ledger has been verified yet.
 // Auditor counters are filled in by the API layer when an auditor is wired.
 type Stats struct {
-	TotalEvents           int64 `json:"total_events"`
-	LastIngestedLedger    int64 `json:"last_ingested_ledger"`
-	VerifiedThroughLedger int64 `json:"verified_through_ledger"`
-	ContractCount         int64 `json:"contract_count"`
-	WatchedContracts      int64 `json:"watched_contracts"`
+	TotalEvents           int64  `json:"total_events"`
+	LastIngestedLedger    int64  `json:"last_ingested_ledger"`
+	VerifiedThroughLedger int64  `json:"verified_through_ledger"`
+	OldestStoredLedger    int64  `json:"oldest_stored_ledger"`
+	ChainHeadLedger       *int64 `json:"chain_head_ledger"`
+	IngestLagLedgers      *int64 `json:"ingest_lag_ledgers"`
+	ContractCount         int64  `json:"contract_count"`
+	WatchedContracts      int64  `json:"watched_contracts"`
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
@@ -120,9 +315,41 @@ type AuditStats struct {
 	RPCRequests           uint64 `json:"rpc_requests"`
 }
 
+// ReplayBatch is one transactional unit of replay work: the rewritten
+// decoded columns for a batch of events, every dependent table re-derived
+// from them, and the progress marker to advance.
+//
+// contributors: derivation order is part of this type's contract. Dependent
+// tables are derived from the *new* Events decoding, never from what is
+// currently in the database, so a replay is a pure function of the raw XDR.
+// When a dependent table lands (e.g. token_events from a SEP-41 decoder) add
+// it as a field here and write it in CommitReplayBatch after Events — that
+// keeps the order in one place instead of spread across call sites.
+type ReplayBatch struct {
+	// Events are the events-table rewrites, applied first because every
+	// dependent table reads from them.
+	Events []EventDecoding
+	// State is the progress marker, written last and in the same
+	// transaction, so committed progress can never run ahead of committed
+	// rewrites.
+	State ReplayState
+}
+
+// EventDecoding is a freshly decoded events row, keyed by event ID.
+type EventDecoding struct {
+	ID     string
+	Topics json.RawMessage
+	Value  json.RawMessage
+}
+
 // Store is the persistence boundary. The ingester, auditor, and API depend
 // on this interface, never on Postgres directly, so alternative backends can
 // be contributed by implementing it.
+//
+// Replay-specific persistence is deliberately not part of this interface —
+// it lives on *Postgres and is consumed through the narrower interface in
+// internal/replay, so backends that don't need a maintenance replay tool
+// aren't forced to implement one.
 type Store interface {
 	// UpsertEvents inserts events idempotently (duplicates by ID are ignored)
 	// and returns the number of newly inserted rows.
@@ -132,10 +359,19 @@ type Store interface {
 	// no longer appear in `events`) are deleted, missing events are
 	// inserted, and same-ID rows are updated (so topic/value mutations on
 	// the RPC side are corrected). Designed for targeted repair from the
-	// auditor; ingest uses UpsertEvents instead.
+	// auditor; ingest uses UpsertEvents instead. Raw XDR already stored for
+	// a surviving event is preserved when the incoming event carries none,
+	// so a repair never costs a row its replayability.
 	ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error
 	// GetEvent returns the event with the given ID, or ErrNotFound.
 	GetEvent(ctx context.Context, id string) (Event, error)
+	// EventExists reports whether an event with the given ID is in the
+	// store. It is the cheap 304 path used by the API when a conditional
+	// GET carries an If-None-Match whose validator matches the request
+	// URL: we want to confirm "still here" without re-serializing the
+	// full row, so retention/pruning (when it lands, see #8) can't leave
+	// cached clients believing a deleted event is still available.
+	EventExists(ctx context.Context, id string) (bool, error)
 	// QueryEvents returns a page of events in ascending ID order, plus a
 	// cursor for the next page ("" when there are no more results).
 	// Default order is ascending (oldest-first) for backward compatibility.
@@ -172,6 +408,36 @@ type Store interface {
 	// range contains a single ledger, or ErrNotFound if none. The auditor
 	// uses this to keep working while a finding is being repaired.
 	ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error)
+
+	// Subscription CRUD.
+	CreateSubscription(ctx context.Context, s Subscription) (Subscription, error)
+	GetSubscription(ctx context.Context, id int64) (Subscription, error)
+	ListSubscriptions(ctx context.Context) ([]Subscription, error)
+	UpdateSubscription(ctx context.Context, s Subscription) (Subscription, error)
+	DeleteSubscription(ctx context.Context, id int64) error
+
+	// ListEnabledSubscriptions returns all subscriptions with enabled=true.
+	ListEnabledSubscriptions(ctx context.Context) ([]Subscription, error)
+
+	// IncrementSubscriptionFailures atomically increments failure_count
+	// and returns the new value. When newCount >= maxFailures the
+	// subscription is also disabled.
+	IncrementSubscriptionFailures(ctx context.Context, id int64, maxFailures int) (newCount int, disabled bool, err error)
+	// ResetSubscriptionFailures sets failure_count to 0.
+	ResetSubscriptionFailures(ctx context.Context, id int64) error
+
+	// RecordDeliveryAttempt persists one delivery attempt.
+	RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (DeliveryAttempt, error)
+	// ListDeliveryAttempts returns delivery attempts for a subscription,
+	// newest first.
+	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
+
+	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
+	// or ErrNotFound when no spec is cached for that hash.
+	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
+	// SetContractSpec persists a JSON-serialized spec keyed by wasm_hash
+	// and contract_id so subsequent lookups avoid an RPC round trip.
+	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
 
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error

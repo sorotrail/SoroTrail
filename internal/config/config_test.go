@@ -11,6 +11,18 @@ import (
 
 const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
+// envKeys is the comprehensive list of env vars Load reads. Each test
+// subtest clears them so leftover values from the host environment or a
+// prior test don't leak across cases.
+var envKeys = []string{
+	"RPC_URL", "DATABASE_URL", "POLL_INTERVAL", "HTTP_ADDR",
+	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL",
+	"AUDIT_ENABLED", "AUDIT_POLL_INTERVAL", "AUDIT_BATCH_LEDGERS",
+	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
+	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
+	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
+}
+
 func TestLoad(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -27,6 +39,9 @@ func TestLoad(t *testing.T) {
 				assert.Equal(t, ":8080", c.HTTPAddr)
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
 				assert.Empty(t, c.WatchedContracts)
+				assert.Zero(t, c.RateLimitRPS, "rate limiter disabled by default")
+				assert.Zero(t, c.RateLimitBurst)
+				assert.False(t, c.RateLimitTrustedProxy)
 			},
 		},
 		{
@@ -76,14 +91,51 @@ func TestLoad(t *testing.T) {
 			},
 			wantErr: "RPC_URL",
 		},
+		{
+			name: "rate limit both set is accepted",
+			env: map[string]string{
+				"DATABASE_URL":             "postgres://localhost/db",
+				"RATE_LIMIT_RPS":           "5",
+				"RATE_LIMIT_BURST":         "10",
+				"RATE_LIMIT_TRUSTED_PROXY": "true",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, float64(5), c.RateLimitRPS)
+				assert.Equal(t, 10, c.RateLimitBurst)
+				assert.True(t, c.RateLimitTrustedProxy)
+			},
+		},
+		{
+			name: "rate limit only RPS set is rejected",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"RATE_LIMIT_RPS": "5",
+			},
+			wantErr: "RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset",
+		},
+		{
+			name: "rate limit only Burst set is rejected",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"RATE_LIMIT_BURST": "10",
+			},
+			wantErr: "RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset",
+		},
+		{
+			name: "rate limit negative RPS rejected",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"RATE_LIMIT_RPS": "-1",
+			},
+			wantErr: "RATE_LIMIT_RPS must be non-negative",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Clear the variables Load reads, then apply the case's env.
 			// t.Setenv registers restoration; Unsetenv makes defaults apply.
-			for _, key := range []string{"RPC_URL", "DATABASE_URL", "POLL_INTERVAL",
-				"HTTP_ADDR", "WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL"} {
+			for _, key := range envKeys {
 				t.Setenv(key, "")
 				os.Unsetenv(key)
 			}
@@ -112,34 +164,19 @@ func TestValidContractID(t *testing.T) {
 	assert.False(t, ValidContractID(validContract[:55]+"a"), "lowercase is not base32")
 }
 
-func TestLoggableFields(t *testing.T) {
-	c := Config{
-		RPCURL:           "https://testnet.local",
-		DatabaseURL:      "postgres://user:secretpassword@localhost:5432/db_name",
-		PollInterval:     5 * time.Second,
-		HTTPAddr:         ":8080",
-		WatchedContracts: []string{"C1", "C2"},
-		StartLedger:      100,
-		RetentionLedgers: 200,
-		LogLevel:         "info",
-		AuditEnabled:     true,
-	}
+func TestValidCursor(t *testing.T) {
+	assert.True(t, ValidCursor("0001099511627776-0000000001"))
+	assert.True(t, ValidCursor("00000000000000000102-00000"))
+	assert.True(t, ValidCursor("e1"))
+	assert.True(t, ValidCursor("cursor-42"))
+	assert.True(t, ValidCursor("pt_1"))
+	assert.True(t, ValidCursor("abc.123:45_67-89"))
 
-	fields := c.LoggableFields()
-	
-	// Convert slice to map for easier assertions
-	m := make(map[string]any)
-	for i := 0; i < len(fields); i += 2 {
-		m[fields[i].(string)] = fields[i+1]
-	}
-
-	assert.Equal(t, "postgres://localhost:5432/db_name", m["database_url"], "credentials should be redacted")
-	assert.Equal(t, "https://testnet.local", m["rpc_url"])
-	assert.Equal(t, 5*time.Second, m["poll_interval"])
-	assert.Equal(t, ":8080", m["http_addr"])
-	assert.Equal(t, 2, m["watched_contracts"], "should log count of watched contracts")
-	assert.Equal(t, uint32(100), m["start_ledger"])
-	assert.Equal(t, uint32(200), m["retention_ledgers"])
-	assert.Equal(t, "info", m["log_level"])
-	assert.Equal(t, true, m["audit_enabled"])
+	assert.False(t, ValidCursor(""), "empty string")
+	assert.False(t, ValidCursor("invalid cursor"), "contains space")
+	assert.False(t, ValidCursor("e1; DROP TABLE events;"), "contains semicolon and space")
+	assert.False(t, ValidCursor("cursor'OR'1'='1"), "contains single quotes")
+	assert.False(t, ValidCursor("<script>alert(1)</script>"), "contains angle brackets")
+	assert.False(t, ValidCursor("e1\n"), "contains newline")
+	assert.False(t, ValidCursor(string(make([]byte, 129))), "too long (>128 chars)")
 }
