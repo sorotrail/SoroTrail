@@ -172,6 +172,17 @@ func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event
 	return nil
 }
 
+// EventExists mirrors GetEvent but stops at presence — the auditor's
+// interface compliance is enough for the cache layer's needs.
+func (m *mockStore) EventExists(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.events[id]; !ok {
+		return false, nil
+	}
+	return true, nil
+}
+
 func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

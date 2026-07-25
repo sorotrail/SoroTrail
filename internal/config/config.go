@@ -43,6 +43,14 @@ type Config struct {
 	RetentionBatchSize int           `env:"RETENTION_BATCH_SIZE" envDefault:"5000"`
 	RetentionPause     time.Duration `env:"RETENTION_PAUSE" envDefault:"100ms"`
 	RetentionInterval  time.Duration `env:"RETENTION_INTERVAL" envDefault:"1h"`
+	// CachePrivate flips the cacheable endpoints from Cache-Control: public
+	// to Cache-Control: private. Set this when the deployment serves
+	// per-user data behind an auth layer (#17, not yet merged) so shared
+	// caches (CDN/proxy) cannot leak responses across keys. Browsers can
+	// still cache the response for the same authenticated user; CDNs and
+	// intermediaries cannot. Defaults to false (the deployment does not
+	// need request-scoped caching).
+	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
 }
 
 // Load reads configuration from the environment and validates it.
