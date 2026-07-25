@@ -18,12 +18,6 @@ CREATE TABLE events (
     raw_value_xdr      text
 );
 
-CREATE INDEX idx_events_contract_id ON events (contract_id);
-CREATE INDEX idx_events_ledger ON events (ledger);
-CREATE INDEX idx_events_contract_ledger ON events (contract_id, ledger);
-CREATE INDEX idx_events_topics ON events USING gin (topics);
-CREATE INDEX idx_events_created_at ON events (created_at);
-
 INSERT INTO events (
     id, contract_id, ledger, type, tx_hash, tx_index, op_index,
     in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr
@@ -37,5 +31,13 @@ ORDER BY ledger, id;
 DROP TABLE events_partitioned CASCADE;
 
 DROP FUNCTION IF EXISTS ensure_event_partitions(bigint, bigint, bigint);
+
+-- Indexes created after the partitioned table is dropped so the carried-over
+-- index names are free to reuse.
+CREATE INDEX idx_events_contract_id ON events (contract_id);
+CREATE INDEX idx_events_ledger ON events (ledger);
+CREATE INDEX idx_events_contract_ledger ON events (contract_id, ledger);
+CREATE INDEX idx_events_topics ON events USING gin (topics);
+CREATE INDEX idx_events_created_at ON events (created_at);
 
 COMMIT;

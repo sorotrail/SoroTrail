@@ -19,13 +19,6 @@ CREATE TABLE events (
     PRIMARY KEY (ledger, id)
 ) PARTITION BY RANGE (ledger);
 
-CREATE INDEX idx_events_id ON events (id);
-CREATE INDEX idx_events_contract_id ON events (contract_id);
-CREATE INDEX idx_events_ledger ON events (ledger);
-CREATE INDEX idx_events_contract_ledger ON events (contract_id, ledger);
-CREATE INDEX idx_events_topics ON events USING gin (topics);
-CREATE INDEX idx_events_created_at ON events (created_at);
-
 CREATE OR REPLACE FUNCTION ensure_event_partitions(from_ledger bigint, to_ledger bigint, partition_span bigint)
 RETURNS void
 LANGUAGE plpgsql
@@ -70,5 +63,15 @@ FROM events_legacy
 ORDER BY ledger, id;
 
 DROP TABLE events_legacy;
+
+-- Indexes are created after events_legacy is dropped so their names don't
+-- collide with the identically-named indexes carried over from the old table
+-- (RENAME TO keeps index names; only the primary-key index is auto-renamed).
+CREATE INDEX idx_events_id ON events (id);
+CREATE INDEX idx_events_contract_id ON events (contract_id);
+CREATE INDEX idx_events_ledger ON events (ledger);
+CREATE INDEX idx_events_contract_ledger ON events (contract_id, ledger);
+CREATE INDEX idx_events_topics ON events USING gin (topics);
+CREATE INDEX idx_events_created_at ON events (created_at);
 
 COMMIT;
