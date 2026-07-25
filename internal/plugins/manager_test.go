@@ -1,15 +1,8 @@
 package plugins
 
 import (
-	"io"
-	"log/slog"
 	"testing"
 )
-
-// quietLogger returns a slogger that discards output, so test runs are clean.
-func quietLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
 
 // ---------------------------------------------------------------
 // Pure-Go unit tests (no wazero runtime, no _test fixture files).

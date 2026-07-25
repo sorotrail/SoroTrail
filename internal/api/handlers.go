@@ -101,12 +101,6 @@ type eventsWithXDRResponse struct {
 	Cursor string         `json:"cursor,omitempty"`
 }
 
-type enrichedEventWithXDR struct {
-	eventWithXDR
-	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
-	Decoded      bool                        `json:"decoded"`
-}
-
 type enrichedEventsResponse struct {
 	Events []store.EnrichedEvent `json:"events"`
 	// Cursor is non-empty when another page exists.
@@ -282,22 +276,6 @@ func eventsWithXDR(events []store.Event) []eventWithXDR {
 	out := make([]eventWithXDR, len(events))
 	for i, event := range events {
 		out[i] = eventToXDRResponse(event)
-	}
-	return out
-}
-
-func enrichEventWithXDR(e store.EnrichedEvent) enrichedEventWithXDR {
-	return enrichedEventWithXDR{
-		eventWithXDR: eventToXDRResponse(e.Event),
-		DecodedEvent: e.DecodedEvent,
-		Decoded:      e.Decoded,
-	}
-}
-
-func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
-	out := make([]enrichedEventWithXDR, len(events))
-	for i, event := range events {
-		out[i] = enrichEventWithXDR(event)
 	}
 	return out
 }

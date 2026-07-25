@@ -28,7 +28,7 @@ type Event struct {
 	DecodedPayload json.RawMessage `json:"decoded_payload,omitempty"`
 	// DecodedBy is the declared name of the plugin that produced
 	// DecodedPayload. "" when DecodedPayload is nil.
-	DecodedBy string `json:"decoded_by,omitempty"`
+	DecodedBy string    `json:"decoded_by,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 
 	// RawTopicXDR and RawValueXDR keep the base64 XDR the RPC delivered, so

@@ -337,7 +337,7 @@ func TestListEvents_IncludeXDR(t *testing.T) {
 	assert.NotContains(t, string(body), "topics_xdr")
 	assert.NotContains(t, string(body), "value_xdr")
 
-	resp, body = doGet(t, s, "/events?include_xdr=true")
+	resp, body = doGet(t, s, "/events?xdr=true")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var out struct {
@@ -372,7 +372,7 @@ func TestGetEvent_IncludeXDR(t *testing.T) {
 	assert.NotContains(t, string(body), "topics_xdr")
 	assert.NotContains(t, string(body), "value_xdr")
 
-	resp, body = doGet(t, s, "/events/0000000000-0000000001?include_xdr=true")
+	resp, body = doGet(t, s, "/events/0000000000-0000000001?xdr=true")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var out struct {

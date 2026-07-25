@@ -462,9 +462,11 @@ func (m *Manager) Close(ctx context.Context) {
 // nil), or a counted failure.
 //
 // Memory layout carved into the plugin's linear memory at instantiation:
-//   [inPtr..inPtr+inLen            : input event JSON]
-//   [outPtr..outPtr+outCap         : plugin JSON output]
-//   [outPtr+outCap..outPtr+outCap+4: u32 LE written by plugin = length]
+//
+//	[inPtr..inPtr+inLen            : input event JSON]
+//	[outPtr..outPtr+outCap         : plugin JSON output]
+//	[outPtr+outCap..outPtr+outCap+4: u32 LE written by plugin = length]
+//
 // The plugin returns the status in its i32 result register; 0 = not mine,
 // 1 = wrote payload, anything else is a plugin error and counts as garbage.
 //
@@ -605,8 +607,6 @@ func NewInput(eventID, contractID string, ledger int64, topicsJSON, valueJSON js
 	}, nil
 }
 
-//
-//
 // slogSink is the default LogSink: it routes plugin log calls through
 // the standard logger with severity-level demotion semantics.
 type slogSink struct {
@@ -623,7 +623,7 @@ func (s *slogSink) PluginLog(name string, severity uint32, msg string) {
 	case LogError:
 		lvl = slog.LevelError
 	}
-	s.log.LogAttrs(nil, lvl, msg, slog.String("plugin", name))
+	s.log.LogAttrs(context.TODO(), lvl, msg, slog.String("plugin", name))
 }
 
 // readBoundedResponse reads the length-prefixed body a plugin wrote.

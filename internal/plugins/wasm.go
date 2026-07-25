@@ -24,8 +24,10 @@ func millisToDuration(ms int64) time.Duration {
 // allocOutput ensures the module has at least (size+4) bytes of linear
 // memory and returns (outputOffset, lengthOffset). The length u32 lives
 // right after the JSON buffer so a plugin writes
-//   [outPtr..outPtr+len          : JSON object]
-//   [outPtr+outCap..outPtr+outCap+4: u32 LE byte count]
+//
+//	[outPtr..outPtr+len          : JSON object]
+//	[outPtr+outCap..outPtr+outCap+4: u32 LE byte count]
+//
 // On warm calls where memory is already large enough, no Grow happens.
 func allocOutput(mod api.Module, size int) (buffer, uint32, error) {
 	if size <= 0 {
@@ -48,8 +50,6 @@ func allocOutput(mod api.Module, size int) (buffer, uint32, error) {
 	lenPtr := ptr + uint32(size)
 	return buffer{ptr: ptr, size: size}, lenPtr, nil
 }
-
-
 
 // callWithDeadline runs fn with a per-call timeout. The WithCloseOnContextDone
 // flag on the module config means context cancellation aborts the call
@@ -76,16 +76,6 @@ func readU32(mod api.Module, ptr uint32) (uint32, error) {
 		return 0, errors.New("u32 out of range")
 	}
 	return binary.LittleEndian.Uint32(b), nil
-}
-
-// writeU32 writes 4 bytes little-endian.
-func writeU32(mod api.Module, ptr, value uint32) error {
-	var buf [4]byte
-	binary.LittleEndian.PutUint32(buf[:], value)
-	if !mod.Memory().Write(ptr, buf[:]) {
-		return errors.New("u32 write out of range")
-	}
-	return nil
 }
 
 // errDeadline is what callWithDeadline returns when the per-call budget
