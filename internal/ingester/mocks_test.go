@@ -44,6 +44,10 @@ func (m *mockRPC) GetHealth(context.Context) (rpc.Health, error) {
 	return m.health, m.healthErr
 }
 
+func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+	return rpc.GetLedgerEntriesResponse{}, nil
+}
+
 // mockStore is an in-memory Store.
 type mockStore struct {
 	mu       sync.Mutex
@@ -93,6 +97,16 @@ func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) 
 		return store.Event{}, store.ErrNotFound
 	}
 	return e, nil
+}
+
+// EventExists is the cheap existence probe added to the Store interface
+// for the API's 304 path. Unused by ingester tests but needed to
+// satisfy the interface.
+func (m *mockStore) EventExists(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.events[id]
+	return ok, nil
 }
 
 func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Event, string, error) {
@@ -155,6 +169,41 @@ func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
 
 func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
 func (m *mockStore) Ping(context.Context) error                 { return nil }
+
+func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
+	return nil, store.ErrNotFound
+}
+func (m *mockStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
+
+// Subscription stubs for the webhook feature.
+func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+	sub.ID = 1
+	return sub, nil
+}
+func (m *mockStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
+	return store.Subscription{}, store.ErrNotFound
+}
+func (m *mockStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
+	return nil, nil
+}
+func (m *mockStore) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+	return sub, nil
+}
+func (m *mockStore) DeleteSubscription(context.Context, int64) error { return nil }
+func (m *mockStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
+	return nil, nil
+}
+func (m *mockStore) IncrementSubscriptionFailures(context.Context, int64, int) (int, bool, error) {
+	return 0, false, nil
+}
+func (m *mockStore) ResetSubscriptionFailures(context.Context, int64) error { return nil }
+func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAttempt) (store.DeliveryAttempt, error) {
+	a.ID = 1
+	return a, nil
+}
+func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
+	return nil, nil
+}
 
 // passthroughDecoder avoids XDR fixtures in ingester tests.
 type passthroughDecoder struct{}

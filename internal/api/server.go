@@ -5,6 +5,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"context"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/khaylebfortune/sorotrail/internal/audit"
 	"github.com/khaylebfortune/sorotrail/internal/metrics"
+	"github.com/khaylebfortune/sorotrail/internal/broadcast"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -46,6 +48,12 @@ func getAuditor() *audit.Auditor {
 	return auditor
 }
 
+// Enricher is the spec-based event enrichment interface used by the API.
+// Defined here so the API package doesn't import internal/spec directly.
+type Enricher interface {
+	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
+}
+
 // Server holds the API's dependencies.
 type Server struct {
 	store   store.Store
@@ -58,6 +66,36 @@ type Server struct {
 // New builds the API server. rpcClient is only used by /health.
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, m *metrics.Metrics, b *Broker) *Server {
 	return &Server{store: st, rpc: rpcClient, log: log, metrics: m, broker: b}
+	store    store.Store
+	rpc      rpc.Client
+	enricher Enricher
+	log      *slog.Logger
+	limiter  *RateLimiter
+	bcast    *broadcast.Broadcaster
+}
+
+// New builds the API server. rpcClient is only used by /health.
+// enricher is optional — pass nil to disable spec decoding.
+func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enricher) *Server {
+	s := &Server{store: st, rpc: rpcClient, log: log}
+	if len(enricher) > 0 {
+		s.enricher = enricher[0]
+	}
+	return s
+}
+
+// SetRateLimiter wires a per-client rate limiter into the router. Pass
+// nil to leave the limiter disabled (the default — no behavior change).
+// The limiter's Start/Stop lifecycle is owned by main, not by the Server.
+func (s *Server) SetRateLimiter(l *RateLimiter) {
+	s.limiter = l
+}
+
+// WithBroadcaster attaches the live event broadcaster so streaming endpoints
+// (SSE, WebSocket) can deliver events as they arrive.
+func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
+	s.bcast = b
+	return s
 }
 
 // Router returns the HTTP handler with all routes mounted.
@@ -79,9 +117,32 @@ func (s *Server) Router() http.Handler {
 		r.Get("/stats", s.handleStats)
 		r.Get("/metrics", s.handleMetrics)
 	})
+	r.Use(middleware.Timeout(30 * time.Second))
+	if s.limiter != nil {
+		// Limiter sits inside Timeout and Recoverer so its instant 429
+		// response always makes it back through the deadline cleanly, and
+		// a panic inside the limiter can't take down the server.
+		r.Use(s.limiter.Middleware)
+	}
+
+	r.Get("/health", s.handleHealth)
+	r.Get("/events", s.handleListEvents)
+	r.Get("/events/{id}", s.handleGetEvent)
+	r.Get("/contracts/{id}/events", s.handleContractEvents)
+	r.Get("/stats", s.handleStats)
+	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// contributors: new read endpoints go here. Anything that writes (e.g.
 	// managing watched contracts at runtime) should come with auth first.
+
+	// Subscription CRUD and delivery history.
+	r.Post("/subscriptions", s.handleCreateSubscription)
+	r.Get("/subscriptions", s.handleListSubscriptions)
+	r.Get("/subscriptions/{id}", s.handleGetSubscription)
+	r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
+	r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
+	r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+
 	return r
 }
 

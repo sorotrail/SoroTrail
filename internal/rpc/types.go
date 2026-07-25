@@ -96,3 +96,22 @@ type Health struct {
 	OldestLedger          uint32 `json:"oldestLedger"`
 	LedgerRetentionWindow uint32 `json:"ledgerRetentionWindow"`
 }
+
+// GetLedgerEntriesRequest is the params for getLedgerEntries.
+type GetLedgerEntriesRequest struct {
+	Keys []string `json:"keys"` // base64-encoded LedgerKey XDR
+}
+
+// GetLedgerEntriesResponse is the result of getLedgerEntries.
+type GetLedgerEntriesResponse struct {
+	Entries []LedgerEntryResult `json:"entries"`
+}
+
+// LedgerEntryResult is one entry returned by getLedgerEntries.
+type LedgerEntryResult struct {
+	Key                   string `json:"key"` // base64-encoded LedgerKey XDR
+	XDR                   string `json:"xdr"` // base64-encoded LedgerEntry XDR
+	LastModifiedLedgerSeq uint32 `json:"lastModifiedLedgerSeq"`
+	// LiveUntilLedgerSeq is set for entries with a time-to-live (e.g. temporary entries).
+	LiveUntilLedgerSeq *uint32 `json:"liveUntilLedgerSeq,omitempty"`
+}
