@@ -14,14 +14,15 @@ import (
 // Config holds all runtime configuration. Every field is settable via the
 // environment variable named in its `env` tag; see .env.example for docs.
 type Config struct {
-	RPCURL           string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
-	DatabaseURL      string        `env:"DATABASE_URL"`
-	PollInterval     time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
-	HTTPAddr         string        `env:"HTTP_ADDR" envDefault:":8080"`
-	WatchedContracts []string      `env:"WATCHED_CONTRACTS"`
-	StartLedger      uint32        `env:"START_LEDGER"`
-	RetentionLedgers uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
-	LogLevel         string        `env:"LOG_LEVEL" envDefault:"info"`
+	RPCURL              string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
+	DatabaseURL         string        `env:"DATABASE_URL"`
+	PollInterval        time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
+	HTTPAddr            string        `env:"HTTP_ADDR" envDefault:":8080"`
+	WatchedContracts    []string      `env:"WATCHED_CONTRACTS"`
+	StartLedger         uint32        `env:"START_LEDGER"`
+	RetentionLedgers    uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
+	PartitionLedgerSpan uint32        `env:"PARTITION_LEDGER_SPAN" envDefault:"120960"`
+	LogLevel            string        `env:"LOG_LEVEL" envDefault:"info"`
 
 	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
 	// entirely; the binary behaves exactly like the pre-audit build.
@@ -34,14 +35,12 @@ type Config struct {
 	AuditMaxRepair      int           `env:"AUDIT_MAX_REPAIR_ATTEMPTS" envDefault:"3"`
 	AuditFindingMaxLgrs uint32        `env:"AUDIT_FINDING_MAX_LEDGERS" envDefault:"100"`
 
-	// CachePrivate flips the cacheable endpoints from Cache-Control: public
-	// to Cache-Control: private. Set this when the deployment serves
-	// per-user data behind an auth layer (#17, not yet merged) so shared
-	// caches (CDN/proxy) cannot leak responses across keys. Browsers can
-	// still cache the response for the same authenticated user; CDNs and
-	// intermediaries cannot. Defaults to false (the deployment does not
-	// need request-scoped caching).
-	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
+	// APIKey, when set, gates the watched-contracts management endpoints
+	// via a constant-time comparison against the X-API-Key request header.
+	// Empty means the watched-contracts surface starts up rejected (every
+	// request gets a 503 with a "no API_KEY configured" message), so
+	// writes are never open even when other auth would be off.
+	APIKey string `env:"API_KEY"`
 	// HTTP rate limiting (per client). RATE_LIMIT_RPS / RATE_LIMIT_BURST
 	// are both unset (zero) by default, which disables the limiter
 	// entirely — a no-op middleware — so deployments without this turned
@@ -54,6 +53,14 @@ type Config struct {
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
+	// CachePrivate flips the cacheable endpoints from Cache-Control: public
+	// to Cache-Control: private. Set this when the deployment serves
+	// per-user data behind an auth layer (#17, not yet merged) so shared
+	// caches (CDN/proxy) cannot leak responses across keys. Browsers can
+	// still cache the response for the same authenticated user; CDNs and
+	// intermediaries cannot. Defaults to false (the deployment does not
+	// need request-scoped caching).
+	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -84,6 +91,9 @@ func (c Config) Validate() error {
 	}
 	if c.RetentionLedgers == 0 {
 		return fmt.Errorf("RETENTION_LEDGERS must be positive")
+	}
+	if c.PartitionLedgerSpan == 0 {
+		return fmt.Errorf("PARTITION_LEDGER_SPAN must be positive")
 	}
 	switch strings.ToLower(c.LogLevel) {
 	case "debug", "info", "warn", "error":
