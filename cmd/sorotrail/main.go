@@ -143,10 +143,19 @@ func run() error {
 	if cfg.RetentionEnabled() {
 		api.SetPruner(prn)
 	}
+	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
+	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
+	// its cleanup goroutine is never started.
+	limiter := api.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.RateLimitTrustedProxy)
+	limiter.Start(ctx)
+	defer limiter.Stop()
+
+	apiServer := api.New(st, rpcClient, log)
+	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.New(st, rpcClient, log).Router(),
+		Handler:           apiServer.Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
