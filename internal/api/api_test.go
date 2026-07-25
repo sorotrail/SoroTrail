@@ -32,16 +32,23 @@ type stubStore struct {
 	event    store.Event
 	eventErr error
 
-	exists       bool
-	existsErr    error
-	existsCalls  int // count of EventExists calls
-	lastExistsID string
+	stats            store.Stats
+	pingErr          error
+	watchedList      []store.WatchedContract
+	watchedListErr   error
+	added            []string
+	removed          []string
+	addErr           error
+	removeErr        error
+	ingestionState   *store.IngestionState
+	ingestionStateEr error
+	exists           bool
+	existsErr        error
+	existsCalls      int // count of EventExists calls
+	lastExistsID     string
 
 	ingestion    store.IngestionState
 	ingestionErr error
-
-	stats   store.Stats
-	pingErr error
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -100,11 +107,25 @@ func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
 // LastIngestedLedger to drive the boundary decisions (just-below, at,
 // and above the frontier).
 func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, error) {
+	if s.ingestionState != nil {
+		return *s.ingestionState, s.ingestionStateEr
+	}
 	return s.ingestion, s.ingestionErr
 }
 
 func (s *stubStore) Stats(context.Context) (store.Stats, error) { return s.stats, nil }
 func (s *stubStore) Ping(context.Context) error                 { return s.pingErr }
+func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
+	return s.watchedList, s.watchedListErr
+}
+func (s *stubStore) AddWatchedContract(_ context.Context, id string) error {
+	s.added = append(s.added, id)
+	return s.addErr
+}
+func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
+	s.removed = append(s.removed, id)
+	return s.removeErr
+}
 
 // Subscription stubs for the webhook feature.
 func (s *stubStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
@@ -148,10 +169,14 @@ func (s *stubRPC) GetHealth(context.Context) (rpc.Health, error) {
 }
 
 func newTestServer(st *stubStore, rc *stubRPC) *Server {
+	return newTestServerWithKey(st, rc, "test-key")
+}
+
+func newTestServerWithKey(st *stubStore, rc *stubRPC, apiKey string) *Server {
 	if rc == nil {
 		rc = &stubRPC{health: rpc.Health{Status: "healthy"}}
 	}
-	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), apiKey)
 }
 
 func doGet(t *testing.T, s *Server, path string) (*http.Response, []byte) {
@@ -225,7 +250,13 @@ func TestListEvents_BadParams(t *testing.T) {
 		"/events?from_time=2026-07-21T00:00:00.123Z",
 		"/events?from_time=2026-07-22T00:00:00Z&to_time=2026-07-21T00:00:00Z",
 		"/events?limit=0",
+		"/events?limit=-1",
 		"/events?limit=99999",
+		"/events?limit=abc",
+		"/events?cursor=bad%20cursor",
+		"/events?cursor=e1%3BDROP",
+		"/events?cursor=%3Cscript%3E",
+		"/events?cursor=cursor%27OR%271%3D%271",
 		"/events?topic_contains=not-valid-json",
 	} {
 		t.Run(path, func(t *testing.T) {
@@ -235,6 +266,43 @@ func TestListEvents_BadParams(t *testing.T) {
 			require.NoError(t, json.Unmarshal(body, &e))
 			assert.NotEmpty(t, e["error"])
 		})
+	}
+}
+
+func TestListEvents_CursorAndLimitValidation(t *testing.T) {
+	st := &stubStore{
+		events: []store.Event{{ID: "e1"}},
+	}
+	srv := newTestServer(st, nil)
+
+	// Valid limit and valid cursor
+	resp, _ := doGet(t, srv, "/events?limit=10&cursor=0001099511627776-0000000001")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, 10, st.lastFilter.Limit)
+	assert.Equal(t, "0001099511627776-0000000001", st.lastFilter.Cursor)
+
+	// Omitted limit applies default
+	st.lastFilter = store.EventFilter{}
+	resp, _ = doGet(t, srv, "/events")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, store.DefaultQueryLimit, st.lastFilter.Limit)
+
+	// Invalid limit returns 400
+	for _, badLimit := range []string{"0", "-5", "201", "xyz"} {
+		resp, body := doGet(t, srv, "/events?limit="+badLimit)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var errResp map[string]string
+		require.NoError(t, json.Unmarshal(body, &errResp))
+		assert.Contains(t, errResp["error"], "limit must be an integer in [1,200]")
+	}
+
+	// Malformed cursor returns 400
+	for _, badCursor := range []string{"has%20space", "e1%3BDROP", "cursor%27OR%271%3D%271", "%3Cscript%3E"} {
+		resp, body := doGet(t, srv, "/events?cursor="+badCursor)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var errResp map[string]string
+		require.NoError(t, json.Unmarshal(body, &errResp))
+		assert.Contains(t, errResp["error"], "invalid cursor")
 	}
 }
 

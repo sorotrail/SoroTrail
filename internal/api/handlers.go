@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -18,6 +19,22 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
+
+// decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
+// unknown fields so a typo like {"contractID": "..."} doesn't fall
+// through with an empty contract_id and a confusing 400 from a later
+// check. Returns a typed error string the handler can surface directly.
+func decodeJSONBody(r *http.Request, dst any) error {
+	if r.Body == nil {
+		return errors.New("request body is empty")
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	return nil
+}
 
 // cachePrivate is the package-wide override that flips Cache-Control
 // directives from `public` to `private`. Production code sets it once at
@@ -177,7 +194,6 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
-
 	decoded := r.URL.Query().Get("decoded") == "true"
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
@@ -247,7 +263,6 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
-
 	decoded := r.URL.Query().Get("decoded") == "true"
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
@@ -571,6 +586,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
 	}
 
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
+	}
+
 	switch t := q.Get("type"); t {
 	case "", "contract", "system", "diagnostic":
 		f.Type = t
@@ -660,10 +679,12 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if raw := q.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
-		if err != nil || limit <= 0 || limit > store.MaxQueryLimit {
+		if err != nil || limit < 1 || limit > store.MaxQueryLimit {
 			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
 		}
 		f.Limit = limit
+	} else {
+		f.Limit = store.DefaultQueryLimit
 	}
 	return f, nil
 }
