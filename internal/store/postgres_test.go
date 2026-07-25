@@ -154,6 +154,44 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		}
 	})
 
+	t.Run("by topic_contains with object in array (containment)", func(t *testing.T) {
+		// topic_contains=[{"u64":7}] should match events whose topics array
+		// contains an element that jsonb-contains {"u64":7}.
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TopicContains: json.RawMessage(`[{"u64":7}]`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 9, "all events with u64:7 (9 out of 10)")
+	})
+
+	t.Run("by topic_contains with object directly does not match array", func(t *testing.T) {
+		// Passing an object directly (not wrapped in array) won't match an
+		// array column — jsonb array @> object is always false in Postgres.
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TopicContains: json.RawMessage(`{"u64":7}`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 0, "object not in array => no match")
+	})
+
+	t.Run("by topic_contains combined with contract_id", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			ContractID:    contractB,
+			TopicContains: json.RawMessage(`[{"u64":7}]`),
+		})
+		require.NoError(t, err)
+		// contractB has 5 events (even indexes), all of which contain {"u64":7}.
+		assert.Len(t, got, 5)
+	})
+
+	t.Run("by topic_contains no match", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TopicContains: json.RawMessage(`[{"symbol":"nonexistent"}]`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 0)
+	})
+
 	t.Run("keyset pagination desc returns newest-first", func(t *testing.T) {
 		var all []Event
 		cursor := ""
@@ -279,8 +317,24 @@ func TestStats(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), stats.TotalEvents)
 	assert.Equal(t, int64(101), stats.LastIngestedLedger)
+	assert.Equal(t, int64(100), stats.OldestStoredLedger)
 	assert.Equal(t, int64(2), stats.ContractCount)
 	assert.Equal(t, int64(1), stats.WatchedContracts)
+
+	var plan string
+	rows, err := st.pool.Query(ctx, `EXPLAIN (COSTS OFF) SELECT coalesce(min(ledger), 0) FROM events`)
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var line string
+		require.NoError(t, rows.Scan(&line))
+		plan += line + "\n"
+	}
+	require.NoError(t, rows.Err())
+	// The exact partition index name is Postgres-generated; the important
+	// property is that min(ledger) stays index-backed.
+	assert.Contains(t, plan, "Index")
+	assert.Contains(t, plan, "ledger")
 }
 
 // TestQueryEvents_PositionalTopics exercises the topic0..topic3 positional

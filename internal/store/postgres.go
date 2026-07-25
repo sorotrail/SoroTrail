@@ -346,6 +346,11 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		where = append(where,
 			fmt.Sprintf("topics->%d = %s::jsonb", i, arg(topic)))
 	}
+	if len(f.TopicContains) > 0 {
+		// Direct containment — caller controls the shape (object wrapped in
+		// array for element match, multi-element arrays for subset match).
+		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
+	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))
 	}
@@ -529,9 +534,10 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 			(SELECT count(*) FROM events),
 			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
 			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
+			(SELECT coalesce(min(ledger), 0) FROM events),
 			(SELECT count(DISTINCT contract_id) FROM events),
 			(SELECT count(*) FROM watched_contracts)`,
-	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.ContractCount, &s.WatchedContracts)
+	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
 	}
@@ -540,6 +546,35 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 
 func (p *Postgres) Ping(ctx context.Context) error {
 	return p.pool.Ping(ctx)
+}
+
+func (p *Postgres) GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error) {
+	var specJSON []byte
+	err := p.pool.QueryRow(ctx,
+		`SELECT spec_json FROM contract_specs WHERE wasm_hash = $1`, wasmHash,
+	).Scan(&specJSON)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading contract spec for wasm_hash %s: %w", wasmHash, err)
+	}
+	return specJSON, nil
+}
+
+func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO contract_specs (wasm_hash, contract_id, spec_json, fetched_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (wasm_hash) DO UPDATE SET
+			spec_json  = EXCLUDED.spec_json,
+			fetched_at = now()`,
+		wasmHash, contractID, specJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("saving contract spec for %s: %w", wasmHash, err)
+	}
+	return nil
 }
 
 func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
