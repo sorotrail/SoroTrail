@@ -45,14 +45,22 @@ func getAuditor() *audit.Auditor {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store store.Store
-	rpc   rpc.Client
-	log   *slog.Logger
+	store   store.Store
+	rpc     rpc.Client
+	log     *slog.Logger
+	limiter *RateLimiter
 }
 
 // New builds the API server. rpcClient is only used by /health.
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger) *Server {
 	return &Server{store: st, rpc: rpcClient, log: log}
+}
+
+// SetRateLimiter wires a per-client rate limiter into the router. Pass
+// nil to leave the limiter disabled (the default — no behavior change).
+// The limiter's Start/Stop lifecycle is owned by main, not by the Server.
+func (s *Server) SetRateLimiter(l *RateLimiter) {
+	s.limiter = l
 }
 
 // Router returns the HTTP handler with all routes mounted.
@@ -61,6 +69,12 @@ func (s *Server) Router() http.Handler {
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
+	if s.limiter != nil {
+		// Limiter sits inside Timeout and Recoverer so its instant 429
+		// response always makes it back through the deadline cleanly, and
+		// a panic inside the limiter can't take down the server.
+		r.Use(s.limiter.Middleware)
+	}
 
 	r.Get("/health", s.handleHealth)
 	r.Get("/events", s.handleListEvents)
