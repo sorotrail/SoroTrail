@@ -156,6 +156,26 @@ func TestListEvents_BareTopicBecomesJSONString(t *testing.T) {
 	assert.JSONEq(t, `"transfer"`, string(st.lastFilter.Topic))
 }
 
+func TestListEvents_PositionalTopicFiltersParse(t *testing.T) {
+	st := &stubStore{}
+	s := newTestServer(st, nil)
+
+	resp, _ := doGet(t, s,
+		"/events?topic0={\"symbol\":\"transfer\"}&topic1=GABC&topic2={\"x\":123}")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.JSONEq(t, `{"symbol":"transfer"}`, string(st.lastFilter.Topic0))
+	assert.JSONEq(t, `"GABC"`, string(st.lastFilter.Topic1))
+	assert.JSONEq(t, `{"x":123}`, string(st.lastFilter.Topic2))
+}
+
+func TestListEvents_TopicAndPositionalFiltersConflict(t *testing.T) {
+	resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/events?topic=transfer&topic0=GABC")
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var e map[string]string
+	require.NoError(t, json.Unmarshal(body, &e))
+	assert.Contains(t, e["error"], "cannot be combined")
+}
+
 func TestListEvents_BadParams(t *testing.T) {
 	for _, path := range []string{
 		"/events?type=bogus",

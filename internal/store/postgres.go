@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -337,6 +338,13 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if len(f.Topic) > 0 {
 		// Containment on the array matches the topic at any position.
 		where = append(where, "topics @> "+arg(fmt.Sprintf("[%s]", f.Topic))+"::jsonb")
+	}
+	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
+		if len(topic) == 0 {
+			continue
+		}
+		where = append(where,
+			fmt.Sprintf("topics->%d = %s::jsonb", i, arg(topic)))
 	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))
