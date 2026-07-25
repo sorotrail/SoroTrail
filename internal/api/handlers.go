@@ -88,17 +88,17 @@ type healthResponse struct {
 // allowlist accepts. It is built from the json struct tags so the compiler
 // catches drift when Event gains or renames fields.
 var eventFieldNames = map[string]bool{
-	"id":                  true,
-	"contract_id":         true,
-	"ledger":              true,
-	"type":                true,
-	"tx_hash":             true,
-	"tx_index":            true,
-	"op_index":            true,
-	"in_successful_call":  true,
-	"topics":              true,
-	"value":               true,
-	"created_at":          true,
+	"id":                 true,
+	"contract_id":        true,
+	"ledger":             true,
+	"type":               true,
+	"tx_hash":            true,
+	"tx_index":           true,
+	"op_index":           true,
+	"in_successful_call": true,
+	"topics":             true,
+	"value":              true,
+	"created_at":         true,
 }
 
 // parseFields splits a comma-separated ?fields= value and returns the
