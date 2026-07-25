@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -18,6 +19,22 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
+
+// decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
+// unknown fields so a typo like {"contractID": "..."} doesn't fall
+// through with an empty contract_id and a confusing 400 from a later
+// check. Returns a typed error string the handler can surface directly.
+func decodeJSONBody(r *http.Request, dst any) error {
+	if r.Body == nil {
+		return errors.New("request body is empty")
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	return nil
+}
 
 // cachePrivate is the package-wide override that flips Cache-Control
 // directives from `public` to `private`. Production code sets it once at
@@ -84,6 +101,109 @@ type healthResponse struct {
 	Checks map[string]string `json:"checks"`
 }
 
+// eventFieldNames is the set of JSON keys on store.Event that the ?fields=
+// allowlist accepts. It is built from the json struct tags so the compiler
+// catches drift when Event gains or renames fields.
+var eventFieldNames = map[string]bool{
+	"id":                 true,
+	"contract_id":        true,
+	"ledger":             true,
+	"type":               true,
+	"tx_hash":            true,
+	"tx_index":           true,
+	"op_index":           true,
+	"in_successful_call": true,
+	"topics":             true,
+	"value":              true,
+	"created_at":         true,
+}
+
+// parseFields splits a comma-separated ?fields= value and returns the
+// allowlist set. Unknown field names are rejected with a 400-style error.
+// An empty or missing raw value returns nil (meaning "return the full object").
+func parseFields(raw string) (map[string]bool, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	set := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		f := strings.TrimSpace(p)
+		if f == "" {
+			continue
+		}
+		if !eventFieldNames[f] {
+			return nil, fmt.Errorf("unknown field %q (valid: id, contract_id, ledger, type, tx_hash, tx_index, op_index, in_successful_call, topics, value, created_at)", f)
+		}
+		set[f] = true
+	}
+	if len(set) == 0 {
+		return nil, nil
+	}
+	return set, nil
+}
+
+// projectEvent returns the event unchanged when fields is nil, or a
+// map[string]any containing only the requested keys.
+func projectEvent(ev store.Event, fields map[string]bool) any {
+	if fields == nil {
+		return ev
+	}
+	return eventToMap(ev, fields)
+}
+
+// projectEvents applies projectEvent to a slice, returning []map[string]any
+// when fields is set, or the original slice when nil.
+func projectEvents(evs []store.Event, fields map[string]bool) any {
+	if fields == nil {
+		return evs
+	}
+	out := make([]map[string]any, len(evs))
+	for i, ev := range evs {
+		out[i] = eventToMap(ev, fields)
+	}
+	return out
+}
+
+// eventToMap builds a map with only the requested fields.
+func eventToMap(ev store.Event, fields map[string]bool) map[string]any {
+	m := make(map[string]any, len(fields))
+	if fields["id"] {
+		m["id"] = ev.ID
+	}
+	if fields["contract_id"] {
+		m["contract_id"] = ev.ContractID
+	}
+	if fields["ledger"] {
+		m["ledger"] = ev.Ledger
+	}
+	if fields["type"] {
+		m["type"] = ev.Type
+	}
+	if fields["tx_hash"] {
+		m["tx_hash"] = ev.TxHash
+	}
+	if fields["tx_index"] {
+		m["tx_index"] = ev.TxIndex
+	}
+	if fields["op_index"] {
+		m["op_index"] = ev.OpIndex
+	}
+	if fields["in_successful_call"] {
+		m["in_successful_call"] = ev.InSuccessfulCall
+	}
+	if fields["topics"] {
+		m["topics"] = ev.Topics
+	}
+	if fields["value"] {
+		m["value"] = ev.Value
+	}
+	if fields["created_at"] {
+		m["created_at"] = ev.CreatedAt
+	}
+	return m
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -107,16 +227,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
-	filter, err := filterFromQuery(r)
+	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	s.serveEvents(w, r, filter)
+	s.serveEvents(w, r, filter, fields)
 }
 
 func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
-	filter, err := filterFromQuery(r)
+	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -127,7 +247,7 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	filter.ContractID = contractID
-	s.serveEvents(w, r, filter)
+	s.serveEvents(w, r, filter, fields)
 }
 
 // serveEvents is the shared body for /events and /contracts/{id}/events.
@@ -135,7 +255,7 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 // SQL query, so an immutable page with a matching If-None-Match never
 // touches the events table at all — only the cheap ingestion_state row
 // used to read the frontier.
-func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter store.EventFilter) {
+func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter store.EventFilter, fields map[string]bool) {
 	policy, etag, err := s.listCachePolicy(r.Context(), filter)
 	if err != nil {
 		// "When in doubt, don't cache" is the explicit guidance: any
@@ -160,11 +280,41 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		return
 	}
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
-	writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
+	// eventsResponse expects []store.Event; when fields projection is active
+	// we wrap the projected maps in a compatible envelope.
+	if fields == nil {
+		writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
+	} else {
+		m := map[string]any{"events": projectEvents(events, fields)}
+		if cursor != "" {
+			m["cursor"] = cursor
+		}
+		writeJSON(w, http.StatusOK, m)
+	}
+}
+
+// parseFilterAndFields parses the shared filter params plus the optional
+// ?fields= allowlist.
+func parseFilterAndFields(r *http.Request) (store.EventFilter, map[string]bool, error) {
+	filter, err := filterFromQuery(r)
+	if err != nil {
+		return filter, nil, err
+	}
+	fields, err := parseFields(r.URL.Query().Get("fields"))
+	if err != nil {
+		return filter, nil, err
+	}
+	return filter, fields, nil
 }
 
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+
+	fields, err := parseFields(r.URL.Query().Get("fields"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 
 	// Strong ETag: the event ID is itself a perfect validator for an
 	// immutable resource (each ID maps to exactly one row, that row's
@@ -216,7 +366,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
-	writeJSON(w, http.StatusOK, event)
+	writeJSON(w, http.StatusOK, projectEvent(event, fields))
 }
 
 // Stats summarizes what the indexer has stored plus, when the auditor is
@@ -243,6 +393,178 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
+}
+
+// addWatchedRequest is the body for POST /watched-contracts: a single
+// contract ID to add to the runtime watch list.
+type addWatchedRequest struct {
+	ContractID string `json:"contract_id"`
+}
+
+// addWatchedResponse includes the current ingestion cursor so callers
+// know exactly where historical replay starts — events before this ledger
+// are not backfilled by the runtime add (a separate replay tool covers them).
+type addWatchedResponse struct {
+	ContractID        string `json:"contract_id"`
+	AddedAt           string `json:"added_at"`
+	HistoryFromLedger int64  `json:"history_from_ledger"`
+	// ModeTransition is "all_to_specific" when the list was empty before
+	// this add, surfacing the same semantic change the confirm guard
+	// guards. Useful to post-run auditors even when the caller already
+	// confirmed.
+	ModeTransition string `json:"mode_transition,omitempty"`
+}
+
+// removeWatchedResponse explains what removal actually did: stored events
+// are NOT deleted; only future ingestion stops. The message is part of
+// the contract so callers don't have to read the README to find out.
+type removeWatchedResponse struct {
+	ContractID       string `json:"contract_id"`
+	RemovedAt        string `json:"removed_at"`
+	HistoryPreserved bool   `json:"history_preserved"`
+	ModeTransition   string `json:"mode_transition,omitempty"`
+}
+
+// watchedListResponse wraps the GET response in an envelope so the route
+// is easy to extend without breaking JSON shape.
+type watchedListResponse struct {
+	Contracts []store.WatchedContract `json:"contracts"`
+	Count     int                     `json:"count"`
+}
+
+// handleListWatchedChains returns the current watch list in stable
+// (contract_id) order.
+func (s *Server) handleListWatchedChains(w http.ResponseWriter, r *http.Request) {
+	contracts, err := s.store.ListWatchedContracts(r.Context())
+	if err != nil {
+		s.log.Error("listing watched contracts", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
+		return
+	}
+	writeJSON(w, http.StatusOK, watchedListResponse{Contracts: contracts, Count: len(contracts)})
+}
+
+// handleAddWatchedChain adds a contract to the runtime watch list and
+// returns where historical replay for it starts (= the current cursor).
+//
+// Guarded by ?confirm=true when the add would switch the ingester from
+// "all contract events" (empty list) to a specific contract list, since
+// that silently narrows what gets stored going forward.
+//
+// TOCTOU note: the confirm check reads the list and then mutates it
+// without holding a row lock. Two concurrent empty→non-empty POSTs can
+// both pass the guard before either mutates — acceptable because
+// ON CONFLICT DO NOTHING makes a duplicate Add a no-op, and only the
+// first response carries the genuine transition; the second reports one
+// too, but no row state diverges.
+func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
+	var req addWatchedRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if !config.ValidContractID(req.ContractID) {
+		writeError(w, http.StatusBadRequest,
+			fmt.Errorf("invalid contract_id %q (want 56-char C... strkey)", req.ContractID))
+		return
+	}
+
+	current, err := s.store.ListWatchedContracts(r.Context())
+	if err != nil {
+		s.log.Error("listing watched contracts for add", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
+		return
+	}
+
+	modeTransition := ""
+	if len(current) == 0 {
+		// Empty -> non-empty switches the ingester from "all contract
+		// events" to a specific list. The guard exists because the new
+		// filter silently narrows what's indexed going forward — exactly
+		// the kind of change an operator should make on purpose, not by
+		// typo.
+		if r.URL.Query().Get("confirm") != "true" {
+			writeError(w, http.StatusBadRequest, errors.New(
+				"adding the first watched contract would switch ingestion from "+
+					"'all contract events' to a specific list — pass ?confirm=true to acknowledge"))
+			return
+		}
+		modeTransition = "all_to_specific"
+	}
+
+	state, err := s.store.GetIngestionState(r.Context())
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.log.Error("loading ingestion state for add", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading ingestion state failed"))
+		return
+	}
+
+	if err := s.store.AddWatchedContract(r.Context(), req.ContractID); err != nil {
+		s.log.Error("adding watched contract", "contract_id", req.ContractID, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("adding watched contract failed"))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, addWatchedResponse{
+		ContractID:        req.ContractID,
+		AddedAt:           time.Now().UTC().Format(time.RFC3339),
+		HistoryFromLedger: state.LastIngestedLedger,
+		ModeTransition:    modeTransition,
+	})
+}
+
+// handleRemoveWatchedChain stops future ingestion for the named contract
+// without deleting any events already stored. The same empty<->non-empty
+// guard fires when removing the last contract on the list (specific -> all).
+//
+// TOCTOU note: same read-then-write shape as POST — see the comment on
+// handleAddWatchedChain. Two concurrent DELETE/s of the last contract
+// could both pass the guard; only the first actually transitions the
+// list (the second returns ErrNotFound → 404), so no mode claim is wrong.
+func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if !config.ValidContractID(id) {
+		writeError(w, http.StatusBadRequest,
+			fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", id))
+		return
+	}
+
+	current, err := s.store.ListWatchedContracts(r.Context())
+	if err != nil {
+		s.log.Error("listing watched contracts for remove", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
+		return
+	}
+
+	modeTransition := ""
+	if len(current) == 1 && current[0].ContractID == id {
+		// Last contract on the list: removing it flips ingestion from
+		// "specific list" back to "all contract events".
+		if r.URL.Query().Get("confirm") != "true" {
+			writeError(w, http.StatusBadRequest, errors.New(
+				"removing the last watched contract would switch ingestion from "+
+					"'a specific list' back to 'all contract events' — pass ?confirm=true to acknowledge"))
+			return
+		}
+		modeTransition = "specific_to_all"
+	}
+
+	if err := s.store.RemoveWatchedContract(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("contract %q is not in the watch list", id))
+			return
+		}
+		s.log.Error("removing watched contract", "contract_id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("removing watched contract failed"))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, removeWatchedResponse{
+		ContractID:       id,
+		RemovedAt:        time.Now().UTC().Format(time.RFC3339),
+		HistoryPreserved: true,
+		ModeTransition:   modeTransition,
+	})
 }
 
 func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
@@ -641,7 +963,7 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filter, err := filterFromQuery(r)
+	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -697,7 +1019,7 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			data, err := json.Marshal(ev)
+			data, err := json.Marshal(projectEvent(ev, fields))
 			if err != nil {
 				s.log.Error("marshal event for ws", "error", err)
 				continue
