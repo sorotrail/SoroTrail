@@ -53,7 +53,7 @@ type mockStore struct {
 	mu       sync.Mutex
 	events   map[string]store.Event
 	state    *store.IngestionState
-	watched  []string
+	watched  []store.WatchedContract
 	upserted [][]store.Event
 }
 
@@ -158,13 +158,23 @@ func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState
 	return nil
 }
 
-func (m *mockStore) ListWatchedContracts(context.Context) ([]string, error) {
+func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return m.watched, nil
 }
 
 func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
-	m.watched = append(m.watched, id)
+	m.watched = append(m.watched, store.WatchedContract{ContractID: id})
 	return nil
+}
+
+func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
+	for i, wc := range m.watched {
+		if wc.ContractID == id {
+			m.watched = append(m.watched[:i], m.watched[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrNotFound
 }
 
 func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
