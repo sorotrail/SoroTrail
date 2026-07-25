@@ -318,12 +318,12 @@ func TestPersistEvents_RetainsRawXDR(t *testing.T) {
 }
 
 func TestFilterBatching(t *testing.T) {
-	watch := func(n int) []string {
-		ids := make([]string, n)
-		for i := range ids {
-			ids[i] = fmt.Sprintf("C%055d", i)
+	watch := func(n int) []store.WatchedContract {
+		out := make([]store.WatchedContract, n)
+		for i := range out {
+			out[i] = store.WatchedContract{ContractID: fmt.Sprintf("C%055d", i)}
 		}
-		return ids
+		return out
 	}
 
 	t.Run("no watched contracts means one match-all filter", func(t *testing.T) {
@@ -364,7 +364,8 @@ func TestFilterBatching(t *testing.T) {
 func TestWindowSweep_MultiBatch(t *testing.T) {
 	st := newMockStore()
 	for i := 0; i < 27; i++ {
-		st.watched = append(st.watched, fmt.Sprintf("C%055d", i))
+		st.watched = append(st.watched,
+			store.WatchedContract{ContractID: fmt.Sprintf("C%055d", i)})
 	}
 	client := &mockRPC{
 		health: rpc.Health{Status: "healthy", LatestLedger: 5_000, OldestLedger: 10},
@@ -428,278 +429,91 @@ func TestRun_StopsOnContextCancel(t *testing.T) {
 	assert.ErrorIs(t, err, context.Canceled)
 }
 
-// -- Lag alarm tests --
-//
-// The lag alarm is a hysteresis-driven WARN-on-crossing / INFO-on-recovery
-// signal that fires once per state change. Each test scripts a sequence
-// of (latest_ledger, ingested_ledger) pairs and asserts on log counts,
-// final hysteresis state, and (where it matters) the last gauge reading.
-// A future "publish only on transitions" optimization should still pass.
+// The runtime API mutates the watched_contracts table mid-run. The
+// ingester's next runOnce must re-read the watch list and issue
+// getEvents with the new filter contractIds — no restart required.
+func TestIngester_PicksUpRuntimeWatchListChange(t *testing.T) {
+	contractB := "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+	contractC := "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
 
-func TestLagAlarm_DisabledIsSilent(t *testing.T) {
-	ing, buf, metrics := makeIngester(t, Options{LagWarnLedgers: 0})
-
-	driveLagCycles(t, ing, []mockCycle{{latest: 1_000, ingested: 100}})
-
-	assert.Empty(t, strings.TrimSpace(buf.String()), "no log lines expected when alarm disabled")
-	assert.Empty(t, metrics.history(), "no metric updates expected when alarm disabled")
-	assert.False(t, ing.lagging, "internal state stays at false")
-}
-
-// Note: the documented default of 100 is enforced by internal/config
-// (LAG_WARN_LEDGERS env, default 100). Ingester.applyDefaults intentionally
-// does NOT auto-substitute 100 for zero because zero is also the
-// documented "disabled" sentinel (TestLagAlarm_DisabledIsSilent above
-// pins that contract). Inlining a default here would force operators to
-// set LagWarnLedgers to a non-zero value to disable, which contradicts
-// the README config table.
-
-func TestLagAlarm_StayHealthy_NoLogs(t *testing.T) {
-	ing, buf, _ := makeIngester(t, Options{LagWarnLedgers: 100})
-
-	driveLagCycles(t, ing, []mockCycle{
-		{latest: 105, ingested: 105},
-		{latest: 106, ingested: 106},
-		{latest: 107, ingested: 107},
-		{latest: 108, ingested: 108},
-		{latest: 109, ingested: 109},
-	})
-
-	assert.Empty(t, strings.TrimSpace(buf.String()), "healthy cycles stay silent")
-	assert.False(t, ing.lagging)
-}
-
-func TestLagAlarm_CrossingFiresOnceAndStaysLaggingNoSpam(t *testing.T) {
-	ing, buf, _ := makeIngester(t, Options{LagWarnLedgers: 100})
-	require.NoError(t, ing.store.SaveIngestionState(context.Background(),
-		store.IngestionState{LastIngestedLedger: 100}))
-
-	driveLagCycles(t, ing, []mockCycle{
-		{latest: 150, ingested: 100}, // lag 50, healthy (no log)
-		{latest: 210, ingested: 100}, // lag 110, CROSS → WARN
-		{latest: 220, ingested: 100}, // still lagging (no log)
-		{latest: 250, ingested: 100}, // still lagging (no log)
-		{latest: 300, ingested: 100}, // still lagging (no log)
-	})
-
-	warns := logRecords(t, buf, func(l string) bool { return l == "WARN" })
-	require.Len(t, warns, 1, "exactly one warn on the crossing, despite 4 lagging cycles")
-	assert.Equal(t, "ingest lag exceeded threshold", warns[0]["msg"])
-	assert.Equal(t, float64(210), warns[0]["latest_ledger"], "snapshot of the cycle that crossed")
-	assert.Equal(t, float64(100), warns[0]["last_ingested_ledger"])
-	assert.Equal(t, float64(110), warns[0]["lag_ledgers"], "210 - 100 = 110")
-	assert.Equal(t, float64(100), warns[0]["threshold_ledgers"])
-	assert.True(t, ing.lagging, "stays true across the still-lagging tail")
-}
-
-func TestLagAlarm_RecoveryFiresOnceAndStaysQuiet(t *testing.T) {
-	ing, buf, _ := makeIngester(t, Options{LagWarnLedgers: 100})
-	require.NoError(t, ing.store.SaveIngestionState(context.Background(),
-		store.IngestionState{LastIngestedLedger: 100}))
-
-	driveLagCycles(t, ing, []mockCycle{
-		{latest: 500, ingested: 100},  // lag 400 → WARN
-		{latest: 110, ingested: 100},  // lag 10, recovered → INFO
-		{latest: 112, ingested: 112},  // catch-up → stays healthy
-		{latest: 115, ingested: 115},
-	})
-
-	levels := map[string]int{}
-	for _, r := range logRecords(t, buf, nil) {
-		levels[r["level"].(string)]++
+	// Two scripted responses: first when the watch list contains only A,
+	// then when the runtime POST adds B between passes.
+	client := &mockRPC{
+		eventsResps: []rpc.GetEventsResponse{
+			{Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 100},
+			{Events: []rpc.Event{rpcEvent("e2", 101)}, LatestLedger: 101},
+		},
 	}
-	assert.Equal(t, 1, levels["WARN"], "exactly one crossing-warn")
-	assert.Equal(t, 1, levels["INFO"], "exactly one recovery-info, even after 3 healthy cycles")
-
-	var infoRec map[string]any
-	for _, r := range logRecords(t, buf, func(l string) bool { return l == "INFO" }) {
-		infoRec = r
-	}
-	require.NotNil(t, infoRec)
-	assert.Equal(t, "ingest lag recovered", infoRec["msg"])
-	assert.Equal(t, float64(110), infoRec["latest_ledger"])
-	assert.Equal(t, float64(10), infoRec["lag_ledgers"])
-	assert.Equal(t, float64(100), infoRec["threshold_ledgers"])
-	assert.False(t, ing.lagging)
-}
-
-func TestLagAlarm_RoundTripFullCrossingSequence(t *testing.T) {
-	ing, buf, _ := makeIngester(t, Options{LagWarnLedgers: 100})
-	require.NoError(t, ing.store.SaveIngestionState(context.Background(),
-		store.IngestionState{LastIngestedLedger: 1_000}))
-
-	driveLagCycles(t, ing, []mockCycle{
-		{latest: 1_010, ingested: 1_000},
-		{latest: 1_080, ingested: 1_000},
-		{latest: 1_110, ingested: 1_000}, // cross (lag 110) → WARN
-		{latest: 1_200, ingested: 1_000},
-		{latest: 1_300, ingested: 1_000},
-		{latest: 1_080, ingested: 1_080}, // recovered (lag 0) → INFO
-		{latest: 1_100, ingested: 1_095},
-		{latest: 1_120, ingested: 1_115},
-	})
-
-	warns := logRecords(t, buf, func(l string) bool { return l == "WARN" })
-	infos := logRecords(t, buf, func(l string) bool { return l == "INFO" })
-	assert.Len(t, warns, 1, "only one crossing despite 8 cycles")
-	assert.Len(t, infos, 1, "only one recovery despite 8 cycles")
-	assert.False(t, ing.lagging)
-}
-
-func TestLagAlarm_ReCrossingFiresAnotherWarn(t *testing.T) {
-	ing, buf, _ := makeIngester(t, Options{LagWarnLedgers: 100})
-	require.NoError(t, ing.store.SaveIngestionState(context.Background(),
-		store.IngestionState{LastIngestedLedger: 1_000}))
-
-	driveLagCycles(t, ing, []mockCycle{
-		{latest: 1_500, ingested: 1_000}, // cross 1 → WARN
-		{latest: 1_050, ingested: 1_050}, // recovered → INFO
-		{latest: 1_500, ingested: 1_050}, // cross 2 → WARN again
-		{latest: 1_600, ingested: 1_050}, // still lagging → no log
-	})
-
-	warns := logRecords(t, buf, func(l string) bool { return l == "WARN" })
-	infos := logRecords(t, buf, func(l string) bool { return l == "INFO" })
-	assert.Len(t, warns, 2, "two distinct crossings → two WARNs")
-	assert.Len(t, infos, 1, "one recovery in between")
-	assert.True(t, ing.lagging)
-}
-
-func TestLagAlarm_ColdStart_NoFireAndSettlesGauge(t *testing.T) {
-	ing, buf, metrics := makeIngester(t, Options{LagWarnLedgers: 100})
-
-	driveLagCycles(t, ing, []mockCycle{{latest: 5_000, ingested: -1}})
-
-	assert.Empty(t, strings.TrimSpace(buf.String()), "no log when no ingestion state exists")
-	gauge := metrics.history()
-	require.NotEmpty(t, gauge, "SetLagging should run on ErrNotFound to prime the gauge")
-	assert.False(t, gauge[len(gauge)-1], "last gauge reading on ErrNotFound is false")
-	assert.False(t, ing.lagging)
-}
-
-// seedLaggingForTest drives the alarm through a real WARN cycle so tests
-// can verify the error paths preserve hysteresis without poking the
-// unexported field directly. Two side effects are managed here so
-// tests stay focused on post-seed behavior:
-//
-//  1. The seeded WARN/INFO lines are routed to a discard logger so the
-//     test's own recording buf only sees events that happen AFTER the
-//     seed returns. Callers can still count "WARN count == 1 if the test
-//     triggered one extra crossing".
-//  2. If the wired client is a *flakyRPC with failLatest=true (used by
-//     error-path tests), the seed temporarily toggles it false so the
-//     WARN actually fires; the original flag is restored on return.
-//     Keeps testLaggingForTest unaware of which RPC variant the test
-//     wired in.
-func seedLaggingForTest(t *testing.T, ing *Ingester) {
-	t.Helper()
-
-	origLog := ing.log
-	ing.log = testLogger()
-	defer func() { ing.log = origLog }()
-
-	if f, ok := ing.client.(*flakyRPC); ok {
-		origFail := f.failLatest
-		f.failLatest = false
-		defer func() { f.failLatest = origFail }()
-	}
-
-	require.NoError(t, ing.store.SaveIngestionState(context.Background(),
-		store.IngestionState{LastIngestedLedger: 100}))
-	driveLagCycles(t, ing, []mockCycle{
-		{latest: 600, ingested: 100}, // lag 500 → triggers WARN
-	})
-	require.True(t, ing.lagging, "seed helper should leave hysteresis true")
-}
-
-func TestLagAlarm_GetLatestLedgerError_KeepsPriorState(t *testing.T) {
-	log, buf := recordingLogger()
-	metrics := &recordingLagMetrics{}
 	st := newMockStore()
-	flaky := &flakyRPC{base: &mockRPC{health: rpc.Health{LatestLedger: 1_000}}, failLatest: true}
-	ing := newTestIngester(flaky, st, Options{LagWarnLedgers: 100})
-	ing.log = log
-	ing.opts.LagMetrics = metrics
-	seedLaggingForTest(t, ing)
-	startHistoryLen := len(metrics.history())
+	require.NoError(t, st.AddWatchedContract(context.Background(),
+		"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"))
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
 
-	flaky.failLatest = true
-	ing.checkLag(context.Background())
+	// Pass 1: list has only A.
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+	require.Len(t, client.eventsRequests, 1)
+	req1 := client.eventsRequests[0]
+	require.Len(t, req1.Filters, 1)
+	require.Len(t, req1.Filters[0].ContractIDs, 1)
+	assert.Equal(t,
+		"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		req1.Filters[0].ContractIDs[0],
+		"first pass issues a filter for A only")
 
-	assert.Empty(t, strings.TrimSpace(buf.String()),
-		"no log lines when getLatestLedger errors (no spurious recovery)")
-	assert.True(t, ing.lagging, "prior hysteresis state preserved on transient RPC failure")
-	assert.Equal(t, startHistoryLen, len(metrics.history()),
-		"no new SetLagging call when evidence is missing")
+	// Operator POSTs B and C; ingester does not know about this directly
+	// — it just re-reads the list on the next pass.
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractB))
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractC))
+	require.NoError(t, st.SaveIngestionState(context.Background(),
+		store.IngestionState{LastIngestedLedger: 100}))
+
+	// Pass 2: list has A, B, C. Without a restart, runOnce should pick
+	// up the new IDs and issue a single batch carrying all three.
+	_, err = ing.runOnce(context.Background())
+	require.NoError(t, err)
+	require.Len(t, client.eventsRequests, 2,
+		"the second pass must issue a fresh getEvents — the previous response was already consumed")
+	req2 := client.eventsRequests[1]
+	require.Len(t, req2.Filters, 1, "three contracts still fit one filter (cap is 5)")
+	assert.ElementsMatch(t,
+		[]string{
+			"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+			contractB, contractC,
+		},
+		req2.Filters[0].ContractIDs,
+		"second pass picks up the newly-added contracts WITHOUT a restart")
 }
 
-func TestLagAlarm_GetIngestionStateError_KeepsPriorState(t *testing.T) {
-	log, buf := recordingLogger()
-	metrics := &recordingLagMetrics{}
-	st := newMockStore()
-	ing := newTestIngester(&mockRPC{health: rpc.Health{LatestLedger: 1_000}}, st,
-		Options{LagWarnLedgers: 100})
-	ing.log = log
-	ing.opts.LagMetrics = metrics
-	seedLaggingForTest(t, ing)
-	startHistoryLen := len(metrics.history())
-
-	setMockStoreIngestErr(t, st, errors.New("database on fire"))
-	ing.checkLag(context.Background())
-
-	assert.Empty(t, strings.TrimSpace(buf.String()),
-		"no log when GetIngestionState errors (no spurious recovery)")
-	assert.True(t, ing.lagging, "prior hysteresis state preserved on transient store error")
-	assert.Equal(t, startHistoryLen, len(metrics.history()),
-		"no new SetLagging call when evidence is missing")
-}
-
-// setMockStoreIngestErr writes ingestErr under mockStore.mu so the
-// in-package test helper matches the rest of mockStore's lock-taking
-// reads.
-func setMockStoreIngestErr(t *testing.T, st *mockStore, err error) {
-	t.Helper()
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.ingestErr = err
-}
-
-func TestLagAlarm_NegativeLagFromReorgIsClamped(t *testing.T) {
-	ing, buf, _ := makeIngester(t, Options{LagWarnLedgers: 100})
-	require.NoError(t, ing.store.SaveIngestionState(context.Background(),
-		store.IngestionState{LastIngestedLedger: 1_000}))
-
-	driveLagCycles(t, ing, []mockCycle{
-		{latest: 1_500, ingested: 1_000}, // lag 500 → WARN
-		{latest: 900, ingested: 1_000},  // "lag" -100 (reorg)
-		{latest: 950, ingested: 1_000},  // "lag" -50
-	})
-
-	warns := logRecords(t, buf, func(l string) bool { return l == "WARN" })
-	infos := logRecords(t, buf, func(l string) bool { return l == "INFO" })
-	assert.Len(t, warns, 1, "the original crossing still fires")
-	assert.Len(t, infos, 0, "negative lag must not emit a spurious recovery")
-	assert.True(t, ing.lagging, "hysteresis preserved across ambiguous cycles")
-}
-
-// flakyRPC wraps mockRPC and fails GetLatestLedger on demand so the
-// alarm's error path can be tested without affecting other RPC methods.
-type flakyRPC struct {
-	base       *mockRPC
-	failLatest bool
-}
-
-func (f *flakyRPC) GetEvents(ctx context.Context, req rpc.GetEventsRequest) (rpc.GetEventsResponse, error) {
-	return f.base.GetEvents(ctx, req)
-}
-
-func (f *flakyRPC) GetLatestLedger(_ context.Context) (rpc.LatestLedger, error) {
-	if f.failLatest {
-		return rpc.LatestLedger{}, fmt.Errorf("flaky: simulated RPC outage")
+// Symmetric coverage in the other direction: removing the only watched
+// contract changes the filter shape from \"specific\" to \"all contracts\".
+func TestIngester_PicksUpRuntimeWatchListRemoval(t *testing.T) {
+	contractA := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	client := &mockRPC{
+		eventsResps: []rpc.GetEventsResponse{
+			{Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 100},
+			{Events: []rpc.Event{rpcEvent("e2", 101)}, LatestLedger: 101},
+		},
 	}
-	return rpc.LatestLedger{Sequence: f.base.health.LatestLedger}, nil
-}
+	st := newMockStore()
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
 
-func (f *flakyRPC) GetHealth(ctx context.Context) (rpc.Health, error) {
-	return f.base.GetHealth(ctx)
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+	require.Len(t, st.watched, 1)
+
+	// Operator DELETE's A; list transitions to empty.
+	require.NoError(t, st.RemoveWatchedContract(context.Background(), contractA))
+	require.NoError(t, st.SaveIngestionState(context.Background(),
+		store.IngestionState{LastIngestedLedger: 100}))
+
+	_, err = ing.runOnce(context.Background())
+	require.NoError(t, err)
+	require.Len(t, client.eventsRequests, 2)
+	req2 := client.eventsRequests[1]
+	require.Len(t, req2.Filters, 1)
+	assert.Empty(t, req2.Filters[0].ContractIDs,
+		"empty watch list means ingest-all: contractIds must be empty")
+	assert.Equal(t, "contract", req2.Filters[0].Type)
 }

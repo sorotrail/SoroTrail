@@ -109,6 +109,10 @@ func (m *mockRPC) GetHealth(context.Context) (rpc.Health, error) {
 	return m.health, nil
 }
 
+func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+	return rpc.GetLedgerEntriesResponse{}, nil
+}
+
 // mockStore is an in-memory implementation of store.Store good enough
 // for the auditor. It mirrors and extends the ingester test mock so we
 // don't import the ingester test package.
@@ -123,7 +127,7 @@ type mockStore struct {
 	findings []store.AuditFinding
 	nextFID  int64
 
-	watched []string
+	watched []store.WatchedContract
 
 	// ledgers lets assertions check whether a finding record was written.
 	ledgerCensusCalls []struct {
@@ -274,13 +278,23 @@ func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, ledger int64) (st
 	return *m.auditState, nil
 }
 
-func (m *mockStore) ListWatchedContracts(context.Context) ([]string, error) {
+func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return m.watched, nil
 }
 
 func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
-	m.watched = append(m.watched, id)
+	m.watched = append(m.watched, store.WatchedContract{ContractID: id})
 	return nil
+}
+
+func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
+	for i, wc := range m.watched {
+		if wc.ContractID == id {
+			m.watched = append(m.watched[:i], m.watched[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrNotFound
 }
 
 func (m *mockStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) (store.AuditFinding, error) {
@@ -339,6 +353,11 @@ func (m *mockStore) Stats(context.Context) (store.Stats, error) {
 }
 
 func (m *mockStore) Ping(context.Context) error { return nil }
+
+func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
+	return nil, store.ErrNotFound
+}
+func (m *mockStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
 
 // Subscription stubs for the webhook feature — unused by auditor tests.
 func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
