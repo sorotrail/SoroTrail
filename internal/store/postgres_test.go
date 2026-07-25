@@ -136,23 +136,6 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		assert.Len(t, got, 1)
 	})
 
-	t.Run("by topic0 and topic1 positionally", func(t *testing.T) {
-		e1 := testEvent(eventID(100), 200, contractA)
-		e1.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GABC"},{"address":"GDEF"}]`)
-		e2 := testEvent(eventID(101), 201, contractA)
-		e2.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GDEF"},{"address":"GABC"}]`)
-		_, err := st.UpsertEvents(ctx, []Event{e1, e2})
-		require.NoError(t, err)
-
-		got, _, err := st.QueryEvents(ctx, EventFilter{
-			Topic0: json.RawMessage(`{"symbol":"transfer"}`),
-			Topic1: json.RawMessage(`{"address":"GABC"}`),
-		})
-		require.NoError(t, err)
-		assert.Len(t, got, 1)
-		assert.Equal(t, e1.ID, got[0].ID)
-	})
-
 	t.Run("keyset pagination walks all rows in order", func(t *testing.T) {
 		var all []Event
 		cursor := ""
@@ -298,4 +281,27 @@ func TestStats(t *testing.T) {
 	assert.Equal(t, int64(101), stats.LastIngestedLedger)
 	assert.Equal(t, int64(2), stats.ContractCount)
 	assert.Equal(t, int64(1), stats.WatchedContracts)
+}
+
+// TestQueryEvents_PositionalTopics exercises the topic0..topic3 positional
+// filters in their own truncated DB so the extra rows do not leak into the
+// shared-dataset assertions in TestQueryEvents_FiltersAndPagination.
+func TestQueryEvents_PositionalTopics(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	e1 := testEvent(eventID(100), 200, contractA)
+	e1.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GABC"},{"address":"GDEF"}]`)
+	e2 := testEvent(eventID(101), 201, contractA)
+	e2.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GDEF"},{"address":"GABC"}]`)
+	_, err := st.UpsertEvents(ctx, []Event{e1, e2})
+	require.NoError(t, err)
+
+	got, _, err := st.QueryEvents(ctx, EventFilter{
+		Topic0: json.RawMessage(`{"symbol":"transfer"}`),
+		Topic1: json.RawMessage(`{"address":"GABC"}`),
+	})
+	require.NoError(t, err)
+	assert.Len(t, got, 1)
+	assert.Equal(t, e1.ID, got[0].ID)
 }
