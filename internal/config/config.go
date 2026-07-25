@@ -22,6 +22,16 @@ type Config struct {
 	StartLedger      uint32        `env:"START_LEDGER"`
 	RetentionLedgers uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
 	LogLevel         string        `env:"LOG_LEVEL" envDefault:"info"`
+	// LagWarnLedgers is the maximum gap (in ledgers) between the chain
+	// head and the last ingested ledger the indexer tolerates before
+	// emitting a warn-level log. The check runs every poll cycle and is
+	// gated on a hysteresis flag so a stuck indexer logs once on
+	// crossing and once on recovery rather than spamming. Set to 0
+	// (the literal zero value is accepted; there is no separate
+	// "disabled" sentinel) to disable the alarm entirely — useful in
+	// tests and for operators who prefer their own monitoring. Default
+	// 100 (~8 minutes at 5s/ledger).
+	LagWarnLedgers uint32 `env:"LAG_WARN_LEDGERS" envDefault:"100"`
 
 	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
 	// entirely; the binary behaves exactly like the pre-audit build.

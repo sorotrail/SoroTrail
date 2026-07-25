@@ -65,6 +65,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `AUDIT_MAX_RPS` | `10` | Total request budget (split between ingest and audit). |
 | `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
 | `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
+| `LAG_WARN_LEDGERS` | `100` | Ingest-lag alarm threshold (ledgers). Emits a single WARN log when the gap between the chain head and the last ingested ledger exceeds this number, plus a single INFO log when it closes; zero disables the alarm. |
 
 ## Ingestion behavior
 
@@ -80,6 +81,14 @@ All configuration comes from environment variables (see `.env.example`):
   project exists to prevent).
 - Requests are rate-limited (~10/s, matching public endpoint limits) and
   errors are retried with jittered exponential backoff.
+- **Ingest-lag alarm**: every poll cycle compares the chain head (fetched via
+  `getLatestLedger`) to the last ingested ledger. When the gap exceeds
+  `LAG_WARN_LEDGERS` (default `100`), a single WARN-level structured log is
+  emitted; a single INFO log fires when the gap closes. Hysteresis keeps the
+  alarm quiet between crossings, so a stuck indexer logs once on crossing
+  and once on recovery rather than spamming. No log is emitted on cold
+  start (no baseline yet) or when the alarm is disabled
+  (`LAG_WARN_LEDGERS=0`).
 - Topics/values are stored as JSON. When the RPC supports `xdrFormat: "json"`
   its decoding is used verbatim; otherwise the base64 XDR is decoded locally
   into shapes like `{"symbol":"transfer"}`, `{"u64":42}`, `{"i128":"-1000"}`,

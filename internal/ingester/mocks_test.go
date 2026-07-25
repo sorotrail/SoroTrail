@@ -46,11 +46,15 @@ func (m *mockRPC) GetHealth(context.Context) (rpc.Health, error) {
 
 // mockStore is an in-memory Store.
 type mockStore struct {
-	mu       sync.Mutex
-	events   map[string]store.Event
-	state    *store.IngestionState
-	watched  []string
-	upserted [][]store.Event
+	mu        sync.Mutex
+	events    map[string]store.Event
+	state     *store.IngestionState
+	watched   []string
+	upserted  [][]store.Event
+	// ingestErr, when non-nil, is returned by GetIngestionState
+	// regardless of `state`. Tests use it to exercise non-NotFound
+	// error paths in the lag alarm.
+	ingestErr error
 }
 
 func newMockStore() *mockStore {
@@ -131,6 +135,9 @@ func (m *mockStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 func (m *mockStore) GetIngestionState(context.Context) (store.IngestionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.ingestErr != nil {
+		return store.IngestionState{}, m.ingestErr
+	}
 	if m.state == nil {
 		return store.IngestionState{}, store.ErrNotFound
 	}

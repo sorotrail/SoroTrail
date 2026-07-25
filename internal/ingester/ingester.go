@@ -32,7 +32,44 @@ type Options struct {
 	// list needs more than one getEvents request (see buildFilterBatches).
 	// Default 1000 ledgers.
 	SweepWindow uint32
+	// LagWarnLedgers triggers a warn-level log when (latest ledger − last
+	// ingested ledger) exceeds this threshold on a poll cycle. The check
+	// uses hysteresis so the warn fires once on crossing and an info
+	// "recovered" line fires once when the gap closes.
+	//
+	// Zero means the alarm is disabled (no log lines, no metric updates);
+	// intended use is for tests and operators with their own monitoring in
+	// place. The env-config layer (internal/config) supplies the
+	// operational default of 100, so this struct does NOT re-default a
+	// zero value — that's deliberate so tests/MSG-built Ingester instances
+	// honor an explicit "0 = off" without surprise.
+	LagWarnLedgers uint32
+	// LagMetrics is the optional sink for ingest-lag signals. The default
+	// is a no-op so the alarm works end-to-end as log-only today, and a
+	// future Prometheus /metrics endpoint can opt in by passing a real
+	// implementation here — main.go wires the no-op until that endpoint
+	// lands. SetLagging is called on every poll cycle so the gauge
+	// reflects the current state even when it doesn't change, so stale
+	// values cannot accumulate across restarts.
+	LagMetrics LagMetrics
 }
+
+// LagMetrics is the optional sink for ingest-lag signals. The Ingester
+// calls SetLagging on every poll cycle with the current hysteresis
+// state; the implementation can publish the value however it sees fit
+// (Prometheus gauge, /stats JSON field, etc.). A no-op default lives
+// in noopLagMetrics.
+type LagMetrics interface {
+	SetLagging(lagging bool)
+}
+
+// noopLagMetrics is the default LagMetrics implementation; it discards
+// every signal so callers don't need to think about it.
+type noopLagMetrics struct{}
+
+// SetLagging discards the lag alarm state. Part of the LagMetrics
+// interface; the no-op variant is the default in Options.applyDefaults.
+func (noopLagMetrics) SetLagging(bool) {}
 
 func (o *Options) applyDefaults() {
 	if o.PollInterval <= 0 {
@@ -50,6 +87,13 @@ func (o *Options) applyDefaults() {
 	if o.SweepWindow == 0 {
 		o.SweepWindow = 1000
 	}
+	if o.LagMetrics == nil {
+		o.LagMetrics = noopLagMetrics{}
+	}
+	// LagWarnLedgers intentionally NOT defaulted to 100 here: see
+	// Options.LagWarnLedgers doc comment. The env-config layer applies
+	// the 100 default; Ingester callers who want any other behavior
+	// (including disabled=0) get exactly what they ask for.
 }
 
 // Ingester pages events out of the RPC and into the store.
@@ -59,6 +103,18 @@ type Ingester struct {
 	decoder decode.Decoder
 	log     *slog.Logger
 	opts    Options
+
+	// lagging is the hysteresis state for the ingest-lag alarm. It is
+	// mutated only from the Run goroutine. Crossing the threshold flips
+	// it from false→true and emits a single warn-level log on the
+	// transition; crossing back flips true→false with an info-level
+	// "recovered" log; in-between cycles on either side stay quiet.
+	//
+	// Invariant: read/written only from the Run() loop body. A future
+	// /admin or Signals() accessor MUST either move the alarm into a
+	// mutex/atomic or document that the new caller is also single-
+	// threaded relative to Run().
+	lagging bool
 }
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
@@ -78,6 +134,10 @@ func (ing *Ingester) Run(ctx context.Context) error {
 		case ctx.Err() != nil:
 			return ctx.Err()
 		case err != nil:
+			// Lag alarm runs BEFORE the backoff so a stuck indexer
+			// doesn't wait out MaxBackoff before the operator sees
+			// it.
+			ing.checkLag(ctx)
 			// Jittered exponential backoff so restarts don't thundering-herd
 			// a shared endpoint.
 			sleep := backoff/2 + rand.N(backoff/2)
@@ -89,6 +149,10 @@ func (ing *Ingester) Run(ctx context.Context) error {
 				backoff = ing.opts.MaxBackoff
 			}
 		default:
+			// Lag alarm runs BEFORE the sleep so the operator sees it
+			// on the cycle that noticed the gap, not PollInterval
+			// later.
+			ing.checkLag(ctx)
 			backoff = time.Second
 			if caughtUp {
 				if !sleepCtx(ctx, ing.opts.PollInterval) {
@@ -411,6 +475,109 @@ func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) erro
 	return ing.store.SaveIngestionState(ctx, store.IngestionState{
 		LastIngestedLedger: int64(health.OldestLedger) - 1,
 	})
+}
+
+// checkLag evaluates the ingest-lag alarm against the chain head and
+// the persisted ingestion state, with hysteresis so the warn fires
+// exactly once on crossing and an info "recovered" line fires exactly
+// once when the gap closes. Run calls it every poll cycle.
+//
+// The hysteresis state lives on the Ingester struct and is mutated only
+// from the Run goroutine, so no synchronization is required. Failures
+// to fetch the chain head or the ingestion state preserve the current
+// state silently — a transient RPC blip should not flip the alarm or
+// emit a spurious recovery line, and the runOnce path already logs
+// real ingestion failures at error level.
+//
+// Cold-start caveat: when LastIngestedLedger is non-positive we have no
+// baseline yet, so any "lag" would compare against a meaningless zero
+// and we deliberately settle the gauge at false rather than firing.
+//
+// Reorg caveat: a raw lag below zero (chain head reported as behind
+// what the store already has — RPC reorg or stale cache) is ambiguous
+// data we can't interpret; we leave hysteresis alone and republish the
+// current value so the gauge stays consistent.
+func (ing *Ingester) checkLag(ctx context.Context) {
+	if ing.opts.LagWarnLedgers == 0 {
+		return // alarm disabled (operators opted out or test fixture)
+	}
+
+	latest, err := ing.client.GetLatestLedger(ctx)
+	if err != nil {
+		// The runOnce path already surfaces RPC failures at error
+		// level; emitting another log line every cycle here would be
+		// noise without adding information.
+		return
+	}
+	state, err := ing.store.GetIngestionState(ctx)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// Cold start: no baseline yet, but still publish the
+			// default so the downstream gauge isn't unknown. The
+			// alarm is intentionally silent here so a fresh deploy
+			// doesn't warn about a chain head that's just "big".
+			//
+			// Asymmetry: this branch publishes SetLagging(false) but
+			// doesn't touch ing.lagging — the load-bearing invariant
+			// is "ingestion_state row never gets deleted", so any
+			// prior ing.lagging=true flips to false on the next
+			// non-ErrNotFound cycle, realigning gauge and memory.
+			ing.opts.LagMetrics.SetLagging(false)
+			return
+		}
+		// Other store errors leave the alarm silent too: gaps in
+		// evidence shouldn't be confused with recovery.
+		return
+	}
+
+	// Compute the new hysteresis state. Guard above means we never get
+	// here with LastIngestedLedger == 0; rawLag is hoisted so it can
+	// also feed the log line (no need to recompute the subtraction).
+	var (
+		lagging bool
+		rawLag  int64
+	)
+	if state.LastIngestedLedger > 0 {
+		rawLag = int64(latest.Sequence) - state.LastIngestedLedger
+		if rawLag < 0 {
+			// RPC reorg / stale cache: we don't know what the new
+			// chain head looks like vs what we have. Preserve
+			// hysteresis (don't flip to "recovered" on data we
+			// can't trust) and republish the gauge so scrapers
+			// see a consistent value.
+			ing.opts.LagMetrics.SetLagging(ing.lagging)
+			return
+		}
+		lagging = rawLag > int64(ing.opts.LagWarnLedgers)
+	}
+
+	// Publish BEFORE the early-return below so the gauge stays fresh
+	// on every cycle (a freshly-attached scraper sees 0 right away
+	// and a restart never leaks a stale value). The hysteresis
+	// transition check still gates the log line.
+	ing.opts.LagMetrics.SetLagging(lagging)
+	if lagging == ing.lagging {
+		return // no edge → no log (this is the spam-suppression rule)
+	}
+	ing.lagging = lagging
+
+	// Both branches print the same key set so downstream log scrapers
+	// can rely on it; reuse rawLag so the math isn't recomputed.
+	if lagging {
+		ing.log.Warn("ingest lag exceeded threshold",
+			"latest_ledger", latest.Sequence,
+			"last_ingested_ledger", state.LastIngestedLedger,
+			"lag_ledgers", rawLag,
+			"threshold_ledgers", ing.opts.LagWarnLedgers,
+		)
+		return
+	}
+	ing.log.Info("ingest lag recovered",
+		"latest_ledger", latest.Sequence,
+		"last_ingested_ledger", state.LastIngestedLedger,
+		"lag_ledgers", rawLag,
+		"threshold_ledgers", ing.opts.LagWarnLedgers,
+	)
 }
 
 // buildFilterBatches converts the watched-contract list into getEvents

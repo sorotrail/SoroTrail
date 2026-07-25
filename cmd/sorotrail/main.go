@@ -104,6 +104,11 @@ func run() error {
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
 		RetentionLedgers: cfg.RetentionLedgers,
+		LagWarnLedgers:   cfg.LagWarnLedgers,
+		// LagMetrics is nil here on purpose: no /metrics endpoint is
+		// wired up yet, so the ingester's applyDefaults installs a
+		// no-op. When a Prometheus endpoint lands, main.go is the
+		// seam to pass a real LagMetrics implementation.
 	})
 
 	// The auditor and its request-rate budget are constructed lazily:
