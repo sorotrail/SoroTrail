@@ -661,28 +661,48 @@ func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
 // (instead of importing `store`) keeps the cache layer unaware of the
 // store's pagination rules and we re-verify by test.
 func listETag(f store.EventFilter) string {
+	// contributors: every field of EventFilter that narrows the result set
+	// MUST appear here. A filter that is missing produces the same hash for
+	// two requests that return different bodies, which on an immutable page
+	// means a conditional request for one is answered 304 for the other, and
+	// a shared cache pools one filter's body under the other's key — for the
+	// full one-year max-age. TestListETag_CoversEveryFilterField enumerates
+	// the fields independently and fails when a new one is not added.
 	key := struct {
-		ContractID string          `json:"c"`
-		Type       string          `json:"t"`
-		Topic      json.RawMessage `json:"p,omitempty"`
-		FromLedger int64           `json:"fl"`
-		ToLedger   int64           `json:"tl"`
-		FromTime   string          `json:"ft,omitempty"`
-		ToTime     string          `json:"tt,omitempty"`
-		Cursor     string          `json:"cu,omitempty"`
-		Limit      int             `json:"l"`
-		Order      string          `json:"o,omitempty"`
+		ContractID    string          `json:"c"`
+		Type          string          `json:"t"`
+		Topic         json.RawMessage `json:"p,omitempty"`
+		Topic0        json.RawMessage `json:"p0,omitempty"`
+		Topic1        json.RawMessage `json:"p1,omitempty"`
+		Topic2        json.RawMessage `json:"p2,omitempty"`
+		Topic3        json.RawMessage `json:"p3,omitempty"`
+		TopicContains json.RawMessage `json:"pc,omitempty"`
+		FromLedger    int64           `json:"fl"`
+		ToLedger      int64           `json:"tl"`
+		FromTime      string          `json:"ft,omitempty"`
+		ToTime        string          `json:"tt,omitempty"`
+		Cursor        string          `json:"cu,omitempty"`
+		Limit         int             `json:"l"`
+		Order         string          `json:"o,omitempty"`
 	}{
 		ContractID: f.ContractID,
 		Type:       f.Type,
 		Topic:      f.Topic,
-		FromLedger: f.FromLedger,
-		ToLedger:   f.ToLedger,
-		FromTime:   timeOrEmpty(f.FromTime),
-		ToTime:     timeOrEmpty(f.ToTime),
-		Cursor:     f.Cursor,
-		Limit:      resolvedLimit(f.Limit),
-		Order:      resolvedOrder(f.Order),
+		// Each positional filter gets its own distinctly named key, so
+		// topic0={x} and topic1={x} — which select different events — cannot
+		// serialize identically.
+		Topic0:        f.Topic0,
+		Topic1:        f.Topic1,
+		Topic2:        f.Topic2,
+		Topic3:        f.Topic3,
+		TopicContains: f.TopicContains,
+		FromLedger:    f.FromLedger,
+		ToLedger:      f.ToLedger,
+		FromTime:      timeOrEmpty(f.FromTime),
+		ToTime:        timeOrEmpty(f.ToTime),
+		Cursor:        f.Cursor,
+		Limit:         resolvedLimit(f.Limit),
+		Order:         resolvedOrder(f.Order),
 	}
 	b, _ := json.Marshal(key)
 	sum := sha256.Sum256(b)
