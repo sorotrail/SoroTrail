@@ -177,6 +177,11 @@ type SubscriptionFilter struct {
 	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
 	FromLedger    int64           `json:"from_ledger,omitempty"`
 	ToLedger      int64           `json:"to_ledger,omitempty"`
+	ContractID string          `json:"contract_id,omitempty"`
+	Type       string          `json:"type,omitempty"`
+	Topic      json.RawMessage `json:"topic,omitempty"`
+	FromLedger int64           `json:"from_ledger,omitempty"`
+	ToLedger   int64           `json:"to_ledger,omitempty"`
 }
 
 // MatchesEvent reports whether an event passes this filter. Zero fields
@@ -258,6 +263,9 @@ func jsonbContains(container, contained json.RawMessage) bool {
 	// Fallback: exact JSON string match (handles strings, numbers, and
 	// cases where unmarshalling into map failed — e.g. arrays).
 	return string(container) == string(contained)
+}
+
+	return true
 }
 
 // Subscription is one registered webhook callback.
@@ -431,6 +439,7 @@ type Store interface {
 	// ListDeliveryAttempts returns delivery attempts for a subscription,
 	// newest first.
 	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
+
 	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
 	// or ErrNotFound when no spec is cached for that hash.
 	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)

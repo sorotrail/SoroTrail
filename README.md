@@ -72,6 +72,28 @@ All configuration comes from environment variables (see `.env.example`):
 | `RATE_LIMIT_RPS`            | unset                                 | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied.                                                                                                      |
 | `RATE_LIMIT_BURST`          | unset                                 | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`.                                                                                                                                                                                    |
 | `RATE_LIMIT_TRUSTED_PROXY`  | `false`                               | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
+| Variable | Default | Description |
+| --- | --- | --- |
+| `RPC_URL` | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet. |
+| `DATABASE_URL` | — (required) | Postgres connection string. |
+| `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. |
+| `HTTP_ADDR` | `:8080` | API listen address. |
+| `WATCHED_CONTRACTS` | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. |
+| `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
+| `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
+| `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
+| `AUDIT_ENABLED` | `false` | Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build. |
+| `AUDIT_POLL_INTERVAL` | `30s` | Sleep between audit passes. |
+| `AUDIT_BATCH_LEDGERS` | `100` | Ledger range covered by one audit pass. |
+| `AUDIT_LAG_THRESHOLD` | `200` | Auditor sleeps until ingest is at least this many ledgers past the verified mark. |
+| `AUDIT_BUDGET_SHARE` | `0.10` | Fraction of the request budget the audit pool gets (rest goes to ingest). |
+| `AUDIT_MAX_RPS` | `10` | Total request budget (split between ingest and audit). |
+| `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
+| `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
+| `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
+| `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
+| `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
+| `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
 
 ## Ingestion behavior
 

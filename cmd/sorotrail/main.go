@@ -99,6 +99,7 @@ func run() error {
 	}
 
 	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
+	bcast := broadcast.New(broadcast.DefaultBufferSize)
 	// Webhook delivery runs alongside ingestion — the notifier is attached
 	// to the ingester so events flow to subscriber callbacks asynchronously.
 	wh := webhook.NewNotifier(st, log)
