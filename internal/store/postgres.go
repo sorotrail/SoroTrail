@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -77,12 +78,17 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 		// representation is "NULL or array" rather than the dual "NULL
 		// or empty array" some servers report inconsistently. Schema
 		// (see migration 0001 + 0003) is 13 columns.
+		// Column list deliberately mirrors the eventColumns constant
+		// (13 fields including raw_topic_xdr / raw_value_xdr) so a
+		// row kept by replay never loses its raw XDR just because the
+		// INSERT forgot the columns.
 		batch.Queue(`
 			INSERT INTO events
 				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 				 in_successful_call, topics, value, created_at,
 				 raw_topic_xdr, raw_value_xdr)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) `+conflict,
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`+conflict,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
 			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
@@ -291,6 +297,26 @@ func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
 	return e, err
 }
 
+// EventExists is the cheap 304 path used by the API's conditional GET:
+// an index-only probe against the primary key that never deserializes
+// the row, so it stays index-bound even on a wide row. Existence is a
+// boolean because 304 responses carry no body — there's nothing to
+// serialize. The call is what backs the "still here" check after a
+// cache hit so that retention/pruning (#8) cannot leave a cache
+// pretending a deleted event is still around; the full row is only
+// loaded on a real cache miss via GetEvent.
+func (p *Postgres) EventExists(ctx context.Context, id string) (bool, error) {
+	var one int
+	err := p.pool.QueryRow(ctx, `SELECT 1 FROM events WHERE id = $1`, id).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("checking event existence: %w", err)
+	}
+	return true, nil
+}
+
 func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
 	limit := f.Limit
 	if limit <= 0 {
@@ -317,6 +343,13 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if len(f.Topic) > 0 {
 		// Containment on the array matches the topic at any position.
 		where = append(where, "topics @> "+arg(fmt.Sprintf("[%s]", f.Topic))+"::jsonb")
+	}
+	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
+		if len(topic) == 0 {
+			continue
+		}
+		where = append(where,
+			fmt.Sprintf("topics->%d = %s::jsonb", i, arg(topic)))
 	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))

@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/khaylebfortune/sorotrail/internal/broadcast"
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
@@ -115,6 +116,7 @@ type Ingester struct {
 	// mutex/atomic or document that the new caller is also single-
 	// threaded relative to Run().
 	lagging bool
+	bcast   *broadcast.Broadcaster
 }
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
@@ -122,6 +124,13 @@ type Ingester struct {
 func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, opts Options) *Ingester {
 	opts.applyDefaults()
 	return &Ingester{client: client, store: st, decoder: dec, log: log, opts: opts}
+}
+
+// WithBroadcaster attaches a live event broadcaster so ingested events are
+// pushed to streaming subscribers.
+func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
+	ing.bcast = b
+	return ing
 }
 
 // Run polls until ctx is canceled. Errors are logged and retried with
@@ -425,6 +434,10 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		"count", len(events), "new", inserted,
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
 		"latest_ledger", latestLedger)
+
+	if ing.bcast != nil {
+		ing.bcast.Publish(ctx, events)
+	}
 	return nil
 }
 

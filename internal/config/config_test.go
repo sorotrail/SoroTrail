@@ -11,6 +11,18 @@ import (
 
 const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
+// envKeys is the comprehensive list of env vars Load reads. Each test
+// subtest clears them so leftover values from the host environment or a
+// prior test don't leak across cases.
+var envKeys = []string{
+	"RPC_URL", "DATABASE_URL", "POLL_INTERVAL", "HTTP_ADDR",
+	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL",
+	"AUDIT_ENABLED", "AUDIT_POLL_INTERVAL", "AUDIT_BATCH_LEDGERS",
+	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
+	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
+	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
+}
+
 func TestLoad(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -50,6 +62,9 @@ func TestLoad(t *testing.T) {
 			check: func(t *testing.T, c Config) {
 				assert.Equal(t, uint32(0), c.LagWarnLedgers,
 					"0 is the documented way to silence the alarm entirely")
+				assert.Zero(t, c.RateLimitRPS, "rate limiter disabled by default")
+				assert.Zero(t, c.RateLimitBurst)
+				assert.False(t, c.RateLimitTrustedProxy)
 			},
 		},
 		{
@@ -99,6 +114,44 @@ func TestLoad(t *testing.T) {
 			},
 			wantErr: "RPC_URL",
 		},
+		{
+			name: "rate limit both set is accepted",
+			env: map[string]string{
+				"DATABASE_URL":             "postgres://localhost/db",
+				"RATE_LIMIT_RPS":           "5",
+				"RATE_LIMIT_BURST":         "10",
+				"RATE_LIMIT_TRUSTED_PROXY": "true",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, float64(5), c.RateLimitRPS)
+				assert.Equal(t, 10, c.RateLimitBurst)
+				assert.True(t, c.RateLimitTrustedProxy)
+			},
+		},
+		{
+			name: "rate limit only RPS set is rejected",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"RATE_LIMIT_RPS": "5",
+			},
+			wantErr: "RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset",
+		},
+		{
+			name: "rate limit only Burst set is rejected",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"RATE_LIMIT_BURST": "10",
+			},
+			wantErr: "RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset",
+		},
+		{
+			name: "rate limit negative RPS rejected",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"RATE_LIMIT_RPS": "-1",
+			},
+			wantErr: "RATE_LIMIT_RPS must be non-negative",
+		},
 	}
 
 	for _, tt := range tests {
@@ -108,6 +161,7 @@ func TestLoad(t *testing.T) {
 			for _, key := range []string{"RPC_URL", "DATABASE_URL", "POLL_INTERVAL",
 				"HTTP_ADDR", "WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL",
 				"LAG_WARN_LEDGERS"} {
+			for _, key := range envKeys {
 				t.Setenv(key, "")
 				os.Unsetenv(key)
 			}

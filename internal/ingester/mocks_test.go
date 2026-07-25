@@ -99,6 +99,16 @@ func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) 
 	return e, nil
 }
 
+// EventExists is the cheap existence probe added to the Store interface
+// for the API's 304 path. Unused by ingester tests but needed to
+// satisfy the interface.
+func (m *mockStore) EventExists(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.events[id]
+	return ok, nil
+}
+
 func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Event, string, error) {
 	return nil, "", nil
 }
