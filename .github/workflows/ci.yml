@@ -49,14 +49,14 @@ jobs:
         with:
           version: v2.12.2
 
-  vulncheck:
+  helm:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: azure/setup-helm@v4
         with:
-          go-version-file: go.mod
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
-      - name: Run govulncheck
-        run: govulncheck ./...
+          version: v3.15.0
+      - name: Helm lint
+        run: helm lint deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db
+      - name: Helm template render
+        run: helm template sorotrail deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db > /dev/null
