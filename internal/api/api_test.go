@@ -32,16 +32,23 @@ type stubStore struct {
 	event    store.Event
 	eventErr error
 
-	exists       bool
-	existsErr    error
-	existsCalls  int // count of EventExists calls
-	lastExistsID string
+	stats            store.Stats
+	pingErr          error
+	watchedList      []store.WatchedContract
+	watchedListErr   error
+	added            []string
+	removed          []string
+	addErr           error
+	removeErr        error
+	ingestionState   *store.IngestionState
+	ingestionStateEr error
+	exists           bool
+	existsErr        error
+	existsCalls      int // count of EventExists calls
+	lastExistsID     string
 
 	ingestion    store.IngestionState
 	ingestionErr error
-
-	stats   store.Stats
-	pingErr error
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -81,6 +88,13 @@ func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
 	return s.event, s.eventErr
 }
 
+func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
+	return nil, store.ErrNotFound
+}
+func (s *stubStore) SetContractSpec(context.Context, string, string, []byte) error {
+	return nil
+}
+
 // EventExists is the cheap 304 path; tests assert the handler uses it
 // (instead of GetEvent) when If-None-Match matches.
 func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
@@ -89,22 +103,29 @@ func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
 	return s.exists, s.existsErr
 }
 
-func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
-	return nil, store.ErrNotFound
-}
-func (s *stubStore) SetContractSpec(context.Context, string, string, []byte) error {
-	return nil
-}
-
 // GetIngestionState backs the list-cache frontier lookup. Tests stage
 // LastIngestedLedger to drive the boundary decisions (just-below, at,
 // and above the frontier).
 func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, error) {
+	if s.ingestionState != nil {
+		return *s.ingestionState, s.ingestionStateEr
+	}
 	return s.ingestion, s.ingestionErr
 }
 
 func (s *stubStore) Stats(context.Context) (store.Stats, error) { return s.stats, nil }
 func (s *stubStore) Ping(context.Context) error                 { return s.pingErr }
+func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
+	return s.watchedList, s.watchedListErr
+}
+func (s *stubStore) AddWatchedContract(_ context.Context, id string) error {
+	s.added = append(s.added, id)
+	return s.addErr
+}
+func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
+	s.removed = append(s.removed, id)
+	return s.removeErr
+}
 
 // Subscription stubs for the webhook feature.
 func (s *stubStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
@@ -148,10 +169,14 @@ func (s *stubRPC) GetHealth(context.Context) (rpc.Health, error) {
 }
 
 func newTestServer(st *stubStore, rc *stubRPC) *Server {
+	return newTestServerWithKey(st, rc, "test-key")
+}
+
+func newTestServerWithKey(st *stubStore, rc *stubRPC, apiKey string) *Server {
 	if rc == nil {
 		rc = &stubRPC{health: rpc.Health{Status: "healthy"}}
 	}
-	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), apiKey)
 }
 
 func doGet(t *testing.T, s *Server, path string) (*http.Response, []byte) {
