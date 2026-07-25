@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/khaylebfortune/sorotrail/internal/audit"
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -45,14 +46,15 @@ func getAuditor() *audit.Auditor {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store store.Store
-	rpc   rpc.Client
-	log   *slog.Logger
+	store   store.Store
+	rpc     rpc.Client
+	log     *slog.Logger
+	metrics *metrics.Metrics
 }
 
 // New builds the API server. rpcClient is only used by /health.
-func New(st store.Store, rpcClient rpc.Client, log *slog.Logger) *Server {
-	return &Server{store: st, rpc: rpcClient, log: log}
+func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, m *metrics.Metrics) *Server {
+	return &Server{store: st, rpc: rpcClient, log: log, metrics: m}
 }
 
 // Router returns the HTTP handler with all routes mounted.
@@ -67,6 +69,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/stats", s.handleStats)
+	r.Get("/metrics", s.handleMetrics)
 
 	// contributors: new read endpoints go here. Anything that writes (e.g.
 	// managing watched contracts at runtime) should come with auth first.
@@ -85,5 +88,16 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 			"duration", time.Since(start),
 			"remote", r.RemoteAddr,
 		)
+		if s.metrics != nil {
+			path := chi.RouteContext(r.Context()).RoutePattern()
+			if path == "" {
+				path = r.URL.Path
+			}
+			s.metrics.RecordHTTPRequest(path, ww.Status(), time.Since(start).Seconds())
+		}
 	})
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	s.metrics.Handler().ServeHTTP(w, r)
 }

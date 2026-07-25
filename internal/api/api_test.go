@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -90,7 +91,7 @@ func newTestServer(st *stubStore, rc *stubRPC) *Server {
 	if rc == nil {
 		rc = &stubRPC{health: rpc.Health{Status: "healthy"}}
 	}
-	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 }
 
 func doGet(t *testing.T, s *Server, path string) (*http.Response, []byte) {
@@ -209,4 +210,37 @@ func TestStats(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &got))
 	assert.Equal(t, int64(42), got.TotalEvents)
 	assert.Equal(t, int64(999), got.LastIngestedLedger)
+}
+
+func TestMetrics_Returns200AndContainsExpectedNames(t *testing.T) {
+	m := metrics.New()
+	// Drive some ingest-like activity so counters/gauge are non-zero and
+	// their metadata lines appear in the registry.
+	m.RecordEventsIngested(5)
+	m.SetLastIngestedLedger(12345)
+	m.SetChainHeadLedger(12400)
+	m.ObserveRPCRequest("getEvents", nil)
+	m.ObserveRPCRequest("getHealth", errors.New("timeout"))
+	m.RecordHTTPRequest("/events", 200, 0.012)
+	m.RecordHTTPRequest("/health", 500, 0.003)
+
+	st := &stubStore{}
+	s := New(st, &stubRPC{health: rpc.Health{Status: "healthy"}},
+		slog.New(slog.NewTextHandler(io.Discard, nil)), m)
+
+	resp, body := doGet(t, s, "/metrics")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	text := string(body)
+	// Verify every required metric name appears.
+	for _, name := range []string{
+		"sorotrail_events_ingested_total",
+		"sorotrail_last_ingested_ledger",
+		"sorotrail_chain_head_ledger",
+		"sorotrail_rpc_requests_total",
+		"sorotrail_http_requests_total",
+		"sorotrail_http_request_duration_seconds",
+	} {
+		assert.Contains(t, text, name, "metrics output must contain %s", name)
+	}
 }

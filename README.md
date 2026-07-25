@@ -243,6 +243,43 @@ Audit behaviour:
 Set `AUDIT_ENABLED=false` (the default) to disable the auditor entirely;
 the binary's behavior is identical to a pre-audit build.
 
+## Monitoring
+
+SoroTrail exposes Prometheus metrics at `GET /metrics` in the standard
+text format. The endpoint is read-only (no auth required) and powered by
+`github.com/prometheus/client_golang`.
+
+### Metrics
+
+| Name | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `sorotrail_events_ingested_total` | counter | — | Total number of contract events persisted. |
+| `sorotrail_last_ingested_ledger` | gauge | — | Ledger sequence of the most recently ingested event. |
+| `sorotrail_chain_head_ledger` | gauge | — | Latest ledger reported by the Stellar RPC. |
+| `sorotrail_rpc_requests_total` | counter | `method`, `outcome` | RPC requests by JSON-RPC method and `success` / `error`. |
+| `sorotrail_http_requests_total` | counter | `path`, `status` | HTTP requests by route pattern and status code. |
+| `sorotrail_http_request_duration_seconds` | histogram | `path` | Request duration in seconds, bucketed with Prometheus defaults. |
+
+### Example alert
+
+Lag behind the chain head is the most important signal — it means the
+ingester has fallen behind and the resume point risks ageing out of the
+RPC retention window:
+
+```yaml
+# AlertManager rule
+groups:
+  - name: sorotrail
+    rules:
+      - alert: IngesterLagging
+        expr: sorotrail_chain_head_ledger - sorotrail_last_ingested_ledger > 200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SoroTrail ingester is {{ $value }} ledgers behind the chain head"
+```
+
 ## Development
 
 ```sh

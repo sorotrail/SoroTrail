@@ -59,13 +59,22 @@ type Ingester struct {
 	decoder decode.Decoder
 	log     *slog.Logger
 	opts    Options
+	metrics IngestObserver
+}
+
+// IngestObserver is called at points where the ingester wants to record
+// metrics without importing a metrics package.
+type IngestObserver interface {
+	RecordEventsIngested(n int)
+	SetLastIngestedLedger(ledger int64)
+	SetChainHeadLedger(ledger uint32)
 }
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
 // mocks.
-func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, opts Options) *Ingester {
+func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, obs IngestObserver, opts Options) *Ingester {
 	opts.applyDefaults()
-	return &Ingester{client: client, store: st, decoder: dec, log: log, opts: opts}
+	return &Ingester{client: client, store: st, decoder: dec, log: log, metrics: obs, opts: opts}
 }
 
 // Run polls until ctx is canceled. Errors are logged and retried with
@@ -146,6 +155,10 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 	}
 	if err := ing.store.SaveIngestionState(ctx, state); err != nil {
 		return false, err
+	}
+	if ing.metrics != nil {
+		ing.metrics.SetLastIngestedLedger(state.LastIngestedLedger)
+		ing.metrics.SetChainHeadLedger(resp.LatestLedger)
 	}
 	return caughtUp, nil
 }
@@ -338,6 +351,10 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	if err != nil {
 		return false, err
 	}
+	if ing.metrics != nil {
+		ing.metrics.SetLastIngestedLedger(lastIngested)
+		ing.metrics.SetChainHeadLedger(end)
+	}
 	return end >= health.LatestLedger, nil
 }
 
@@ -361,6 +378,9 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		"count", len(events), "new", inserted,
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
 		"latest_ledger", latestLedger)
+	if ing.metrics != nil {
+		ing.metrics.RecordEventsIngested(len(events))
+	}
 	return nil
 }
 

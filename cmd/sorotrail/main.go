@@ -25,6 +25,7 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/ingester"
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -99,8 +100,10 @@ func run() error {
 		}
 	}
 
-	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
-	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
+	m := metrics.New()
+
+	rpcClient := rpc.NewHTTPClient(cfg.RPCURL, rpc.WithRequestObserver(m))
+	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, m, ingester.Options{
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
 		RetentionLedgers: cfg.RetentionLedgers,
@@ -130,7 +133,7 @@ func run() error {
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.New(st, rpcClient, log).Router(),
+		Handler:           api.New(st, rpcClient, log, m).Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
