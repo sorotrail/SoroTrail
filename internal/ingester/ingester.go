@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/khaylebfortune/sorotrail/internal/broadcast"
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
@@ -52,13 +53,21 @@ func (o *Options) applyDefaults() {
 	}
 }
 
+// EventNotifier is notified after events are persisted so external
+// systems (webhooks, SSE, etc.) can react without blocking ingestion.
+type EventNotifier interface {
+	NotifyEvents(ctx context.Context, events []store.Event)
+}
+
 // Ingester pages events out of the RPC and into the store.
 type Ingester struct {
-	client  rpc.Client
-	store   store.Store
-	decoder decode.Decoder
-	log     *slog.Logger
-	opts    Options
+	client   rpc.Client
+	store    store.Store
+	decoder  decode.Decoder
+	log      *slog.Logger
+	opts     Options
+	bcast    *broadcast.Broadcaster
+	notifier EventNotifier // optional; nil means no notification
 }
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
@@ -66,6 +75,20 @@ type Ingester struct {
 func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, opts Options) *Ingester {
 	opts.applyDefaults()
 	return &Ingester{client: client, store: st, decoder: dec, log: log, opts: opts}
+}
+
+// WithBroadcaster attaches a live event broadcaster so ingested events are
+// pushed to streaming subscribers.
+func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
+	ing.bcast = b
+	return ing
+}
+
+// SetNotifier attaches an optional EventNotifier that is called after
+// every successful event persistence. When nil (the default) no
+// notification is sent — the ingester behaves exactly as before.
+func (ing *Ingester) SetNotifier(n EventNotifier) {
+	ing.notifier = n
 }
 
 // Run polls until ctx is canceled. Errors are logged and retried with
@@ -371,6 +394,15 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		"count", len(events), "new", inserted,
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
 		"latest_ledger", latestLedger)
+
+	if ing.bcast != nil {
+		ing.bcast.Publish(ctx, events)
+	}
+	// Notify webhooks (or other listeners) after successful persistence.
+	// This is a fire-and-forget call — it must never block ingestion.
+	if ing.notifier != nil {
+		ing.notifier.NotifyEvents(ctx, events)
+	}
 	return nil
 }
 

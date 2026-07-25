@@ -15,12 +15,12 @@ const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 // subtest clears them so leftover values from the host environment or a
 // prior test don't leak across cases.
 var envKeys = []string{
-	"RPC_URL", "RPC_URLS", "RPC_RATE_LIMIT_RPS", "DATABASE_URL",
-	"POLL_INTERVAL", "HTTP_ADDR",
+	"RPC_URL", "DATABASE_URL", "POLL_INTERVAL", "HTTP_ADDR",
 	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL",
 	"AUDIT_ENABLED", "AUDIT_POLL_INTERVAL", "AUDIT_BATCH_LEDGERS",
 	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
 	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
+	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
 }
 
 func TestLoad(t *testing.T) {
@@ -39,6 +39,9 @@ func TestLoad(t *testing.T) {
 				assert.Equal(t, ":8080", c.HTTPAddr)
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
 				assert.Empty(t, c.WatchedContracts)
+				assert.Zero(t, c.RateLimitRPS, "rate limiter disabled by default")
+				assert.Zero(t, c.RateLimitBurst)
+				assert.False(t, c.RateLimitTrustedProxy)
 			},
 		},
 		{
@@ -89,51 +92,42 @@ func TestLoad(t *testing.T) {
 			wantErr: "RPC_URL",
 		},
 		{
-			name: "RPC_URLS with valid URLs accepted",
+			name: "rate limit both set is accepted",
 			env: map[string]string{
-				"DATABASE_URL": "postgres://localhost/db",
-				"RPC_URLS":     "https://rpc1.example.com,https://rpc2.example.com",
+				"DATABASE_URL":             "postgres://localhost/db",
+				"RATE_LIMIT_RPS":           "5",
+				"RATE_LIMIT_BURST":         "10",
+				"RATE_LIMIT_TRUSTED_PROXY": "true",
 			},
 			check: func(t *testing.T, c Config) {
-				assert.Equal(t, []string{"https://rpc1.example.com", "https://rpc2.example.com"}, c.RPCURLS)
-				assert.Equal(t, float64(10), c.RPCRateLimitRPS)
+				assert.Equal(t, float64(5), c.RateLimitRPS)
+				assert.Equal(t, 10, c.RateLimitBurst)
+				assert.True(t, c.RateLimitTrustedProxy)
 			},
 		},
 		{
-			name: "RPC_URLS invalid URL rejected",
+			name: "rate limit only RPS set is rejected",
 			env: map[string]string{
-				"DATABASE_URL": "postgres://localhost/db",
-				"RPC_URLS":     "https://good.example.com,not a url",
+				"DATABASE_URL":   "postgres://localhost/db",
+				"RATE_LIMIT_RPS": "5",
 			},
-			wantErr: "RPC_URLS[1]",
+			wantErr: "RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset",
 		},
 		{
-			name: "RPC_URLS empty entries trimmed",
+			name: "rate limit only Burst set is rejected",
 			env: map[string]string{
-				"DATABASE_URL": "postgres://localhost/db",
-				"RPC_URLS":     "https://rpc.example.com, ,",
+				"DATABASE_URL":     "postgres://localhost/db",
+				"RATE_LIMIT_BURST": "10",
 			},
-			check: func(t *testing.T, c Config) {
-				assert.Equal(t, []string{"https://rpc.example.com"}, c.RPCURLS)
-			},
+			wantErr: "RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset",
 		},
 		{
-			name: "RPC_RATE_LIMIT_RPS custom value",
+			name: "rate limit negative RPS rejected",
 			env: map[string]string{
-				"DATABASE_URL":       "postgres://localhost/db",
-				"RPC_RATE_LIMIT_RPS": "5",
+				"DATABASE_URL":   "postgres://localhost/db",
+				"RATE_LIMIT_RPS": "-1",
 			},
-			check: func(t *testing.T, c Config) {
-				assert.Equal(t, float64(5), c.RPCRateLimitRPS)
-			},
-		},
-		{
-			name: "RPC_RATE_LIMIT_RPS zero rejected",
-			env: map[string]string{
-				"DATABASE_URL":       "postgres://localhost/db",
-				"RPC_RATE_LIMIT_RPS": "0",
-			},
-			wantErr: "RPC_RATE_LIMIT_RPS must be positive",
+			wantErr: "RATE_LIMIT_RPS must be non-negative",
 		},
 	}
 
@@ -168,4 +162,21 @@ func TestValidContractID(t *testing.T) {
 	assert.False(t, ValidContractID("G"+validContract[1:]), "account keys are not contracts")
 	assert.False(t, ValidContractID(validContract[:55]), "too short")
 	assert.False(t, ValidContractID(validContract[:55]+"a"), "lowercase is not base32")
+}
+
+func TestValidCursor(t *testing.T) {
+	assert.True(t, ValidCursor("0001099511627776-0000000001"))
+	assert.True(t, ValidCursor("00000000000000000102-00000"))
+	assert.True(t, ValidCursor("e1"))
+	assert.True(t, ValidCursor("cursor-42"))
+	assert.True(t, ValidCursor("pt_1"))
+	assert.True(t, ValidCursor("abc.123:45_67-89"))
+
+	assert.False(t, ValidCursor(""), "empty string")
+	assert.False(t, ValidCursor("invalid cursor"), "contains space")
+	assert.False(t, ValidCursor("e1; DROP TABLE events;"), "contains semicolon and space")
+	assert.False(t, ValidCursor("cursor'OR'1'='1"), "contains single quotes")
+	assert.False(t, ValidCursor("<script>alert(1)</script>"), "contains angle brackets")
+	assert.False(t, ValidCursor("e1\n"), "contains newline")
+	assert.False(t, ValidCursor(string(make([]byte, 129))), "too long (>128 chars)")
 }

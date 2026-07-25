@@ -15,7 +15,6 @@ type Client interface {
 	GetLatestLedger(ctx context.Context) (rpc.LatestLedger, error)
 	GetHealth(ctx context.Context) (rpc.Health, error)
 	GetLedgerEntries(ctx context.Context, req rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error)
-	SimulateTransaction(ctx context.Context, req rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error)
 }
 
 // budgetedClient wraps an inner rpc.Client, accounting every call against
@@ -59,13 +58,6 @@ func (c *budgetedClient) GetLedgerEntries(ctx context.Context, req rpc.GetLedger
 		return rpc.GetLedgerEntriesResponse{}, err
 	}
 	return c.inner.GetLedgerEntries(ctx, req)
-}
-
-func (c *budgetedClient) SimulateTransaction(ctx context.Context, req rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error) {
-	if err := c.budget.WaitAudit(ctx); err != nil {
-		return rpc.SimulateTransactionResponse{}, err
-	}
-	return c.inner.SimulateTransaction(ctx, req)
 }
 
 // Compile-time check that we satisfy the audit Client interface.

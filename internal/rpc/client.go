@@ -22,8 +22,10 @@ type Client interface {
 	GetEvents(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error)
 	GetLatestLedger(ctx context.Context) (LatestLedger, error)
 	GetHealth(ctx context.Context) (Health, error)
+	// GetLedgerEntries returns the current state of one or more ledger entries.
+	// Keys are base64-encoded LedgerKey XDR, returned entries include the
+	// base64-encoded LedgerEntry XDR.
 	GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error)
-	SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error)
 }
 
 // Error is a JSON-RPC 2.0 error object returned by the server.
@@ -134,12 +136,6 @@ func (c *HTTPClient) GetHealth(ctx context.Context) (Health, error) {
 func (c *HTTPClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
 	var resp GetLedgerEntriesResponse
 	err := c.call(ctx, "getLedgerEntries", req, &resp)
-	return resp, err
-}
-
-func (c *HTTPClient) SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error) {
-	var resp SimulateTransactionResponse
-	err := c.call(ctx, "simulateTransaction", req, &resp)
 	return resp, err
 }
 
