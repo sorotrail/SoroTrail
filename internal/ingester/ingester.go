@@ -68,6 +68,12 @@ type Ingester struct {
 	opts     Options
 	notifier EventNotifier // optional; nil means no notification
 	bcast    *broadcast.Broadcaster
+	client  rpc.Client
+	store   store.Store
+	decoder decode.Decoder
+	log     *slog.Logger
+	opts    Options
+	bcast   *broadcast.Broadcaster
 }
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
