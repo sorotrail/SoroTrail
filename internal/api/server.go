@@ -57,13 +57,14 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store    store.Store
-	rpc      rpc.Client
-	enricher Enricher
-	log      *slog.Logger
-	apiKey   string
-	limiter  *RateLimiter
-	bcast    *broadcast.Broadcaster
+	store       store.Store
+	rpc         rpc.Client
+	enricher    Enricher
+	log         *slog.Logger
+	apiKey      string
+	limiter     *RateLimiter
+	bcast       *broadcast.Broadcaster
+	corsOrigins []string
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -86,6 +87,12 @@ func (s *Server) SetRateLimiter(l *RateLimiter) {
 	s.limiter = l
 }
 
+// SetCORSOrigins wires a CORS origins list into the router. Pass nil or
+// an empty slice to disable CORS headers (the default).
+func (s *Server) SetCORSOrigins(origins []string) {
+	s.corsOrigins = origins
+}
+
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
 // (SSE, WebSocket) can deliver events as they arrive.
 func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
@@ -99,6 +106,9 @@ func (s *Server) Router() http.Handler {
 	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
+	if len(s.corsOrigins) > 0 {
+		r.Use(corsMiddleware(s.corsOrigins))
+	}
 	r.Use(middleware.Timeout(30 * time.Second))
 	if s.limiter != nil {
 		// Limiter sits inside Timeout and Recoverer so its instant 429

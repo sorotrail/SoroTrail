@@ -61,6 +61,16 @@ type Config struct {
 	// intermediaries cannot. Defaults to false (the deployment does not
 	// need request-scoped caching).
 	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
+
+	// CORSAllowedOrigins controls cross-origin resource sharing. Set to a
+	// comma-separated list of origins (e.g. "https://app.example.com,https://admin.example.com")
+	// or "*" to allow any origin. Empty (default) disables CORS headers
+	// entirely, preserving the current behavior for deployments that do not
+	// need browser-based cross-origin access.
+	CORSAllowedOrigins string `env:"CORS_ALLOWED_ORIGINS"`
+	// CORSAllowedOriginsList is the parsed list of allowed origins,
+	// populated from CORSAllowedOrigins during Load().
+	CORSAllowedOriginsList []string
 }
 
 // Load reads configuration from the environment and validates it.
@@ -71,11 +81,15 @@ func Load() (Config, error) {
 	}
 	// env/v11 splits on "," but keeps empty entries and whitespace.
 	cfg.WatchedContracts = cleanContractList(cfg.WatchedContracts)
+	cfg.CORSAllowedOriginsList = parseCORSOrigins(cfg.CORSAllowedOrigins)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
+
+// parseCORSOrigins splits CORS_ALLOWED_ORIGINS on commas and
+// trims whitespace, dropping empty entries.
 
 // Validate checks the configuration for values that would fail at runtime.
 func (c Config) Validate() error {
@@ -184,6 +198,10 @@ func cleanContractList(in []string) []string {
 	return out
 }
 
+func parseCORSOrigins(in string) []string {
+	return cleanContractList(strings.Split(in, ","))
+}
+
 // LoggableFields returns the configuration as a map of fields suitable for logging,
 // with credentials redacted (e.g., from DATABASE_URL).
 func (c Config) LoggableFields() []any {
@@ -193,6 +211,10 @@ func (c Config) LoggableFields() []any {
 		dbURL = u.String()
 	}
 
+	origins := "(disabled)"
+	if c.CORSAllowedOrigins != "" {
+		origins = c.CORSAllowedOrigins
+	}
 	return []any{
 		"rpc_url", c.RPCURL,
 		"database_url", dbURL,
@@ -203,5 +225,6 @@ func (c Config) LoggableFields() []any {
 		"retention_ledgers", c.RetentionLedgers,
 		"log_level", c.LogLevel,
 		"audit_enabled", c.AuditEnabled,
+		"cors_allowed_origins", origins,
 	}
 }

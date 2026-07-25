@@ -673,3 +673,116 @@ func TestRequestID(t *testing.T) {
 		})
 	}
 }
+
+func doRequestWithOrigin(t *testing.T, s *Server, method string, path string, origin string) (*http.Response, []byte) {
+	t.Helper()
+	srv := httptest.NewServer(s.Router())
+	defer srv.Close()
+	req, err := http.NewRequest(method, srv.URL+path, nil)
+	require.NoError(t, err)
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	resp.Body.Close()
+	return resp, body
+}
+
+func TestCORS(t *testing.T) {
+	t.Run("no cors origins configured", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/health")
+		assert.Empty(t, resp.Header.Get("Access-Control-Allow-Origin"))
+	})
+
+	tests := []struct {
+		name            string
+		corsOrigins     []string
+		requestOrigin   string
+		wantAllowOrigin string
+	}{
+		{
+			name:            "matching origin",
+			corsOrigins:     []string{"https://app.example.com"},
+			requestOrigin:   "https://app.example.com",
+			wantAllowOrigin: "https://app.example.com",
+		},
+		{
+			name:            "non-matching origin",
+			corsOrigins:     []string{"https://app.example.com"},
+			requestOrigin:   "https://evil.com",
+			wantAllowOrigin: "",
+		},
+		{
+			name:            "wildcard matches any",
+			corsOrigins:     []string{"*"},
+			requestOrigin:   "https://anything.com",
+			wantAllowOrigin: "*",
+		},
+		{
+			name:            "multiple origins match",
+			corsOrigins:     []string{"https://app.example.com", "https://admin.example.com"},
+			requestOrigin:   "https://admin.example.com",
+			wantAllowOrigin: "https://admin.example.com",
+		},
+		{
+			name:            "empty origin header passes through",
+			corsOrigins:     []string{"https://app.example.com"},
+			requestOrigin:   "",
+			wantAllowOrigin: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			s.SetCORSOrigins(tt.corsOrigins)
+			resp, _ := doRequestWithOrigin(t, s, "GET", "/health", tt.requestOrigin)
+			assert.Equal(t, tt.wantAllowOrigin, resp.Header.Get("Access-Control-Allow-Origin"))
+			if tt.wantAllowOrigin != "" {
+				assert.Equal(t, "GET, POST, PUT, DELETE, PATCH, OPTIONS", resp.Header.Get("Access-Control-Allow-Methods"))
+				assert.Equal(t, "Content-Type, Authorization, X-API-Key", resp.Header.Get("Access-Control-Allow-Headers"))
+				assert.Equal(t, "X-Request-ID", resp.Header.Get("Access-Control-Expose-Headers"))
+				assert.Equal(t, "86400", resp.Header.Get("Access-Control-Max-Age"))
+				assert.Contains(t, resp.Header.Get("Vary"), "Origin")
+			} else {
+				assert.Empty(t, resp.Header.Get("Vary"))
+			}
+		})
+	}
+
+	t.Run("preflight options returns 204", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		s.SetCORSOrigins([]string{"https://app.example.com"})
+		srv := httptest.NewServer(s.Router())
+		defer srv.Close()
+		req, err := http.NewRequest("OPTIONS", srv.URL+"/health", nil)
+		require.NoError(t, err)
+		req.Header.Set("Origin", "https://app.example.com")
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+		assert.Equal(t, "https://app.example.com", resp.Header.Get("Access-Control-Allow-Origin"))
+	})
+
+	t.Run("preflight non-matching origin bypasses CORS", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		s.SetCORSOrigins([]string{"https://app.example.com"})
+		srv := httptest.NewServer(s.Router())
+		defer srv.Close()
+		req, err := http.NewRequest("OPTIONS", srv.URL+"/health", nil)
+		require.NoError(t, err)
+		req.Header.Set("Origin", "https://evil.com")
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		assert.Empty(t, resp.Header.Get("Access-Control-Allow-Origin"))
+	})
+}
