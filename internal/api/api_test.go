@@ -288,12 +288,49 @@ func TestHealth(t *testing.T) {
 }
 
 func TestStats(t *testing.T) {
-	st := &stubStore{stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999}}
-	resp, body := doGet(t, newTestServer(st, nil), "/stats")
-	require.Equal(t, http.StatusOK, resp.StatusCode)
+	t.Run("includes store and freshness fields", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{
+			TotalEvents:        42,
+			LastIngestedLedger: 999,
+			OldestStoredLedger: 100,
+		}}
+		rc := &stubRPC{health: rpc.Health{Status: "healthy", LatestLedger: 1_020}}
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var got store.Stats
-	require.NoError(t, json.Unmarshal(body, &got))
-	assert.Equal(t, int64(42), got.TotalEvents)
-	assert.Equal(t, int64(999), got.LastIngestedLedger)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, int64(42), got.TotalEvents)
+		assert.Equal(t, int64(999), got.LastIngestedLedger)
+		assert.Equal(t, int64(100), got.OldestStoredLedger)
+		require.NotNil(t, got.ChainHeadLedger)
+		assert.Equal(t, int64(1_020), *got.ChainHeadLedger)
+		require.NotNil(t, got.IngestLagLedgers)
+		assert.Equal(t, int64(21), *got.IngestLagLedgers)
+	})
+
+	t.Run("keeps stored stats when RPC is down", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{
+			TotalEvents:        42,
+			LastIngestedLedger: 999,
+			OldestStoredLedger: 100,
+		}}
+		rc := &stubRPC{healthErr: errors.New("rpc unreachable")}
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, int64(42), got.TotalEvents)
+		assert.Equal(t, int64(999), got.LastIngestedLedger)
+		assert.Equal(t, int64(100), got.OldestStoredLedger)
+		assert.Nil(t, got.ChainHeadLedger)
+		assert.Nil(t, got.IngestLagLedgers)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(body, &raw))
+		assert.Contains(t, raw, "chain_head_ledger")
+		assert.Nil(t, raw["chain_head_ledger"])
+		assert.Contains(t, raw, "ingest_lag_ledgers")
+		assert.Nil(t, raw["ingest_lag_ledgers"])
+	})
 }

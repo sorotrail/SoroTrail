@@ -237,11 +237,14 @@ type DeliveryAttempt struct {
 // to match a fresh RPC fetch; 0 means no ledger has been verified yet.
 // Auditor counters are filled in by the API layer when an auditor is wired.
 type Stats struct {
-	TotalEvents           int64 `json:"total_events"`
-	LastIngestedLedger    int64 `json:"last_ingested_ledger"`
-	VerifiedThroughLedger int64 `json:"verified_through_ledger"`
-	ContractCount         int64 `json:"contract_count"`
-	WatchedContracts      int64 `json:"watched_contracts"`
+	TotalEvents           int64  `json:"total_events"`
+	LastIngestedLedger    int64  `json:"last_ingested_ledger"`
+	VerifiedThroughLedger int64  `json:"verified_through_ledger"`
+	OldestStoredLedger    int64  `json:"oldest_stored_ledger"`
+	ChainHeadLedger       *int64 `json:"chain_head_ledger"`
+	IngestLagLedgers      *int64 `json:"ingest_lag_ledgers"`
+	ContractCount         int64  `json:"contract_count"`
+	WatchedContracts      int64  `json:"watched_contracts"`
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
