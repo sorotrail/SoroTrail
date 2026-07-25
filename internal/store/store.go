@@ -100,14 +100,20 @@ type EventFilter struct {
 	TopicContains json.RawMessage
 	// Topic0-Topic3 match the exact JSON value at that specific topic array
 	// position. Unspecified positions are wildcards.
-	Topic0     json.RawMessage
-	Topic1     json.RawMessage
-	Topic2     json.RawMessage
-	Topic3     json.RawMessage
-	FromLedger int64     // inclusive
-	ToLedger   int64     // inclusive
-	FromTime   time.Time // inclusive, zero = no constraint
-	ToTime     time.Time // inclusive, zero = no constraint
+	Topic0 json.RawMessage
+	Topic1 json.RawMessage
+	Topic2 json.RawMessage
+	Topic3 json.RawMessage
+	// TopicContains matches events whose topics array jsonb-contains this
+	// value (Postgres @> operator). Unlike Topic, the value is passed
+	// directly without array-wrapping, so callers can use multi-element
+	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
+	// Uses the GIN index on events.topics.
+	TopicContains json.RawMessage
+	FromLedger    int64     // inclusive
+	ToLedger      int64     // inclusive
+	FromTime      time.Time // inclusive, zero = no constraint
+	ToTime        time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int
@@ -129,6 +135,15 @@ type IngestionState struct {
 type AuditState struct {
 	VerifiedThroughLedger int64
 	UpdatedAt             time.Time
+}
+
+// WatchedContract is one entry of the watch list: a contract ID and the
+// time it was added (either by env seeding on startup, or by a runtime
+// POST). The API uses this to render the GET response; the ingester reads
+// only ContractID for its filter batches.
+type WatchedContract struct {
+	ContractID string    `json:"contract_id"`
+	AddedAt    time.Time `json:"added_at"`
 }
 
 // LedgerCensus is one row of a per-ledger census over a contiguous range.
@@ -177,11 +192,6 @@ type SubscriptionFilter struct {
 	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
 	FromLedger    int64           `json:"from_ledger,omitempty"`
 	ToLedger      int64           `json:"to_ledger,omitempty"`
-	ContractID string          `json:"contract_id,omitempty"`
-	Type       string          `json:"type,omitempty"`
-	Topic      json.RawMessage `json:"topic,omitempty"`
-	FromLedger int64           `json:"from_ledger,omitempty"`
-	ToLedger   int64           `json:"to_ledger,omitempty"`
 }
 
 // MatchesEvent reports whether an event passes this filter. Zero fields
@@ -263,9 +273,6 @@ func jsonbContains(container, contained json.RawMessage) bool {
 	// Fallback: exact JSON string match (handles strings, numbers, and
 	// cases where unmarshalling into map failed — e.g. arrays).
 	return string(container) == string(contained)
-}
-
-	return true
 }
 
 // Subscription is one registered webhook callback.
@@ -403,8 +410,19 @@ type Store interface {
 	// HWM even if they race.
 	SaveAuditStateIfGreater(ctx context.Context, ledger int64) (AuditState, error)
 
-	ListWatchedContracts(ctx context.Context) ([]string, error)
+	// ListWatchedContracts returns every watched contract in stable
+	// (contract_id) order, with its add timestamp. An empty result means
+	// the watch list is empty, and the ingester interprets that as
+	// "ingest all contract events" — distinct from "ingest nothing".
+	ListWatchedContracts(ctx context.Context) ([]WatchedContract, error)
 	AddWatchedContract(ctx context.Context, contractID string) error
+	// RemoveWatchedContract stops future ingestion for the given contract
+	// by removing its row from watched_contracts. It does NOT delete any
+	// (event) rows already in storage — removal is "stop watching", not
+	// "drop history", so a removed contract's events stay queryable.
+	// ErrNotFound is returned when no row matches the given ID, so the
+	// API can surface 404 for typos.
+	RemoveWatchedContract(ctx context.Context, contractID string) error
 
 	// RecordAuditFinding persists a new finding (status "open") and
 	// returns it with its assigned ID populated.

@@ -35,6 +35,12 @@ type Config struct {
 	AuditMaxRepair      int           `env:"AUDIT_MAX_REPAIR_ATTEMPTS" envDefault:"3"`
 	AuditFindingMaxLgrs uint32        `env:"AUDIT_FINDING_MAX_LEDGERS" envDefault:"100"`
 
+	// APIKey, when set, gates the watched-contracts management endpoints
+	// via a constant-time comparison against the X-API-Key request header.
+	// Empty means the watched-contracts surface starts up rejected (every
+	// request gets a 503 with a "no API_KEY configured" message), so
+	// writes are never open even when other auth would be off.
+	APIKey string `env:"API_KEY"`
 	// HTTP rate limiting (per client). RATE_LIMIT_RPS / RATE_LIMIT_BURST
 	// are both unset (zero) by default, which disables the limiter
 	// entirely — a no-op middleware — so deployments without this turned
@@ -162,6 +168,24 @@ func ValidContractID(s string) bool {
 	return true
 }
 
+// ValidCursor reports whether s is a valid pagination cursor.
+// A cursor must be non-empty, at most 128 characters, and consist only of
+// alphanumeric characters, hyphens, underscores, dots, or colons.
+func ValidCursor(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	for _, r := range s {
+		if (r < 'a' || r > 'z') &&
+			(r < 'A' || r > 'Z') &&
+			(r < '0' || r > '9') &&
+			r != '-' && r != '_' && r != '.' && r != ':' {
+			return false
+		}
+	}
+	return true
+}
+
 func cleanContractList(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
@@ -170,4 +194,26 @@ func cleanContractList(in []string) []string {
 		}
 	}
 	return out
+}
+
+// LoggableFields returns the configuration as a map of fields suitable for logging,
+// with credentials redacted (e.g., from DATABASE_URL).
+func (c Config) LoggableFields() []any {
+	dbURL := c.DatabaseURL
+	if u, err := url.Parse(c.DatabaseURL); err == nil {
+		u.User = nil
+		dbURL = u.String()
+	}
+
+	return []any{
+		"rpc_url", c.RPCURL,
+		"database_url", dbURL,
+		"poll_interval", c.PollInterval,
+		"http_addr", c.HTTPAddr,
+		"watched_contracts", len(c.WatchedContracts),
+		"start_ledger", c.StartLedger,
+		"retention_ledgers", c.RetentionLedgers,
+		"log_level", c.LogLevel,
+		"audit_enabled", c.AuditEnabled,
+	}
 }
