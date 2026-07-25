@@ -17,7 +17,25 @@ long after the RPC has forgotten them.
 
 ## Quickstart
 
-### Docker (one command)
+### Published image (fastest)
+
+Tagged releases publish a multi-arch (amd64/arm64) image to GHCR. Point it at
+a Postgres you already have:
+
+```sh
+docker run --rm -p 8080:8080 \
+  -e DATABASE_URL='postgres://user:pass@host:5432/sorotrail?sslmode=disable' \
+  -e RPC_URL='https://soroban-testnet.stellar.org' \
+  ghcr.io/stephaniepez21-art/sorotrail:latest
+```
+
+Pin a specific release with a version tag instead of `latest`, e.g.
+`ghcr.io/stephaniepez21-art/sorotrail:v1.2.0`. See [Configuration](#configuration) for
+the full list of environment variables.
+
+### Docker Compose (full stack)
+
+Brings up Postgres and the indexer together — no external database required:
 
 ```sh
 docker compose up --build
@@ -65,6 +83,10 @@ All configuration comes from environment variables (see `.env.example`):
 | `AUDIT_MAX_RPS` | `10` | Total request budget (split between ingest and audit). |
 | `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
 | `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
+| `API_KEY` | empty | Required to use the runtime `/watched-contracts` surface; empty means every request there is rejected with 503. This is a placeholder until #17 (real auth) lands — at that point `API_KEY` will be replaced. |
+| `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
+| `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
+| `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
 | `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
