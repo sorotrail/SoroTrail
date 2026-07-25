@@ -92,12 +92,6 @@ type EventFilter struct {
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic json.RawMessage
-	// TopicContains matches events whose topics array jsonb-contains this
-	// value (Postgres @> operator). Unlike Topic, the value is passed
-	// directly without array-wrapping, so callers can use multi-element
-	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
-	// Uses the GIN index on events.topics.
-	TopicContains json.RawMessage
 	// Topic0-Topic3 match the exact JSON value at that specific topic array
 	// position. Unspecified positions are wildcards.
 	Topic0     json.RawMessage
@@ -173,9 +167,8 @@ type AuditFinding struct {
 type SubscriptionFilter struct {
 	ContractID string          `json:"contract_id,omitempty"`
 	Type       string          `json:"type,omitempty"`
-	Topic         json.RawMessage `json:"topic,omitempty"`
-	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
-	FromLedger    int64           `json:"from_ledger,omitempty"`
+	Topic      json.RawMessage `json:"topic,omitempty"`
+	FromLedger int64           `json:"from_ledger,omitempty"`
 	ToLedger   int64           `json:"to_ledger,omitempty"`
 }
 
@@ -212,52 +205,7 @@ func (f SubscriptionFilter) MatchesEvent(e Event) bool {
 			return false
 		}
 	}
-	if len(f.TopicContains) > 0 && len(e.Topics) > 0 {
-		var topics []json.RawMessage
-		if err := json.Unmarshal(e.Topics, &topics); err != nil {
-			return false
-		}
-		// Unwrap a single-element array so topic_contains=[{...}] works
-		// the same way in-memory as it does in Postgres @> containment.
-		needle := f.TopicContains
-		var arr []json.RawMessage
-		if err := json.Unmarshal(f.TopicContains, &arr); err == nil && len(arr) == 1 {
-			needle = arr[0]
-		}
-		matched := false
-		for _, t := range topics {
-			if jsonbContains(t, needle) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return false
-		}
-	}
 	return true
-}
-
-// jsonbContains reports whether the container jsonb-contains the contained
-// value. For objects it checks that every key in contained exists with the
-// same raw JSON value in container; for scalars/arrays it falls back to
-// direct byte comparison (JSON string equality). This mirrors the Postgres
-// @> operator's semantics for the topic-matching use case.
-func jsonbContains(container, contained json.RawMessage) bool {
-	// If both are objects, check key-value subset.
-	var cMap, dMap map[string]json.RawMessage
-	if json.Unmarshal(container, &cMap) == nil && json.Unmarshal(contained, &dMap) == nil {
-		for k, v := range dMap {
-			cv, ok := cMap[k]
-			if !ok || string(cv) != string(v) {
-				return false
-			}
-		}
-		return true
-	}
-	// Fallback: exact JSON string match (handles strings, numbers, and
-	// cases where unmarshalling into map failed — e.g. arrays).
-	return string(container) == string(contained)
 }
 
 // Subscription is one registered webhook callback.
@@ -431,6 +379,7 @@ type Store interface {
 	// ListDeliveryAttempts returns delivery attempts for a subscription,
 	// newest first.
 	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
+
 	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
 	// or ErrNotFound when no spec is cached for that hash.
 	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)

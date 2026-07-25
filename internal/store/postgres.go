@@ -384,11 +384,6 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		// Containment on the array matches the topic at any position.
 		where = append(where, "topics @> "+arg(fmt.Sprintf("[%s]", f.Topic))+"::jsonb")
 	}
-	if len(f.TopicContains) > 0 {
-		// Direct containment — caller controls the shape (object wrapped in
-		// array for element match, multi-element arrays for subset match).
-		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
-	}
 	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
 		if len(topic) == 0 {
 			continue
@@ -606,52 +601,11 @@ func (p *Postgres) Ping(ctx context.Context) error {
 	return p.pool.Ping(ctx)
 }
 
-func (p *Postgres) withStatementTimeoutTx(ctx context.Context, fn func(pgx.Tx) error) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	tx, err := p.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin guarded tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if timeout, ok := statementTimeoutFromContext(ctx); ok && timeout > 0 {
-		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = '%dms'", timeout.Milliseconds())); err != nil {
-			return fmt.Errorf("setting statement_timeout: %w", err)
-		}
-	}
-	if err := fn(tx); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit guarded tx: %w", err)
-	}
-	return nil
-}
-
-func statementTimeoutFromContext(ctx context.Context) (time.Duration, bool) {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return 0, false
-	}
-	timeout := time.Until(deadline)
-	if timeout <= 0 {
-		return 0, false
-	}
-	if timeout < time.Millisecond {
-		return time.Millisecond, true
-	}
-	return timeout, true
-}
-
 func (p *Postgres) GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error) {
 	var specJSON []byte
-	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx,
-			`SELECT spec_json FROM contract_specs WHERE wasm_hash = $1`, wasmHash,
-		).Scan(&specJSON)
-	})
+	err := p.pool.QueryRow(ctx,
+		`SELECT spec_json FROM contract_specs WHERE wasm_hash = $1`, wasmHash,
+	).Scan(&specJSON)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

@@ -119,6 +119,7 @@ func run() error {
 	}
 
 	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
+	bcast := broadcast.New(broadcast.DefaultBufferSize)
 	// Webhook delivery runs alongside ingestion — the notifier is attached
 	// to the ingester so events flow to subscriber callbacks asynchronously.
 	wh := webhook.NewNotifier(st, log)
@@ -128,7 +129,6 @@ func run() error {
 	specFetcher := spec.NewFetcher(rpcClient)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
-	bcast := broadcast.New(broadcast.DefaultBufferSize)
 	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
@@ -165,12 +165,7 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
-		Timeout:            cfg.APIQueryTimeout,
-		SlowQueryThreshold: cfg.APISlowQueryThreshold,
-		Logger:             log,
-	})
-	apiServer := api.New(apiStore, rpcClient, log, specEnricher).WithBroadcaster(bcast)
+	apiServer := api.New(st, rpcClient, log, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{

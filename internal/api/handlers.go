@@ -73,34 +73,10 @@ type eventsResponse struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
-type eventsWithXDRResponse struct {
-	Events []eventWithXDR `json:"events"`
-	// Cursor is non-empty when another page exists; pass it back as ?cursor=.
-	Cursor string `json:"cursor,omitempty"`
-}
-
 type enrichedEventsResponse struct {
 	Events []store.EnrichedEvent `json:"events"`
 	// Cursor is non-empty when another page exists.
 	Cursor string `json:"cursor,omitempty"`
-}
-
-type enrichedEventsWithXDRResponse struct {
-	Events []enrichedEventWithXDR `json:"events"`
-	// Cursor is non-empty when another page exists.
-	Cursor string `json:"cursor,omitempty"`
-}
-
-type eventWithXDR struct {
-	store.Event
-	TopicsXDR []string `json:"topics_xdr"`
-	ValueXDR  *string  `json:"value_xdr"`
-}
-
-type enrichedEventWithXDR struct {
-	eventWithXDR
-	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
-	Decoded      bool                        `json:"decoded"`
 }
 
 type healthResponse struct {
@@ -177,18 +153,9 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
-
 	decoded := r.URL.Query().Get("decoded") == "true"
-	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), events)
-		if includeXDR {
-			writeJSON(w, http.StatusOK, enrichedEventsWithXDRResponse{
-				Events: enrichEventsWithXDR(enriched),
-				Cursor: cursor,
-			})
-			return
-		}
 		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
 		return
 	}
@@ -247,16 +214,10 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
-
 	decoded := r.URL.Query().Get("decoded") == "true"
-	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {
-			if includeXDR {
-				writeJSON(w, http.StatusOK, enrichEventWithXDR(enriched[0]))
-				return
-			}
 			writeJSON(w, http.StatusOK, enriched[0])
 			return
 		}
@@ -590,16 +551,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 			return nil, fmt.Errorf("invalid %s: %w", name, err)
 		}
 		return quoted, nil
-	}
-
-	// topic_contains accepts any valid JSON value and uses @> containment
-	// directly (no automatic array-wrapping). Unlike topic, bare words are
-	// not allowed — the input must be parseable JSON.
-	if raw := q.Get("topic_contains"); raw != "" {
-		if !json.Valid([]byte(raw)) {
-			return f, fmt.Errorf("topic_contains must be valid JSON")
-		}
-		f.TopicContains = json.RawMessage(raw)
 	}
 
 	// order controls sort direction for paginated results.
