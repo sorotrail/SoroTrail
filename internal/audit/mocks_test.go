@@ -348,6 +348,21 @@ func (m *mockStore) Stats(context.Context) (store.Stats, error) {
 }
 
 func (m *mockStore) Ping(context.Context) error { return nil }
+func (m *mockStore) ListContractIDs(context.Context) ([]string, error) {
+	return nil, nil
+}
+func (m *mockStore) GetContractMeta(context.Context, string) (store.ContractMeta, error) {
+	return store.ContractMeta{}, store.ErrNotFound
+}
+func (m *mockStore) UpsertContractMeta(context.Context, store.ContractMeta) error {
+	return nil
+}
+func (m *mockStore) CountContractEvents(context.Context, string) (int64, error) {
+	return 0, nil
+}
+func (m *mockStore) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
+	return nil, nil
+}
 
 // Subscription stubs for the webhook feature — unused by auditor tests.
 func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {

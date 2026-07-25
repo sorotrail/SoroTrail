@@ -426,21 +426,23 @@ func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
 // store's pagination rules and we re-verify by test.
 func listETag(f store.EventFilter) string {
 	key := struct {
-		ContractID string          `json:"c"`
-		Type       string          `json:"t"`
-		Topic      json.RawMessage `json:"p,omitempty"`
-		FromLedger int64           `json:"fl"`
-		ToLedger   int64           `json:"tl"`
-		FromTime   string          `json:"ft,omitempty"`
-		ToTime     string          `json:"tt,omitempty"`
-		Cursor     string          `json:"cu,omitempty"`
-		Limit      int             `json:"l"`
-		Order      string          `json:"o,omitempty"`
+		ContractID    string          `json:"c"`
+		Type          string          `json:"t"`
+		Topic         json.RawMessage `json:"p,omitempty"`
+		TopicContains json.RawMessage `json:"tc,omitempty"`
+		FromLedger    int64           `json:"fl"`
+		ToLedger      int64           `json:"tl"`
+		FromTime      string          `json:"ft,omitempty"`
+		ToTime        string          `json:"tt,omitempty"`
+		Cursor        string          `json:"cu,omitempty"`
+		Limit         int             `json:"l"`
+		Order         string          `json:"o,omitempty"`
 	}{
 		ContractID: f.ContractID,
 		Type:       f.Type,
-		Topic:      f.Topic,
-		FromLedger: f.FromLedger,
+		Topic:         f.Topic,
+		TopicContains: f.TopicContains,
+		FromLedger:    f.FromLedger,
 		ToLedger:   f.ToLedger,
 		FromTime:   timeOrEmpty(f.FromTime),
 		ToTime:     timeOrEmpty(f.ToTime),
@@ -629,6 +631,14 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if len(f.Topic) > 0 && (len(f.Topic0) > 0 || len(f.Topic1) > 0 || len(f.Topic2) > 0 || len(f.Topic3) > 0) {
 		return f, fmt.Errorf("topic and topic0..topic3 filters cannot be combined")
+	}
+
+	// topic_contains is a jsonb containment filter against the topics array.
+	if raw := q.Get("topic_contains"); raw != "" {
+		if !json.Valid([]byte(raw)) {
+			return f, fmt.Errorf("topic_contains must be valid JSON")
+		}
+		f.TopicContains = json.RawMessage(raw)
 	}
 
 	if f.FromLedger, err = parseLedgerParam(q.Get("from_ledger"), "from_ledger"); err != nil {

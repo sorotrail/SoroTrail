@@ -118,7 +118,10 @@ type EventFilter struct {
 	Topic1     json.RawMessage
 	Topic2     json.RawMessage
 	Topic3     json.RawMessage
-	FromLedger int64     // inclusive
+	// TopicContains is a jsonb containment filter against the topics array.
+	// Pass a JSON array to match events whose topics @> the given value.
+	TopicContains json.RawMessage
+	FromLedger   int64     // inclusive
 	ToLedger   int64     // inclusive
 	FromTime   time.Time // inclusive, zero = no constraint
 	ToTime     time.Time // inclusive, zero = no constraint
@@ -402,4 +405,11 @@ type Store interface {
 
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error
+
+	// Contract metadata (token enrichment).
+	ListContractIDs(ctx context.Context) ([]string, error)
+	GetContractMeta(ctx context.Context, contractID string) (ContractMeta, error)
+	UpsertContractMeta(ctx context.Context, m ContractMeta) error
+	CountContractEvents(ctx context.Context, contractID string) (int64, error)
+	ListContractsNeedingRefresh(ctx context.Context, olderThan time.Time) ([]string, error)
 }

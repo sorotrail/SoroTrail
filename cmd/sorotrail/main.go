@@ -26,9 +26,7 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/ingester"
-	"github.com/khaylebfortune/sorotrail/internal/meta"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/spec"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 	"github.com/khaylebfortune/sorotrail/internal/webhook"
 )
@@ -203,24 +201,6 @@ func run() error {
 				"max_repair_attempts", cfg.AuditMaxRepair)
 			if err := aud.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- fmt.Errorf("auditor: %w", err)
-			} else {
-				errCh <- nil
-			}
-		}()
-	}
-
-	// Contract metadata enrichment worker: discovers contracts from ingested
-	// events and attempts SEP-41 token interface reads (name/symbol/decimals)
-	// via RPC simulation. Never blocks ingestion, rate-limits itself, and
-	// negative-caches non-token contracts so they're never re-probed.
-	if cfg.ContractMetaEnabled {
-		metaWorker := meta.New(rpcClient, st, log, cfg.ContractMetaTTL, cfg.ContractMetaInterval)
-		go func() {
-			log.Info("metadata enrichment worker starting",
-				"ttl", cfg.ContractMetaTTL,
-				"poll_interval", cfg.ContractMetaInterval)
-			if err := metaWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				errCh <- fmt.Errorf("metadata enrichment: %w", err)
 			} else {
 				errCh <- nil
 			}
