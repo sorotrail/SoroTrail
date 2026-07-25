@@ -42,9 +42,7 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 		return 0, err
 	}
 	return rows, nil
-}
-
-// insertEventsBatch builds the event INSERT used by every write path, so
+}// insertEventsBatch builds the event INSERT used by every write path, so
 // the column list can't drift between them — notably raw_topic_xdr /
 // raw_value_xdr, which `sorotrail replay` depends on: a path that forgot
 // them would quietly make its rows unreplayable.
@@ -73,18 +71,20 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	}
 	batch := &pgx.Batch{}
 	for _, e := range events {
+		// Single INSERT for both code paths: the only difference is the
+		// conflict handler, which `conflict` interpolates. Empty raw XDR
+		// is stored as SQL NULL via nullableText{,Array} so the column
+		// representation is "NULL or array" rather than the dual "NULL
+		// or empty array" some servers report inconsistently. Schema
+		// (see migration 0001 + 0003) is 13 columns.
 		batch.Queue(`
 			INSERT INTO events
 				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-				 in_successful_call, topics, value, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-			ON CONFLICT (id) DO NOTHING`,
+				 in_successful_call, topics, value, created_at,
+				 raw_topic_xdr, raw_value_xdr)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) `+conflict,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
-				 in_successful_call, topics, value, raw_topic_xdr, raw_value_xdr)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) `+conflict,
-			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
-			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value,
 			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
 	}
