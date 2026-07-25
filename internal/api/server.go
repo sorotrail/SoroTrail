@@ -4,7 +4,6 @@ package api
 
 import (
 	"context"
-	_ "embed"
 	"log/slog"
 	"net/http"
 	"sync"
