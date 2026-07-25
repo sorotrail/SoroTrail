@@ -35,6 +35,12 @@ type Config struct {
 	AuditMaxRepair      int           `env:"AUDIT_MAX_REPAIR_ATTEMPTS" envDefault:"3"`
 	AuditFindingMaxLgrs uint32        `env:"AUDIT_FINDING_MAX_LEDGERS" envDefault:"100"`
 
+	// APIKey, when set, gates the watched-contracts management endpoints
+	// via a constant-time comparison against the X-API-Key request header.
+	// Empty means the watched-contracts surface starts up rejected (every
+	// request gets a 503 with a "no API_KEY configured" message), so
+	// writes are never open even when other auth would be off.
+	APIKey string `env:"API_KEY"`
 	// HTTP rate limiting (per client). RATE_LIMIT_RPS / RATE_LIMIT_BURST
 	// are both unset (zero) by default, which disables the limiter
 	// entirely — a no-op middleware — so deployments without this turned
@@ -144,6 +150,24 @@ func ValidContractID(s string) bool {
 	}
 	for _, r := range s[1:] {
 		if (r < 'A' || r > 'Z') && (r < '2' || r > '7') {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidCursor reports whether s is a valid pagination cursor.
+// A cursor must be non-empty, at most 128 characters, and consist only of
+// alphanumeric characters, hyphens, underscores, dots, or colons.
+func ValidCursor(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	for _, r := range s {
+		if (r < 'a' || r > 'z') &&
+			(r < 'A' || r > 'Z') &&
+			(r < '0' || r > '9') &&
+			r != '-' && r != '_' && r != '.' && r != ':' {
 			return false
 		}
 	}

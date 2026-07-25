@@ -103,6 +103,7 @@ func run() error {
 	}
 
 	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
+	bcast := broadcast.New(broadcast.DefaultBufferSize)
 	// Webhook delivery runs alongside ingestion — the notifier is attached
 	// to the ingester so events flow to subscriber callbacks asynchronously.
 	wh := webhook.NewNotifier(st, log)
@@ -112,7 +113,6 @@ func run() error {
 	specFetcher := spec.NewFetcher(rpcClient)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
-	bcast := broadcast.New(broadcast.DefaultBufferSize)
 	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
@@ -149,13 +149,18 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpcClient, log, specEnricher).WithBroadcaster(bcast)
+	apiServer := api.New(st, rpcClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiServer.Router(),
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if cfg.APIKey == "" {
+		log.Warn("API_KEY env is unset; watched-contracts endpoints will reject every request with 503")
+	} else {
+		log.Info("watched-contracts endpoints are auth-gated")
 	}
 
 	errCh := make(chan error, 4)
