@@ -112,6 +112,109 @@ type healthResponse struct {
 	Checks map[string]string `json:"checks"`
 }
 
+// eventFieldNames is the set of JSON keys on store.Event that the ?fields=
+// allowlist accepts. It is built from the json struct tags so the compiler
+// catches drift when Event gains or renames fields.
+var eventFieldNames = map[string]bool{
+	"id":                 true,
+	"contract_id":        true,
+	"ledger":             true,
+	"type":               true,
+	"tx_hash":            true,
+	"tx_index":           true,
+	"op_index":           true,
+	"in_successful_call": true,
+	"topics":             true,
+	"value":              true,
+	"created_at":         true,
+}
+
+// parseFields splits a comma-separated ?fields= value and returns the
+// allowlist set. Unknown field names are rejected with a 400-style error.
+// An empty or missing raw value returns nil (meaning "return the full object").
+func parseFields(raw string) (map[string]bool, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	set := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		f := strings.TrimSpace(p)
+		if f == "" {
+			continue
+		}
+		if !eventFieldNames[f] {
+			return nil, fmt.Errorf("unknown field %q (valid: id, contract_id, ledger, type, tx_hash, tx_index, op_index, in_successful_call, topics, value, created_at)", f)
+		}
+		set[f] = true
+	}
+	if len(set) == 0 {
+		return nil, nil
+	}
+	return set, nil
+}
+
+// projectEvent returns the event unchanged when fields is nil, or a
+// map[string]any containing only the requested keys.
+func projectEvent(ev store.Event, fields map[string]bool) any {
+	if fields == nil {
+		return ev
+	}
+	return eventToMap(ev, fields)
+}
+
+// projectEvents applies projectEvent to a slice, returning []map[string]any
+// when fields is set, or the original slice when nil.
+func projectEvents(evs []store.Event, fields map[string]bool) any {
+	if fields == nil {
+		return evs
+	}
+	out := make([]map[string]any, len(evs))
+	for i, ev := range evs {
+		out[i] = eventToMap(ev, fields)
+	}
+	return out
+}
+
+// eventToMap builds a map with only the requested fields.
+func eventToMap(ev store.Event, fields map[string]bool) map[string]any {
+	m := make(map[string]any, len(fields))
+	if fields["id"] {
+		m["id"] = ev.ID
+	}
+	if fields["contract_id"] {
+		m["contract_id"] = ev.ContractID
+	}
+	if fields["ledger"] {
+		m["ledger"] = ev.Ledger
+	}
+	if fields["type"] {
+		m["type"] = ev.Type
+	}
+	if fields["tx_hash"] {
+		m["tx_hash"] = ev.TxHash
+	}
+	if fields["tx_index"] {
+		m["tx_index"] = ev.TxIndex
+	}
+	if fields["op_index"] {
+		m["op_index"] = ev.OpIndex
+	}
+	if fields["in_successful_call"] {
+		m["in_successful_call"] = ev.InSuccessfulCall
+	}
+	if fields["topics"] {
+		m["topics"] = ev.Topics
+	}
+	if fields["value"] {
+		m["value"] = ev.Value
+	}
+	if fields["created_at"] {
+		m["created_at"] = ev.CreatedAt
+	}
+	return m
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -135,16 +238,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
-	filter, err := filterFromQuery(r)
+	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	s.serveEvents(w, r, filter)
+	s.serveEvents(w, r, filter, fields)
 }
 
 func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
-	filter, err := filterFromQuery(r)
+	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -155,7 +258,7 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	filter.ContractID = contractID
-	s.serveEvents(w, r, filter)
+	s.serveEvents(w, r, filter, fields)
 }
 
 // serveEvents is the shared body for /events and /contracts/{id}/events.
@@ -163,7 +266,7 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 // SQL query, so an immutable page with a matching If-None-Match never
 // touches the events table at all — only the cheap ingestion_state row
 // used to read the frontier.
-func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter store.EventFilter) {
+func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter store.EventFilter, fields map[string]bool) {
 	policy, etag, err := s.listCachePolicy(r.Context(), filter)
 	if err != nil {
 		// "When in doubt, don't cache" is the explicit guidance: any
@@ -188,19 +291,41 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		return
 	}
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
-	includeXDR := r.URL.Query().Get("xdr") == "true"
-	if includeXDR {
-		writeJSON(w, http.StatusOK, eventsWithXDRResponse{
-			Events: eventsWithXDR(events),
-			Cursor: cursor,
-		})
-		return
+	// eventsResponse expects []store.Event; when fields projection is active
+	// we wrap the projected maps in a compatible envelope.
+	if fields == nil {
+		writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
+	} else {
+		m := map[string]any{"events": projectEvents(events, fields)}
+		if cursor != "" {
+			m["cursor"] = cursor
+		}
+		writeJSON(w, http.StatusOK, m)
 	}
-	writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
+}
+
+// parseFilterAndFields parses the shared filter params plus the optional
+// ?fields= allowlist.
+func parseFilterAndFields(r *http.Request) (store.EventFilter, map[string]bool, error) {
+	filter, err := filterFromQuery(r)
+	if err != nil {
+		return filter, nil, err
+	}
+	fields, err := parseFields(r.URL.Query().Get("fields"))
+	if err != nil {
+		return filter, nil, err
+	}
+	return filter, fields, nil
 }
 
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+
+	fields, err := parseFields(r.URL.Query().Get("fields"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 
 	// Strong ETag: the event ID is itself a perfect validator for an
 	// immutable resource (each ID maps to exactly one row, that row's
@@ -252,12 +377,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
-	includeXDR := r.URL.Query().Get("xdr") == "true"
-	if includeXDR {
-		writeJSON(w, http.StatusOK, eventToXDRResponse(event))
-		return
-	}
-	writeJSON(w, http.StatusOK, event)
+	writeJSON(w, http.StatusOK, projectEvent(event, fields))
 }
 
 func eventToXDRResponse(e store.Event) eventWithXDR {
@@ -854,7 +974,7 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filter, err := filterFromQuery(r)
+	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -910,7 +1030,7 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			data, err := json.Marshal(ev)
+			data, err := json.Marshal(projectEvent(ev, fields))
 			if err != nil {
 				s.log.Error("marshal event for ws", "error", err)
 				continue
