@@ -170,7 +170,6 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
-
 	decoded := r.URL.Query().Get("decoded") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), events)
@@ -225,7 +224,6 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
-
 	decoded := r.URL.Query().Get("decoded") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
@@ -247,6 +245,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
 	}
+	s.addStatsFreshness(r.Context(), &stats)
 	if a := getAuditor(); a != nil {
 		m := a.Metrics()
 		stats.Auditor = store.AuditStats{
@@ -263,176 +262,26 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
-// addWatchedRequest is the body for POST /watched-contracts: a single
-// contract ID to add to the runtime watch list.
-type addWatchedRequest struct {
-	ContractID string `json:"contract_id"`
-}
+func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
+	if s.rpc == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 
-// addWatchedResponse includes the current ingestion cursor so callers
-// know exactly where historical replay starts — events before this ledger
-// are not backfilled by the runtime add (a separate replay tool covers them).
-type addWatchedResponse struct {
-	ContractID        string `json:"contract_id"`
-	AddedAt           string `json:"added_at"`
-	HistoryFromLedger int64  `json:"history_from_ledger"`
-	// ModeTransition is "all_to_specific" when the list was empty before
-	// this add, surfacing the same semantic change the confirm guard
-	// guards. Useful to post-run auditors even when the caller already
-	// confirmed.
-	ModeTransition string `json:"mode_transition,omitempty"`
-}
-
-// removeWatchedResponse explains what removal actually did: stored events
-// are NOT deleted; only future ingestion stops. The message is part of
-// the contract so callers don't have to read the README to find out.
-type removeWatchedResponse struct {
-	ContractID       string `json:"contract_id"`
-	RemovedAt        string `json:"removed_at"`
-	HistoryPreserved bool   `json:"history_preserved"`
-	ModeTransition   string `json:"mode_transition,omitempty"`
-}
-
-// watchedListResponse wraps the GET response in an envelope so the route
-// is easy to extend without breaking JSON shape.
-type watchedListResponse struct {
-	Contracts []store.WatchedContract `json:"contracts"`
-	Count     int                     `json:"count"`
-}
-
-// handleListWatchedChains returns the current watch list in stable
-// (contract_id) order.
-func (s *Server) handleListWatchedChains(w http.ResponseWriter, r *http.Request) {
-	contracts, err := s.store.ListWatchedContracts(r.Context())
+	health, err := s.rpc.GetHealth(ctx)
 	if err != nil {
-		s.log.Error("listing watched contracts", "error", err)
-		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
+		s.log.Warn("loading RPC health for stats", "error", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, watchedListResponse{Contracts: contracts, Count: len(contracts)})
+	head := int64(health.LatestLedger)
+	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
+	stats.ChainHeadLedger = &head
+	stats.IngestLagLedgers = &lag
 }
 
-// handleAddWatchedChain adds a contract to the runtime watch list and
-// returns where historical replay for it starts (= the current cursor).
-//
-// Guarded by ?confirm=true when the add would switch the ingester from
-// "all contract events" (empty list) to a specific contract list, since
-// that silently narrows what gets stored going forward.
-//
-// TOCTOU note: the confirm check reads the list and then mutates it
-// without holding a row lock. Two concurrent empty→non-empty POSTs can
-// both pass the guard before either mutates — acceptable because
-// ON CONFLICT DO NOTHING makes a duplicate Add a no-op, and only the
-// first response carries the genuine transition; the second reports one
-// too, but no row state diverges.
-func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
-	var req addWatchedRequest
-	if err := decodeJSONBody(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if !config.ValidContractID(req.ContractID) {
-		writeError(w, http.StatusBadRequest,
-			fmt.Errorf("invalid contract_id %q (want 56-char C... strkey)", req.ContractID))
-		return
-	}
-
-	current, err := s.store.ListWatchedContracts(r.Context())
-	if err != nil {
-		s.log.Error("listing watched contracts for add", "error", err)
-		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
-		return
-	}
-
-	modeTransition := ""
-	if len(current) == 0 {
-		// Empty -> non-empty switches the ingester from "all contract
-		// events" to a specific list. The guard exists because the new
-		// filter silently narrows what's indexed going forward — exactly
-		// the kind of change an operator should make on purpose, not by
-		// typo.
-		if r.URL.Query().Get("confirm") != "true" {
-			writeError(w, http.StatusBadRequest, errors.New(
-				"adding the first watched contract would switch ingestion from "+
-					"'all contract events' to a specific list — pass ?confirm=true to acknowledge"))
-			return
-		}
-		modeTransition = "all_to_specific"
-	}
-
-	state, err := s.store.GetIngestionState(r.Context())
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		s.log.Error("loading ingestion state for add", "error", err)
-		writeError(w, http.StatusInternalServerError, errors.New("loading ingestion state failed"))
-		return
-	}
-
-	if err := s.store.AddWatchedContract(r.Context(), req.ContractID); err != nil {
-		s.log.Error("adding watched contract", "contract_id", req.ContractID, "error", err)
-		writeError(w, http.StatusInternalServerError, errors.New("adding watched contract failed"))
-		return
-	}
-
-	writeJSON(w, http.StatusOK, addWatchedResponse{
-		ContractID:        req.ContractID,
-		AddedAt:           time.Now().UTC().Format(time.RFC3339),
-		HistoryFromLedger: state.LastIngestedLedger,
-		ModeTransition:    modeTransition,
-	})
-}
-
-// handleRemoveWatchedChain stops future ingestion for the named contract
-// without deleting any events already stored. The same empty<->non-empty
-// guard fires when removing the last contract on the list (specific -> all).
-//
-// TOCTOU note: same read-then-write shape as POST — see the comment on
-// handleAddWatchedChain. Two concurrent DELETE/s of the last contract
-// could both pass the guard; only the first actually transitions the
-// list (the second returns ErrNotFound → 404), so no mode claim is wrong.
-func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	if !config.ValidContractID(id) {
-		writeError(w, http.StatusBadRequest,
-			fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", id))
-		return
-	}
-
-	current, err := s.store.ListWatchedContracts(r.Context())
-	if err != nil {
-		s.log.Error("listing watched contracts for remove", "error", err)
-		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
-		return
-	}
-
-	modeTransition := ""
-	if len(current) == 1 && current[0].ContractID == id {
-		// Last contract on the list: removing it flips ingestion from
-		// "specific list" back to "all contract events".
-		if r.URL.Query().Get("confirm") != "true" {
-			writeError(w, http.StatusBadRequest, errors.New(
-				"removing the last watched contract would switch ingestion from "+
-					"'a specific list' back to 'all contract events' — pass ?confirm=true to acknowledge"))
-			return
-		}
-		modeTransition = "specific_to_all"
-	}
-
-	if err := s.store.RemoveWatchedContract(r.Context(), id); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, fmt.Errorf("contract %q is not in the watch list", id))
-			return
-		}
-		s.log.Error("removing watched contract", "contract_id", id, "error", err)
-		writeError(w, http.StatusInternalServerError, errors.New("removing watched contract failed"))
-		return
-	}
-
-	writeJSON(w, http.StatusOK, removeWatchedResponse{
-		ContractID:       id,
-		RemovedAt:        time.Now().UTC().Format(time.RFC3339),
-		HistoryPreserved: true,
-		ModeTransition:   modeTransition,
-	})
+func ingestLagLedgers(chainHead, lastIngested int64) int64 {
+	return chainHead - lastIngested
 }
 
 // listCachePolicy decides whether a list page is cacheable as immutable

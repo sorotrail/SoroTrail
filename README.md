@@ -70,6 +70,9 @@ All configuration comes from environment variables (see `.env.example`):
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
 | `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
+| `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
+| `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
+| `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
 
 ## Ingestion behavior
 
@@ -467,136 +470,20 @@ curl -s localhost:8080/stats
 ```
 
 ```json
-{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
+{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"oldest_stored_ledger":242001,"chain_head_ledger":260130,"ingest_lag_ledgers":7,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
 ```
+
+`oldest_stored_ledger` is the lowest ledger currently present in the
+store. `chain_head_ledger` is read from Stellar RPC `getHealth`, and
+`ingest_lag_ledgers` is `chain_head_ledger - last_ingested_ledger`. If
+the RPC is temporarily unreachable, `/stats` still returns HTTP 200 with
+the stored fields populated and the RPC-derived freshness fields
+(`chain_head_ledger`, `ingest_lag_ledgers`) set to `null`.
 
 `verified_through_ledger` is the inclusive highest ledger whose stored
 events have been proven to match a fresh RPC fetch by the auditor. When
 `AUDIT_ENABLED=false` it stays at `0`. See the Data integrity section
 below for the contract the field implies.
-
-### Watched-contracts management
-
-The runtime surface for adding, listing, and removing contracts from the
-watch list — without restarting the process and losing in-flight ingestion
-progress. **All three endpoints require the `X-API-Key` header** to match
-the `API_KEY` env var, even when other auth would be off. A missing or
-mismatched `API_KEY` env causes every request here to be rejected with
-`503`, so writes are never open.
-
-```sh
-curl -s -H "X-API-Key: $API_KEY" localhost:8080/watched-contracts
-curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"contract_id":"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"}' \
-  localhost:8080/watched-contracts
-curl -s -X DELETE -H "X-API-Key: $API_KEY" \
-  localhost:8080/watched-contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
-```
-
-#### `POST /watched-contracts`
-
-Adds a contract to the runtime watch list. Body:
-`{"contract_id": "C..."}`. The body parser rejects unknown fields and
-caps the body at 4 KiB; a 400 with `invalid JSON body` is returned if
-either rule trips. Response:
-
-```json
-{
-  "contract_id": "CDLZ...CYSC",
-  "added_at": "2026-07-24T12:00:00Z",
-  "history_from_ledger": 258900,
-  "mode_transition": ""
-}
-```
-
-`history_from_ledger` is the **current ingestion cursor**: events for the
-newly-added contract are only captured from this ledger forward. Events
-before it are NOT backfilled by the API — that requires `sorotrail
-replay` over the relevant range. This is on purpose; the cursor tells
-operators where their gap will start so the surprise is a feature, not a
-discovery.
-
-`mode_transition` is non-empty when this add flips the ingester from
-"all contract events" to a specific list (`"all_to_specific"`). When the
-list is empty, the request requires `?confirm=true` and returns `400`
-without it — see [Mode transitions](#mode-transitions) below.
-
-#### `GET /watched-contracts`
-
-Lists every watched contract in stable order, with the time it was added
-(by an env seed on startup, or by a runtime POST):
-
-```json
-{
-  "contracts": [
-    {"contract_id": "CDLZ...CYSC", "added_at": "2026-07-21T08:00:00Z"}
-  ],
-  "count": 1
-}
-```
-
-#### `DELETE /watched-contracts/{id}`
-
-Stops future ingestion for the named contract. **Stored event rows are
-NEVER deleted** — they remain queryable through `GET /events` and
-`GET /contracts/{id}/events` after removal. Response:
-
-```json
-{
-  "contract_id": "CDLZ...CYSC",
-  "removed_at": "2026-07-24T12:00:00Z",
-  "history_preserved": true
-}
-```
-
-`404` if the id isn't on the watch list. Removing the **last** contract
-returns `400` without `?confirm=true`, because it flips the ingester
-from a specific list back to "all contract events" — see below.
-
-#### Mode transitions
-
-The watch list has two shapes with very different ingest costs:
-
-| Empty | Non-empty |
-| --- | --- |
-| Ingest **all** contract events | Ingest only the listed contracts |
-
-Both directions change what gets stored — a silent change is a bad
-operator experience. Transitions are gated on `?confirm=true`:
-
-- **Empty → non-empty** (adding the first contract): the request returns
-  `400` with a guidance message unless `?confirm=true` is present, and the
-  response includes `"mode_transition": "all_to_specific"`.
-- **Non-empty → empty** (removing the last contract): same guard, message,
-  and `"mode_transition": "specific_to_all"`.
-- **Non-empty → non-empty** (any add or remove with a list of ≥2): no
-  `?confirm` needed; `mode_transition` is empty in the response.
-
-The ingester picks up list changes on the next polling pass — no
-restart, no in-flight progress lost. `buildFilterBatches` re-reads
-`watched_contracts` on every pass, so a POST/DELETE that lands between
-passes is reflected in the very next `getEvents` request.
-
-#### Seeding & precedence
-
-`WATCHED_CONTRACTS` env seeds the watch list via
-`AddWatchedContract` on **every startup**, not just the first time. The
-upsert uses `ON CONFLICT DO NOTHING`, so re-seeding an existing
-contract is a no-op; re-applying the same list across restarts is
-idempotent. The implication for runtime changes:
-
-- `WATCHED_CONTRACTS=A` on first run + `POST B` → list = `{A, B}`.
-- Restart with the same env → list = `{A, B}` (env entry A was already
-  present, POST entry B is preserved).
-- `DELETE A` at runtime + restart with `WATCHED_CONTRACTS=A` → list = `{A}`
-  (env re-seeds A because it's not present). If you want runtime deletes
-  to survive a restart, also remove A from `WATCHED_CONTRACTS`.
-- `DELETE B` at runtime + restart with `WATCHED_CONTRACTS=A` → list = `{A}`
-  (the env re-add doesn't touch B; runtime delete is preserved).
-
-In short: env seeds on every run; runtime adds and runtime deletes that
-target items NOT in the env are durable across restarts; runtime deletes
-that target env-seeded items get undone on the next restart.
 
 ### `GET /events/ws` (WebSocket live stream)
 

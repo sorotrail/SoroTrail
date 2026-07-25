@@ -103,6 +103,13 @@ func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
 	return s.exists, s.existsErr
 }
 
+func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
+	return nil, store.ErrNotFound
+}
+func (s *stubStore) SetContractSpec(context.Context, string, string, []byte) error {
+	return nil
+}
+
 // GetIngestionState backs the list-cache frontier lookup. Tests stage
 // LastIngestedLedger to drive the boundary decisions (just-below, at,
 // and above the frontier).
@@ -125,6 +132,36 @@ func (s *stubStore) AddWatchedContract(_ context.Context, id string) error {
 func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
 	s.removed = append(s.removed, id)
 	return s.removeErr
+}
+
+// Subscription stubs for the webhook feature.
+func (s *stubStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+	sub.ID = 1
+	return sub, nil
+}
+func (s *stubStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
+	return store.Subscription{}, store.ErrNotFound
+}
+func (s *stubStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
+	return nil, nil
+}
+func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+	return sub, nil
+}
+func (s *stubStore) DeleteSubscription(context.Context, int64) error { return nil }
+func (s *stubStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
+	return nil, nil
+}
+func (s *stubStore) IncrementSubscriptionFailures(context.Context, int64, int) (int, bool, error) {
+	return 0, false, nil
+}
+func (s *stubStore) ResetSubscriptionFailures(context.Context, int64) error { return nil }
+func (s *stubStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAttempt) (store.DeliveryAttempt, error) {
+	a.ID = 1
+	return a, nil
+}
+func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
+	return nil, nil
 }
 
 // Subscription stubs for the webhook feature.
@@ -313,12 +350,49 @@ func TestHealth(t *testing.T) {
 }
 
 func TestStats(t *testing.T) {
-	st := &stubStore{stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999}}
-	resp, body := doGet(t, newTestServer(st, nil), "/stats")
-	require.Equal(t, http.StatusOK, resp.StatusCode)
+	t.Run("includes store and freshness fields", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{
+			TotalEvents:        42,
+			LastIngestedLedger: 999,
+			OldestStoredLedger: 100,
+		}}
+		rc := &stubRPC{health: rpc.Health{Status: "healthy", LatestLedger: 1_020}}
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var got store.Stats
-	require.NoError(t, json.Unmarshal(body, &got))
-	assert.Equal(t, int64(42), got.TotalEvents)
-	assert.Equal(t, int64(999), got.LastIngestedLedger)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, int64(42), got.TotalEvents)
+		assert.Equal(t, int64(999), got.LastIngestedLedger)
+		assert.Equal(t, int64(100), got.OldestStoredLedger)
+		require.NotNil(t, got.ChainHeadLedger)
+		assert.Equal(t, int64(1_020), *got.ChainHeadLedger)
+		require.NotNil(t, got.IngestLagLedgers)
+		assert.Equal(t, int64(21), *got.IngestLagLedgers)
+	})
+
+	t.Run("keeps stored stats when RPC is down", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{
+			TotalEvents:        42,
+			LastIngestedLedger: 999,
+			OldestStoredLedger: 100,
+		}}
+		rc := &stubRPC{healthErr: errors.New("rpc unreachable")}
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, int64(42), got.TotalEvents)
+		assert.Equal(t, int64(999), got.LastIngestedLedger)
+		assert.Equal(t, int64(100), got.OldestStoredLedger)
+		assert.Nil(t, got.ChainHeadLedger)
+		assert.Nil(t, got.IngestLagLedgers)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(body, &raw))
+		assert.Contains(t, raw, "chain_head_ledger")
+		assert.Nil(t, raw["chain_head_ledger"])
+		assert.Contains(t, raw, "ingest_lag_ledgers")
+		assert.Nil(t, raw["ingest_lag_ledgers"])
+	})
 }
