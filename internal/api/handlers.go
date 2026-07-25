@@ -327,7 +327,7 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		// "When in doubt, don't cache" is the explicit guidance: any
 		// failure to read the frontier falls back to no-cache rather
 		// than guessing the page is safe.
-		s.log.Warn("deciding list cache policy", "error", err)
+		loggerFromContext(r.Context()).Warn("deciding list cache policy", "error", err)
 	} else if etag != "" && ifNoneMatch(r, etag) {
 		writeNotModified(w, etag, policy)
 		return
@@ -335,7 +335,7 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 
 	events, cursor, qerr := s.store.QueryEvents(r.Context(), filter)
 	if qerr != nil {
-		s.log.Error("querying events", "error", qerr)
+		loggerFromContext(r.Context()).Error("querying events", "error", qerr)
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
@@ -407,7 +407,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	if ifNoneMatch(r, etag) {
 		exists, err := s.store.EventExists(r.Context(), id, scope)
 		if err != nil {
-			s.log.Error("checking event existence", "id", id, "error", err)
+			loggerFromContext(r.Context()).Error("checking event existence", "id", id, "error", err)
 			writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 			return
 		}
@@ -429,7 +429,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("loading event", "id", id, "error", err)
+		loggerFromContext(r.Context()).Error("loading event", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
@@ -452,7 +452,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.Stats(r.Context(), scopeFrom(r.Context()))
 	if err != nil {
-		s.log.Error("loading stats", "error", err)
+		loggerFromContext(r.Context()).Error("loading stats", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
 	}
@@ -654,7 +654,7 @@ func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
 
 	health, err := s.rpc.GetHealth(ctx)
 	if err != nil {
-		s.log.Warn("loading RPC health for stats", "error", err)
+		loggerFromContext(ctx).Warn("loading RPC health for stats", "error", err)
 		return
 	}
 	head := int64(health.LatestLedger)
@@ -739,36 +739,48 @@ func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
 // (instead of importing `store`) keeps the cache layer unaware of the
 // store's pagination rules and we re-verify by test.
 func listETag(f store.EventFilter) string {
+	// contributors: every field of EventFilter that narrows the result set
+	// MUST appear here. A filter that is missing produces the same hash for
+	// two requests that return different bodies, which on an immutable page
+	// means a conditional request for one is answered 304 for the other, and
+	// a shared cache pools one filter's body under the other's key — for the
+	// full one-year max-age. TestListETag_CoversEveryFilterField enumerates
+	// the fields independently and fails when a new one is not added.
 	key := struct {
-		ContractID string          `json:"c"`
-		Type       string          `json:"t"`
-		Topic      json.RawMessage `json:"p,omitempty"`
-		FromLedger int64           `json:"fl"`
-		ToLedger   int64           `json:"tl"`
-		FromTime   string          `json:"ft,omitempty"`
-		ToTime     string          `json:"tt,omitempty"`
-		Cursor     string          `json:"cu,omitempty"`
-		Limit      int             `json:"l"`
-		Order      string          `json:"o,omitempty"`
-		// Scope makes the validator tenant-specific. Two tenants issuing
-		// the same request are asking for different representations of
-		// this URL, and without this component the second one's
-		// If-None-Match would match the first one's page and be answered
-		// 304 — a cross-tenant disclosure produced entirely inside this
-		// server, with no CDN involved.
-		Scope string `json:"s"`
+		ContractID    string          `json:"c"`
+		Type          string          `json:"t"`
+		Topic         json.RawMessage `json:"p,omitempty"`
+		Topic0        json.RawMessage `json:"p0,omitempty"`
+		Topic1        json.RawMessage `json:"p1,omitempty"`
+		Topic2        json.RawMessage `json:"p2,omitempty"`
+		Topic3        json.RawMessage `json:"p3,omitempty"`
+		TopicContains json.RawMessage `json:"pc,omitempty"`
+		FromLedger    int64           `json:"fl"`
+		ToLedger      int64           `json:"tl"`
+		FromTime      string          `json:"ft,omitempty"`
+		ToTime        string          `json:"tt,omitempty"`
+		Cursor        string          `json:"cu,omitempty"`
+		Limit         int             `json:"l"`
+		Order         string          `json:"o,omitempty"`
 	}{
 		ContractID: f.ContractID,
 		Type:       f.Type,
 		Topic:      f.Topic,
-		FromLedger: f.FromLedger,
-		ToLedger:   f.ToLedger,
-		FromTime:   timeOrEmpty(f.FromTime),
-		ToTime:     timeOrEmpty(f.ToTime),
-		Cursor:     f.Cursor,
-		Limit:      resolvedLimit(f.Limit),
-		Order:      resolvedOrder(f.Order),
-		Scope:      f.Scope.Fingerprint(),
+		// Each positional filter gets its own distinctly named key, so
+		// topic0={x} and topic1={x} — which select different events — cannot
+		// serialize identically.
+		Topic0:        f.Topic0,
+		Topic1:        f.Topic1,
+		Topic2:        f.Topic2,
+		Topic3:        f.Topic3,
+		TopicContains: f.TopicContains,
+		FromLedger:    f.FromLedger,
+		ToLedger:      f.ToLedger,
+		FromTime:      timeOrEmpty(f.FromTime),
+		ToTime:        timeOrEmpty(f.ToTime),
+		Cursor:        f.Cursor,
+		Limit:         resolvedLimit(f.Limit),
+		Order:         resolvedOrder(f.Order),
 	}
 	b, _ := json.Marshal(key)
 	sum := sha256.Sum256(b)
@@ -1157,10 +1169,12 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
-		s.log.Error("websocket accept", "error", err)
+		loggerFromContext(r.Context()).Error("websocket accept", "error", err)
 		return
 	}
 	defer c.Close(websocket.StatusNormalClosure, "")
+
+	log := loggerFromContext(r.Context())
 
 	sub := s.bcast.Subscribe(filter)
 	defer sub.Close()
@@ -1210,7 +1224,7 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 			}
 			data, err := json.Marshal(projectEvent(ev, fields))
 			if err != nil {
-				s.log.Error("marshal event for ws", "error", err)
+				log.Error("marshal event for ws", "error", err)
 				continue
 			}
 			err = c.Write(ctx, websocket.MessageText, data)

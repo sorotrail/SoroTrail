@@ -106,7 +106,7 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 	}
 	created, err := s.store.CreateSubscription(r.Context(), sub)
 	if err != nil {
-		s.log.Error("creating subscription", "error", err)
+		loggerFromContext(r.Context()).Error("creating subscription", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("creating subscription failed"))
 		return
 	}
@@ -125,7 +125,7 @@ func (s *Server) handleGetSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("getting subscription", "id", id, "error", err)
+		loggerFromContext(r.Context()).Error("getting subscription", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("getting subscription failed"))
 		return
 	}
@@ -135,7 +135,7 @@ func (s *Server) handleGetSubscription(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListSubscriptions(w http.ResponseWriter, r *http.Request) {
 	subs, err := s.store.ListSubscriptions(r.Context(), s.subscriptionOwner(r))
 	if err != nil {
-		s.log.Error("listing subscriptions", "error", err)
+		loggerFromContext(r.Context()).Error("listing subscriptions", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing subscriptions failed"))
 		return
 	}
@@ -163,7 +163,7 @@ func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if err != nil {
-		s.log.Error("getting subscription for update", "id", id, "error", err)
+		loggerFromContext(r.Context()).Error("getting subscription for update", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("getting subscription failed"))
 		return
 	}
@@ -199,7 +199,7 @@ func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request
 
 	updated, err := s.store.UpdateSubscription(r.Context(), existing, owner)
 	if err != nil {
-		s.log.Error("updating subscription", "id", id, "error", err)
+		loggerFromContext(r.Context()).Error("updating subscription", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("updating subscription failed"))
 		return
 	}
@@ -217,7 +217,7 @@ func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusNotFound, fmt.Errorf("subscription %d not found", id))
 			return
 		}
-		s.log.Error("deleting subscription", "id", id, "error", err)
+		loggerFromContext(r.Context()).Error("deleting subscription", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("deleting subscription failed"))
 		return
 	}
@@ -252,7 +252,7 @@ func (s *Server) handleListDeliveries(w http.ResponseWriter, r *http.Request) {
 
 	attempts, err := s.store.ListDeliveryAttempts(r.Context(), id, limit, owner)
 	if err != nil {
-		s.log.Error("listing delivery attempts", "subscription_id", id, "error", err)
+		loggerFromContext(r.Context()).Error("listing delivery attempts", "subscription_id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing delivery attempts failed"))
 		return
 	}
