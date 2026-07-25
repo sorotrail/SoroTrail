@@ -39,10 +39,34 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
+	dropEventPartitions(t, pool)
 	_, err = pool.Exec(context.Background(),
 		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
 	require.NoError(t, err)
 	return NewPostgres(pool, span)
+}
+
+// dropEventPartitions removes any events_<range> partition child tables left
+// by a prior test. Tests use different partition spans on one shared database,
+// and TRUNCATE keeps child partitions, so a leftover would cause "would overlap
+// partition" errors for a subsequent test that uses a different span.
+func dropEventPartitions(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(), `DO $$
+DECLARE r record;
+BEGIN
+	FOR r IN
+		SELECT c.relname
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public'
+		  AND c.relkind IN ('r', 'p')
+		  AND c.relname ~ '^events_[0-9]'
+	LOOP
+		EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.relname) || ' CASCADE';
+	END LOOP;
+END $$;`)
+	require.NoError(t, err)
 }
 
 func testEvent(id string, ledger int64, contractID string) Event {
@@ -320,6 +344,7 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
+	dropEventPartitions(t, pool)
 	st := NewPostgres(pool, 10)
 	ctx := context.Background()
 
