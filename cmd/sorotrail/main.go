@@ -80,6 +80,8 @@ func run() error {
 	}
 	log := newLogger(cfg.LogLevel)
 
+	log.Info("startup configuration", cfg.LoggableFields()...)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -106,6 +108,8 @@ func run() error {
 		}
 	}
 
+	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
+	bcast := broadcast.New(broadcast.DefaultBufferSize)
 	// Webhook delivery runs alongside ingestion — the notifier is attached
 	// to the ingester so events flow to subscriber callbacks asynchronously.
 	wh := webhook.NewNotifier(st, log)
@@ -117,67 +121,21 @@ func run() error {
 	specFetcher := spec.NewFetcher(rpc.NewHTTPClient(cfg.Networks[0].RPCURL))
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
-	bcast := broadcast.New(broadcast.DefaultBufferSize)
+	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
+		PollInterval:     cfg.PollInterval,
+		StartLedger:      cfg.StartLedger,
+		RetentionLedgers: cfg.RetentionLedgers,
+	}).WithBroadcaster(bcast)
+	ing.SetNotifier(wh)
 
-	// Fan out: one ingester goroutine per network, each with its own RPC
-	// client and independent state.
-	networkNames := cfg.NetworkNames()
-	errCh := make(chan error, 3+len(cfg.Networks)*2) // generous capacity for all goroutines
-
-	// Start webhook worker pool.
-	go wh.Run(ctx)
-
-	for _, netCfg := range cfg.Networks {
-		netCfg := netCfg // capture for goroutine
-		rpcClient := rpc.NewHTTPClient(netCfg.RPCURL)
-		ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log.With("network", netCfg.Name), ingester.Options{
-			PollInterval:     cfg.PollInterval,
-			StartLedger:      cfg.StartLedger,
-			RetentionLedgers: cfg.RetentionLedgers,
-			Network:          netCfg.Name,
-		}).WithBroadcaster(bcast)
-		ing.SetNotifier(wh)
-
-		go func() {
-			log.Info("ingester starting", "network", netCfg.Name, "rpc_url", netCfg.RPCURL, "poll_interval", cfg.PollInterval)
-			if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				errCh <- fmt.Errorf("ingester[%s]: %w", netCfg.Name, err)
-			} else {
-				errCh <- nil
-			}
-		}()
-
-		// Per-network auditor.
-		if cfg.AuditEnabled {
-			budget, err := rpc.NewBudget(cfg.AuditMaxRPS, cfg.AuditBudgetShare)
-			if err != nil {
-				return err
-			}
-			auditClient := audit.NewBudgetedClient(rpcClient, budget)
-			aud := audit.New(auditClient, st, ing, log.With("network", netCfg.Name), audit.Options{
-				PollInterval:      cfg.AuditPollInterval,
-				BatchLedgers:      cfg.AuditBatchLedgers,
-				LagThreshold:      cfg.AuditLagThreshold,
-				MaxRepairAttempts: cfg.AuditMaxRepair,
-				FindingMaxLedgers: cfg.AuditFindingMaxLgrs,
-				Network:           netCfg.Name,
-			})
-			// APIs see the first auditor for /stats compatibility.
-			api.SetAuditor(aud)
-
-			go func() {
-				log.Info("auditor starting",
-					"network", netCfg.Name,
-					"budget_share", cfg.AuditBudgetShare,
-					"batch_ledgers", cfg.AuditBatchLedgers,
-					"lag_threshold", cfg.AuditLagThreshold,
-					"max_repair_attempts", cfg.AuditMaxRepair)
-				if err := aud.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-					errCh <- fmt.Errorf("auditor[%s]: %w", netCfg.Name, err)
-				} else {
-					errCh <- nil
-				}
-			}()
+	// The auditor and its request-rate budget are constructed lazily:
+	// AUDIT_ENABLED=false (the default) means a binary identical to a
+	// pre-audit build, so we skip every allocation.
+	var aud *audit.Auditor
+	if cfg.AuditEnabled {
+		budget, err := rpc.NewBudget(cfg.AuditMaxRPS, cfg.AuditBudgetShare)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -186,13 +144,18 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpc.NewHTTPClient(cfg.Networks[0].RPCURL), log, networkNames, specEnricher).WithBroadcaster(bcast)
+	apiServer := api.New(st, rpcClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiServer.Router(),
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if cfg.APIKey == "" {
+		log.Warn("API_KEY env is unset; watched-contracts endpoints will reject every request with 503")
+	} else {
+		log.Info("watched-contracts endpoints are auth-gated")
 	}
 
 	go func() {

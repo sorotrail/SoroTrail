@@ -241,77 +241,19 @@ func TestValidContractID(t *testing.T) {
 	assert.False(t, ValidContractID(validContract[:55]+"a"), "lowercase is not base32")
 }
 
-func TestParseNetworks(t *testing.T) {
-	tests := []struct {
-		name    string
-		raw     string
-		want    []NetworkConfig
-		wantErr string
-	}{
-		{
-			name: "single network",
-			raw:  "testnet=https://testnet.example.com",
-			want: []NetworkConfig{{Name: "testnet", RPCURL: "https://testnet.example.com"}},
-		},
-		{
-			name: "two networks",
-			raw:  "testnet=https://testnet.example.com,mainnet=https://mainnet.example.com",
-			want: []NetworkConfig{
-				{Name: "testnet", RPCURL: "https://testnet.example.com"},
-				{Name: "mainnet", RPCURL: "https://mainnet.example.com"},
-			},
-		},
-		{
-			name: "trims whitespace",
-			raw:  "  testnet  =  https://testnet.example.com  , mainnet = https://mainnet.example.com ",
-			want: []NetworkConfig{
-				{Name: "testnet", RPCURL: "https://testnet.example.com"},
-				{Name: "mainnet", RPCURL: "https://mainnet.example.com"},
-			},
-		},
-		{
-			name:    "empty string returns error",
-			raw:     "",
-			wantErr: "parsed to zero networks",
-		},
-		{
-			name:    "missing equals returns error",
-			raw:     "testnet",
-			wantErr: "invalid network entry",
-		},
-		{
-			name:    "empty name returns error",
-			raw:     "=https://example.com",
-			wantErr: "invalid network entry",
-		},
-		{
-			name:    "duplicate names returns error",
-			raw:     "dup=https://a.com,dup=https://b.com",
-			wantErr: "duplicate network name",
-		},
-	}
+func TestValidCursor(t *testing.T) {
+	assert.True(t, ValidCursor("0001099511627776-0000000001"))
+	assert.True(t, ValidCursor("00000000000000000102-00000"))
+	assert.True(t, ValidCursor("e1"))
+	assert.True(t, ValidCursor("cursor-42"))
+	assert.True(t, ValidCursor("pt_1"))
+	assert.True(t, ValidCursor("abc.123:45_67-89"))
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseNetworks(tt.raw)
-			if tt.wantErr != "" {
-				require.ErrorContains(t, err, tt.wantErr)
-				return
-			}
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
-func TestNetworkByURL(t *testing.T) {
-	cfg := Config{
-		Networks: []NetworkConfig{
-			{Name: "testnet", RPCURL: "https://testnet.example.com"},
-			{Name: "mainnet", RPCURL: "https://mainnet.example.com"},
-		},
-	}
-	assert.Equal(t, "testnet", cfg.NetworkByURL("https://testnet.example.com"))
-	assert.Equal(t, "mainnet", cfg.NetworkByURL("https://mainnet.example.com"))
-	assert.Empty(t, cfg.NetworkByURL("https://unknown.example.com"))
+	assert.False(t, ValidCursor(""), "empty string")
+	assert.False(t, ValidCursor("invalid cursor"), "contains space")
+	assert.False(t, ValidCursor("e1; DROP TABLE events;"), "contains semicolon and space")
+	assert.False(t, ValidCursor("cursor'OR'1'='1"), "contains single quotes")
+	assert.False(t, ValidCursor("<script>alert(1)</script>"), "contains angle brackets")
+	assert.False(t, ValidCursor("e1\n"), "contains newline")
+	assert.False(t, ValidCursor(string(make([]byte, 129))), "too long (>128 chars)")
 }
