@@ -583,3 +583,23 @@ func TestStats(t *testing.T) {
 		assert.Nil(t, raw["ingest_lag_ledgers"])
 	})
 }
+
+func TestRequestID(t *testing.T) {
+	t.Run("generated ID in response header", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/health")
+		requestID := resp.Header.Get("X-Request-ID")
+		require.NotEmpty(t, requestID)
+	})
+
+	t.Run("echoes incoming X-Request-ID", func(t *testing.T) {
+		srv := httptest.NewServer(newTestServer(&stubStore{}, nil).Router())
+		defer srv.Close()
+		req, err := http.NewRequest("GET", srv.URL+"/health", nil)
+		require.NoError(t, err)
+		req.Header.Set("X-Request-ID", "test-request-id-123")
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, "test-request-id-123", resp.Header.Get("X-Request-ID"))
+	})
+}
