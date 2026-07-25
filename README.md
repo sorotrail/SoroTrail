@@ -204,7 +204,11 @@ curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"G
 ```
 
 `cursor` is present when more results exist; pass it back as `?cursor=` for
-the next page.
+the next page. The API also emits RFC 5988 `Link` headers on list responses:
+`rel="next"` points to the same request with the returned cursor wired in,
+and `rel="prev"` points back to the previous page when the current request
+already carries a cursor. Other query filters (for example `contract_id`,
+`topic`, `from_time`, or `limit`) are preserved across these links.
 
 When `include_xdr=true`, events also include the original base64 XDR payload:
 

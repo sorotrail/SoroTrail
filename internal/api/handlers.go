@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -177,6 +178,8 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
+
+	setPaginationHeaders(w, r, cursor)
 
 	decoded := r.URL.Query().Get("decoded") == "true"
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
@@ -501,6 +504,46 @@ func ifNoneMatch(r *http.Request, etag string) bool {
 		}
 	}
 	return false
+}
+
+func setPaginationHeaders(w http.ResponseWriter, r *http.Request, nextCursor string) {
+	var links []string
+	if nextCursor != "" {
+		links = append(links, fmt.Sprintf(`<%s>; rel="next"`, paginationLink(r, nextCursor)))
+	}
+	if _, ok := r.URL.Query()["cursor"]; ok {
+		links = append(links, fmt.Sprintf(`<%s>; rel="prev"`, paginationLink(r, "")))
+	}
+	if len(links) > 0 {
+		w.Header().Set("Link", strings.Join(links, ", "))
+	}
+}
+
+func paginationLink(r *http.Request, cursor string) string {
+	q := r.URL.Query()
+	if cursor == "" {
+		q.Del("cursor")
+	} else {
+		q.Set("cursor", cursor)
+	}
+
+	scheme := "http"
+	if r.URL.Scheme != "" {
+		scheme = r.URL.Scheme
+	} else if r.TLS != nil {
+		scheme = "https"
+	}
+
+	host := r.Host
+	if host == "" {
+		host = r.URL.Host
+	}
+
+	u := &url.URL{Scheme: scheme, Host: host, Path: r.URL.Path, RawQuery: q.Encode()}
+	if r.URL.RawPath != "" {
+		u.RawPath = r.URL.RawPath
+	}
+	return u.String()
 }
 
 // writeCacheHeaders is the single place in the package that writes
