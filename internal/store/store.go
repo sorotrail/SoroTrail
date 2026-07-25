@@ -92,6 +92,10 @@ type EventFilter struct {
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic json.RawMessage
+	// TopicContains matches events whose topics array jsonb-contains this
+	// value (Postgres @> operator). Unlike Topic, the value is passed
+	// directly without array-wrapping.
+	TopicContains json.RawMessage
 	// Topic0-Topic3 match the exact JSON value at that specific topic array
 	// position. Unspecified positions are wildcards.
 	Topic0     json.RawMessage
@@ -165,11 +169,12 @@ type AuditFinding struct {
 // GET /events query parameters. An empty (zero-value) filter matches
 // every event.
 type SubscriptionFilter struct {
-	ContractID string          `json:"contract_id,omitempty"`
-	Type       string          `json:"type,omitempty"`
-	Topic      json.RawMessage `json:"topic,omitempty"`
-	FromLedger int64           `json:"from_ledger,omitempty"`
-	ToLedger   int64           `json:"to_ledger,omitempty"`
+	ContractID    string          `json:"contract_id,omitempty"`
+	Type          string          `json:"type,omitempty"`
+	Topic         json.RawMessage `json:"topic,omitempty"`
+	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
+	FromLedger    int64           `json:"from_ledger,omitempty"`
+	ToLedger      int64           `json:"to_ledger,omitempty"`
 }
 
 // MatchesEvent reports whether an event passes this filter. Zero fields
@@ -251,9 +256,6 @@ func jsonbContains(container, contained json.RawMessage) bool {
 	// Fallback: exact JSON string match (handles strings, numbers, and
 	// cases where unmarshalling into map failed — e.g. arrays).
 	return string(container) == string(contained)
-}
-
-	return true
 }
 
 // Subscription is one registered webhook callback.

@@ -68,8 +68,6 @@ type Ingester struct {
 	opts     Options
 	notifier EventNotifier // optional; nil means no notification
 	bcast    *broadcast.Broadcaster
-	bcast    *broadcast.Broadcaster
-	notifier EventNotifier // optional; nil means no notification
 }
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
@@ -91,13 +89,6 @@ func (ing *Ingester) SetNotifier(n EventNotifier) {
 func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
 	ing.bcast = b
 	return ing
-}
-
-// SetNotifier attaches an optional EventNotifier that is called after
-// every successful event persistence. When nil (the default) no
-// notification is sent — the ingester behaves exactly as before.
-func (ing *Ingester) SetNotifier(n EventNotifier) {
-	ing.notifier = n
 }
 
 // Run polls until ctx is canceled. Errors are logged and retried with
@@ -401,9 +392,6 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	// This is a fire-and-forget call — it must never block ingestion.
 	if ing.notifier != nil {
 		ing.notifier.NotifyEvents(ctx, events)
-	}
-	if ing.bcast != nil {
-		ing.bcast.Publish(ctx, events)
 	}
 	return nil
 }

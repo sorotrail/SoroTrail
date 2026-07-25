@@ -63,6 +63,7 @@
           { "$ref": "#/components/parameters/topic1" },
           { "$ref": "#/components/parameters/topic2" },
           { "$ref": "#/components/parameters/topic3" },
+          { "$ref": "#/components/parameters/topicContains" },
           { "$ref": "#/components/parameters/fromLedger" },
           { "$ref": "#/components/parameters/toLedger" },
           { "$ref": "#/components/parameters/fromTime" },
@@ -70,11 +71,12 @@
           { "$ref": "#/components/parameters/limit" },
           { "$ref": "#/components/parameters/cursor" },
           { "$ref": "#/components/parameters/order" },
-          { "$ref": "#/components/parameters/decoded" }
+          { "$ref": "#/components/parameters/decoded" },
+          { "$ref": "#/components/parameters/includeXDR" }
         ],
         "responses": {
           "200": {
-            "description": "Paginated list of events. When ?decoded=true, returns EnrichedEvent items instead of Event items.",
+            "description": "Paginated list of events. Response shape depends on query params: plain events, ?include_xdr=true adds raw XDR fields, ?decoded=true enriches events, and both can be combined.",
             "headers": {
               "ETag": { "$ref": "#/components/headers/ETag" },
               "Cache-Control": { "$ref": "#/components/headers/CacheControl" }
@@ -84,7 +86,9 @@
                 "schema": {
                   "oneOf": [
                     { "$ref": "#/components/schemas/EventsResponse" },
-                    { "$ref": "#/components/schemas/EnrichedEventsResponse" }
+                    { "$ref": "#/components/schemas/EventsWithXDRResponse" },
+                    { "$ref": "#/components/schemas/EnrichedEventsResponse" },
+                    { "$ref": "#/components/schemas/EnrichedEventsWithXDRResponse" }
                   ]
                 }
               }
@@ -115,11 +119,12 @@
             "schema": { "type": "string" },
             "description": "The event ID (TOID-based identifier, e.g. 0001099511627776-0000000001)"
           },
-          { "$ref": "#/components/parameters/decoded" }
+          { "$ref": "#/components/parameters/decoded" },
+          { "$ref": "#/components/parameters/includeXDR" }
         ],
         "responses": {
           "200": {
-            "description": "The requested event. When ?decoded=true, returns an EnrichedEvent instead.",
+            "description": "The requested event. Response shape depends on query params: plain event, ?include_xdr=true adds raw XDR fields, ?decoded=true enriches the event, and both can be combined.",
             "headers": {
               "ETag": { "$ref": "#/components/headers/ETag" },
               "Cache-Control": { "$ref": "#/components/headers/CacheControl" }
@@ -129,7 +134,9 @@
                 "schema": {
                   "oneOf": [
                     { "$ref": "#/components/schemas/Event" },
-                    { "$ref": "#/components/schemas/EnrichedEvent" }
+                    { "$ref": "#/components/schemas/EventWithXDR" },
+                    { "$ref": "#/components/schemas/EnrichedEvent" },
+                    { "$ref": "#/components/schemas/EnrichedEventWithXDR" }
                   ]
                 }
               }
@@ -159,6 +166,11 @@
           { "$ref": "#/components/parameters/contractId" },
           { "$ref": "#/components/parameters/eventType" },
           { "$ref": "#/components/parameters/topic" },
+          { "$ref": "#/components/parameters/topic0" },
+          { "$ref": "#/components/parameters/topic1" },
+          { "$ref": "#/components/parameters/topic2" },
+          { "$ref": "#/components/parameters/topic3" },
+          { "$ref": "#/components/parameters/topicContains" },
           { "$ref": "#/components/parameters/fromLedger" },
           { "$ref": "#/components/parameters/toLedger" },
           { "$ref": "#/components/parameters/fromTime" },
@@ -207,6 +219,7 @@
           { "$ref": "#/components/parameters/topic1" },
           { "$ref": "#/components/parameters/topic2" },
           { "$ref": "#/components/parameters/topic3" },
+          { "$ref": "#/components/parameters/topicContains" },
           { "$ref": "#/components/parameters/fromLedger" },
           { "$ref": "#/components/parameters/toLedger" },
           { "$ref": "#/components/parameters/fromTime" },
@@ -214,11 +227,12 @@
           { "$ref": "#/components/parameters/limit" },
           { "$ref": "#/components/parameters/cursor" },
           { "$ref": "#/components/parameters/order" },
-          { "$ref": "#/components/parameters/decoded" }
+          { "$ref": "#/components/parameters/decoded" },
+          { "$ref": "#/components/parameters/includeXDR" }
         ],
         "responses": {
           "200": {
-            "description": "Paginated list of events for the contract. When ?decoded=true, returns EnrichedEvent items.",
+            "description": "Paginated list of events for the contract. Response shape depends on query params (see /events).",
             "headers": {
               "ETag": { "$ref": "#/components/headers/ETag" },
               "Cache-Control": { "$ref": "#/components/headers/CacheControl" }
@@ -228,7 +242,9 @@
                 "schema": {
                   "oneOf": [
                     { "$ref": "#/components/schemas/EventsResponse" },
-                    { "$ref": "#/components/schemas/EnrichedEventsResponse" }
+                    { "$ref": "#/components/schemas/EventsWithXDRResponse" },
+                    { "$ref": "#/components/schemas/EnrichedEventsResponse" },
+                    { "$ref": "#/components/schemas/EnrichedEventsWithXDRResponse" }
                   ]
                 }
               }
@@ -525,6 +541,12 @@
         "schema": { "type": "string" },
         "description": "Exact JSON match against topic position 3. Cannot be combined with topic."
       },
+      "topicContains": {
+        "name": "topic_contains",
+        "in": "query",
+        "schema": { "type": "string" },
+        "description": "JSONB containment filter on topics. Must be valid JSON. A single-element array is unwrapped to its element."
+      },
       "fromLedger": {
         "name": "from_ledger",
         "in": "query",
@@ -572,6 +594,12 @@
         "in": "query",
         "schema": { "type": "boolean" },
         "description": "When true, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data."
+      },
+      "includeXDR": {
+        "name": "include_xdr",
+        "in": "query",
+        "schema": { "type": "boolean" },
+        "description": "When true, includes raw base64 XDR for topics and value alongside decoded fields."
       }
     },
     "headers": {
@@ -653,16 +681,103 @@
           },
           "topics": {
             "type": "array",
-            "description": "Decoded event topics as JSON values (e.g. {\"symbol\":\"transfer\"}, {\"address\":\"G...\"}).",
+            "description": "Decoded event topics as JSON values.",
             "items": {}
           },
           "value": {
-            "description": "Decoded event value as a JSON ScVal representation (e.g. {\"i128\":\"10000000\"})."
+            "description": "Decoded event value as a JSON ScVal representation."
           },
           "created_at": {
             "type": "string",
             "format": "date-time",
             "description": "Timestamp when the event was ingested."
+          }
+        }
+      },
+      "EventWithXDR": {
+        "type": "object",
+        "required": ["id", "contract_id", "ledger", "type", "tx_hash", "tx_index", "op_index", "in_successful_call", "topics", "value", "created_at"],
+        "properties": {
+          "id": { "type": "string" },
+          "contract_id": { "type": "string" },
+          "ledger": { "type": "integer", "format": "int64" },
+          "type": { "type": "string" },
+          "tx_hash": { "type": "string" },
+          "tx_index": { "type": "integer", "format": "int32" },
+          "op_index": { "type": "integer", "format": "int32" },
+          "in_successful_call": { "type": "boolean" },
+          "topics": { "type": "array", "items": {} },
+          "value": {},
+          "created_at": { "type": "string", "format": "date-time" },
+          "topics_xdr": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Raw base64 XDR for each topic element."
+          },
+          "value_xdr": {
+            "description": "Raw base64 XDR for value. Can be null when no raw XDR exists.",
+            "type": ["string", "null"]
+          }
+        }
+      },
+      "EventsWithXDRResponse": {
+        "type": "object",
+        "required": ["events"],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/EventWithXDR" }
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor."
+          }
+        }
+      },
+      "EnrichedEventWithXDR": {
+        "type": "object",
+        "required": ["id", "contract_id", "ledger", "type", "tx_hash", "tx_index", "op_index", "in_successful_call", "topics", "value", "created_at", "decoded"],
+        "properties": {
+          "id": { "type": "string" },
+          "contract_id": { "type": "string" },
+          "ledger": { "type": "integer", "format": "int64" },
+          "type": { "type": "string" },
+          "tx_hash": { "type": "string" },
+          "tx_index": { "type": "integer", "format": "int32" },
+          "op_index": { "type": "integer", "format": "int32" },
+          "in_successful_call": { "type": "boolean" },
+          "topics": { "type": "array", "items": {} },
+          "value": {},
+          "created_at": { "type": "string", "format": "date-time" },
+          "topics_xdr": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Raw base64 XDR for each topic element."
+          },
+          "value_xdr": {
+            "description": "Raw base64 XDR for value. Can be null when no raw XDR exists.",
+            "type": ["string", "null"]
+          },
+          "decoded": {
+            "type": "boolean",
+            "description": "Whether the event was successfully enriched with spec-driven field names."
+          },
+          "decoded_event": {
+            "$ref": "#/components/schemas/DecodedEvent"
+          }
+        }
+      },
+      "EnrichedEventsWithXDRResponse": {
+        "type": "object",
+        "required": ["events"],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/EnrichedEventWithXDR" }
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor."
           }
         }
       },
@@ -686,12 +801,15 @@
             "description": "Whether the event was successfully enriched with spec-driven field names."
           },
           "decoded_event": {
-            "type": "object",
-            "properties": {
-              "event": { "type": "string", "description": "The event name from the contract spec." },
-              "fields": { "type": "object", "description": "Named fields and their decoded values.", "additionalProperties": true }
-            }
+            "$ref": "#/components/schemas/DecodedEvent"
           }
+        }
+      },
+      "DecodedEvent": {
+        "type": "object",
+        "properties": {
+          "event": { "type": "string", "description": "The event name from the contract spec." },
+          "fields": { "type": "object", "description": "Named fields and their decoded values.", "additionalProperties": true }
         }
       },
       "EnrichedEventsResponse": {
@@ -724,13 +842,16 @@
       },
       "Stats": {
         "type": "object",
-        "required": ["total_events", "last_ingested_ledger", "verified_through_ledger", "contract_count", "watched_contracts"],
+        "required": ["total_events", "last_ingested_ledger", "verified_through_ledger", "oldest_stored_ledger", "contract_count", "watched_contracts"],
         "properties": {
           "total_events": { "type": "integer", "format": "int64", "description": "Total number of events stored." },
           "last_ingested_ledger": { "type": "integer", "format": "int64", "description": "Most recently ingested ledger." },
           "verified_through_ledger": { "type": "integer", "format": "int64", "description": "Highest ledger verified by the auditor (0 when auditor disabled)." },
+          "oldest_stored_ledger": { "type": "integer", "format": "int64", "description": "Oldest ledger with events in the store." },
           "contract_count": { "type": "integer", "format": "int64", "description": "Number of distinct contracts indexed." },
           "watched_contracts": { "type": "integer", "format": "int64", "description": "Number of actively watched contracts." },
+          "chain_head_ledger": { "type": "integer", "format": "int64", "description": "Current chain tip ledger (from RPC). Omitted when RPC is unreachable." },
+          "ingest_lag_ledgers": { "type": "integer", "format": "int64", "description": "Ledger lag: chain_head_ledger minus last_ingested_ledger. Omitted when RPC is unreachable." },
           "auditor": {
             "$ref": "#/components/schemas/AuditStats"
           }
@@ -754,6 +875,7 @@
           "contract_id": { "type": "string", "description": "Only deliver events from this contract." },
           "type": { "type": "string", "enum": ["contract", "system", "diagnostic"], "description": "Only deliver events of this type." },
           "topic": { "type": "string", "description": "Exact JSON match against any topic position." },
+          "topic_contains": { "type": "string", "description": "JSONB containment filter on topics. Must be valid JSON." },
           "from_ledger": { "type": "integer", "format": "int64", "minimum": 1, "description": "Inclusive lower ledger bound." },
           "to_ledger": { "type": "integer", "format": "int64", "minimum": 1, "description": "Inclusive upper ledger bound." }
         }

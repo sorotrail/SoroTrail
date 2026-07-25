@@ -55,18 +55,6 @@ type Config struct {
 	// intermediaries cannot. Defaults to false (the deployment does not
 	// need request-scoped caching).
 	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
-	// HTTP rate limiting (per client). RATE_LIMIT_RPS / RATE_LIMIT_BURST
-	// are both unset (zero) by default, which disables the limiter
-	// entirely — a no-op middleware — so deployments without this turned
-	// on keep today's behavior bit-for-bit.
-	//
-	// RATE_LIMIT_TRUSTED_PROXY defaults to false because X-Forwarded-For
-	// is set by the client itself; enabling it without an upstream proxy
-	// that strips/rewrites the header would let any caller pick their own
-	// rate-limit key and bypass arbitrary per-IP throttling.
-	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
-	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
-	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -155,7 +143,7 @@ func ValidContractID(s string) bool {
 		return false
 	}
 	for _, r := range s[1:] {
-		if (r < 'A' || r > 'Z') && (r < '2' || r > '7') {
+		if !strings.ContainsRune("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", r) {
 			return false
 		}
 	}
@@ -170,10 +158,7 @@ func ValidCursor(s string) bool {
 		return false
 	}
 	for _, r := range s {
-		if !(r >= 'a' && r <= 'z') &&
-			!(r >= 'A' && r <= 'Z') &&
-			!(r >= '0' && r <= '9') &&
-			r != '-' && r != '_' && r != '.' && r != ':' {
+		if !strings.ContainsRune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:", r) {
 			return false
 		}
 	}

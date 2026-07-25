@@ -78,23 +78,8 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			topics             = EXCLUDED.topics,
 			value              = EXCLUDED.value,
 			created_at         = EXCLUDED.created_at,
-			raw_topic_xdr      = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
-			raw_value_xdr      = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
-	conflict := "ON CONFLICT (id) DO NOTHING"
-	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
-			contract_id        = COALESCE(EXCLUDED.contract_id,        events.contract_id),
-			ledger             = COALESCE(EXCLUDED.ledger,             events.ledger),
-			type               = COALESCE(EXCLUDED.type,               events.type),
-			tx_hash            = COALESCE(EXCLUDED.tx_hash,            events.tx_hash),
-			tx_index           = COALESCE(EXCLUDED.tx_index,           events.tx_index),
-			op_index           = COALESCE(EXCLUDED.op_index,           events.op_index),
-			in_successful_call = COALESCE(EXCLUDED.in_successful_call, events.in_successful_call),
-			topics             = COALESCE(EXCLUDED.topics,             events.topics),
-			value              = COALESCE(EXCLUDED.value,              events.value),
-			created_at         = COALESCE(EXCLUDED.created_at,         events.created_at),
-			topics_xdr         = COALESCE(EXCLUDED.topics_xdr,         events.topics_xdr),
-			value_xdr          = COALESCE(EXCLUDED.value_xdr,          events.value_xdr)`
+			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
 	sql := `
 		INSERT INTO events
