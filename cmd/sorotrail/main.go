@@ -27,6 +27,7 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/ingester"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
+	"github.com/khaylebfortune/sorotrail/internal/spec"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 	"github.com/khaylebfortune/sorotrail/internal/webhook"
 )
@@ -107,6 +108,11 @@ func run() error {
 	// to the ingester so events flow to subscriber callbacks asynchronously.
 	wh := webhook.NewNotifier(st, log)
 
+	// Wire the spec cache and enricher for spec-decoded event views.
+	specCache := spec.NewCache(st)
+	specFetcher := spec.NewFetcher(rpcClient)
+	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
+
 	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
@@ -143,7 +149,7 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpcClient, log).WithBroadcaster(bcast)
+	apiServer := api.New(st, rpcClient, log, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{
