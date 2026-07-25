@@ -458,10 +458,19 @@ func (ing *Ingester) buildFilterBatches(ctx context.Context) ([][]rpc.EventFilte
 	if len(watched) == 0 {
 		return [][]rpc.EventFilter{{{Type: "contract"}}}, nil
 	}
+	// Copy IDs into a local slice: the watched list can grow between
+	// passes (a runtime POST that lands mid-process is picked up by the
+	// next runOnce without restart — see BuildFilterBatches' caller in
+	// runOnce), and we don't want to capture a slice that an inserter
+	// could mutate under us.
+	ids := make([]string, len(watched))
+	for i, wc := range watched {
+		ids[i] = wc.ContractID
+	}
 	var filters []rpc.EventFilter
-	for start := 0; start < len(watched); start += rpc.MaxContractIDsPerFilter {
-		end := min(start+rpc.MaxContractIDsPerFilter, len(watched))
-		filters = append(filters, rpc.EventFilter{Type: "contract", ContractIDs: watched[start:end]})
+	for start := 0; start < len(ids); start += rpc.MaxContractIDsPerFilter {
+		end := min(start+rpc.MaxContractIDsPerFilter, len(ids))
+		filters = append(filters, rpc.EventFilter{Type: "contract", ContractIDs: ids[start:end]})
 	}
 	var batches [][]rpc.EventFilter
 	for start := 0; start < len(filters); start += rpc.MaxFiltersPerRequest {
