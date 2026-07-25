@@ -383,7 +383,7 @@ func TestHealth(t *testing.T) {
 		st := &stubStore{pingErr: errors.New("connection refused")}
 		resp, body := doGet(t, newTestServer(st, nil), "/health")
 		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
-		assert.Contains(t, string(body), "connection refused")
+		assert.Contains(t, string(body), "pool unhealthy")
 	})
 	t.Run("rpc down", func(t *testing.T) {
 		rc := &stubRPC{healthErr: errors.New("rpc unreachable")}
