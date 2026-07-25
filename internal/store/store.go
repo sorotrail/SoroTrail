@@ -92,12 +92,6 @@ type EventFilter struct {
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic json.RawMessage
-	// TopicContains matches events whose topics array jsonb-contains this
-	// value (Postgres @> operator). Unlike Topic, the value is passed
-	// directly without array-wrapping, so callers can use multi-element
-	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
-	// Uses the GIN index on events.topics.
-	TopicContains json.RawMessage
 	// Topic0-Topic3 match the exact JSON value at that specific topic array
 	// position. Unspecified positions are wildcards.
 	Topic0     json.RawMessage
@@ -173,9 +167,8 @@ type AuditFinding struct {
 type SubscriptionFilter struct {
 	ContractID string          `json:"contract_id,omitempty"`
 	Type       string          `json:"type,omitempty"`
-	Topic         json.RawMessage `json:"topic,omitempty"`
-	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
-	FromLedger    int64           `json:"from_ledger,omitempty"`
+	Topic      json.RawMessage `json:"topic,omitempty"`
+	FromLedger int64           `json:"from_ledger,omitempty"`
 	ToLedger   int64           `json:"to_ledger,omitempty"`
 }
 
@@ -258,6 +251,9 @@ func jsonbContains(container, contained json.RawMessage) bool {
 	// Fallback: exact JSON string match (handles strings, numbers, and
 	// cases where unmarshalling into map failed — e.g. arrays).
 	return string(container) == string(contained)
+}
+
+	return true
 }
 
 // Subscription is one registered webhook callback.
@@ -431,12 +427,6 @@ type Store interface {
 	// ListDeliveryAttempts returns delivery attempts for a subscription,
 	// newest first.
 	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
-	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
-	// or ErrNotFound when no spec is cached for that hash.
-	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
-	// SetContractSpec persists a JSON-serialized spec keyed by wasm_hash
-	// and contract_id so subsequent lookups avoid an RPC round trip.
-	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
 
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error

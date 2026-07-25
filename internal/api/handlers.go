@@ -604,6 +604,12 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 			return f, fmt.Errorf("topic_contains must be valid JSON")
 		}
 		f.TopicContains = json.RawMessage(raw)
+		}
+		quoted, err := json.Marshal(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s: %w", name, err)
+		}
+		return quoted, nil
 	}
 
 	// order controls sort direction for paginated results.
