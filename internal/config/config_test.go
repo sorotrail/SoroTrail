@@ -21,6 +21,8 @@ var envKeys = []string{
 	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
 	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
 	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
+	"MULTI_TENANT", "MULTI_TENANT_MAX_WATCHED", "MULTI_TENANT_USAGE_FLUSH",
+	"MULTI_TENANT_STREAM_SCOPE_SYNC", "MULTI_TENANT_BOOTSTRAP_KEY",
 }
 
 func TestLoad(t *testing.T) {
@@ -179,4 +181,110 @@ func TestValidCursor(t *testing.T) {
 	assert.False(t, ValidCursor("<script>alert(1)</script>"), "contains angle brackets")
 	assert.False(t, ValidCursor("e1\n"), "contains newline")
 	assert.False(t, ValidCursor(string(make([]byte, 129))), "too long (>128 chars)")
+}
+
+// Multi-tenancy is off unless asked for, and its knobs are validated.
+func TestLoad_MultiTenancy(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+		wantErr string
+		check   func(t *testing.T, c Config)
+	}{
+		{
+			name: "off by default",
+			env:  map[string]string{"DATABASE_URL": "postgres://localhost/db"},
+			check: func(t *testing.T, c Config) {
+				assert.False(t, c.MultiTenant,
+					"an upgraded deployment must not silently start requiring API keys")
+				assert.Equal(t, 250, c.MultiTenantMaxWatched)
+				assert.Equal(t, 10*time.Second, c.MultiTenantUsageFlush)
+				assert.Equal(t, 30*time.Second, c.MultiTenantStreamScopeSync)
+			},
+		},
+		{
+			name: "enabled with overrides",
+			env: map[string]string{
+				"DATABASE_URL":                   "postgres://localhost/db",
+				"MULTI_TENANT":                   "true",
+				"MULTI_TENANT_MAX_WATCHED":       "50",
+				"MULTI_TENANT_USAGE_FLUSH":       "5s",
+				"MULTI_TENANT_STREAM_SCOPE_SYNC": "2s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.True(t, c.MultiTenant)
+				assert.Equal(t, 50, c.MultiTenantMaxWatched)
+				assert.Equal(t, 5*time.Second, c.MultiTenantUsageFlush)
+				assert.Equal(t, 2*time.Second, c.MultiTenantStreamScopeSync)
+			},
+		},
+		{
+			name: "zero disables the instance watch cap",
+			env: map[string]string{
+				"DATABASE_URL":             "postgres://localhost/db",
+				"MULTI_TENANT":             "true",
+				"MULTI_TENANT_MAX_WATCHED": "0",
+			},
+			check: func(t *testing.T, c Config) { assert.Equal(t, 0, c.MultiTenantMaxWatched) },
+		},
+		{
+			name: "a negative watch cap is rejected",
+			env: map[string]string{
+				"DATABASE_URL":             "postgres://localhost/db",
+				"MULTI_TENANT_MAX_WATCHED": "-1",
+			},
+			wantErr: "MULTI_TENANT_MAX_WATCHED",
+		},
+		{
+			name: "a non-positive scope sync is rejected",
+			env: map[string]string{
+				"DATABASE_URL":                   "postgres://localhost/db",
+				"MULTI_TENANT_STREAM_SCOPE_SYNC": "0s",
+			},
+			wantErr: "MULTI_TENANT_STREAM_SCOPE_SYNC",
+		},
+		{
+			// Silently ignoring this would leave an operator believing the
+			// instance is protected when it is wide open.
+			name: "a bootstrap key without multi-tenancy is rejected",
+			env: map[string]string{
+				"DATABASE_URL":               "postgres://localhost/db",
+				"MULTI_TENANT_BOOTSTRAP_KEY": "st_ABCDEFGHIJKLMNOP_secret",
+			},
+			wantErr: "MULTI_TENANT_BOOTSTRAP_KEY is set but MULTI_TENANT is false",
+		},
+		{
+			name: "a bootstrap key with multi-tenancy is accepted",
+			env: map[string]string{
+				"DATABASE_URL":               "postgres://localhost/db",
+				"MULTI_TENANT":               "true",
+				"MULTI_TENANT_BOOTSTRAP_KEY": "st_ABCDEFGHIJKLMNOP_secret",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "st_ABCDEFGHIJKLMNOP_secret", c.MultiTenantBootstrapKey)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, key := range envKeys {
+				t.Setenv(key, "")
+				os.Unsetenv(key)
+			}
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			cfg, err := Load()
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			if tt.check != nil {
+				tt.check(t, cfg)
+			}
+		})
+	}
 }

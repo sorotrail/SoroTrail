@@ -54,6 +54,29 @@ type Config struct {
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
+
+	// Multi-tenancy (#48). MULTI_TENANT=false (the default) means no
+	// authentication, no tenant boundary, and no usage accounting — every
+	// request runs with full access exactly as it did before. Turning it on
+	// makes an API key mandatory on every endpoint except /health.
+	MultiTenant bool `env:"MULTI_TENANT" envDefault:"false"`
+	// MultiTenantMaxWatched caps the union of all tenants' watch lists, so
+	// tenants collectively cannot push the ingester past the RPC budget the
+	// operator planned for. 0 disables the cap.
+	MultiTenantMaxWatched int `env:"MULTI_TENANT_MAX_WATCHED" envDefault:"250"`
+	// MultiTenantUsageFlush is how often accumulated per-tenant usage
+	// counters are written.
+	MultiTenantUsageFlush time.Duration `env:"MULTI_TENANT_USAGE_FLUSH" envDefault:"10s"`
+	// MultiTenantStreamScopeSync bounds how long an open stream can keep
+	// serving a contract whose grant has been revoked.
+	MultiTenantStreamScopeSync time.Duration `env:"MULTI_TENANT_STREAM_SCOPE_SYNC" envDefault:"30s"`
+	// MultiTenantBootstrapKey solves the chicken-and-egg of a fresh
+	// multi-tenant install: minting the first key requires an admin key,
+	// which requires minting a key. When set, this value is installed as an
+	// API key for the seeded "default" admin tenant at startup, so the
+	// operator has a way in. Treat it as a secret; rotate it by revoking
+	// through /admin once real keys exist.
+	MultiTenantBootstrapKey string `env:"MULTI_TENANT_BOOTSTRAP_KEY"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -128,6 +151,22 @@ func (c Config) Validate() error {
 	// expected throttling to kick in.
 	if (c.RateLimitRPS > 0) != (c.RateLimitBurst > 0) {
 		return fmt.Errorf("RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
+	}
+	if c.MultiTenantMaxWatched < 0 {
+		return fmt.Errorf("MULTI_TENANT_MAX_WATCHED must be non-negative")
+	}
+	if c.MultiTenantUsageFlush <= 0 {
+		return fmt.Errorf("MULTI_TENANT_USAGE_FLUSH must be positive")
+	}
+	if c.MultiTenantStreamScopeSync <= 0 {
+		return fmt.Errorf("MULTI_TENANT_STREAM_SCOPE_SYNC must be positive")
+	}
+	// Rejected rather than ignored: an operator who sets a bootstrap key
+	// without enabling multi-tenancy has configured a credential that
+	// authenticates nothing, and would reasonably assume the instance is
+	// protected when it is wide open.
+	if c.MultiTenantBootstrapKey != "" && !c.MultiTenant {
+		return fmt.Errorf("MULTI_TENANT_BOOTSTRAP_KEY is set but MULTI_TENANT is false")
 	}
 	return nil
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
+	"github.com/khaylebfortune/sorotrail/internal/broadcast"
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -34,6 +35,31 @@ var cachePrivate atomic.Bool
 // SetCachePrivate flips the public→private override for all cacheable
 // endpoints. Call once at startup before serving requests.
 func SetCachePrivate(v bool) { cachePrivate.Store(v) }
+
+// tenantScoped mirrors Server.multiTenant for the package-level cache
+// helpers, which are plain functions and have no server to ask.
+// WithMultiTenancy sets it at startup, before any request is served.
+//
+// Caching is where multi-tenancy leaks if nobody is looking. Two tenants
+// issuing byte-identical requests produce different bodies, so the response
+// is not a function of the URL any more. Three things follow, and all three
+// are needed — any one alone is insufficient:
+//
+//   - Cache-Control must be `private`, so a CDN or proxy never pools a
+//     tenant-scoped body for the next caller.
+//   - Vary must name the credential headers, so a cache that does store the
+//     response keys it per credential.
+//   - The ETag must incorporate the scope, so a conditional request
+//     carrying another tenant's validator cannot be answered 304.
+//
+// The first two constrain intermediaries; the third constrains this server,
+// which is the one that would otherwise hand out a 304 for a page the
+// caller has never been entitled to see.
+var tenantScoped atomic.Bool
+
+// SetTenantScopedCaching marks responses as tenant-specific for caching
+// purposes. Called by WithMultiTenancy; exported for tests.
+func SetTenantScopedCaching(v bool) { tenantScoped.Store(v) }
 
 // immutableMaxAge is the max-age used for cacheable responses on
 // immutable resources (single events and list pages whose entire
@@ -109,7 +135,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 	filter, err := filterFromQuery(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeFilterError(w, err)
 		return
 	}
 	s.serveEvents(w, r, filter)
@@ -118,7 +144,7 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 	filter, err := filterFromQuery(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeFilterError(w, err)
 		return
 	}
 	contractID := chi.URLParam(r, "id")
@@ -126,8 +152,48 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid contract ID %q", contractID))
 		return
 	}
+	if !filter.Scope.Allows(contractID) {
+		writeForbiddenContract(w, contractID)
+		return
+	}
 	filter.ContractID = contractID
 	s.serveEvents(w, r, filter)
+}
+
+// errForbiddenContract is returned by filterFromQuery when the request names
+// a contract outside the caller's grants. It is a distinct type rather than
+// a sentinel string so writeFilterError can separate "you asked wrongly"
+// (400) from "you asked for someone else's data" (403).
+type errForbiddenContract struct{ contractID string }
+
+func (e errForbiddenContract) Error() string {
+	return fmt.Sprintf("contract %s is not granted to this tenant", e.contractID)
+}
+
+// writeFilterError maps a filter-construction failure to its status. Every
+// caller of filterFromQuery routes errors through here, so the 403 case
+// cannot be reported as a 400 by one endpoint and correctly by another.
+func writeFilterError(w http.ResponseWriter, err error) {
+	var forbidden errForbiddenContract
+	if errors.As(err, &forbidden) {
+		writeForbiddenContract(w, forbidden.contractID)
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
+}
+
+// writeForbiddenContract reports a contract the caller named explicitly but
+// may not read.
+//
+// 403 rather than 404 is deliberate here, and is the opposite of the choice
+// made for event IDs. The caller already possesses the contract ID — they
+// typed it into the path — and contract IDs are public on-chain identifiers,
+// so confirming "this exists but is not yours" discloses nothing they could
+// not learn from a block explorer. Answering 404 instead would leave
+// operators debugging a missing grant as though it were missing data.
+func writeForbiddenContract(w http.ResponseWriter, contractID string) {
+	writeError(w, http.StatusForbidden,
+		errForbiddenContract{contractID: contractID})
 }
 
 // serveEvents is the shared body for /events and /contracts/{id}/events.
@@ -153,9 +219,14 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
+	s.recordEventsServed(r.Context(), len(events))
 	decoded := r.URL.Query().Get("decoded") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), events)
+		// The enriched branch writes no cache headers, so the Vary the
+		// scoped path relies on is set explicitly here too. Without it a
+		// shared cache could key ?decoded=true responses on URL alone.
+		writeVary(w)
 		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
 		return
 	}
@@ -165,6 +236,11 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	// Both the existence probe and the row fetch below run under this
+	// scope, so an event belonging to an ungranted contract is reported as
+	// absent on every path through this handler — including the 304 fast
+	// path, which would otherwise be a free existence oracle.
+	scope := scopeFrom(r.Context())
 
 	// Strong ETag: the event ID is itself a perfect validator for an
 	// immutable resource (each ID maps to exactly one row, that row's
@@ -179,7 +255,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	// present. A miss in EventExists is reported as 404, matching the
 	// unconditional code path.
 	if ifNoneMatch(r, etag) {
-		exists, err := s.store.EventExists(r.Context(), id)
+		exists, err := s.store.EventExists(r.Context(), id, scope)
 		if err != nil {
 			s.log.Error("checking event existence", "id", id, "error", err)
 			writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
@@ -197,7 +273,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	event, err := s.store.GetEvent(r.Context(), id)
+	event, err := s.store.GetEvent(r.Context(), id, scope)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
 		return
@@ -207,10 +283,12 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
+	s.recordEventsServed(r.Context(), 1)
 	decoded := r.URL.Query().Get("decoded") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {
+			writeVary(w)
 			writeJSON(w, http.StatusOK, enriched[0])
 			return
 		}
@@ -222,7 +300,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 // Stats summarizes what the indexer has stored plus, when the auditor is
 // running, the post-processing counters it has accumulated.
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.store.Stats(r.Context())
+	stats, err := s.store.Stats(r.Context(), scopeFrom(r.Context()))
 	if err != nil {
 		s.log.Error("loading stats", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
@@ -350,6 +428,13 @@ func listETag(f store.EventFilter) string {
 		Cursor     string          `json:"cu,omitempty"`
 		Limit      int             `json:"l"`
 		Order      string          `json:"o,omitempty"`
+		// Scope makes the validator tenant-specific. Two tenants issuing
+		// the same request are asking for different representations of
+		// this URL, and without this component the second one's
+		// If-None-Match would match the first one's page and be answered
+		// 304 — a cross-tenant disclosure produced entirely inside this
+		// server, with no CDN involved.
+		Scope string `json:"s"`
 	}{
 		ContractID: f.ContractID,
 		Type:       f.Type,
@@ -361,6 +446,7 @@ func listETag(f store.EventFilter) string {
 		Cursor:     f.Cursor,
 		Limit:      resolvedLimit(f.Limit),
 		Order:      resolvedOrder(f.Order),
+		Scope:      f.Scope.Fingerprint(),
 	}
 	b, _ := json.Marshal(key)
 	sum := sha256.Sum256(b)
@@ -429,15 +515,7 @@ func ifNoneMatch(r *http.Request, etag string) bool {
 // we MERGE rather than overwrite so distinct dimensions coexist in
 // the comma-separated value the cache uses.
 func writeCacheHeaders(w http.ResponseWriter, kind cacheability, maxAge time.Duration, etag string) {
-	vary := w.Header().Get("Vary")
-	if !strings.Contains(vary, "Accept-Encoding") {
-		if vary == "" {
-			vary = "Accept-Encoding"
-		} else {
-			vary = vary + ", Accept-Encoding"
-		}
-		w.Header().Set("Vary", vary)
-	}
+	writeVary(w)
 	if etag != "" {
 		w.Header().Set("ETag", etag)
 	}
@@ -448,14 +526,50 @@ func writeCacheHeaders(w http.ResponseWriter, kind cacheability, maxAge time.Dur
 		w.Header().Set("Cache-Control", "no-cache")
 	case cacheImmutable:
 		scope := "public"
-		if cachePrivate.Load() {
+		if cachePrivate.Load() || tenantScoped.Load() {
 			// Auth'd deployments get `private`: caching stays scoped to
 			// the authenticated user (browser cache works), but shared
 			// caches (CDN/proxy) cannot pool responses across users.
+			//
+			// Multi-tenant mode forces this regardless of CACHE_PRIVATE.
+			// The setting is an operator preference; the tenant boundary
+			// is not, and `public` on a tenant-scoped body is a
+			// cross-tenant disclosure waiting for a CDN to happen.
 			scope = "private"
 		}
 		w.Header().Set("Cache-Control",
 			fmt.Sprintf("%s, max-age=%d, immutable", scope, int(maxAge.Seconds())))
+	}
+}
+
+// varyDimensions are the request headers a response can depend on.
+// Accept-Encoding is set proactively for the compression middleware (#25);
+// the credential headers are added in multi-tenant mode because the body
+// genuinely differs per credential.
+func varyDimensions() []string {
+	if tenantScoped.Load() {
+		return []string{"Accept-Encoding", "Authorization", "X-API-Key"}
+	}
+	return []string{"Accept-Encoding"}
+}
+
+// writeVary merges the response's Vary dimensions into whatever a previous
+// middleware may already have set, rather than overwriting — distinct
+// dimensions have to coexist in the one comma-separated value a cache reads.
+func writeVary(w http.ResponseWriter) {
+	vary := w.Header().Get("Vary")
+	for _, dim := range varyDimensions() {
+		if strings.Contains(vary, dim) {
+			continue
+		}
+		if vary == "" {
+			vary = dim
+		} else {
+			vary += ", " + dim
+		}
+	}
+	if vary != "" {
+		w.Header().Set("Vary", vary)
 	}
 }
 
@@ -474,15 +588,31 @@ func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 
 // filterFromQuery parses the shared event-filter query params:
 // contract_id, type, topic, from_ledger, to_ledger, from_time, to_time, cursor, limit.
+//
+// It is also the one place a list-shaped read acquires its authorization.
+// Every endpoint that returns events builds its filter here, so the tenant
+// boundary is attached by construction rather than by each handler
+// remembering to attach it. A handler that hand-rolled an EventFilter
+// instead would get the zero Scope and return nothing — see store.Scope for
+// why that is the failure mode we chose.
 func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	q := r.URL.Query()
 	f := store.EventFilter{
 		ContractID: q.Get("contract_id"),
 		Cursor:     q.Get("cursor"),
+		Scope:      scopeFrom(r.Context()),
 	}
 
 	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
 		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
+	}
+	// An explicitly named contract the tenant lacks is refused rather than
+	// quietly filtered to nothing, so a missing grant is distinguishable
+	// from a contract with no events. The store still ANDs the scope into
+	// the query regardless, so this check being wrong or removed downgrades
+	// the error message without opening a leak.
+	if f.ContractID != "" && !f.Scope.Allows(f.ContractID) {
+		return f, errForbiddenContract{contractID: f.ContractID}
 	}
 
 	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
@@ -615,6 +745,77 @@ func parseTimeParam(raw, name string) (time.Time, error) {
 	return t, nil
 }
 
+// DefaultStreamScopeSync bounds how long a live stream can keep serving a
+// contract after the tenant's grant was revoked (and how long it waits for a
+// newly granted one to start flowing).
+const DefaultStreamScopeSync = 30 * time.Second
+
+// syncStreamScope re-resolves the tenant's grants periodically and pushes
+// them into the live subscription.
+//
+// Without this, the answer to the issue's "a tenant granted a contract
+// mid-stream" question would be "nothing happens until they reconnect" —
+// and, worse, the mirror-image case would be that revoking a grant does not
+// stop delivery to anyone already connected. A stream is exactly the place
+// where a snapshot-at-open authorization decision decays, because the
+// snapshot can outlive the entitlement by hours.
+//
+// Single-tenant deployments start no goroutine: their scope is a constant.
+func (s *Server) syncStreamScope(ctx context.Context, sub *broadcast.Subscription) {
+	if !s.multiTenant {
+		return
+	}
+	p, ok := PrincipalFrom(ctx)
+	if !ok || p.Untenanted {
+		return
+	}
+	every := s.streamScopeSync
+	if every <= 0 {
+		every = DefaultStreamScopeSync
+	}
+	go func() {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Re-read the tenant too, so a suspension (enabled=false)
+				// or a switch away from wildcard takes effect on open
+				// streams and not just on new requests.
+				tenant, err := s.tenants.GetTenant(ctx, p.Tenant.ID)
+				if errors.Is(err, store.ErrNotFound) {
+					// Deleted mid-stream: revoke everything. The read loop
+					// sees an empty scope and the connection goes quiet
+					// rather than continuing to serve a tenant that no
+					// longer exists.
+					sub.SetScope(store.Scope{})
+					return
+				}
+				if err != nil {
+					// Leave the existing scope in place on a transient
+					// database error: it was correct as of the last
+					// successful resolve, and widening or narrowing on a
+					// failed read would be guessing.
+					s.log.Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
+					continue
+				}
+				if !tenant.Enabled {
+					sub.SetScope(store.Scope{})
+					return
+				}
+				scope, err := s.tenants.ScopeForTenant(ctx, tenant)
+				if err != nil {
+					s.log.Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
+					continue
+				}
+				sub.SetScope(scope)
+			}
+		}
+	}()
+}
+
 func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	if s.bcast == nil {
 		http.Error(w, "streaming not configured", http.StatusNotImplemented)
@@ -623,7 +824,7 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 
 	filter, err := filterFromQuery(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeFilterError(w, err)
 		return
 	}
 
@@ -647,6 +848,14 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	// Use CloseRead to get a context cancelled when the client disconnects
 	// and to ensure the library processes control frames (ping/pong/close).
 	ctx = c.CloseRead(ctx)
+
+	// Attribute the connection's wall-clock duration to the tenant when it
+	// ends, however it ends.
+	streamStart := time.Now()
+	defer func() { s.recordStreamTime(r.Context(), time.Since(streamStart)) }()
+
+	// Keep the subscription's authorization current for its whole life.
+	s.syncStreamScope(ctx, sub)
 
 	// Periodic ping to detect stale connections.
 	pingCtx, pingCancel := context.WithCancel(ctx)

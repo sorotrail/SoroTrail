@@ -77,13 +77,13 @@ func (s *stubStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 	return store.AuditFinding{}, store.ErrNotFound
 }
 
-func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
+func (s *stubStore) GetEvent(context.Context, string, store.Scope) (store.Event, error) {
 	return s.event, s.eventErr
 }
 
 // EventExists is the cheap 304 path; tests assert the handler uses it
 // (instead of GetEvent) when If-None-Match matches.
-func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
+func (s *stubStore) EventExists(_ context.Context, id string, _ store.Scope) (bool, error) {
 	s.existsCalls++
 	s.lastExistsID = id
 	return s.exists, s.existsErr
@@ -103,24 +103,26 @@ func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, er
 	return s.ingestion, s.ingestionErr
 }
 
-func (s *stubStore) Stats(context.Context) (store.Stats, error) { return s.stats, nil }
-func (s *stubStore) Ping(context.Context) error                 { return s.pingErr }
+func (s *stubStore) Stats(context.Context, store.Scope) (store.Stats, error) { return s.stats, nil }
+func (s *stubStore) Ping(context.Context) error                              { return s.pingErr }
 
 // Subscription stubs for the webhook feature.
 func (s *stubStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
 	sub.ID = 1
 	return sub, nil
 }
-func (s *stubStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
+func (s *stubStore) GetSubscription(_ context.Context, id int64, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return store.Subscription{}, store.ErrNotFound
 }
-func (s *stubStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
+func (s *stubStore) ListSubscriptions(context.Context, store.SubscriptionOwner) ([]store.Subscription, error) {
 	return nil, nil
 }
-func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return sub, nil
 }
-func (s *stubStore) DeleteSubscription(context.Context, int64) error { return nil }
+func (s *stubStore) DeleteSubscription(context.Context, int64, store.SubscriptionOwner) error {
+	return nil
+}
 func (s *stubStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
 	return nil, nil
 }
@@ -132,7 +134,7 @@ func (s *stubStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 	a.ID = 1
 	return a, nil
 }
-func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
+func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int, store.SubscriptionOwner) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
 

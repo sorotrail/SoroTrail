@@ -69,6 +69,11 @@ All configuration comes from environment variables (see `.env.example`):
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
+| `MULTI_TENANT` | `false` | Serve several consumers from one deployment, each scoped to its own contracts. Off means no authentication and no tenant boundary — identical to the pre-multi-tenancy build. See [Multi-tenancy](docs/multi-tenancy.md). |
+| `MULTI_TENANT_MAX_WATCHED` | `250` | Cap on the union of all tenants' watch lists, bounding the ingester's RPC cost. `0` disables the cap. |
+| `MULTI_TENANT_USAGE_FLUSH` | `10s` | How often accumulated per-tenant usage counters are persisted. |
+| `MULTI_TENANT_STREAM_SCOPE_SYNC` | `30s` | How often an open stream re-resolves its tenant's grants, bounding how long a revoked grant keeps being served. |
+| `MULTI_TENANT_BOOTSTRAP_KEY` | unset | Installs an admin API key for the seeded `default` tenant at startup, so a fresh multi-tenant install can mint its first keys. Rejected unless `MULTI_TENANT=true`. |
 
 ## Ingestion behavior
 
@@ -113,6 +118,16 @@ advisory-lock strategy, and the derivation order for dependent tables.
 ## API reference
 
 All responses are JSON. Errors look like `{"error": "message"}`.
+
+By default the API is unauthenticated and every caller sees every ingested
+contract. Setting `MULTI_TENANT=true` puts the whole API behind API keys and
+scopes each caller to the contracts its tenant has been granted, and adds the
+`/tenant/*` and `/admin/*` endpoints — see
+[docs/multi-tenancy.md](docs/multi-tenancy.md). The endpoints below are
+documented in their single-tenant form; under multi-tenancy each returns only
+the caller's own contracts, and naming an ungranted contract answers `403`.
+Webhook subscriptions additionally belong to the tenant that created them and
+may only be registered against contracts that tenant has been granted.
 
 ### `GET /health`
 
@@ -600,15 +615,21 @@ not-found status. We accept this self-healing delay rather than
 arbitrarily shortening the immutable max-age, because for un-deleted
 rows the long `max-age` is the whole point of the cache.
 
-### Auth'd deployments (#17)
+### Auth'd deployments
 
-When authentication lands, the spec calls out that caching must "never
-leak across keys". Today the API is unauthenticated, but the
-`CACHE_PRIVATE` config flag flips every cacheable response from
-`Cache-Control: public` to `Cache-Control: private` (with the same
-`max-age` and `immutable` preset), so the same build can serve shared
+Caching must never leak across keys. The `CACHE_PRIVATE` flag flips every
+cacheable response from `Cache-Control: public` to `Cache-Control: private`
+(same `max-age` and `immutable` preset), so the same build can serve shared
 caches in one deployment and per-user scenarios in another. Set
-`CACHE_PRIVATE=true` as soon as auth (#17) is in front of the API.
+`CACHE_PRIVATE=true` whenever an auth layer sits in front of the API.
+
+Under `MULTI_TENANT=true` this is not left to configuration. Responses are
+forced to `private`, `Vary` gains `Authorization` and `X-API-Key`, and the
+`ETag` incorporates a digest of the caller's scope — so two tenants issuing
+identical requests cannot share a cache entry, and a conditional request
+carrying another tenant's validator cannot be answered `304`. The last of
+those matters most: it is the only one of the three that does not need a CDN
+to misbehave. See [Caching](docs/multi-tenancy.md#caching).
 
 ## Development
 
