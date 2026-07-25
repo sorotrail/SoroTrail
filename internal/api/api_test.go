@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/khaylebfortune/sorotrail/internal/buildinfo"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -581,6 +582,56 @@ func TestStats(t *testing.T) {
 		assert.Nil(t, raw["chain_head_ledger"])
 		assert.Contains(t, raw, "ingest_lag_ledgers")
 		assert.Nil(t, raw["ingest_lag_ledgers"])
+	})
+}
+
+func TestVersion(t *testing.T) {
+	t.Run("returns default values", func(t *testing.T) {
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/version")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var got struct {
+			Version   string `json:"version"`
+			Commit    string `json:"commit"`
+			BuildDate string `json:"build_date"`
+		}
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, "unknown", got.Version)
+		assert.Equal(t, "unknown", got.Commit)
+		assert.Equal(t, "unknown", got.BuildDate)
+	})
+
+	t.Run("reflects injected build info", func(t *testing.T) {
+		origV, origC, origD := buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate
+		buildinfo.Version = "v1.2.3"
+		buildinfo.Commit = "abc1234"
+		buildinfo.BuildDate = "2026-07-26T00:00:00Z"
+		t.Cleanup(func() {
+			buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate = origV, origC, origD
+		})
+
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/version")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var got struct {
+			Version   string `json:"version"`
+			Commit    string `json:"commit"`
+			BuildDate string `json:"build_date"`
+		}
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, "v1.2.3", got.Version)
+		assert.Equal(t, "abc1234", got.Commit)
+		assert.Equal(t, "2026-07-26T00:00:00Z", got.BuildDate)
+	})
+
+	t.Run("no-store cache header", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/version")
+		assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	})
+
+	t.Run("content type is json", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/version")
+		assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
 	})
 }
 
