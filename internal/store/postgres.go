@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -73,13 +74,18 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	}
 	batch := &pgx.Batch{}
 	for _, e := range events {
+		// Column list deliberately mirrors the eventColumns constant
+		// (13 fields including raw_topic_xdr / raw_value_xdr) so a
+		// row kept by replay never loses its raw XDR just because the
+		// INSERT forgot the columns.
 		batch.Queue(`
 			INSERT INTO events
 				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-				 in_successful_call, topics, value, raw_topic_xdr, raw_value_xdr)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) `+conflict,
+				 in_successful_call, topics, value, created_at,
+				 raw_topic_xdr, raw_value_xdr)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`+conflict,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
-			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value,
+			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
 			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
 	}
@@ -286,6 +292,26 @@ func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
 	return e, err
 }
 
+// EventExists is the cheap 304 path used by the API's conditional GET:
+// an index-only probe against the primary key that never deserializes
+// the row, so it stays index-bound even on a wide row. Existence is a
+// boolean because 304 responses carry no body — there's nothing to
+// serialize. The call is what backs the "still here" check after a
+// cache hit so that retention/pruning (#8) cannot leave a cache
+// pretending a deleted event is still around; the full row is only
+// loaded on a real cache miss via GetEvent.
+func (p *Postgres) EventExists(ctx context.Context, id string) (bool, error) {
+	var one int
+	err := p.pool.QueryRow(ctx, `SELECT 1 FROM events WHERE id = $1`, id).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("checking event existence: %w", err)
+	}
+	return true, nil
+}
+
 func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
 	limit := f.Limit
 	if limit <= 0 {
@@ -313,11 +339,29 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		// Containment on the array matches the topic at any position.
 		where = append(where, "topics @> "+arg(fmt.Sprintf("[%s]", f.Topic))+"::jsonb")
 	}
+	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
+		if len(topic) == 0 {
+			continue
+		}
+		where = append(where,
+			fmt.Sprintf("topics->%d = %s::jsonb", i, arg(topic)))
+	}
+	if len(f.TopicContains) > 0 {
+		// Direct containment — caller controls the shape (object wrapped in
+		// array for element match, multi-element arrays for subset match).
+		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
+	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))
 	}
 	if f.ToLedger > 0 {
 		where = append(where, "ledger <= "+arg(f.ToLedger))
+	}
+	if !f.FromTime.IsZero() {
+		where = append(where, "created_at >= "+arg(f.FromTime))
+	}
+	if !f.ToTime.IsZero() {
+		where = append(where, "created_at <= "+arg(f.ToTime))
 	}
 
 	// if f.Cursor != "" {
@@ -490,9 +534,10 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 			(SELECT count(*) FROM events),
 			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
 			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
+			(SELECT coalesce(min(ledger), 0) FROM events),
 			(SELECT count(DISTINCT contract_id) FROM events),
 			(SELECT count(*) FROM watched_contracts)`,
-	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.ContractCount, &s.WatchedContracts)
+	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
 	}
@@ -501,6 +546,35 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 
 func (p *Postgres) Ping(ctx context.Context) error {
 	return p.pool.Ping(ctx)
+}
+
+func (p *Postgres) GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error) {
+	var specJSON []byte
+	err := p.pool.QueryRow(ctx,
+		`SELECT spec_json FROM contract_specs WHERE wasm_hash = $1`, wasmHash,
+	).Scan(&specJSON)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading contract spec for wasm_hash %s: %w", wasmHash, err)
+	}
+	return specJSON, nil
+}
+
+func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO contract_specs (wasm_hash, contract_id, spec_json, fetched_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (wasm_hash) DO UPDATE SET
+			spec_json  = EXCLUDED.spec_json,
+			fetched_at = now()`,
+		wasmHash, contractID, specJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("saving contract spec for %s: %w", wasmHash, err)
+	}
+	return nil
 }
 
 func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {

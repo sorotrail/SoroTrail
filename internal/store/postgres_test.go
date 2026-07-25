@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
@@ -153,6 +154,44 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		}
 	})
 
+	t.Run("by topic_contains with object in array (containment)", func(t *testing.T) {
+		// topic_contains=[{"u64":7}] should match events whose topics array
+		// contains an element that jsonb-contains {"u64":7}.
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TopicContains: json.RawMessage(`[{"u64":7}]`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 9, "all events with u64:7 (9 out of 10)")
+	})
+
+	t.Run("by topic_contains with object directly does not match array", func(t *testing.T) {
+		// Passing an object directly (not wrapped in array) won't match an
+		// array column — jsonb array @> object is always false in Postgres.
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TopicContains: json.RawMessage(`{"u64":7}`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 0, "object not in array => no match")
+	})
+
+	t.Run("by topic_contains combined with contract_id", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			ContractID:    contractB,
+			TopicContains: json.RawMessage(`[{"u64":7}]`),
+		})
+		require.NoError(t, err)
+		// contractB has 5 events (even indexes), all of which contain {"u64":7}.
+		assert.Len(t, got, 5)
+	})
+
+	t.Run("by topic_contains no match", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TopicContains: json.RawMessage(`[{"symbol":"nonexistent"}]`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 0)
+	})
+
 	t.Run("keyset pagination desc returns newest-first", func(t *testing.T) {
 		var all []Event
 		cursor := ""
@@ -173,6 +212,63 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		for i := 1; i < len(all); i++ {
 			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
 		}
+	})
+}
+
+func TestQueryEvents_TimeRange(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	var events []Event
+	for i := 1; i <= 5; i++ {
+		e := testEvent(eventID(i), int64(100+i), contractA)
+		e.CreatedAt = time.Date(2026, 7, 20+i, 12, 0, 0, 0, time.UTC)
+		events = append(events, e)
+	}
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	t.Run("from_time only", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			FromTime: time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 3) // Jul 23, 24, 25 inclusive
+	})
+
+	t.Run("to_time only", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			ToTime: time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 2) // Jul 21, 22 inclusive
+	})
+
+	t.Run("both bounds inclusive", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			FromTime: time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC),
+			ToTime:   time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 3) // Jul 22, 23, 24
+	})
+
+	t.Run("intersection with ledger range", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			FromLedger: 104,
+			ToLedger:   106,
+			FromTime:   time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 2) // ledger 104+106, time >= Jul23 -> events 4,5 (ledger 104,105 -> Jul24,25)
+	})
+
+	t.Run("empty window returns nothing", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			FromTime: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 0)
 	})
 }
 
@@ -221,6 +317,45 @@ func TestStats(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), stats.TotalEvents)
 	assert.Equal(t, int64(101), stats.LastIngestedLedger)
+	assert.Equal(t, int64(100), stats.OldestStoredLedger)
 	assert.Equal(t, int64(2), stats.ContractCount)
 	assert.Equal(t, int64(1), stats.WatchedContracts)
+
+	var plan string
+	rows, err := st.pool.Query(ctx, `EXPLAIN (COSTS OFF) SELECT coalesce(min(ledger), 0) FROM events`)
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var line string
+		require.NoError(t, rows.Scan(&line))
+		plan += line + "\n"
+	}
+	require.NoError(t, rows.Err())
+	// The exact partition index name is Postgres-generated; the important
+	// property is that min(ledger) stays index-backed.
+	assert.Contains(t, plan, "Index")
+	assert.Contains(t, plan, "ledger")
+}
+
+// TestQueryEvents_PositionalTopics exercises the topic0..topic3 positional
+// filters in their own truncated DB so the extra rows do not leak into the
+// shared-dataset assertions in TestQueryEvents_FiltersAndPagination.
+func TestQueryEvents_PositionalTopics(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	e1 := testEvent(eventID(100), 200, contractA)
+	e1.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GABC"},{"address":"GDEF"}]`)
+	e2 := testEvent(eventID(101), 201, contractA)
+	e2.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GDEF"},{"address":"GABC"}]`)
+	_, err := st.UpsertEvents(ctx, []Event{e1, e2})
+	require.NoError(t, err)
+
+	got, _, err := st.QueryEvents(ctx, EventFilter{
+		Topic0: json.RawMessage(`{"symbol":"transfer"}`),
+		Topic1: json.RawMessage(`{"address":"GABC"}`),
+	})
+	require.NoError(t, err)
+	assert.Len(t, got, 1)
+	assert.Equal(t, e1.ID, got[0].ID)
 }
