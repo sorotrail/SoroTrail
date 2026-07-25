@@ -127,6 +127,11 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 		Filters:     filters,
 		Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
 	})
+	if rpc.IsFailoverReanchor(err) {
+		ing.log.Warn("failover re-anchor: discarding cursor, re-scanning from last ingested ledger")
+		ing.discardCursor(ctx)
+		return false, err
+	}
 	if rpc.IsLedgerOutOfRange(err) {
 		return false, ing.reclampToOldest(ctx, startLedger)
 	}
@@ -303,6 +308,11 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 				Filters:     filters,
 				Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
 			})
+			if rpc.IsFailoverReanchor(err) {
+				ing.log.Warn("failover re-anchor during window sweep: discarding cursor")
+				ing.discardCursor(ctx)
+				return false, err
+			}
 			if rpc.IsLedgerOutOfRange(err) {
 				return false, ing.reclampToOldest(ctx, start)
 			}
@@ -411,6 +421,30 @@ func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) erro
 	return ing.store.SaveIngestionState(ctx, store.IngestionState{
 		LastIngestedLedger: int64(health.OldestLedger) - 1,
 	})
+}
+
+// discardCursor reads the persisted ingestion state and re-saves it without
+// the cursor, so the next resolvePosition falls through to the
+// ledger-based path. Idempotent upserts absorb the overlap from re-scanning.
+//
+// In windowSweep the internal cursor is never persisted (only
+// LastIngestedLedger is saved at sweep end), so this is a defensive no-op
+// in that path — it guards against any future change that might persist a
+// cursor mid-sweep.
+func (ing *Ingester) discardCursor(ctx context.Context) {
+	state, err := ing.store.GetIngestionState(ctx)
+	if err != nil {
+		ing.log.Warn("discardCursor: could not read state", "error", err)
+		return
+	}
+	if state.LastCursor == "" {
+		return
+	}
+	if err := ing.store.SaveIngestionState(ctx, store.IngestionState{
+		LastIngestedLedger: state.LastIngestedLedger,
+	}); err != nil {
+		ing.log.Warn("discardCursor: could not save state", "error", err)
+	}
 }
 
 // buildFilterBatches converts the watched-contract list into getEvents

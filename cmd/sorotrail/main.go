@@ -99,7 +99,27 @@ func run() error {
 		}
 	}
 
-	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
+	// Build the RPC client: single URL (RPC_URL) or multi-provider
+	// failover (RPC_URLS). The single-URL path keeps existing deployments
+	// working unchanged.
+	var rpcClient rpc.Client
+	if len(cfg.RPCURLS) > 0 {
+		fc := rpc.NewFailoverClient(
+			cfg.RPCURLS,
+			cfg.RPCRateLimitRPS,
+			rpc.NewHTTPClientForFailover,
+			rpc.WithFailoverLogger(log),
+		)
+		// Background getHealth probes for demoted providers so they can
+		// be promoted back when they recover.
+		fc.RunProbes(ctx)
+		rpcClient = fc
+		log.Info("failover rpc client created", "providers", len(cfg.RPCURLS),
+			"rate_limit_rps", cfg.RPCRateLimitRPS)
+	} else {
+		rpcClient = rpc.NewHTTPClient(cfg.RPCURL)
+	}
+
 	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
@@ -136,7 +156,7 @@ func run() error {
 
 	errCh := make(chan error, 3)
 	go func() {
-		log.Info("ingester starting", "rpc_url", cfg.RPCURL, "poll_interval", cfg.PollInterval)
+		log.Info("ingester starting", "rpc_urls", rpcURLsForLog(cfg), "poll_interval", cfg.PollInterval)
 		if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errCh <- fmt.Errorf("ingester: %w", err)
 		} else {
@@ -206,4 +226,11 @@ func newLogger(level string) *slog.Logger {
 		lvl = slog.LevelInfo
 	}
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
+}
+
+func rpcURLsForLog(cfg config.Config) []string {
+	if len(cfg.RPCURLS) > 0 {
+		return cfg.RPCURLS
+	}
+	return []string{cfg.RPCURL}
 }

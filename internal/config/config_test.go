@@ -11,6 +11,18 @@ import (
 
 const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
+// envKeys is the comprehensive list of env vars Load reads. Each test
+// subtest clears them so leftover values from the host environment or a
+// prior test don't leak across cases.
+var envKeys = []string{
+	"RPC_URL", "RPC_URLS", "RPC_RATE_LIMIT_RPS", "DATABASE_URL",
+	"POLL_INTERVAL", "HTTP_ADDR",
+	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL",
+	"AUDIT_ENABLED", "AUDIT_POLL_INTERVAL", "AUDIT_BATCH_LEDGERS",
+	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
+	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
+}
+
 func TestLoad(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -76,14 +88,60 @@ func TestLoad(t *testing.T) {
 			},
 			wantErr: "RPC_URL",
 		},
+		{
+			name: "RPC_URLS with valid URLs accepted",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"RPC_URLS":     "https://rpc1.example.com,https://rpc2.example.com",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{"https://rpc1.example.com", "https://rpc2.example.com"}, c.RPCURLS)
+				assert.Equal(t, float64(10), c.RPCRateLimitRPS)
+			},
+		},
+		{
+			name: "RPC_URLS invalid URL rejected",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"RPC_URLS":     "https://good.example.com,not a url",
+			},
+			wantErr: "RPC_URLS[1]",
+		},
+		{
+			name: "RPC_URLS empty entries trimmed",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"RPC_URLS":     "https://rpc.example.com, ,",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{"https://rpc.example.com"}, c.RPCURLS)
+			},
+		},
+		{
+			name: "RPC_RATE_LIMIT_RPS custom value",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"RPC_RATE_LIMIT_RPS": "5",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, float64(5), c.RPCRateLimitRPS)
+			},
+		},
+		{
+			name: "RPC_RATE_LIMIT_RPS zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"RPC_RATE_LIMIT_RPS": "0",
+			},
+			wantErr: "RPC_RATE_LIMIT_RPS must be positive",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Clear the variables Load reads, then apply the case's env.
 			// t.Setenv registers restoration; Unsetenv makes defaults apply.
-			for _, key := range []string{"RPC_URL", "DATABASE_URL", "POLL_INTERVAL",
-				"HTTP_ADDR", "WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL"} {
+			for _, key := range envKeys {
 				t.Setenv(key, "")
 				os.Unsetenv(key)
 			}

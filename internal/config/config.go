@@ -14,14 +14,16 @@ import (
 // Config holds all runtime configuration. Every field is settable via the
 // environment variable named in its `env` tag; see .env.example for docs.
 type Config struct {
-	RPCURL           string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
-	DatabaseURL      string        `env:"DATABASE_URL"`
-	PollInterval     time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
-	HTTPAddr         string        `env:"HTTP_ADDR" envDefault:":8080"`
-	WatchedContracts []string      `env:"WATCHED_CONTRACTS"`
-	StartLedger      uint32        `env:"START_LEDGER"`
-	RetentionLedgers uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
-	LogLevel         string        `env:"LOG_LEVEL" envDefault:"info"`
+	RPCURL              string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
+	RPCURLS             []string      `env:"RPC_URLS"`
+	RPCRateLimitRPS     float64       `env:"RPC_RATE_LIMIT_RPS" envDefault:"10"`
+	DatabaseURL         string        `env:"DATABASE_URL"`
+	PollInterval        time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
+	HTTPAddr            string        `env:"HTTP_ADDR" envDefault:":8080"`
+	WatchedContracts    []string      `env:"WATCHED_CONTRACTS"`
+	StartLedger         uint32        `env:"START_LEDGER"`
+	RetentionLedgers    uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
+	LogLevel            string        `env:"LOG_LEVEL" envDefault:"info"`
 
 	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
 	// entirely; the binary behaves exactly like the pre-audit build.
@@ -43,6 +45,7 @@ func Load() (Config, error) {
 	}
 	// env/v11 splits on "," but keeps empty entries and whitespace.
 	cfg.WatchedContracts = cleanContractList(cfg.WatchedContracts)
+	cfg.RPCURLS = cleanContractList(cfg.RPCURLS)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -54,9 +57,20 @@ func (c Config) Validate() error {
 	if c.DatabaseURL == "" {
 		return fmt.Errorf("DATABASE_URL is required")
 	}
-	u, err := url.Parse(c.RPCURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("RPC_URL %q is not a valid URL", c.RPCURL)
+	// RPC_URLS takes priority when set; RPC_URL is the single-provider
+	// fallback that works unchanged for existing deployments.
+	if len(c.RPCURLS) > 0 {
+		for i, raw := range c.RPCURLS {
+			u, err := url.Parse(raw)
+			if err != nil || u.Scheme == "" || u.Host == "" {
+				return fmt.Errorf("RPC_URLS[%d] %q is not a valid URL", i, raw)
+			}
+		}
+	} else {
+		u, err := url.Parse(c.RPCURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("RPC_URL %q is not a valid URL", c.RPCURL)
+		}
 	}
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("POLL_INTERVAL must be positive, got %s", c.PollInterval)
@@ -94,6 +108,9 @@ func (c Config) Validate() error {
 	}
 	if c.AuditFindingMaxLgrs == 0 {
 		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
+	}
+	if c.RPCRateLimitRPS <= 0 {
+		return fmt.Errorf("RPC_RATE_LIMIT_RPS must be positive")
 	}
 	return nil
 }
