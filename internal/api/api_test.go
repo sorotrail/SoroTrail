@@ -32,16 +32,23 @@ type stubStore struct {
 	event    store.Event
 	eventErr error
 
-	exists       bool
-	existsErr    error
-	existsCalls  int // count of EventExists calls
-	lastExistsID string
+	stats            store.Stats
+	pingErr          error
+	watchedList      []store.WatchedContract
+	watchedListErr   error
+	added            []string
+	removed          []string
+	addErr           error
+	removeErr        error
+	ingestionState   *store.IngestionState
+	ingestionStateEr error
+	exists           bool
+	existsErr        error
+	existsCalls      int // count of EventExists calls
+	lastExistsID     string
 
 	ingestion    store.IngestionState
 	ingestionErr error
-
-	stats   store.Stats
-	pingErr error
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -81,6 +88,13 @@ func (s *stubStore) GetEvent(context.Context, string, store.Scope) (store.Event,
 	return s.event, s.eventErr
 }
 
+func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
+	return nil, store.ErrNotFound
+}
+func (s *stubStore) SetContractSpec(context.Context, string, string, []byte) error {
+	return nil
+}
+
 // EventExists is the cheap 304 path; tests assert the handler uses it
 // (instead of GetEvent) when If-None-Match matches.
 func (s *stubStore) EventExists(_ context.Context, id string, _ store.Scope) (bool, error) {
@@ -89,17 +103,13 @@ func (s *stubStore) EventExists(_ context.Context, id string, _ store.Scope) (bo
 	return s.exists, s.existsErr
 }
 
-func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
-	return nil, store.ErrNotFound
-}
-func (s *stubStore) SetContractSpec(context.Context, string, string, []byte) error {
-	return nil
-}
-
 // GetIngestionState backs the list-cache frontier lookup. Tests stage
 // LastIngestedLedger to drive the boundary decisions (just-below, at,
 // and above the frontier).
 func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, error) {
+	if s.ingestionState != nil {
+		return *s.ingestionState, s.ingestionStateEr
+	}
 	return s.ingestion, s.ingestionErr
 }
 
@@ -150,10 +160,14 @@ func (s *stubRPC) GetHealth(context.Context) (rpc.Health, error) {
 }
 
 func newTestServer(st *stubStore, rc *stubRPC) *Server {
+	return newTestServerWithKey(st, rc, "test-key")
+}
+
+func newTestServerWithKey(st *stubStore, rc *stubRPC, apiKey string) *Server {
 	if rc == nil {
 		rc = &stubRPC{health: rpc.Health{Status: "healthy"}}
 	}
-	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), apiKey)
 }
 
 func doGet(t *testing.T, s *Server, path string) (*http.Response, []byte) {
@@ -377,6 +391,139 @@ func TestHealth(t *testing.T) {
 		rc := &stubRPC{healthErr: errors.New("rpc unreachable")}
 		resp, _ := doGet(t, newTestServer(&stubStore{}, rc), "/health")
 		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	})
+}
+
+func TestListEvents_FieldsProjection(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	st := &stubStore{
+		events: []store.Event{
+			{
+				ID:               "0000000001-0000000001",
+				ContractID:       testContract,
+				Ledger:           1,
+				Type:             "contract",
+				TxHash:           "abc123",
+				TxIndex:          0,
+				OpIndex:          0,
+				InSuccessfulCall: true,
+				Topics:           json.RawMessage(`["transfer"]`),
+				Value:            json.RawMessage(`{"amount":"100"}`),
+				CreatedAt:        now,
+			},
+		},
+		nextCursor: "0000000001-0000000001",
+	}
+	s := newTestServer(st, nil)
+
+	t.Run("returns only requested fields", func(t *testing.T) {
+		resp, body := doGet(t, s, "/events?fields=id,ledger")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out struct {
+			Events []map[string]any `json:"events"`
+			Cursor string           `json:"cursor"`
+		}
+		require.NoError(t, json.Unmarshal(body, &out))
+		require.Len(t, out.Events, 1)
+		ev := out.Events[0]
+		assert.Equal(t, "0000000001-0000000001", ev["id"])
+		assert.Equal(t, float64(1), ev["ledger"])
+		assert.Nil(t, ev["contract_id"])
+		assert.Nil(t, ev["type"])
+		assert.Nil(t, ev["tx_hash"])
+		assert.Equal(t, "0000000001-0000000001", out.Cursor)
+	})
+
+	t.Run("omitting fields returns full object", func(t *testing.T) {
+		resp, body := doGet(t, s, "/events")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out struct {
+			Events []store.Event `json:"events"`
+		}
+		require.NoError(t, json.Unmarshal(body, &out))
+		require.Len(t, out.Events, 1)
+		ev := out.Events[0]
+		assert.Equal(t, "abc123", ev.TxHash)
+		assert.Equal(t, "contract", ev.Type)
+		assert.Contains(t, string(out.Events[0].Topics), "transfer")
+	})
+}
+
+func TestListEvents_FieldsRejectsUnknown(t *testing.T) {
+	st := &stubStore{}
+	s := newTestServer(st, nil)
+
+	t.Run("unknown field returns 400", func(t *testing.T) {
+		resp, body := doGet(t, s, "/events?fields=id,nope")
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+		var e map[string]string
+		require.NoError(t, json.Unmarshal(body, &e))
+		assert.Contains(t, e["error"], "unknown field")
+		assert.Contains(t, e["error"], "nope")
+	})
+
+	t.Run("empty fields acts like omission", func(t *testing.T) {
+		resp, _ := doGet(t, s, "/events?fields=")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+
+	t.Run("all known fields accepted", func(t *testing.T) {
+		resp, _ := doGet(t, s, "/events?fields=id,contract_id,ledger,type,tx_hash,tx_index,op_index,in_successful_call,topics,value,created_at")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+}
+
+func TestGetEvent_FieldsProjection(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	eventID := "0000000001-0000000001"
+	st := &stubStore{
+		event: store.Event{
+			ID:               eventID,
+			ContractID:       testContract,
+			Ledger:           1,
+			Type:             "contract",
+			TxHash:           "abc123",
+			TxIndex:          0,
+			OpIndex:          0,
+			InSuccessfulCall: true,
+			Topics:           json.RawMessage(`["transfer"]`),
+			Value:            json.RawMessage(`{"amount":"100"}`),
+			CreatedAt:        now,
+		},
+	}
+	s := newTestServer(st, nil)
+
+	t.Run("returns only requested fields", func(t *testing.T) {
+		resp, body := doGet(t, s, "/events/"+eventID+"?fields=id,ledger")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.Equal(t, eventID, out["id"])
+		assert.Equal(t, float64(1), out["ledger"])
+		assert.Nil(t, out["contract_id"])
+		assert.Nil(t, out["type"])
+	})
+
+	t.Run("omitting fields returns full object", func(t *testing.T) {
+		resp, body := doGet(t, s, "/events/"+eventID)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out store.Event
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.Equal(t, "abc123", out.TxHash)
+		assert.Equal(t, "contract", out.Type)
+	})
+
+	t.Run("unknown field returns 400", func(t *testing.T) {
+		resp, body := doGet(t, s, "/events/"+eventID+"?fields=id,bogus")
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var e map[string]string
+		require.NoError(t, json.Unmarshal(body, &e))
+		assert.Contains(t, e["error"], "unknown field")
 	})
 }
 

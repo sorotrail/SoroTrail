@@ -40,6 +40,7 @@ func TestLoad(t *testing.T) {
 				assert.Equal(t, 5*time.Second, c.PollInterval)
 				assert.Equal(t, ":8080", c.HTTPAddr)
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
+				assert.Equal(t, uint32(120960), c.PartitionLedgerSpan)
 				assert.Empty(t, c.WatchedContracts)
 				assert.Zero(t, c.RateLimitRPS, "rate limiter disabled by default")
 				assert.Zero(t, c.RateLimitBurst)

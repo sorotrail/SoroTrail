@@ -57,6 +57,7 @@ type Server struct {
 	rpc      rpc.Client
 	enricher Enricher
 	log      *slog.Logger
+	apiKey   string
 	limiter  *RateLimiter
 	bcast    *broadcast.Broadcaster
 
@@ -72,9 +73,12 @@ type Server struct {
 }
 
 // New builds the API server. rpcClient is only used by /health.
-// enricher is optional — pass nil to disable spec decoding.
-func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log}
+// apiKey gates the watched-contracts management endpoints; pass "" to
+// fail closed (every request gets a 503 with "API_KEY not configured").
+// See apiKeyAuth for the exact contract. The trailing enricher is optional —
+// pass nil to disable spec decoding, or one Enricher to enable it.
+func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
+	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
