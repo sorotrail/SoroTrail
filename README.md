@@ -74,6 +74,9 @@ All configuration comes from environment variables (see `.env.example`):
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
 | `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
+| `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
+| `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
+| `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
 
 ## Storage backends
 
@@ -212,27 +215,25 @@ Lists stored events in ascending (oldest-first) or descending (newest-first) ord
 
 Query parameters (all optional, combinable):
 
-Param	Example	Meaning
-contract_id	CDLZ...CYSC	Only events from this contract.
-type	contract	contract | system | diagnostic.
-topic	{"symbol":"transfer"}	Exact match against any topic position. A bare word is treated as a JSON string.
-topic_contains	[{"address":"G..."}]	Postgres jsonb containment (@>) against the topics array. Pass an array to match one or more topic elements: [{"address":"G..."}] matches any event where a topic contains that address; [{"symbol":"transfer"},{"address":"G..."}] requires both. Must be parseable JSON (400 otherwise). Uses the GIN index on topics.
-topic0	{"symbol":"transfer"}	Exact match against topic position 0.
-topic1	{"address":"G..."}	Exact match against topic position 1.
-topic2	{"address":"G..."}	Exact match against topic position 2.
-topic3	{"u64":7}	Exact match against topic position 3.
-from_ledger	250000	Inclusive lower ledger bound.
-to_ledger	260000	Inclusive upper ledger bound.
-from_time	2026-07-21T00:00:00Z	Inclusive lower created_at bound (RFC 3339). Sub-second precision and missing timezone are rejected.
-to_time	2026-07-22T00:00:00Z	Inclusive upper created_at bound (RFC 3339). Sub-second precision and missing timezone are rejected.
-limit	50	Page size, 1–200 (default 50). Values outside [1, 200] or non-integers return HTTP 400.
-cursor	0001234...	Opaque pagination cursor from a previous response. Must consist of alphanumeric characters, hyphens, underscores, dots, or colons (up to 128 characters). Malformed cursors return HTTP 400.
-order	desc	asc
-decoded	true	When true, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with "decoded": false.
-include_xdr	true	When true, includes raw base64 topics_xdr and value_xdr on each event. Omitted by default to keep responses small.
-Topic filters may use topic for any-position matching, or topic0..topic3 for position-specific matching. topic and positional topic filters cannot be combined.
+| Param | Example | Meaning |
+| --- | --- | --- |
+| `contract_id` | `CDLZ...CYSC` | Only events from this contract. |
+| `type` | `contract` | `contract` \| `system` \| `diagnostic`. |
+| `topic` | `{"symbol":"transfer"}` | Exact match against any topic position. A bare word is treated as a JSON string. |
+| `topic0` | `{"symbol":"transfer"}` | Exact match against topic position 0. |
+| `topic1` | `{"address":"G..."}` | Exact match against topic position 1. |
+| `topic2` | `{"address":"G..."}` | Exact match against topic position 2. |
+| `topic3` | `{"u64":7}` | Exact match against topic position 3. |
+| `from_ledger` | `250000` | Inclusive lower ledger bound. |
+| `to_ledger` | `260000` | Inclusive upper ledger bound. |
+| `from_time` | `2026-07-21T00:00:00Z` | Inclusive lower `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
+| `to_time` | `2026-07-22T00:00:00Z` | Inclusive upper `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
+| `limit` | `50` | Page size, 1–200 (default 50). |
+| `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
+| `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
+| `decoded` | `true` | When `true`, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with `"decoded": false`. |
 
-Shell
+Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
 
 curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic={"symbol":"transfer"}&limit=2'
 Containment search (topic_contains) lets you filter by partial topic
@@ -256,6 +257,11 @@ Shell
 curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"GABC..."}&topic2={"address":"GDEF..."}'
 JSON
 
+```sh
+curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"GABC..."}&topic2={"address":"GDEF..."}'
+```
+
+```json
 {
   "events": [
     {
@@ -329,8 +335,33 @@ curl -s -X POST localhost:8080/subscriptions \
   }'
 Response (201 Created):
 
-JSON
+### Webhooks
 
+Consumers can register callback URLs that receive matching events as they are
+ingested. Delivery is asynchronous — it never blocks ingestion — and includes
+HMAC-SHA256 signatures so subscribers can verify payload authenticity.
+
+#### `POST /subscriptions`
+
+Register a new webhook subscription.
+
+```sh
+curl -s -X POST localhost:8080/subscriptions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com/webhook",
+    "secret": "whsec_z8eP5qL3vR2xK9yB4w",
+    "filters": {
+      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "type": "contract",
+      "topic": {"symbol":"transfer"}
+    }
+  }'
+```
+
+Response (`201 Created`):
+
+```json
 {
   "id": 1,
   "url": "https://example.com/webhook",
@@ -344,45 +375,56 @@ JSON
   "failure_count": 0,
   "created_at": "2026-07-24T12:00:00Z"
 }
-filters has the same shape as GET /events query parameters — an empty
-object {} matches every event. enabled defaults to true.
+```
 
-GET /subscriptions
+`filters` has the same shape as `GET /events` query parameters — an empty
+object `{}` matches every event. `enabled` defaults to `true`.
+
+#### `GET /subscriptions`
+
 List all subscriptions.
 
-Shell
-
+```sh
 curl -s localhost:8080/subscriptions
-GET /subscriptions/{id}
-Fetch a single subscription by ID. 404 if unknown.
+```
 
-Shell
+#### `GET /subscriptions/{id}`
 
+Fetch a single subscription by ID. `404` if unknown.
+
+```sh
 curl -s localhost:8080/subscriptions/1
-PUT /subscriptions/{id}
+```
+
+#### `PUT /subscriptions/{id}`
+
 Update a subscription. Only fields present in the body are changed; omit a
 field to leave it unchanged.
 
-Shell
-
+```sh
 curl -s -X PUT localhost:8080/subscriptions/1 \
   -H "Content-Type: application/json" \
   -d '{"enabled": false}'
-DELETE /subscriptions/{id}
-Delete a subscription and its delivery history. 204 No Content on success.
+```
 
-Shell
+#### `DELETE /subscriptions/{id}`
 
+Delete a subscription and its delivery history. `204 No Content` on success.
+
+```sh
 curl -s -X DELETE localhost:8080/subscriptions/1
-GET /subscriptions/{id}/deliveries
-List delivery attempts for a subscription, newest first. Optional ?limit=
+```
+
+#### `GET /subscriptions/{id}/deliveries`
+
+List delivery attempts for a subscription, newest first. Optional `?limit=`
 (default 50, max 200).
 
-Shell
-
+```sh
 curl -s localhost:8080/subscriptions/1/deliveries?limit=10
-JSON
+```
 
+```json
 [
   {
     "id": 42,
@@ -404,12 +446,14 @@ JSON
     "created_at": "2026-07-24T12:00:55Z"
   }
 ]
-Webhook payload
+```
+
+#### Webhook payload
+
 When an ingested event matches a subscription's filters, SoroTrail POSTs the
 event to the subscription's URL with this body:
 
-JSON
-
+```json
 {
   "event": {
     "id": "0001099511627776-0000000001",
@@ -425,16 +469,19 @@ JSON
     "created_at": "2026-07-24T12:00:00Z"
   }
 }
-Every request includes an X-SoroTrail-Signature header holding the
+```
+
+Every request includes an `X-SoroTrail-Signature` header holding the
 hex-encoded HMAC-SHA256 digest of the request body, keyed with the
-subscription's secret. Subscribers must verify this signature to
+subscription's secret. Subscribers **must verify** this signature to
 confirm the payload came from SoroTrail and has not been tampered with.
 
-Verifying signatures — code samples:
+**Verifying signatures — code samples:**
 
-<details> <summary>Go</summary>
-Go
+<details>
+<summary>Go</summary>
 
+```go
 import (
     "crypto/hmac"
     "crypto/sha256"
@@ -453,9 +500,14 @@ func verifySignature(r *http.Request, secret string) ([]byte, bool) {
     }
     return body, true
 }
-</details><details> <summary>Python</summary>
-Python
+```
 
+</details>
+
+<details>
+<summary>Python</summary>
+
+```python
 import hmac
 import hashlib
 
@@ -471,9 +523,14 @@ def verify_signature(request_body: bytes, signature_header: str, secret: str) ->
 #         return "bad signature", 401
 #     payload = json.loads(body)
 #     # process payload["event"]
-</details><details> <summary>JavaScript (Node.js)</summary>
-JavaScript
+```
 
+</details>
+
+<details>
+<summary>JavaScript (Node.js)</summary>
+
+```js
 const crypto = require('crypto');
 
 function verifySignature(body, signatureHeader, secret) {
@@ -488,9 +545,14 @@ function verifySignature(body, signatureHeader, secret) {
 //   const { event } = JSON.parse(req.body);
 //   // process event
 // });
-</details><details> <summary>TypeScript (Bun / Deno)</summary>
-TypeScript
+```
 
+</details>
+
+<details>
+<summary>TypeScript (Bun / Deno)</summary>
+
+```ts
 async function verifySignature(req: Request, secret: string): Promise<boolean> {
   const body = await req.arrayBuffer();
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret),
@@ -504,74 +566,86 @@ async function verifySignature(req: Request, secret: string): Promise<boolean> {
     new TextEncoder().encode(sigHeader)
   );
 }
+```
+
 </details>
-Delivery semantics
-Delivery is at-least-once: a subscriber may receive the same event more
-than once. Deduplicate by event id.
-Failed deliveries are retried up to 5 times with exponential backoff
-(1s → 2s → 4s → 8s → 16s).
-After 5 consecutive failures the subscription is auto-disabled. A
-successful delivery resets the failure counter to 0.
-Delivery attempts are recorded in delivery_attempts and queryable via
-GET /subscriptions/{id}/deliveries.
-Subscribers should return a 2xx status code to acknowledge receipt.
-Non-2xx responses are treated as failures and retried.
-GET /stats
-Shell
+
+#### Delivery semantics
+
+- Delivery is **at-least-once**: a subscriber may receive the same event more
+  than once. Deduplicate by event `id`.
+- Failed deliveries are retried up to **5 times** with exponential backoff
+  (1s → 2s → 4s → 8s → 16s).
+- After **5 consecutive failures** the subscription is **auto-disabled**. A
+  successful delivery resets the failure counter to 0.
+- Delivery attempts are recorded in `delivery_attempts` and queryable via
+  `GET /subscriptions/{id}/deliveries`.
+- Subscribers should return a **2xx status code** to acknowledge receipt.
+  Non-2xx responses are treated as failures and retried.
+
+### `GET /stats`
 
 curl -s localhost:8080/stats
 JSON
 
+```json
 {"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"oldest_stored_ledger":242001,"chain_head_ledger":260130,"ingest_lag_ledgers":7,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
-oldest_stored_ledger is the lowest ledger currently present in the
-store. chain_head_ledger is read from Stellar RPC getHealth, and
-ingest_lag_ledgers is chain_head_ledger - last_ingested_ledger. If
-the RPC is temporarily unreachable, /stats still returns HTTP 200 with
-the stored fields populated and the RPC-derived freshness fields
-(chain_head_ledger, ingest_lag_ledgers) set to null.
+```
 
-verified_through_ledger is the inclusive highest ledger whose stored
+`oldest_stored_ledger` is the lowest ledger currently present in the
+store. `chain_head_ledger` is read from Stellar RPC `getHealth`, and
+`ingest_lag_ledgers` is `chain_head_ledger - last_ingested_ledger`. If
+the RPC is temporarily unreachable, `/stats` still returns HTTP 200 with
+the stored fields populated and the RPC-derived freshness fields
+(`chain_head_ledger`, `ingest_lag_ledgers`) set to `null`.
+
+`verified_through_ledger` is the inclusive highest ledger whose stored
 events have been proven to match a fresh RPC fetch by the auditor. When
 AUDIT_ENABLED=false it stays at 0. See the Data integrity section
 below for the contract the field implies.
 
-GET /events/ws (WebSocket live stream)
+### `GET /events/ws` (WebSocket live stream)
+
 Pushes ingested events to the client over a single WebSocket connection
 as soon as they are written to the store. There is no replay — the
 stream starts at "now", and the client only sees events the indexer
 ingests after it connects.
 
-Query parameters share the same EventFilter shape as GET /events
-(contract_id, type, topic, from_ledger, to_ledger,
-from_time, to_time), so any filter that works against the query
+Query parameters share the same `EventFilter` shape as `GET /events`
+(`contract_id`, `type`, `topic`, `from_ledger`, `to_ledger`,
+`from_time`, `to_time`), so any filter that works against the query
 API works against the stream.
 
 Frame format:
 
-One store.Event per WebSocket text frame, JSON-encoded.
-Server-to-client only — clients do not send messages; the nhooyr.io/websocket
-library handles ping/pong internally.
-The server pings every 30s so proxies don't idle the connection.
+- One `store.Event` per WebSocket text frame, JSON-encoded.
+- Server-to-client only — clients do not send messages; the `nhooyr.io/websocket`
+  library handles ping/pong internally.
+- The server pings every 30s so proxies don't idle the connection.
+
 Behavior:
 
-Slow-consumer eviction: each subscriber gets a bounded channel
-buffer (broadcast.DefaultBufferSize = 64). A subscriber whose
-channel fills is evicted silently: its Events() channel is closed,
-the handler returns, and the WebSocket is closed from the server side.
-This protects the indexer from one stuck client back-pressuring the
-broadcaster.
-Broadcaster unwired: returns 501 Not Implemented (only happens
-if the binary was built without the broadcaster wired).
-Bad filter: returns 400 Bad Request before the WebSocket
-upgrade, with the standard {"error": "..."} JSON body.
-Example with websocat:
+- **Slow-consumer eviction**: each subscriber gets a bounded channel
+  buffer (`broadcast.DefaultBufferSize` = 64). A subscriber whose
+  channel fills is evicted silently: its `Events()` channel is closed,
+  the handler returns, and the WebSocket is closed from the server side.
+  This protects the indexer from one stuck client back-pressuring the
+  broadcaster.
+- **Broadcaster unwired**: returns `501 Not Implemented` (only happens
+  if the binary was built without the broadcaster wired).
+- **Bad filter**: returns `400 Bad Request` before the WebSocket
+  upgrade, with the standard `{"error": "..."}` JSON body.
 
-Shell
+Example with [`websocat`](https://github.com/vi/websocat):
 
+```sh
 websocat 'ws://localhost:8080/events/ws?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic=mint'
 {"id":"…","contract_id":"…","topics":["mint"], …}
 {"id":"…","contract_id":"…","topics":["mint"], …}
-Data integrity
+```
+
+## Data integrity
+
 A background auditor walks recently-ingested ledger ranges (behind the
 ingest frontier, inside the RPC's retention window) and re-fetches each
 range with the same filter configuration the ingester uses, comparing

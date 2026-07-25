@@ -74,9 +74,115 @@ func TestUpsertEvents_CreatesPartitionsAndIsIdempotent(t *testing.T) {
 		require.NoError(t, rows.Scan(&line))
 		plan += line + "\n"
 	}
-	require.NoError(t, rows.Err())
-	assert.Contains(t, plan, "events_10_19")
-	assert.NotContains(t, plan, "events_20_29")
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	t.Run("by contract", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{ContractID: contractB})
+		require.NoError(t, err)
+		assert.Len(t, got, 5)
+	})
+
+	t.Run("by ledger range", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{FromLedger: 103, ToLedger: 105})
+		require.NoError(t, err)
+		assert.Len(t, got, 3)
+	})
+
+	t.Run("by type", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{Type: "diagnostic"})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, eventID(3), got[0].ID)
+	})
+
+	t.Run("by topic at any position", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{Topic: json.RawMessage(`{"u64":7}`)})
+		require.NoError(t, err)
+		assert.Len(t, got, 9, "second-position topic matches too")
+
+		got, _, err = st.QueryEvents(ctx, EventFilter{Topic: json.RawMessage(`{"symbol":"mint"}`)})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+	})
+
+	t.Run("keyset pagination walks all rows in order", func(t *testing.T) {
+		var all []Event
+		cursor := ""
+		for {
+			page, next, err := st.QueryEvents(ctx, EventFilter{Limit: 3, Cursor: cursor})
+			require.NoError(t, err)
+			all = append(all, page...)
+			if next == "" {
+				break
+			}
+			cursor = next
+		}
+		require.Len(t, all, 10)
+		for i := 1; i < len(all); i++ {
+			assert.Less(t, all[i-1].ID, all[i].ID, "ascending ID order across pages")
+		}
+	})
+
+	t.Run("by topic_contains with object in array (containment)", func(t *testing.T) {
+		// topic_contains=[{"u64":7}] should match events whose topics array
+		// contains an element that jsonb-contains {"u64":7}.
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TopicContains: json.RawMessage(`[{"u64":7}]`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 9, "all events with u64:7 (9 out of 10)")
+	})
+
+	t.Run("by topic_contains with object directly does not match array", func(t *testing.T) {
+		// Passing an object directly (not wrapped in array) won't match an
+		// array column — jsonb array @> object is always false in Postgres.
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TopicContains: json.RawMessage(`{"u64":7}`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 0, "object not in array => no match")
+	})
+
+	t.Run("by topic_contains combined with contract_id", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			ContractID:    contractB,
+			TopicContains: json.RawMessage(`[{"u64":7}]`),
+		})
+		require.NoError(t, err)
+		// contractB has 5 events (even indexes), all of which contain {"u64":7}.
+		assert.Len(t, got, 5)
+	})
+
+	t.Run("by topic_contains no match", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TopicContains: json.RawMessage(`[{"symbol":"nonexistent"}]`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 0)
+	})
+
+	t.Run("keyset pagination desc returns newest-first", func(t *testing.T) {
+		var all []Event
+		cursor := ""
+		for {
+			page, next, err := st.QueryEvents(ctx, EventFilter{
+				Limit:  3,
+				Cursor: cursor,
+				Order:  "desc",
+			})
+			require.NoError(t, err)
+			all = append(all, page...)
+			if next == "" {
+				break
+			}
+			cursor = next
+		}
+		require.Len(t, all, 10)
+		for i := 1; i < len(all); i++ {
+			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
+		}
+	})
 }
 
 func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
@@ -167,6 +273,15 @@ func TestPostgres_StatsWithExplain(t *testing.T) {
 	var plan string
 	rows, err := st.pool.Query(ctx, `EXPLAIN (COSTS OFF) SELECT coalesce(min(ledger), 0) FROM events`)
 	require.NoError(t, err)
+	assert.Equal(t, int64(2), stats.TotalEvents)
+	assert.Equal(t, int64(101), stats.LastIngestedLedger)
+	assert.Equal(t, int64(100), stats.OldestStoredLedger)
+	assert.Equal(t, int64(2), stats.ContractCount)
+	assert.Equal(t, int64(1), stats.WatchedContracts)
+
+	var plan string
+	rows, err := st.pool.Query(ctx, `EXPLAIN (COSTS OFF) SELECT coalesce(min(ledger), 0) FROM events`)
+	require.NoError(t, err)
 	defer rows.Close()
 	for rows.Next() {
 		var line string
@@ -174,6 +289,31 @@ func TestPostgres_StatsWithExplain(t *testing.T) {
 		plan += line + "\n"
 	}
 	require.NoError(t, rows.Err())
+	// The exact partition index name is Postgres-generated; the important
+	// property is that min(ledger) stays index-backed.
 	assert.Contains(t, plan, "Index")
 	assert.Contains(t, plan, "ledger")
+}
+
+// TestQueryEvents_PositionalTopics exercises the topic0..topic3 positional
+// filters in their own truncated DB so the extra rows do not leak into the
+// shared-dataset assertions in TestQueryEvents_FiltersAndPagination.
+func TestQueryEvents_PositionalTopics(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	e1 := testEvent(eventID(100), 200, contractA)
+	e1.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GABC"},{"address":"GDEF"}]`)
+	e2 := testEvent(eventID(101), 201, contractA)
+	e2.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GDEF"},{"address":"GABC"}]`)
+	_, err := st.UpsertEvents(ctx, []Event{e1, e2})
+	require.NoError(t, err)
+
+	got, _, err := st.QueryEvents(ctx, EventFilter{
+		Topic0: json.RawMessage(`{"symbol":"transfer"}`),
+		Topic1: json.RawMessage(`{"address":"GABC"}`),
+	})
+	require.NoError(t, err)
+	assert.Len(t, got, 1)
+	assert.Equal(t, e1.ID, got[0].ID)
 }

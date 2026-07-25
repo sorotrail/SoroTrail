@@ -92,22 +92,22 @@ type EventFilter struct {
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic json.RawMessage
+	// Topic0-Topic3 match the exact JSON value at that specific topic array
+	// position. Unspecified positions are wildcards.
+	Topic0 json.RawMessage
+	Topic1 json.RawMessage
+	Topic2 json.RawMessage
+	Topic3 json.RawMessage
 	// TopicContains matches events whose topics array jsonb-contains this
 	// value (Postgres @> operator). Unlike Topic, the value is passed
 	// directly without array-wrapping, so callers can use multi-element
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	// Topic0-Topic3 match the exact JSON value at that specific topic array
-	// position. Unspecified positions are wildcards.
-	Topic0     json.RawMessage
-	Topic1     json.RawMessage
-	Topic2     json.RawMessage
-	Topic3     json.RawMessage
-	FromLedger int64     // inclusive
-	ToLedger   int64     // inclusive
-	FromTime   time.Time // inclusive, zero = no constraint
-	ToTime     time.Time // inclusive, zero = no constraint
+	FromLedger    int64     // inclusive
+	ToLedger      int64     // inclusive
+	FromTime      time.Time // inclusive, zero = no constraint
+	ToTime        time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int
@@ -431,6 +431,7 @@ type Store interface {
 	// ListDeliveryAttempts returns delivery attempts for a subscription,
 	// newest first.
 	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
+
 	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
 	// or ErrNotFound when no spec is cached for that hash.
 	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
