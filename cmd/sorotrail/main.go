@@ -28,6 +28,7 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/ingester"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/khaylebfortune/sorotrail/internal/webhook"
 )
 
 func main() {
@@ -102,11 +103,16 @@ func run() error {
 
 	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
 	bcast := broadcast.New(broadcast.DefaultBufferSize)
+	// Webhook delivery runs alongside ingestion — the notifier is attached
+	// to the ingester so events flow to subscriber callbacks asynchronously.
+	wh := webhook.NewNotifier(st, log)
+
 	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
 		RetentionLedgers: cfg.RetentionLedgers,
 	}).WithBroadcaster(bcast)
+	ing.SetNotifier(wh)
 
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a
@@ -146,7 +152,10 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
+	go func() {
+		go wh.Run(ctx)
+	}()
 	go func() {
 		log.Info("ingester starting", "rpc_url", cfg.RPCURL, "poll_interval", cfg.PollInterval)
 		if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -179,9 +188,9 @@ func run() error {
 	}
 
 	var firstErr error
-	remaining := 2 // ingester + http server
+	remaining := 3 // ingester + http server + webhook
 	if aud != nil {
-		remaining = 3
+		remaining = 4
 	}
 	select {
 	case <-ctx.Done():
