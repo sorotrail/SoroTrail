@@ -674,6 +674,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
 	}
 
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
+	}
+
 	switch t := q.Get("type"); t {
 	case "", "contract", "system", "diagnostic":
 		f.Type = t
@@ -693,6 +697,16 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 			return nil, fmt.Errorf("invalid %s: %w", name, err)
 		}
 		return quoted, nil
+	}
+
+	// topic_contains accepts any valid JSON value and uses @> containment
+	// directly (no automatic array-wrapping). Unlike topic, bare words are
+	// not allowed — the input must be parseable JSON.
+	if raw := q.Get("topic_contains"); raw != "" {
+		if !json.Valid([]byte(raw)) {
+			return f, fmt.Errorf("topic_contains must be valid JSON")
+		}
+		f.TopicContains = json.RawMessage(raw)
 	}
 
 	// order controls sort direction for paginated results.
@@ -753,10 +767,12 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if raw := q.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
-		if err != nil || limit <= 0 || limit > store.MaxQueryLimit {
+		if err != nil || limit < 1 || limit > store.MaxQueryLimit {
 			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
 		}
 		f.Limit = limit
+	} else {
+		f.Limit = store.DefaultQueryLimit
 	}
 	return f, nil
 }

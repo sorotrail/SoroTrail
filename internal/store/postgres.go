@@ -383,6 +383,11 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		where = append(where,
 			fmt.Sprintf("topics->%d = %s::jsonb", i, arg(topic)))
 	}
+	if len(f.TopicContains) > 0 {
+		// Direct containment — caller controls the shape (object wrapped in
+		// array for element match, multi-element arrays for subset match).
+		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
+	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))
 	}
