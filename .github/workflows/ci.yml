@@ -30,8 +30,8 @@ jobs:
           --health-timeout 2s
           --health-retries 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5.5.0
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -66,8 +66,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5.5.0
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -81,7 +81,7 @@ jobs:
   helm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
         with:
           version: v3.15.0
