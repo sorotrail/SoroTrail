@@ -96,6 +96,13 @@ func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
 	return s.exists, s.existsErr
 }
 
+func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
+	return nil, store.ErrNotFound
+}
+func (s *stubStore) SetContractSpec(context.Context, string, string, []byte) error {
+	return nil
+}
+
 // GetIngestionState backs the list-cache frontier lookup. Tests stage
 // LastIngestedLedger to drive the boundary decisions (just-below, at,
 // and above the frontier).
@@ -225,7 +232,13 @@ func TestListEvents_BadParams(t *testing.T) {
 		"/events?from_time=2026-07-21T00:00:00.123Z",
 		"/events?from_time=2026-07-22T00:00:00Z&to_time=2026-07-21T00:00:00Z",
 		"/events?limit=0",
+		"/events?limit=-1",
 		"/events?limit=99999",
+		"/events?limit=abc",
+		"/events?cursor=bad%20cursor",
+		"/events?cursor=e1%3BDROP",
+		"/events?cursor=%3Cscript%3E",
+		"/events?cursor=cursor%27OR%271%3D%271",
 		"/events?topic_contains=not-valid-json",
 	} {
 		t.Run(path, func(t *testing.T) {
@@ -235,6 +248,43 @@ func TestListEvents_BadParams(t *testing.T) {
 			require.NoError(t, json.Unmarshal(body, &e))
 			assert.NotEmpty(t, e["error"])
 		})
+	}
+}
+
+func TestListEvents_CursorAndLimitValidation(t *testing.T) {
+	st := &stubStore{
+		events: []store.Event{{ID: "e1"}},
+	}
+	srv := newTestServer(st, nil)
+
+	// Valid limit and valid cursor
+	resp, _ := doGet(t, srv, "/events?limit=10&cursor=0001099511627776-0000000001")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, 10, st.lastFilter.Limit)
+	assert.Equal(t, "0001099511627776-0000000001", st.lastFilter.Cursor)
+
+	// Omitted limit applies default
+	st.lastFilter = store.EventFilter{}
+	resp, _ = doGet(t, srv, "/events")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, store.DefaultQueryLimit, st.lastFilter.Limit)
+
+	// Invalid limit returns 400
+	for _, badLimit := range []string{"0", "-5", "201", "xyz"} {
+		resp, body := doGet(t, srv, "/events?limit="+badLimit)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var errResp map[string]string
+		require.NoError(t, json.Unmarshal(body, &errResp))
+		assert.Contains(t, errResp["error"], "limit must be an integer in [1,200]")
+	}
+
+	// Malformed cursor returns 400
+	for _, badCursor := range []string{"has%20space", "e1%3BDROP", "cursor%27OR%271%3D%271", "%3Cscript%3E"} {
+		resp, body := doGet(t, srv, "/events?cursor="+badCursor)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var errResp map[string]string
+		require.NoError(t, json.Unmarshal(body, &errResp))
+		assert.Contains(t, errResp["error"], "invalid cursor")
 	}
 }
 

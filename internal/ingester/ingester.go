@@ -67,8 +67,8 @@ type Ingester struct {
 	decoder  decode.Decoder
 	log      *slog.Logger
 	opts     Options
-	notifier EventNotifier // optional; nil means no notification
 	bcast    *broadcast.Broadcaster
+	notifier EventNotifier // optional; nil means no notification
 }
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
@@ -91,6 +91,20 @@ func (ing *Ingester) SetNotifier(n EventNotifier) {
 func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
 	ing.bcast = b
 	return ing
+}
+
+// WithBroadcaster attaches a live event broadcaster so ingested events are
+// pushed to streaming subscribers.
+func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
+	ing.bcast = b
+	return ing
+}
+
+// SetNotifier attaches an optional EventNotifier that is called after
+// every successful event persistence. When nil (the default) no
+// notification is sent — the ingester behaves exactly as before.
+func (ing *Ingester) SetNotifier(n EventNotifier) {
+	ing.notifier = n
 }
 
 // Run polls until ctx is canceled. Errors are logged and retried with
@@ -387,13 +401,13 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
 		"latest_ledger", latestLedger)
 
+	if ing.bcast != nil {
+		ing.bcast.Publish(ctx, events)
+	}
 	// Notify webhooks (or other listeners) after successful persistence.
 	// This is a fire-and-forget call — it must never block ingestion.
 	if ing.notifier != nil {
 		ing.notifier.NotifyEvents(ctx, events)
-	}
-	if ing.bcast != nil {
-		ing.bcast.Publish(ctx, events)
 	}
 	return nil
 }

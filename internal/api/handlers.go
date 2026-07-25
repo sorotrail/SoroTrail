@@ -73,34 +73,10 @@ type eventsResponse struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
-type eventsWithXDRResponse struct {
-	Events []eventWithXDR `json:"events"`
-	// Cursor is non-empty when another page exists; pass it back as ?cursor=.
-	Cursor string `json:"cursor,omitempty"`
-}
-
 type enrichedEventsResponse struct {
 	Events []store.EnrichedEvent `json:"events"`
 	// Cursor is non-empty when another page exists.
 	Cursor string `json:"cursor,omitempty"`
-}
-
-type enrichedEventsWithXDRResponse struct {
-	Events []enrichedEventWithXDR `json:"events"`
-	// Cursor is non-empty when another page exists.
-	Cursor string `json:"cursor,omitempty"`
-}
-
-type eventWithXDR struct {
-	store.Event
-	TopicsXDR []string `json:"topics_xdr"`
-	ValueXDR  *string  `json:"value_xdr"`
-}
-
-type enrichedEventWithXDR struct {
-	eventWithXDR
-	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
-	Decoded      bool                        `json:"decoded"`
 }
 
 type healthResponse struct {
@@ -177,18 +153,9 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
-
 	decoded := r.URL.Query().Get("decoded") == "true"
-	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), events)
-		if includeXDR {
-			writeJSON(w, http.StatusOK, enrichedEventsWithXDRResponse{
-				Events: enrichEventsWithXDR(enriched),
-				Cursor: cursor,
-			})
-			return
-		}
 		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
 		return
 	}
@@ -247,16 +214,10 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
-
 	decoded := r.URL.Query().Get("decoded") == "true"
-	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {
-			if includeXDR {
-				writeJSON(w, http.StatusOK, enrichEventWithXDR(enriched[0]))
-				return
-			}
 			writeJSON(w, http.StatusOK, enriched[0])
 			return
 		}
@@ -571,6 +532,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
 	}
 
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
+	}
+
 	switch t := q.Get("type"); t {
 	case "", "contract", "system", "diagnostic":
 		f.Type = t
@@ -660,10 +625,12 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if raw := q.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
-		if err != nil || limit <= 0 || limit > store.MaxQueryLimit {
+		if err != nil || limit < 1 || limit > store.MaxQueryLimit {
 			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
 		}
 		f.Limit = limit
+	} else {
+		f.Limit = store.DefaultQueryLimit
 	}
 	return f, nil
 }

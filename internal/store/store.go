@@ -99,27 +99,23 @@ type EventFilter struct {
 	Type       string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
-	Topic      json.RawMessage
+	Topic json.RawMessage
+	// Topic0-Topic3 match the exact JSON value at that specific topic array
+	// position. Unspecified positions are wildcards.
+	Topic0 json.RawMessage
+	Topic1 json.RawMessage
+	Topic2 json.RawMessage
+	Topic3 json.RawMessage
 	// TopicContains matches events whose topics array jsonb-contains this
 	// value (Postgres @> operator). Unlike Topic, the value is passed
 	// directly without array-wrapping, so callers can use multi-element
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	Topic json.RawMessage
-	// Decoded matches events whose plugin-decoded payload contains this
-	// JSON value (Postgres @> containment on decoded_payload).
-	Decoded json.RawMessage
-	// Topic0-Topic3 match the exact JSON value at that specific topic array
-	// position. Unspecified positions are wildcards.
-	Topic0     json.RawMessage
-	Topic1     json.RawMessage
-	Topic2     json.RawMessage
-	Topic3     json.RawMessage
-	FromLedger int64     // inclusive
-	ToLedger   int64     // inclusive
-	FromTime   time.Time // inclusive, zero = no constraint
-	ToTime     time.Time // inclusive, zero = no constraint
+	FromLedger    int64     // inclusive
+	ToLedger      int64     // inclusive
+	FromTime      time.Time // inclusive, zero = no constraint
+	ToTime        time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int
@@ -183,12 +179,12 @@ type AuditFinding struct {
 // GET /events query parameters. An empty (zero-value) filter matches
 // every event.
 type SubscriptionFilter struct {
-	ContractID string          `json:"contract_id,omitempty"`
-	Type       string          `json:"type,omitempty"`
+	ContractID    string          `json:"contract_id,omitempty"`
+	Type          string          `json:"type,omitempty"`
 	Topic         json.RawMessage `json:"topic,omitempty"`
 	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
 	FromLedger    int64           `json:"from_ledger,omitempty"`
-	ToLedger   int64           `json:"to_ledger,omitempty"`
+	ToLedger      int64           `json:"to_ledger,omitempty"`
 }
 
 // MatchesEvent reports whether an event passes this filter. Zero fields
@@ -301,16 +297,6 @@ type DeliveryAttempt struct {
 // to match a fresh RPC fetch; 0 means no ledger has been verified yet.
 // Auditor counters are filled in by the API layer when an auditor is wired.
 type Stats struct {
-	TotalEvents        int64 `json:"total_events"`
-	LastIngestedLedger int64 `json:"last_ingested_ledger"`
-	ContractCount      int64 `json:"contract_count"`
-	WatchedContracts   int64 `json:"watched_contracts"`
-	DecodedEvents      int64 `json:"decoded_events"`
-	TotalEvents           int64 `json:"total_events"`
-	LastIngestedLedger    int64 `json:"last_ingested_ledger"`
-	VerifiedThroughLedger int64 `json:"verified_through_ledger"`
-	ContractCount         int64 `json:"contract_count"`
-	WatchedContracts      int64 `json:"watched_contracts"`
 	TotalEvents           int64  `json:"total_events"`
 	LastIngestedLedger    int64  `json:"last_ingested_ledger"`
 	VerifiedThroughLedger int64  `json:"verified_through_ledger"`
@@ -453,6 +439,7 @@ type Store interface {
 	// ListDeliveryAttempts returns delivery attempts for a subscription,
 	// newest first.
 	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
+
 	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
 	// or ErrNotFound when no spec is cached for that hash.
 	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
