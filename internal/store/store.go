@@ -112,22 +112,16 @@ type EventFilter struct {
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic json.RawMessage
-	// TopicContains matches events whose topics array jsonb-contains this
-	// value (Postgres @> operator). Unlike Topic, the value is passed
-	// directly without array-wrapping, so callers can use multi-element
-	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
-	// Uses the GIN index on events.topics.
-	TopicContains json.RawMessage
 	// Topic0-Topic3 match the exact JSON value at that specific topic array
 	// position. Unspecified positions are wildcards.
 	Topic0     json.RawMessage
 	Topic1     json.RawMessage
 	Topic2     json.RawMessage
 	Topic3     json.RawMessage
-	FromLedger  int64     // inclusive
-	ToLedger    int64     // inclusive
-	FromTime    time.Time // inclusive, zero = no constraint
-	ToTime      time.Time // inclusive, zero = no constraint
+	FromLedger int64     // inclusive
+	ToLedger   int64     // inclusive
+	FromTime   time.Time // inclusive, zero = no constraint
+	ToTime     time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int
@@ -191,12 +185,11 @@ type AuditFinding struct {
 // GET /events query parameters. An empty (zero-value) filter matches
 // every event.
 type SubscriptionFilter struct {
-	ContractID    string          `json:"contract_id,omitempty"`
-	Type          string          `json:"type,omitempty"`
-	Topic         json.RawMessage `json:"topic,omitempty"`
-	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
-	FromLedger    int64           `json:"from_ledger,omitempty"`
-	ToLedger      int64           `json:"to_ledger,omitempty"`
+	ContractID string          `json:"contract_id,omitempty"`
+	Type       string          `json:"type,omitempty"`
+	Topic      json.RawMessage `json:"topic,omitempty"`
+	FromLedger int64           `json:"from_ledger,omitempty"`
+	ToLedger   int64           `json:"to_ledger,omitempty"`
 }
 
 // MatchesEvent reports whether an event passes this filter. Zero fields
@@ -215,69 +208,24 @@ func (f SubscriptionFilter) MatchesEvent(e Event) bool {
 	if f.ToLedger > 0 && e.Ledger > f.ToLedger {
 		return false
 	}
-	if (len(f.Topic) > 0 || len(f.TopicContains) > 0) && len(e.Topics) > 0 {
+	if len(f.Topic) > 0 && len(e.Topics) > 0 {
+		// Match if any event topic equals the filter topic.
 		var topics []json.RawMessage
 		if err := json.Unmarshal(e.Topics, &topics); err != nil {
 			return false
 		}
-
-		if len(f.Topic) > 0 {
-			// Match if any event topic equals the filter topic.
-			matched := false
-			for _, t := range topics {
-				if string(t) == string(f.Topic) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				return false
+		matched := false
+		for _, t := range topics {
+			if string(t) == string(f.Topic) {
+				matched = true
+				break
 			}
 		}
-
-		if len(f.TopicContains) > 0 {
-			// Unwrap a single-element array so topic_contains=[{...}] works
-			// the same way in-memory as it does in Postgres @> containment.
-			needle := f.TopicContains
-			var arr []json.RawMessage
-			if err := json.Unmarshal(f.TopicContains, &arr); err == nil && len(arr) == 1 {
-				needle = arr[0]
-			}
-			matched := false
-			for _, t := range topics {
-				if jsonbContains(t, needle) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				return false
-			}
+		if !matched {
+			return false
 		}
 	}
 	return true
-}
-
-// jsonbContains reports whether the container jsonb-contains the contained
-// value. For objects it checks that every key in contained exists with the
-// same raw JSON value in container; for scalars/arrays it falls back to
-// direct byte comparison (JSON string equality). This mirrors the Postgres
-// @> operator's semantics for the topic-matching use case.
-func jsonbContains(container, contained json.RawMessage) bool {
-	// If both are objects, check key-value subset.
-	var cMap, dMap map[string]json.RawMessage
-	if json.Unmarshal(container, &cMap) == nil && json.Unmarshal(contained, &dMap) == nil {
-		for k, v := range dMap {
-			cv, ok := cMap[k]
-			if !ok || string(cv) != string(v) {
-				return false
-			}
-		}
-		return true
-	}
-	// Fallback: exact JSON string match (handles strings, numbers, and
-	// cases where unmarshalling into map failed — e.g. arrays).
-	return string(container) == string(contained)
 }
 
 // Subscription is one registered webhook callback.
@@ -451,28 +399,6 @@ type Store interface {
 	// ListDeliveryAttempts returns delivery attempts for a subscription,
 	// newest first.
 	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
-	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
-	// or ErrNotFound when no spec is cached for that hash.
-	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
-	// SetContractSpec persists a JSON-serialized spec keyed by wasm_hash
-	// and contract_id so subsequent lookups avoid an RPC round trip.
-	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
-
-	// ContractMeta methods for the token metadata cache.
-	// GetContractMeta returns the cached metadata for a contract, or
-	// ErrNotFound when no row exists for that contract.
-	GetContractMeta(ctx context.Context, contractID string) (ContractMeta, error)
-	// UpsertContractMeta inserts or updates a contract metadata row.
-	UpsertContractMeta(ctx context.Context, m ContractMeta) error
-	// ListContractIDs returns all distinct contract IDs from the events
-	// table. Used by the metadata worker to discover contracts to enrich.
-	ListContractIDs(ctx context.Context) ([]string, error)
-	// ListContractsNeedingRefresh returns contract IDs whose metadata
-	// was fetched before the given cutoff, or that have no metadata row
-	// at all (including contracts never yet probed).
-	ListContractsNeedingRefresh(ctx context.Context, olderThan time.Time) ([]string, error)
-	// CountContractEvents returns the number of events for a given contract.
-	CountContractEvents(ctx context.Context, contractID string) (int64, error)
 
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error

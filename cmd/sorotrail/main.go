@@ -104,16 +104,11 @@ func run() error {
 	}
 
 	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
+	bcast := broadcast.New(broadcast.DefaultBufferSize)
 	// Webhook delivery runs alongside ingestion — the notifier is attached
 	// to the ingester so events flow to subscriber callbacks asynchronously.
 	wh := webhook.NewNotifier(st, log)
 
-	// Wire the spec cache and enricher for spec-decoded event views.
-	specCache := spec.NewCache(st)
-	specFetcher := spec.NewFetcher(rpcClient)
-	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
-
-	bcast := broadcast.New(broadcast.DefaultBufferSize)
 	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
@@ -150,7 +145,7 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpcClient, log, specEnricher).WithBroadcaster(bcast)
+	apiServer := api.New(st, rpcClient, log).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{
@@ -215,10 +210,7 @@ func run() error {
 	var firstErr error
 	remaining := 3 // ingester + http server + webhook
 	if aud != nil {
-		remaining++
-	}
-	if cfg.ContractMetaEnabled {
-		remaining++ // metadata enrichment worker
+		remaining = 4
 	}
 	select {
 	case <-ctx.Done():

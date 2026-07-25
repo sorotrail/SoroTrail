@@ -175,11 +175,6 @@ func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
 func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
 func (m *mockStore) Ping(context.Context) error                 { return nil }
 
-func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
-	return nil, store.ErrNotFound
-}
-func (m *mockStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
-
 // Subscription stubs for the webhook feature.
 func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
 	sub.ID = 1
@@ -208,21 +203,6 @@ func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 }
 func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
 	return nil, nil
-}
-func (m *mockStore) GetContractMeta(context.Context, string) (store.ContractMeta, error) {
-	return store.ContractMeta{}, store.ErrNotFound
-}
-func (m *mockStore) UpsertContractMeta(context.Context, store.ContractMeta) error {
-	return nil
-}
-func (m *mockStore) ListContractIDs(context.Context) ([]string, error) {
-	return nil, nil
-}
-func (m *mockStore) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
-	return nil, nil
-}
-func (m *mockStore) CountContractEvents(context.Context, string) (int64, error) {
-	return 0, nil
 }
 
 // passthroughDecoder avoids XDR fixtures in ingester tests.

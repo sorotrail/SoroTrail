@@ -135,21 +135,6 @@ func (s *stubStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
-func (s *stubStore) GetContractMeta(context.Context, string) (store.ContractMeta, error) {
-	return store.ContractMeta{}, store.ErrNotFound
-}
-func (s *stubStore) UpsertContractMeta(context.Context, store.ContractMeta) error {
-	return nil
-}
-func (s *stubStore) ListContractIDs(context.Context) ([]string, error) {
-	return nil, nil
-}
-func (s *stubStore) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
-	return nil, nil
-}
-func (s *stubStore) CountContractEvents(context.Context, string) (int64, error) {
-	return 0, nil
-}
 
 type stubRPC struct {
 	rpc.Client

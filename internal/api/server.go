@@ -53,12 +53,11 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store    store.Store
-	rpc      rpc.Client
-	enricher Enricher
-	log      *slog.Logger
-	limiter  *RateLimiter
-	bcast    *broadcast.Broadcaster
+	store   store.Store
+	rpc     rpc.Client
+	log     *slog.Logger
+	limiter *RateLimiter
+	bcast   *broadcast.Broadcaster
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -68,6 +67,20 @@ func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enr
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
+	return s
+}
+
+// SetRateLimiter wires a per-client rate limiter into the router. Pass
+// nil to leave the limiter disabled (the default — no behavior change).
+// The limiter's Start/Stop lifecycle is owned by main, not by the Server.
+func (s *Server) SetRateLimiter(l *RateLimiter) {
+	s.limiter = l
+}
+
+// WithBroadcaster attaches the live event broadcaster so streaming endpoints
+// (SSE, WebSocket) can deliver events as they arrive.
+func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
+	s.bcast = b
 	return s
 }
 

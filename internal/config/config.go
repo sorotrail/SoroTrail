@@ -55,19 +55,18 @@ type Config struct {
 	// intermediaries cannot. Defaults to false (the deployment does not
 	// need request-scoped caching).
 	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
-
-	// ContractMetaEnabled toggles the background contract metadata
-	// enrichment worker. When false the worker is not started and
-	// /contracts endpoints return null metadata. Defaults to true so
-	// deployments get enrichment out of the box.
-	ContractMetaEnabled bool `env:"CONTRACT_META_ENABLED" envDefault:"true"`
-	// ContractMetaTTL is how long cached token metadata is considered
-	// fresh before the worker re-fetches it. Token name/symbol/decimals
-	// rarely change, so the default is 24h. Set to 0 to never refresh
-	// (one-shot fetch).
-	ContractMetaTTL time.Duration `env:"CONTRACT_META_TTL" envDefault:"24h"`
-	// ContractMetaInterval is the sleep between enrichment worker passes.
-	ContractMetaInterval time.Duration `env:"CONTRACT_META_INTERVAL" envDefault:"60s"`
+	// HTTP rate limiting (per client). RATE_LIMIT_RPS / RATE_LIMIT_BURST
+	// are both unset (zero) by default, which disables the limiter
+	// entirely — a no-op middleware — so deployments without this turned
+	// on keep today's behavior bit-for-bit.
+	//
+	// RATE_LIMIT_TRUSTED_PROXY defaults to false because X-Forwarded-For
+	// is set by the client itself; enabling it without an upstream proxy
+	// that strips/rewrites the header would let any caller pick their own
+	// rate-limit key and bypass arbitrary per-IP throttling.
+	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
+	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
+	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
 }
 
 // Load reads configuration from the environment and validates it.

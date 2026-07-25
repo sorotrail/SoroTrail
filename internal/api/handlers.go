@@ -596,16 +596,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return quoted, nil
 	}
 
-	// topic_contains accepts any valid JSON value and uses @> containment
-	// directly (no automatic array-wrapping). Unlike topic, bare words are
-	// not allowed — the input must be parseable JSON.
-	if raw := q.Get("topic_contains"); raw != "" {
-		if !json.Valid([]byte(raw)) {
-			return f, fmt.Errorf("topic_contains must be valid JSON")
-		}
-		f.TopicContains = json.RawMessage(raw)
-	}
-
 	// order controls sort direction for paginated results.
 	order := q.Get("order")
 	switch order {

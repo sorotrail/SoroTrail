@@ -349,11 +349,6 @@ func (m *mockStore) Stats(context.Context) (store.Stats, error) {
 
 func (m *mockStore) Ping(context.Context) error { return nil }
 
-func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
-	return nil, store.ErrNotFound
-}
-func (m *mockStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
-
 // Subscription stubs for the webhook feature — unused by auditor tests.
 func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
 	sub.ID = 1
@@ -382,23 +377,6 @@ func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 }
 func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
 	return nil, nil
-}
-
-// Contract metadata stubs.
-func (m *mockStore) GetContractMeta(_ context.Context, contractID string) (store.ContractMeta, error) {
-	return store.ContractMeta{}, store.ErrNotFound
-}
-func (m *mockStore) UpsertContractMeta(_ context.Context, _ store.ContractMeta) error {
-	return nil
-}
-func (m *mockStore) ListContractIDs(context.Context) ([]string, error) {
-	return nil, nil
-}
-func (m *mockStore) ListContractsNeedingRefresh(_ context.Context, _ time.Time) ([]string, error) {
-	return nil, nil
-}
-func (m *mockStore) CountContractEvents(context.Context, string) (int64, error) {
-	return 0, nil
 }
 
 // seedLedgers records pre-existing events in m.events so tests can set up
