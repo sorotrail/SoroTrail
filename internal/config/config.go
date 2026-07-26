@@ -14,17 +14,28 @@ import (
 // Config holds all runtime configuration. Every field is settable via the
 // environment variable named in its `env` tag; see .env.example for docs.
 type Config struct {
-	RPCURL              string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
-	RPCURLS             []string      `env:"RPC_URLS"`
-	RPCRateLimitRPS     float64       `env:"RPC_RATE_LIMIT_RPS" envDefault:"10"`
-	DatabaseURL         string        `env:"DATABASE_URL"`
-	PollInterval        time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
-	HTTPAddr            string        `env:"HTTP_ADDR" envDefault:":8080"`
-	WatchedContracts    []string      `env:"WATCHED_CONTRACTS"`
-	StartLedger         uint32        `env:"START_LEDGER"`
-	RetentionLedgers    uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
-	PartitionLedgerSpan uint32        `env:"PARTITION_LEDGER_SPAN" envDefault:"120960"`
-	LogLevel            string        `env:"LOG_LEVEL" envDefault:"info"`
+	RPCURL                string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
+	DatabaseURL           string        `env:"DATABASE_URL"`
+	PollInterval          time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
+	HTTPAddr              string        `env:"HTTP_ADDR" envDefault:":8080"`
+	WatchedContracts      []string      `env:"WATCHED_CONTRACTS"`
+	StartLedger           uint32        `env:"START_LEDGER"`
+	RetentionLedgers      uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
+	PartitionLedgerSpan   uint32        `env:"PARTITION_LEDGER_SPAN" envDefault:"120960"`
+	LogLevel              string        `env:"LOG_LEVEL" envDefault:"info"`
+	APIQueryTimeout       time.Duration `env:"API_QUERY_TIMEOUT" envDefault:"25s"`
+	APISlowQueryThreshold time.Duration `env:"API_SLOW_QUERY_THRESHOLD" envDefault:"2s"`
+
+	// Horizon backfill configuration. HORIZON_URL is the REST endpoint
+	// the backfill command reads; BACKFILL_RATE_RPS controls how many
+	// requests per second the backfill command issues (env/v11 parses
+	// the float directly). Both are used only by `sorotrail backfill`,
+	// not by the live indexer. The defaults match the documented
+	// public-testnet target and a safe ~10 req/s pace; private
+	// deployments can point HORIZON_URL at themselves and allow a
+	// tighter rate via the flag or env override.
+	HorizonURL      string  `env:"HORIZON_URL" envDefault:"https://horizon-testnet.stellar.org"`
+	BackfillRateRPS float64 `env:"BACKFILL_RATE_RPS" envDefault:"10"`
 
 	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
 	// entirely; the binary behaves exactly like the pre-audit build.
@@ -37,6 +48,12 @@ type Config struct {
 	AuditMaxRepair      int           `env:"AUDIT_MAX_REPAIR_ATTEMPTS" envDefault:"3"`
 	AuditFindingMaxLgrs uint32        `env:"AUDIT_FINDING_MAX_LEDGERS" envDefault:"100"`
 
+	// APIKey, when set, gates the watched-contracts management endpoints
+	// via a constant-time comparison against the X-API-Key request header.
+	// Empty means the watched-contracts surface starts up rejected (every
+	// request gets a 503 with a "no API_KEY configured" message), so
+	// writes are never open even when other auth would be off.
+	APIKey string `env:"API_KEY"`
 	// HTTP rate limiting (per client). RATE_LIMIT_RPS / RATE_LIMIT_BURST
 	// are both unset (zero) by default, which disables the limiter
 	// entirely — a no-op middleware — so deployments without this turned
@@ -94,8 +111,17 @@ func (c Config) Validate() error {
 			return fmt.Errorf("RPC_URL %q is not a valid URL", c.RPCURL)
 		}
 	}
+	if u, err := url.Parse(c.HorizonURL); err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("HORIZON_URL %q is not a valid URL", c.HorizonURL)
+	}
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("POLL_INTERVAL must be positive, got %s", c.PollInterval)
+	}
+	if c.APIQueryTimeout <= 0 {
+		return fmt.Errorf("API_QUERY_TIMEOUT must be positive, got %s", c.APIQueryTimeout)
+	}
+	if c.APISlowQueryThreshold <= 0 {
+		return fmt.Errorf("API_SLOW_QUERY_THRESHOLD must be positive, got %s", c.APISlowQueryThreshold)
 	}
 	if c.RetentionLedgers == 0 {
 		return fmt.Errorf("RETENTION_LEDGERS must be positive")
@@ -175,9 +201,9 @@ func ValidCursor(s string) bool {
 		return false
 	}
 	for _, r := range s {
-		if !(r >= 'a' && r <= 'z') &&
-			!(r >= 'A' && r <= 'Z') &&
-			!(r >= '0' && r <= '9') &&
+		if (r < 'a' || r > 'z') &&
+			(r < 'A' || r > 'Z') &&
+			(r < '0' || r > '9') &&
 			r != '-' && r != '_' && r != '.' && r != ':' {
 			return false
 		}
@@ -193,4 +219,26 @@ func cleanContractList(in []string) []string {
 		}
 	}
 	return out
+}
+
+// LoggableFields returns the configuration as a map of fields suitable for logging,
+// with credentials redacted (e.g., from DATABASE_URL).
+func (c Config) LoggableFields() []any {
+	dbURL := c.DatabaseURL
+	if u, err := url.Parse(c.DatabaseURL); err == nil {
+		u.User = nil
+		dbURL = u.String()
+	}
+
+	return []any{
+		"rpc_url", c.RPCURL,
+		"database_url", dbURL,
+		"poll_interval", c.PollInterval,
+		"http_addr", c.HTTPAddr,
+		"watched_contracts", len(c.WatchedContracts),
+		"start_ledger", c.StartLedger,
+		"retention_ledgers", c.RetentionLedgers,
+		"log_level", c.LogLevel,
+		"audit_enabled", c.AuditEnabled,
+	}
 }

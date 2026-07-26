@@ -4,6 +4,7 @@
 // With no arguments it runs the indexer. Subcommands cover maintenance:
 //
 //	sorotrail replay --from-ledger N [--to-ledger M]
+//	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
 package main
 
 import (
@@ -52,6 +53,8 @@ func dispatch(args []string) error {
 	switch args[0] {
 	case "replay":
 		return runReplay(args[1:])
+	case "backfill":
+		return runBackfill(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -69,6 +72,8 @@ With no subcommand, runs the indexer (ingester + HTTP API).
 subcommands:
   replay    re-decode stored events with the current decoder
             (sorotrail replay --help)
+  backfill  ingest historical contract events from Horizon
+            (sorotrail backfill --help)
 `)
 }
 
@@ -79,53 +84,51 @@ func run() error {
 	}
 	log := newLogger(cfg.LogLevel)
 
+	log.Info("startup configuration", cfg.LoggableFields()...)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
-	if err != nil {
-		return fmt.Errorf("connecting to postgres: %w", err)
-	}
-	defer pool.Close()
-	if err := pool.Ping(ctx); err != nil {
-		return fmt.Errorf("pinging postgres: %w", err)
-	}
 
-	st := store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+	var (
+		st   store.Store
+		pool *pgxpool.Pool
+	)
+	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
+		st, err = store.NewStoreFromURL(cfg.DatabaseURL)
+		if err != nil {
+			return err
+		}
+	} else {
+		pool, err = pgxpool.New(ctx, cfg.DatabaseURL)
+		if err != nil {
+			return fmt.Errorf("connecting to postgres: %w", err)
+		}
+		defer pool.Close()
+		if err := pool.Ping(ctx); err != nil {
+			return fmt.Errorf("pinging postgres: %w", err)
+		}
+		st = store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+	}
 	for _, id := range cfg.WatchedContracts {
 		if err := st.AddWatchedContract(ctx, id); err != nil {
 			return err
 		}
 	}
 
-	// Build the RPC client: single URL (RPC_URL) or multi-provider
-	// failover (RPC_URLS). The single-URL path keeps existing deployments
-	// working unchanged.
-	var rpcClient rpc.Client
-	if len(cfg.RPCURLS) > 0 {
-		fc := rpc.NewFailoverClient(
-			cfg.RPCURLS,
-			cfg.RPCRateLimitRPS,
-			rpc.NewHTTPClientForFailover,
-			rpc.WithFailoverLogger(log),
-		)
-		// Background getHealth probes for demoted providers so they can
-		// be promoted back when they recover.
-		fc.RunProbes(ctx)
-		rpcClient = fc
-		log.Info("failover rpc client created", "providers", len(cfg.RPCURLS),
-			"rate_limit_rps", cfg.RPCRateLimitRPS)
-	} else {
-		rpcClient = rpc.NewHTTPClient(cfg.RPCURL)
-	}
-
+	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
 	bcast := broadcast.New(broadcast.DefaultBufferSize)
 	// Webhook delivery runs alongside ingestion — the notifier is attached
 	// to the ingester so events flow to subscriber callbacks asynchronously.
 	wh := webhook.NewNotifier(st, log)
+
+	// Wire the spec cache and enricher for spec-decoded event views.
+	specCache := spec.NewCache(st)
+	specFetcher := spec.NewFetcher(rpcClient)
+	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
 	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:     cfg.PollInterval,
@@ -163,13 +166,23 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpcClient, log).WithBroadcaster(bcast)
+	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
+		Timeout:            cfg.APIQueryTimeout,
+		SlowQueryThreshold: cfg.APISlowQueryThreshold,
+		Logger:             log,
+	})
+	apiServer := api.New(apiStore, rpcClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiServer.Router(),
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if cfg.APIKey == "" {
+		log.Warn("API_KEY env is unset; watched-contracts endpoints will reject every request with 503")
+	} else {
+		log.Info("watched-contracts endpoints are auth-gated")
 	}
 
 	errCh := make(chan error, 4)
