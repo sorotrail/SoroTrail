@@ -517,6 +517,38 @@ func TestIngestionStateRoundTrip(t *testing.T) {
 	assert.Empty(t, got.LastCursor, "state is a single row, fully replaced")
 }
 
+func TestIngestionState_LastSuccessfulPoll(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// Initial save without LastSuccessfulPoll should have nil
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 10, LastCursor: "c1"}))
+	got, err := st.GetIngestionState(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, got.LastSuccessfulPoll, "LastSuccessfulPoll is nil when not set")
+
+	// Save with LastSuccessfulPoll set
+	now := time.Now().Truncate(time.Millisecond)
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{
+		LastIngestedLedger: 20,
+		LastCursor:         "c2",
+		LastSuccessfulPoll: &now,
+	}))
+
+	got, err = st.GetIngestionState(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(20), got.LastIngestedLedger)
+	require.NotNil(t, got.LastSuccessfulPoll)
+	assert.Equal(t, now, *got.LastSuccessfulPoll)
+
+	// Overwrite without LastSuccessfulPoll should keep the old value? No, it should update to nil
+	// The UPSERT sets last_successful_poll = EXCLUDED.last_successful_poll, so nil overwrites
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 30, LastCursor: "c3"}))
+	got, err = st.GetIngestionState(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, got.LastSuccessfulPoll, "LastSuccessfulPoll is nil when not provided in save")
+}
+
 func TestWatchedContracts(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -577,7 +609,13 @@ func TestStats(t *testing.T) {
 		testEvent(eventID(2), 101, contractB),
 	})
 	require.NoError(t, err)
-	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 101}))
+
+	// Save ingestion state with LastSuccessfulPoll
+	now := time.Now().Truncate(time.Millisecond)
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{
+		LastIngestedLedger: 101,
+		LastSuccessfulPoll: &now,
+	}))
 	require.NoError(t, st.AddWatchedContract(ctx, contractA))
 
 	stats, err := st.Stats(ctx)
@@ -587,6 +625,8 @@ func TestStats(t *testing.T) {
 	assert.Equal(t, int64(100), stats.OldestStoredLedger)
 	assert.Equal(t, int64(2), stats.ContractCount)
 	assert.Equal(t, int64(1), stats.WatchedContracts)
+	require.NotNil(t, stats.LastSuccessfulPoll)
+	assert.Equal(t, now, *stats.LastSuccessfulPoll)
 
 	var plan string
 	rows, err := st.pool.Query(ctx, `EXPLAIN (COSTS OFF) SELECT coalesce(min(ledger), 0) FROM events`)
