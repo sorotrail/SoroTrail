@@ -1,6 +1,6 @@
 # SoroTrail Helm Chart
 
-Deploys [SoroTrail](https://github.com/khaylebfortune/sorotrail) — a Stellar/Soroban contract-event indexer — to Kubernetes.
+Deploys [SoroTrail](https://github.com/sorotrail/sorotrail) — a Stellar/Soroban contract-event indexer — to Kubernetes.
 
 ## Prerequisites
 
@@ -39,7 +39,7 @@ Key values:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `image.repository` | `ghcr.io/khaylebfortune/sorotrail` | Image repository |
+| `image.repository` | `ghcr.io/sorotrail/sorotrail` | Image repository |
 | `image.tag` | `""` (uses appVersion) | Image tag |
 | `config.rpcUrl` | testnet | Stellar RPC endpoint |
 | `config.watchedContracts` | `""` | Comma-separated contract IDs; empty = all |
