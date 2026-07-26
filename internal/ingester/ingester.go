@@ -10,10 +10,10 @@ import (
 	"math/rand/v2"
 	"time"
 
-	"github.com/khaylebfortune/sorotrail/internal/broadcast"
-	"github.com/khaylebfortune/sorotrail/internal/decode"
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/broadcast"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // Options configure an Ingester.
@@ -66,8 +66,8 @@ type Ingester struct {
 	decoder  decode.Decoder
 	log      *slog.Logger
 	opts     Options
-	notifier EventNotifier // optional; nil means no notification
 	bcast    *broadcast.Broadcaster
+	notifier EventNotifier // optional; nil means no notification
 }
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
@@ -77,18 +77,18 @@ func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger
 	return &Ingester{client: client, store: st, decoder: dec, log: log, opts: opts}
 }
 
-// SetNotifier attaches an optional EventNotifier that is called after
-// every successful event persistence. When nil (the default) no
-// notification is sent — the ingester behaves exactly as before.
-func (ing *Ingester) SetNotifier(n EventNotifier) {
-	ing.notifier = n
-}
-
 // WithBroadcaster attaches a live event broadcaster so ingested events are
 // pushed to streaming subscribers.
 func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
 	ing.bcast = b
 	return ing
+}
+
+// SetNotifier attaches an optional EventNotifier that is called after
+// every successful event persistence. When nil (the default) no
+// notification is sent — the ingester behaves exactly as before.
+func (ing *Ingester) SetNotifier(n EventNotifier) {
+	ing.notifier = n
 }
 
 // Run polls until ctx is canceled. Errors are logged and retried with
@@ -385,13 +385,13 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
 		"latest_ledger", latestLedger)
 
+	if ing.bcast != nil {
+		ing.bcast.Publish(ctx, events)
+	}
 	// Notify webhooks (or other listeners) after successful persistence.
 	// This is a fire-and-forget call — it must never block ingestion.
 	if ing.notifier != nil {
 		ing.notifier.NotifyEvents(ctx, events)
-	}
-	if ing.bcast != nil {
-		ing.bcast.Publish(ctx, events)
 	}
 	return nil
 }
@@ -458,10 +458,19 @@ func (ing *Ingester) buildFilterBatches(ctx context.Context) ([][]rpc.EventFilte
 	if len(watched) == 0 {
 		return [][]rpc.EventFilter{{{Type: "contract"}}}, nil
 	}
+	// Copy IDs into a local slice: the watched list can grow between
+	// passes (a runtime POST that lands mid-process is picked up by the
+	// next runOnce without restart — see BuildFilterBatches' caller in
+	// runOnce), and we don't want to capture a slice that an inserter
+	// could mutate under us.
+	ids := make([]string, len(watched))
+	for i, wc := range watched {
+		ids[i] = wc.ContractID
+	}
 	var filters []rpc.EventFilter
-	for start := 0; start < len(watched); start += rpc.MaxContractIDsPerFilter {
-		end := min(start+rpc.MaxContractIDsPerFilter, len(watched))
-		filters = append(filters, rpc.EventFilter{Type: "contract", ContractIDs: watched[start:end]})
+	for start := 0; start < len(ids); start += rpc.MaxContractIDsPerFilter {
+		end := min(start+rpc.MaxContractIDsPerFilter, len(ids))
+		filters = append(filters, rpc.EventFilter{Type: "contract", ContractIDs: ids[start:end]})
 	}
 	var batches [][]rpc.EventFilter
 	for start := 0; start < len(filters); start += rpc.MaxFiltersPerRequest {
