@@ -68,6 +68,8 @@ All configuration comes from environment variables (see `.env.example`):
 | Variable | Default | Description |
 | --- | --- | --- |
 | `RPC_URL` | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet. |
+| `HORIZON_URL` | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. |
+| `BACKFILL_RATE_RPS` | `10` | Pace against Horizon when backfilling. 10 req/s is the public-instance cap; private deployments can lift this. |
 | `DATABASE_URL` | — (required) | Postgres connection string. |
 | `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. |
 | `HTTP_ADDR` | `:8080` | API listen address. |
@@ -75,6 +77,8 @@ All configuration comes from environment variables (see `.env.example`):
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
+| `API_QUERY_TIMEOUT` | `25s` | Per-request database timeout for API-originated store reads. The timeout is enforced in-process and mirrored to Postgres via `statement_timeout`. |
+| `API_SLOW_QUERY_THRESHOLD` | `2s` | Warn when an API-originated store query takes longer than this threshold; logs include the query name and elapsed duration. |
 | `AUDIT_ENABLED` | `false` | Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build. |
 | `AUDIT_POLL_INTERVAL` | `30s` | Sleep between audit passes. |
 | `AUDIT_BATCH_LEDGERS` | `100` | Ledger range covered by one audit pass. |
@@ -112,7 +116,46 @@ All configuration comes from environment variables (see `.env.example`):
   `{"address":"C..."}`.
 - The raw base64 XDR is stored alongside the decoded JSON, so an improved
   decoder can be applied to already-indexed events — see
-  [decoder replay](#decoder-replay).
+  [decoder replay](#decoder-replay). This intentionally duplicates payload
+  data in `events.topics_xdr` and `events.value_xdr`; budget extra event-table
+  storage for deployments that retain large event histories.
+
+## Backfilling historical events
+
+SoroTrail's live ingester only reaches as far back as the Stellar RPC's
+retention window (typically 24h on the public testnet, up to a couple
+weeks on private deployments). For contracts whose history you care
+about, this leaves a permanent blind spot.
+
+`sorotrail backfill` closes that gap by walking `/accounts/{contract_id}/transactions`
+on a Horizon deployment that retains historical transaction meta,
+decoding each `result_meta_xdr` through the standard pipeline so
+backfilled rows are indistinguishable from live-ingested ones
+(including raw XDR for replay).
+
+```sh
+# First-pass dry run to see what would be written
+sorotrail backfill \
+  --contract CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC \
+  --from-ledger 1 --to-ledger 250000 --dry-run
+
+# Then commit it
+sorotrail backfill \
+  --contract CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC \
+  --from-ledger 1 --to-ledger 250000
+```
+
+It is batched, resumable (Ctrl-C and re-run picks up where it stopped),
+idempotent (re-runs write nothing once finished), and safe alongside
+live ingestion. A single-row `backfill_state` table holds progress so
+resume works across restarts; idempotent upserts make the resume
+overlap harmless.
+
+Source limitations are spelled out in [docs/backfill.md](docs/backfill.md) —
+notably: Horizon must retain historical meta for the target network,
+only Soroban V3/V4 transactions carry events, and the public Stellar
+testnet Horizon retains everything from protocol 17 onward while
+mainnet varies.
 
 ## Decoder replay
 
@@ -233,6 +276,15 @@ curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"G
 
 `cursor` is present when more results exist; pass it back as `?cursor=` for
 the next page.
+
+When `include_xdr=true`, events also include the original base64 XDR payload:
+
+```json
+{
+  "topics_xdr": ["AAAADwAAAAh0cmFuc2Zlcg=="],
+  "value_xdr": "AAAACgAAAAAAAAAB"
+}
+```
 
 Time filtering narrows results and does not change ordering (events remain in
 ascending event-ID order, which agrees with `created_at` order because both
