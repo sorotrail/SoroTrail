@@ -241,11 +241,32 @@ Query parameters (all optional, combinable):
 | `to_time` | `2026-07-22T00:00:00Z` | Inclusive upper `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
 | `limit` | `50` | Page size, 1–200 (default 50). |
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
-| `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
+| `order` | `desc` | `asc` \| `desc`, defaults to asc. Sort direction. |
+| `order_by` | `created_at` | `id` \| `ledger` \| `created_at`, defaults to `id`. Sort column. Anything else is a `400`. |
 | `decoded` | `true` | When `true`, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with `"decoded": false`. |
 | `include_xdr` | `true` | When `true`, includes raw base64 `topics_xdr` and `value_xdr` on each event. Omitted by default to keep responses small. |
 
 Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
+
+#### Ordering and pagination
+
+`order_by` picks the sort column and `order` the direction, so they combine:
+
+```sh
+curl -s 'localhost:8080/events?order_by=created_at&order=desc&limit=100'
+```
+
+Pagination stays correct under every ordering. `ledger` and `created_at` both
+have duplicates — a ledger holds many events, and a batch insert stamps one
+`created_at` on all of them — so those orderings sort by `(column, id)` and
+their cursors carry both halves. That keeps a page boundary landing in the
+middle of a run of equal values from skipping or repeating rows.
+
+Cursors are opaque and tied to the ordering that produced them: feeding a
+cursor from one `order_by` into another returns `400`. Always pass back the
+`cursor` from the previous response with the same `order_by`/`order`. Cursors
+issued for the default `id` ordering are unchanged, so existing clients keep
+working.
 
 ```sh
 curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic={"symbol":"transfer"}&limit=2'

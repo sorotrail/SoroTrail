@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -670,6 +671,61 @@ func TestStats(t *testing.T) {
 		assert.Nil(t, raw["ingest_lag_ledgers"])
 		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
 	})
+}
+
+func TestListEvents_OrderByParses(t *testing.T) {
+	for _, orderBy := range []string{"id", "ledger", "created_at"} {
+		t.Run(orderBy, func(t *testing.T) {
+			st := &stubStore{}
+			resp, body := doGet(t, newTestServer(st, nil), "/events?order_by="+orderBy+"&order=desc")
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			assert.Equal(t, orderBy, st.lastFilter.OrderBy)
+			assert.Equal(t, "desc", st.lastFilter.Order, "order_by and order combine")
+		})
+	}
+}
+
+// Omitting order_by keeps the historical default rather than inventing one.
+func TestListEvents_OrderByDefaultsToEmpty(t *testing.T) {
+	st := &stubStore{}
+	resp, _ := doGet(t, newTestServer(st, nil), "/events")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "", st.lastFilter.OrderBy)
+}
+
+// An unsupported sort column is a 400, not a silently-ignored parameter.
+func TestListEvents_InvalidOrderByIsBadRequest(t *testing.T) {
+	for _, bad := range []string{"tx_hash", "ledger; DROP TABLE events", "LEDGER"} {
+		t.Run(bad, func(t *testing.T) {
+			resp, body := doGet(t, newTestServer(&stubStore{}, nil),
+				"/events?order_by="+url.QueryEscape(bad))
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			var e map[string]string
+			require.NoError(t, json.Unmarshal(body, &e))
+			assert.Contains(t, e["error"], "invalid order_by")
+		})
+	}
+}
+
+// order_by applies to the contract-scoped listing too, since it shares the
+// same filter parsing.
+func TestContractEvents_OrderByParses(t *testing.T) {
+	st := &stubStore{}
+	resp, body := doGet(t, newTestServer(st, nil),
+		"/contracts/"+testContract+"/events?order_by=created_at")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	assert.Equal(t, "created_at", st.lastFilter.OrderBy)
+	assert.Equal(t, testContract, st.lastFilter.ContractID)
+}
+
+// A cursor that doesn't decode under the requested ordering is client error.
+func TestListEvents_InvalidCursorIsBadRequest(t *testing.T) {
+	st := &stubStore{queryErr: store.ErrInvalidCursor}
+	resp, body := doGet(t, newTestServer(st, nil), "/events?order_by=ledger&cursor=bogus")
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var e map[string]string
+	require.NoError(t, json.Unmarshal(body, &e))
+	assert.Contains(t, e["error"], "invalid cursor")
 }
 
 func TestVersion(t *testing.T) {
