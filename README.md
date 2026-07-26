@@ -26,11 +26,11 @@ a Postgres you already have:
 docker run --rm -p 8080:8080 \
   -e DATABASE_URL='postgres://user:pass@host:5432/sorotrail?sslmode=disable' \
   -e RPC_URL='https://soroban-testnet.stellar.org' \
-  ghcr.io/stephaniepez21-art/sorotrail:latest
+  ghcr.io/sorotrail/sorotrail:latest
 ```
 
 Pin a specific release with a version tag instead of `latest`, e.g.
-`ghcr.io/stephaniepez21-art/sorotrail:v1.2.0`. See [Configuration](#configuration) for
+`ghcr.io/sorotrail/sorotrail:v1.2.0`. See [Configuration](#configuration) for
 the full list of environment variables.
 
 ### Docker Compose (full stack)

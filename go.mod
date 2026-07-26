@@ -1,4 +1,4 @@
-module github.com/khaylebfortune/sorotrail
+module github.com/sorotrail/sorotrail
 
 go 1.25.0
 
