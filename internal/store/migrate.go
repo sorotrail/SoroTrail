@@ -5,7 +5,6 @@ import (
 	"embed"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -25,23 +24,14 @@ var sqliteMigrationsFS embed.FS
 // It detects the dialect from the URL scheme and runs the appropriate
 // migration series. Safe to call on every startup; up-to-date schema is a no-op.
 func Migrate(databaseURL string) error {
-	url := strings.TrimSpace(databaseURL)
-	if isSQLite(url) {
-		return migrateSQLite(url)
+	if strings.HasPrefix(databaseURL, "clickhouse://") {
+		return nil
 	}
-	return migratePostgres(url)
-}
+	if !strings.HasPrefix(databaseURL, "postgres://") && !strings.HasPrefix(databaseURL, "postgresql://") {
+		return fmt.Errorf("unsupported database url scheme")
+	}
 
-func isSQLite(url string) bool {
-	return strings.HasPrefix(url, "sqlite:")
-}
-
-func parseSQLiteDSN(url string) string {
-	return url[7:]
-}
-
-func migratePostgres(databaseURL string) error {
-	src, err := iofs.New(postgresMigrationsFS, "migrations")
+	src, err := iofs.New(migrationsFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("loading embedded migrations: %w", err)
 	}

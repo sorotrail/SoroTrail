@@ -4,6 +4,7 @@
 // With no arguments it runs the indexer. Subcommands cover maintenance:
 //
 //	sorotrail replay --from-ledger N [--to-ledger M]
+//	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
 package main
 
 import (
@@ -55,6 +56,8 @@ func dispatch(args []string) error {
 	switch args[0] {
 	case "replay":
 		return runReplay(args[1:])
+	case "backfill":
+		return runBackfill(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -72,6 +75,8 @@ With no subcommand, runs the indexer (ingester + HTTP API).
 subcommands:
   replay    re-decode stored events with the current decoder
             (sorotrail replay --help)
+  backfill  ingest historical contract events from Horizon
+            (sorotrail backfill --help)
 `)
 }
 
@@ -82,6 +87,8 @@ func run() error {
 	}
 	log := newLogger(cfg.LogLevel)
 
+	log.Info("startup configuration", cfg.LoggableFields()...)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -89,24 +96,17 @@ func run() error {
 		return err
 	}
 
-	var st store.Store
-	if config.IsSQLite(cfg.DatabaseURL) {
-		dsn := cfg.DatabaseURL[7:]
-		sqldb, err := sql.Open("sqlite", dsn)
+	var (
+		st   store.Store
+		pool *pgxpool.Pool
+	)
+	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
+		st, err = store.NewStoreFromURL(cfg.DatabaseURL)
 		if err != nil {
-			return fmt.Errorf("opening sqlite: %w", err)
+			return err
 		}
-		defer sqldb.Close()
-
-		if _, err := sqldb.ExecContext(ctx, `PRAGMA journal_mode=WAL`); err != nil {
-			return fmt.Errorf("setting WAL mode: %w", err)
-		}
-		if _, err := sqldb.ExecContext(ctx, `PRAGMA busy_timeout=5000`); err != nil {
-			return fmt.Errorf("setting busy timeout: %w", err)
-		}
-		st = store.NewSQLite(sqldb)
 	} else {
-		pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+		pool, err = pgxpool.New(ctx, cfg.DatabaseURL)
 		if err != nil {
 			return fmt.Errorf("connecting to postgres: %w", err)
 		}
@@ -169,13 +169,23 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpcClient, log, specEnricher).WithBroadcaster(bcast)
+	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
+		Timeout:            cfg.APIQueryTimeout,
+		SlowQueryThreshold: cfg.APISlowQueryThreshold,
+		Logger:             log,
+	})
+	apiServer := api.New(apiStore, rpcClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiServer.Router(),
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if cfg.APIKey == "" {
+		log.Warn("API_KEY env is unset; watched-contracts endpoints will reject every request with 503")
+	} else {
+		log.Info("watched-contracts endpoints are auth-gated")
 	}
 
 	errCh := make(chan error, 4)
