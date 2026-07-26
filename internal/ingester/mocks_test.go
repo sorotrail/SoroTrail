@@ -167,6 +167,16 @@ func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
 	return nil
 }
 
+func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
+	for i, wc := range m.watched {
+		if wc.ContractID == id {
+			m.watched = append(m.watched[:i], m.watched[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+
 func (m *mockStore) Stats(context.Context, store.Scope) (store.Stats, error) {
 	return store.Stats{}, nil
 }

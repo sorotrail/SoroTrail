@@ -49,6 +49,27 @@ func getAuditor() *audit.Auditor {
 	return auditor
 }
 
+// SetRPCCounter registers the CountingClient so /stats can expose
+// per-method RPC error totals. Call this before ListenAndServe.
+// The setter is guarded by a RWMutex so concurrent /stats readers
+// never observe a torn pointer.
+var (
+	rpcCounterMu sync.RWMutex
+	rpcCounter   *rpc.CountingClient
+)
+
+func SetRPCCounter(c *rpc.CountingClient) {
+	rpcCounterMu.Lock()
+	rpcCounter = c
+	rpcCounterMu.Unlock()
+}
+
+func getRPCCounter() *rpc.CountingClient {
+	rpcCounterMu.RLock()
+	defer rpcCounterMu.RUnlock()
+	return rpcCounter
+}
+
 // Enricher is the spec-based event enrichment interface used by the API.
 // Defined here so the API package doesn't import internal/spec directly.
 type Enricher interface {
@@ -57,13 +78,14 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store    store.Store
-	rpc      rpc.Client
-	enricher Enricher
-	log      *slog.Logger
-	apiKey   string
-	limiter  *RateLimiter
-	bcast    *broadcast.Broadcaster
+	store     store.Store
+	rpc       rpc.Client
+	enricher  Enricher
+	log       *slog.Logger
+	apiKey    string
+	limiter   *RateLimiter
+	recoverer *Recoverer
+	bcast     *broadcast.Broadcaster
 
 	// Multi-tenancy (#48). multiTenant is false by default, which makes
 	// every request run as an untenanted wildcard principal — the exact
@@ -82,7 +104,7 @@ type Server struct {
 // See apiKeyAuth for the exact contract. The trailing enricher is optional —
 // pass nil to disable spec decoding, or one Enricher to enable it.
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey}
+	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log)}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
@@ -142,7 +164,7 @@ func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
-	r.Use(middleware.Recoverer)
+	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 
 	// Authentication runs before the limiter so the limiter can key on the
@@ -175,6 +197,23 @@ func (s *Server) Router() http.Handler {
 	// scopeFrom (single-object reads) and pass it to the store — see
 	// docs/multi-tenancy.md. Endpoints that skip this return nothing
 	// rather than everything, but "returns nothing" is still a bug.
+
+	// Watched-contracts management: writes and updates to the runtime
+	// filter list. Always auth-gated, even when AUTH_ENABLED would be
+	// false elsewhere — that asymmetry is intentional and part of the
+	// "writes are never open" contract. GET is gated too so an operator
+	// with the key can confirm the current list without touching /stats.
+	// Routes are absolute (no sub-router) so callers don't need a
+	// trailing slash or chi's RedirectSlashes middleware.
+	//
+	// This is the operator's own list, not a tenant's: it is keyed on
+	// API_KEY rather than a tenant credential, and it edits the global
+	// watched_contracts table that forms one side of the ingestion union.
+	// Tenants manage their own claims through /tenant/watch below.
+	watchedMW := apiKeyAuth(s.apiKey)
+	r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
+	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
+	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
 
 	// Subscription CRUD and delivery history.
 	r.Post("/subscriptions", s.handleCreateSubscription)

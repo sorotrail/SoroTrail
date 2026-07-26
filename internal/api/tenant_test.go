@@ -231,7 +231,7 @@ func newTenantFixture(t *testing.T) *tenantFixture {
 	f.keyWildcard = tenants.addTenant(t, store.Tenant{ID: 5, Name: "legacy", Enabled: true, Wildcard: true})
 
 	srv := New(st, &stubRPC{health: rpc.Health{Status: "healthy"}},
-		slog.New(slog.NewTextHandler(io.Discard, nil))).
+		slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key").
 		WithMultiTenancy(tenants, MultiTenantOptions{MaxWatchedContracts: 10})
 	f.srv = srv.Router()
 	return f
@@ -600,7 +600,7 @@ func TestSingleTenantModeIsUnchanged(t *testing.T) {
 		{ID: "ev-a1", ContractID: contractA},
 		{ID: "ev-b1", ContractID: contractB},
 	}}
-	srv := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Router()
+	srv := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key").Router()
 
 	t.Run("no credential is needed and everything is visible", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/events", nil)
@@ -876,7 +876,7 @@ func newSubFixture(t *testing.T) (*tenantFixture, *subStore) {
 		store.Tenant{ID: 5, Name: "legacy", Enabled: true, Wildcard: true})
 
 	f.srv = New(st, &stubRPC{health: rpc.Health{Status: "healthy"}},
-		slog.New(slog.NewTextHandler(io.Discard, nil))).
+		slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key").
 		WithMultiTenancy(tenants, MultiTenantOptions{}).Router()
 	return f, st
 }
@@ -1039,7 +1039,7 @@ func TestSubscriptionUpdateCannotWidenScope(t *testing.T) {
 func TestSubscriptionsUnchangedInSingleTenantMode(t *testing.T) {
 	SetTenantScopedCaching(false)
 	st := newSubStore()
-	srv := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).Router()
+	srv := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key").Router()
 
 	req := httptest.NewRequest(http.MethodPost, "/subscriptions", strings.NewReader(subBody("")))
 	rec := httptest.NewRecorder()

@@ -331,13 +331,9 @@ func (p *Postgres) GetEvent(ctx context.Context, id string, sc Scope) (Event, er
 		query += ` AND contract_id = ANY($2)`
 		args = append(args, sc.Contracts())
 	}
-	row := p.pool.QueryRow(ctx, query, args...)
-	e, err := scanEvent(row)
-	if errors.Is(err, pgx.ErrNoRows) {
-func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
 	var e Event
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
-		row := tx.QueryRow(ctx, `SELECT `+eventColumns+` FROM events WHERE id = $1`, id)
+		row := tx.QueryRow(ctx, query, args...)
 		var err error
 		e, err = scanEvent(row)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -370,9 +366,8 @@ func (p *Postgres) EventExists(ctx context.Context, id string, sc Scope) (bool, 
 		args = append(args, sc.Contracts())
 	}
 	var one int
-	err := p.pool.QueryRow(ctx, query, args...).Scan(&one)
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `SELECT 1 FROM events WHERE id = $1`, id).Scan(&one)
+		return tx.QueryRow(ctx, query, args...).Scan(&one)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
@@ -418,8 +413,8 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
-	if f.Type != "" {
-		where = append(where, "type = "+arg(f.Type))
+	if len(f.Types) > 0 {
+		where = append(where, "type = ANY("+arg(f.Types)+")")
 	}
 	if len(f.Topic) > 0 {
 		// Containment on the array matches the topic at any position.
@@ -602,12 +597,20 @@ func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (A
 // contract is watched for exactly as long as at least one row somewhere
 // still names it, and one tenant dropping its claim cannot stop ingestion
 // for another that still holds one.
+// added_at is aggregated rather than carried through the set operation:
+// once the timestamp is in the projection, two tenants who claimed the same
+// contract at different moments are distinct rows and a plain UNION stops
+// deduplicating. Grouping restores one row per contract, and min() reads as
+// "watched since" — the earliest claim is what ingestion has actually been
+// following.
 const watchedContractsUnion = `
-	SELECT contract_id FROM watched_contracts
-	UNION
-	SELECT contract_id FROM tenant_watched_contracts`
+	SELECT contract_id, min(added_at) AS added_at FROM (
+		SELECT contract_id, added_at FROM watched_contracts
+		UNION ALL
+		SELECT contract_id, added_at FROM tenant_watched_contracts
+	) w GROUP BY contract_id`
 
-func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]string, error) {
+func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	rows, err := p.pool.Query(ctx,
 		watchedContractsUnion+` ORDER BY contract_id`)
 	if err != nil {
@@ -683,7 +686,7 @@ func (p *Postgres) statsWhere(ctx context.Context, pred string, args []any) (Sta
 	// subquery exposes a contract_id column, so the identical WHERE clause
 	// applies — keeping a tenant's view of "how many contracts is this
 	// instance following" limited to the ones it can read.
-	err := p.pool.QueryRow(ctx, fmt.Sprintf(`
+	query := fmt.Sprintf(`
 		SELECT
 			(SELECT count(*) FROM events %[1]s),
 			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
@@ -691,19 +694,11 @@ func (p *Postgres) statsWhere(ctx context.Context, pred string, args []any) (Sta
 			(SELECT coalesce(min(ledger), 0) FROM events %[1]s),
 			(SELECT count(DISTINCT contract_id) FROM events %[1]s),
 			(SELECT count(*) FROM (%[2]s) w %[1]s)`,
-		pred, watchedContractsUnion),
-		args...,
-	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
+		pred, watchedContractsUnion)
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `
-			SELECT
-				(SELECT count(*) FROM events),
-				(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
-				(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
-				(SELECT coalesce(min(ledger), 0) FROM events),
-				(SELECT count(DISTINCT contract_id) FROM events),
-				(SELECT count(*) FROM watched_contracts)`,
-		).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
+		return tx.QueryRow(ctx, query, args...).Scan(
+			&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger,
+			&s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
 	})
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)

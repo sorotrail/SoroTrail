@@ -17,7 +17,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -131,7 +130,13 @@ func run() error {
 	specFetcher := spec.NewFetcher(rpcClient)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
-	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
+	// Wrap the raw RPC client so per-method error totals are tracked and
+	// surfaced via /stats. specFetcher already holds a reference to the
+	// unwrapped client (spec lookups are not counted as ingestion errors).
+	countingClient := rpc.NewCountingClient(rpcClient)
+	api.SetRPCCounter(countingClient)
+
+	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
 		RetentionLedgers: cfg.RetentionLedgers,
@@ -147,7 +152,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		auditClient := audit.NewBudgetedClient(rpcClient, budget)
+		auditClient := audit.NewBudgetedClient(countingClient, budget)
 		aud = audit.New(auditClient, st, ing, log, audit.Options{
 			PollInterval:      cfg.AuditPollInterval,
 			BatchLedgers:      cfg.AuditBatchLedgers,
@@ -180,16 +185,26 @@ func run() error {
 		SlowQueryThreshold: cfg.APISlowQueryThreshold,
 		Logger:             log,
 	})
-	apiServer := api.New(apiStore, rpcClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
+	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	if cfg.MultiTenant {
-		apiServer = apiServer.WithMultiTenancy(st, api.MultiTenantOptions{
+		// Tenancy lives in tables (tenants, grants, api_keys, usage) that
+		// only the Postgres backend has. Refusing at startup is the whole
+		// point: silently running a ClickHouse deployment with MULTI_TENANT
+		// set would mean an operator believing a boundary is enforced when
+		// there is none, which is the one failure this feature must not have.
+		tenants, ok := st.(store.TenantStore)
+		if !ok {
+			return fmt.Errorf(
+				"MULTI_TENANT=true requires a backend with tenant storage, but %T has none; use a postgres:// DATABASE_URL", st)
+		}
+		apiServer = apiServer.WithMultiTenancy(tenants, api.MultiTenantOptions{
 			MaxWatchedContracts: cfg.MultiTenantMaxWatched,
 			UsageFlushInterval:  cfg.MultiTenantUsageFlush,
 			StreamScopeSync:     cfg.MultiTenantStreamScopeSync,
 		})
-		if err := bootstrapAdminKey(ctx, st, cfg.MultiTenantBootstrapKey, log); err != nil {
+		if err := bootstrapAdminKey(ctx, tenants, cfg.MultiTenantBootstrapKey, log); err != nil {
 			return err
 		}
 		usage := apiServer.Usage()
@@ -203,7 +218,10 @@ func run() error {
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiServer.Router(),
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       cfg.HTTPReadTimeout,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
+		IdleTimeout:       cfg.HTTPIdleTimeout,
+		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
 	}
 	if cfg.APIKey == "" {
 		log.Warn("API_KEY env is unset; watched-contracts endpoints will reject every request with 503")
@@ -259,7 +277,7 @@ func run() error {
 		stop() // one component failed; wind down the others
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Error("http shutdown", "error", err)
