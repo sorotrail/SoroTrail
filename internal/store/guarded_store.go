@@ -7,7 +7,6 @@ import (
 	"time"
 )
 
-// GuardedStoreOptions configures the API-facing store wrapper.
 type GuardedStoreOptions struct {
 	Timeout            time.Duration
 	SlowQueryThreshold time.Duration
@@ -165,7 +164,7 @@ func (s *guardedStore) SaveAuditStateIfGreater(ctx context.Context, ledger int64
 	return state, err
 }
 
-func (s *guardedStore) ListWatchedContracts(ctx context.Context) ([]string, error) {
+func (s *guardedStore) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.ListWatchedContracts")
 	defer cancel()
 	start := time.Now()
@@ -180,6 +179,15 @@ func (s *guardedStore) AddWatchedContract(ctx context.Context, contractID string
 	start := time.Now()
 	err := s.Store.AddWatchedContract(ctx, contractID)
 	s.logSlowQuery("store.AddWatchedContract", start, err)
+	return err
+}
+
+func (s *guardedStore) RemoveWatchedContract(ctx context.Context, contractID string) error {
+	ctx, cancel := s.wrapContext(ctx, "store.RemoveWatchedContract")
+	defer cancel()
+	start := time.Now()
+	err := s.Store.RemoveWatchedContract(ctx, contractID)
+	s.logSlowQuery("store.RemoveWatchedContract", start, err)
 	return err
 }
 

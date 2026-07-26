@@ -64,7 +64,6 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
-	batch := &pgx.Batch{}
 	conflict := `ON CONFLICT (id) DO NOTHING`
 	if onUpdate {
 		conflict = `ON CONFLICT (id) DO UPDATE SET
@@ -78,21 +77,22 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			topics             = EXCLUDED.topics,
 			value              = EXCLUDED.value,
 			created_at         = EXCLUDED.created_at,
-			topics_xdr         = COALESCE(EXCLUDED.topics_xdr, events.topics_xdr),
-			value_xdr          = COALESCE(EXCLUDED.value_xdr, events.value_xdr)`
+			raw_topic_xdr      = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
-	sql := `
+	stmt := `
 		INSERT INTO events
 			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 			 in_successful_call, topics, value, created_at,
-			 topics_xdr, value_xdr)
+			 raw_topic_xdr, raw_value_xdr)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		` + conflict
+	batch := &pgx.Batch{}
 	for _, e := range events {
 		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
 		// into SQL NULL so the column has one representation of "absent"
 		// rather than two.
-		batch.Queue(sql,
+		batch.Queue(stmt,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
 			nullableStringSlice(e.RawTopicXDR), nullableText(e.RawValueXDR),
@@ -209,10 +209,10 @@ type rawXDR struct {
 // keyed by event ID, so a delete-and-reinsert repair can put it back.
 func rawXDRInRange(ctx context.Context, tx pgx.Tx, fromLedger, toLedger int64) (map[string]rawXDR, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT id, topics_xdr, value_xdr
+		SELECT id, raw_topic_xdr, raw_value_xdr
 		FROM events
 		WHERE ledger BETWEEN $1 AND $2
-		  AND (topics_xdr IS NOT NULL OR value_xdr IS NOT NULL)`,
+		  AND (raw_topic_xdr IS NOT NULL OR raw_value_xdr IS NOT NULL)`,
 		fromLedger, toLedger)
 	if err != nil {
 		return nil, fmt.Errorf("reading raw XDR in ledger range [%d,%d]: %w", fromLedger, toLedger, err)
@@ -300,7 +300,7 @@ func (p *Postgres) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger i
 }
 
 const eventColumns = `id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-	in_successful_call, topics, value, created_at, topics_xdr, value_xdr`
+	in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr`
 
 // nullableText and nullableStringSlice store empty raw-XDR values as SQL NULL
 // so "no raw XDR" is one representation, not two.
@@ -390,6 +390,11 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		}
 		where = append(where,
 			fmt.Sprintf("topics->%d = %s::jsonb", i, arg(topic)))
+	}
+	if len(f.TopicContains) > 0 {
+		// Direct containment — caller controls the shape (object wrapped in
+		// array for element match, multi-element arrays for subset match).
+		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
 	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))
@@ -546,23 +551,39 @@ func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (A
 	return s, nil
 }
 
-func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]string, error) {
+func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT contract_id FROM watched_contracts ORDER BY contract_id`)
+		`SELECT contract_id, added_at FROM watched_contracts ORDER BY contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
 	defer rows.Close()
 
-	var ids []string
+	var out []WatchedContract
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var wc WatchedContract
+		if err := rows.Scan(&wc.ContractID, &wc.AddedAt); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		out = append(out, wc)
 	}
-	return ids, rows.Err()
+	return out, rows.Err()
+}
+
+// RemoveWatchedContract stops future ingestion for the given contract by
+// removing its row from watched_contracts. It does NOT delete any event
+// rows already in storage — those remain queryable. ErrNotFound signals a
+// typo so the API can respond 404.
+func (p *Postgres) RemoveWatchedContract(ctx context.Context, contractID string) error {
+	tag, err := p.pool.Exec(ctx,
+		`DELETE FROM watched_contracts WHERE contract_id = $1`, contractID)
+	if err != nil {
+		return fmt.Errorf("removing watched contract: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) error {
@@ -707,6 +728,45 @@ func nullableString(s string) any {
 		return nil
 	}
 	return s
+}
+
+func (p *Postgres) withStatementTimeoutTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin guarded tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if timeout, ok := statementTimeoutFromContext(ctx); ok && timeout > 0 {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = '%dms'", timeout.Milliseconds())); err != nil {
+			return fmt.Errorf("setting statement_timeout: %w", err)
+		}
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit guarded tx: %w", err)
+	}
+	return nil
+}
+
+func statementTimeoutFromContext(ctx context.Context) (time.Duration, bool) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0, false
+	}
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		return 0, false
+	}
+	if timeout < time.Millisecond {
+		return time.Millisecond, true
+	}
+	return timeout, true
 }
 
 func scanEvent(row pgx.Row) (Event, error) {
