@@ -157,6 +157,9 @@ func (c Config) Validate() error {
 	if c.AuditFindingMaxLgrs == 0 {
 		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
 	}
+	if c.BackfillRateRPS <= 0 {
+		return fmt.Errorf("BACKFILL_RATE_RPS must be positive, got %v", c.BackfillRateRPS)
+	}
 	if c.RateLimitRPS < 0 {
 		return fmt.Errorf("RATE_LIMIT_RPS must be non-negative")
 	}
