@@ -85,6 +85,38 @@ func TestLoad(t *testing.T) {
 			wantErr: "LOG_LEVEL",
 		},
 		{
+			name: "valid log levels",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
+				tests := []struct {
+					env    string
+					expect string
+				}{
+					{"debug", "debug"},
+					{"info", "info"},
+					{"warn", "warn"},
+					{"error", "error"},
+					{"DEBUG", "DEBUG"},
+					{"INFO", "INFO"},
+					{"WARN", "WARN"},
+					{"ERROR", "ERROR"},
+					{"Debug", "Debug"},
+					{"Info", "Info"},
+					{"Warn", "Warn"},
+					{"Error", "Error"},
+				}
+				for _, tc := range tests {
+					t.Setenv("LOG_LEVEL", tc.env)
+					cfg, err := Load()
+					require.NoError(t, err, "LOG_LEVEL=%s", tc.env)
+					assert.Equal(t, tc.expect, cfg.LogLevel, "LOG_LEVEL=%s", tc.env)
+					os.Unsetenv("LOG_LEVEL")
+				}
+			},
+		},
+		{
 			name: "bad rpc url",
 			env: map[string]string{
 				"DATABASE_URL": "postgres://localhost/db",
