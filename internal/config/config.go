@@ -48,6 +48,15 @@ type Config struct {
 	AuditMaxRepair      int           `env:"AUDIT_MAX_REPAIR_ATTEMPTS" envDefault:"3"`
 	AuditFindingMaxLgrs uint32        `env:"AUDIT_FINDING_MAX_LEDGERS" envDefault:"100"`
 
+	// HTTP server timeouts. Zero means no timeout for that field.
+	// HTTP_READ_TIMEOUT limits the time to read the full request
+	// (including body); HTTP_READ_HEADER_TIMEOUT limits header reads
+	// only and is the most important defence against slow-client attacks.
+	HTTPReadTimeout       time.Duration `env:"HTTP_READ_TIMEOUT" envDefault:"30s"`
+	HTTPWriteTimeout      time.Duration `env:"HTTP_WRITE_TIMEOUT" envDefault:"30s"`
+	HTTPIdleTimeout       time.Duration `env:"HTTP_IDLE_TIMEOUT" envDefault:"60s"`
+	HTTPReadHeaderTimeout time.Duration `env:"HTTP_READ_HEADER_TIMEOUT" envDefault:"10s"`
+
 	// APIKey, when set, gates the watched-contracts management endpoints
 	// via a constant-time comparison against the X-API-Key request header.
 	// Empty means the watched-contracts surface starts up rejected (every
@@ -154,6 +163,18 @@ func (c Config) Validate() error {
 	if c.RateLimitBurst < 0 {
 		return fmt.Errorf("RATE_LIMIT_BURST must be non-negative")
 	}
+	if c.HTTPReadTimeout < 0 {
+		return fmt.Errorf("HTTP_READ_TIMEOUT must be non-negative, got %s", c.HTTPReadTimeout)
+	}
+	if c.HTTPWriteTimeout < 0 {
+		return fmt.Errorf("HTTP_WRITE_TIMEOUT must be non-negative, got %s", c.HTTPWriteTimeout)
+	}
+	if c.HTTPIdleTimeout < 0 {
+		return fmt.Errorf("HTTP_IDLE_TIMEOUT must be non-negative, got %s", c.HTTPIdleTimeout)
+	}
+	if c.HTTPReadHeaderTimeout < 0 {
+		return fmt.Errorf("HTTP_READ_HEADER_TIMEOUT must be non-negative, got %s", c.HTTPReadHeaderTimeout)
+	}
 	// Both must be set together: half-configured limits would silently
 	// behave like the disabled case (Enabled returns false when either is
 	// non-positive), which would confuse operators who set one and
@@ -224,6 +245,10 @@ func (c Config) LoggableFields() []any {
 		"start_ledger", c.StartLedger,
 		"retention_ledgers", c.RetentionLedgers,
 		"log_level", c.LogLevel,
+		"http_read_timeout", c.HTTPReadTimeout,
+		"http_write_timeout", c.HTTPWriteTimeout,
+		"http_idle_timeout", c.HTTPIdleTimeout,
+		"http_read_header_timeout", c.HTTPReadHeaderTimeout,
 		"audit_enabled", c.AuditEnabled,
 	}
 }
