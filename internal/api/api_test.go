@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,13 +10,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/khaylebfortune/sorotrail/internal/metrics"
+	"github.com/khaylebfortune/sorotrail/internal/buildinfo"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -406,6 +408,139 @@ func TestHealth(t *testing.T) {
 	})
 }
 
+func TestListEvents_FieldsProjection(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	st := &stubStore{
+		events: []store.Event{
+			{
+				ID:               "0000000001-0000000001",
+				ContractID:       testContract,
+				Ledger:           1,
+				Type:             "contract",
+				TxHash:           "abc123",
+				TxIndex:          0,
+				OpIndex:          0,
+				InSuccessfulCall: true,
+				Topics:           json.RawMessage(`["transfer"]`),
+				Value:            json.RawMessage(`{"amount":"100"}`),
+				CreatedAt:        now,
+			},
+		},
+		nextCursor: "0000000001-0000000001",
+	}
+	s := newTestServer(st, nil)
+
+	t.Run("returns only requested fields", func(t *testing.T) {
+		resp, body := doGet(t, s, "/events?fields=id,ledger")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out struct {
+			Events []map[string]any `json:"events"`
+			Cursor string           `json:"cursor"`
+		}
+		require.NoError(t, json.Unmarshal(body, &out))
+		require.Len(t, out.Events, 1)
+		ev := out.Events[0]
+		assert.Equal(t, "0000000001-0000000001", ev["id"])
+		assert.Equal(t, float64(1), ev["ledger"])
+		assert.Nil(t, ev["contract_id"])
+		assert.Nil(t, ev["type"])
+		assert.Nil(t, ev["tx_hash"])
+		assert.Equal(t, "0000000001-0000000001", out.Cursor)
+	})
+
+	t.Run("omitting fields returns full object", func(t *testing.T) {
+		resp, body := doGet(t, s, "/events")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out struct {
+			Events []store.Event `json:"events"`
+		}
+		require.NoError(t, json.Unmarshal(body, &out))
+		require.Len(t, out.Events, 1)
+		ev := out.Events[0]
+		assert.Equal(t, "abc123", ev.TxHash)
+		assert.Equal(t, "contract", ev.Type)
+		assert.Contains(t, string(out.Events[0].Topics), "transfer")
+	})
+}
+
+func TestListEvents_FieldsRejectsUnknown(t *testing.T) {
+	st := &stubStore{}
+	s := newTestServer(st, nil)
+
+	t.Run("unknown field returns 400", func(t *testing.T) {
+		resp, body := doGet(t, s, "/events?fields=id,nope")
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+		var e map[string]string
+		require.NoError(t, json.Unmarshal(body, &e))
+		assert.Contains(t, e["error"], "unknown field")
+		assert.Contains(t, e["error"], "nope")
+	})
+
+	t.Run("empty fields acts like omission", func(t *testing.T) {
+		resp, _ := doGet(t, s, "/events?fields=")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+
+	t.Run("all known fields accepted", func(t *testing.T) {
+		resp, _ := doGet(t, s, "/events?fields=id,contract_id,ledger,type,tx_hash,tx_index,op_index,in_successful_call,topics,value,created_at")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+}
+
+func TestGetEvent_FieldsProjection(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	eventID := "0000000001-0000000001"
+	st := &stubStore{
+		event: store.Event{
+			ID:               eventID,
+			ContractID:       testContract,
+			Ledger:           1,
+			Type:             "contract",
+			TxHash:           "abc123",
+			TxIndex:          0,
+			OpIndex:          0,
+			InSuccessfulCall: true,
+			Topics:           json.RawMessage(`["transfer"]`),
+			Value:            json.RawMessage(`{"amount":"100"}`),
+			CreatedAt:        now,
+		},
+	}
+	s := newTestServer(st, nil)
+
+	t.Run("returns only requested fields", func(t *testing.T) {
+		resp, body := doGet(t, s, "/events/"+eventID+"?fields=id,ledger")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.Equal(t, eventID, out["id"])
+		assert.Equal(t, float64(1), out["ledger"])
+		assert.Nil(t, out["contract_id"])
+		assert.Nil(t, out["type"])
+	})
+
+	t.Run("omitting fields returns full object", func(t *testing.T) {
+		resp, body := doGet(t, s, "/events/"+eventID)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out store.Event
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.Equal(t, "abc123", out.TxHash)
+		assert.Equal(t, "contract", out.Type)
+	})
+
+	t.Run("unknown field returns 400", func(t *testing.T) {
+		resp, body := doGet(t, s, "/events/"+eventID+"?fields=id,bogus")
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var e map[string]string
+		require.NoError(t, json.Unmarshal(body, &e))
+		assert.Contains(t, e["error"], "unknown field")
+	})
+}
+
 func TestStats(t *testing.T) {
 	t.Run("includes store and freshness fields", func(t *testing.T) {
 		st := &stubStore{stats: store.Stats{
@@ -454,187 +589,89 @@ func TestStats(t *testing.T) {
 	})
 }
 
-// TestBroker_FilteredDelivery verifies that the broker only sends events to
-// subscribers whose filters match.
-func TestBroker_FilteredDelivery(t *testing.T) {
-	b := NewBroker()
+func TestVersion(t *testing.T) {
+	t.Run("returns default values", func(t *testing.T) {
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/version")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
 
-	// Subscriber 1: only contract CAAAA..., type contract.
-	ch1, cancel1 := b.Subscribe(store.EventFilter{
-		ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-		Type:       "contract",
-	})
-	defer cancel1()
-
-	// Subscriber 2: only diagnostic events.
-	ch2, cancel2 := b.Subscribe(store.EventFilter{Type: "diagnostic"})
-	defer cancel2()
-
-	// Subscriber 3: no filter (receives everything).
-	ch3, cancel3 := b.Subscribe(store.EventFilter{})
-	defer cancel3()
-
-	events := []store.Event{
-		{ID: "e1", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Type: "contract", Ledger: 100},
-		{ID: "e2", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Type: "diagnostic", Ledger: 100},
-		{ID: "e3", ContractID: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", Type: "contract", Ledger: 101},
-	}
-	b.Publish(events)
-
-	// Sub 1: should get e1 only (matching contract + type)
-	ev := drainOne(t, ch1)
-	assert.Equal(t, "e1", ev.ID)
-	assertNoMore(t, ch1)
-
-	// Sub 2: should get e2 only (diagnostic)
-	ev = drainOne(t, ch2)
-	assert.Equal(t, "e2", ev.ID)
-	assertNoMore(t, ch2)
-
-	// Sub 3: should get all three.
-	ids := drainAll(t, ch3, 3)
-	assert.Len(t, ids, 3)
-}
-
-// TestBroker_TopicFiltering verifies that topic matching is exact and doesn't
-// false-positive on substring overlaps (e.g. "transfer" in "transfer_from").
-func TestBroker_TopicFiltering(t *testing.T) {
-	b := NewBroker()
-
-	ch, cancel := b.Subscribe(store.EventFilter{
-		Topic: json.RawMessage(`{"symbol":"transfer"}`),
-	})
-	defer cancel()
-
-	// Event with exact matching topic.
-	eMatch := store.Event{
-		ID:     "e1",
-		Topics: json.RawMessage(`[{"symbol":"transfer"},{"symbol":"approve"}]`),
-	}
-	// Event with a topic that contains the filter topic as a substring.
-	eSubstring := store.Event{
-		ID:     "e2",
-		Topics: json.RawMessage(`[{"symbol":"transfer_from"}]`),
-	}
-
-	b.Publish([]store.Event{eMatch, eSubstring})
-
-	// Only e1 should match; e2 must not false-positive.
-	ev := drainOne(t, ch)
-	assert.Equal(t, "e1", ev.ID)
-	assertNoMore(t, ch)
-}
-
-// TestBroker_SlowSubscriberOverflow verifies that a subscriber whose buffer
-// fills up is dropped (channel closed) without blocking the publisher.
-func TestBroker_SlowSubscriberOverflow(t *testing.T) {
-	b := NewBroker()
-
-	ch, cancel := b.Subscribe(store.EventFilter{})
-	defer cancel()
-
-	// Fill the buffer and overflow it.
-	n := subscriberBufferSize + 10
-	events := make([]store.Event, n)
-	for i := range events {
-		events[i] = store.Event{ID: fmt.Sprintf("e%d", i)}
-	}
-	b.Publish(events)
-
-	// Drain up to buffer size — after overflow the channel should be closed.
-	drained := 0
-	for range ch {
-		drained++
-	}
-	assert.LessOrEqual(t, drained, subscriberBufferSize,
-		"overflow should drop the subscriber after buffer is full")
-}
-
-// TestSubscribe_RouteExists verifies the SSE endpoint is registered, returns
-// proper headers, and validates filter params. Core publish/subscribe logic
-// is tested by TestBroker_FilteredDelivery and TestBroker_SlowSubscriberOverflow.
-func TestSubscribe_RouteExists(t *testing.T) {
-	b := NewBroker()
-	st := &stubStore{}
-	s := New(st, &stubRPC{health: rpc.Health{Status: "healthy"}},
-		slog.New(slog.NewTextHandler(io.Discard, nil)), nil, b)
-
-	srv := httptest.NewServer(s.Router())
-	defer srv.Close()
-
-	// A bad filter should return 400.
-	resp, body := doGet(t, s, "/events/subscribe?type=bogus")
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	assert.Contains(t, string(body), "error")
-}
-
-// drainOne reads a single event from a channel (non-blocking with short
-// timeout).
-func drainOne(t *testing.T, ch <-chan store.Event) store.Event {
-	t.Helper()
-	select {
-	case e := <-ch:
-		return e
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("timed out waiting for event on channel")
-	}
-	return store.Event{}
-}
-
-// assertNoMore asserts that no more events are immediately available on ch.
-func assertNoMore(t *testing.T, ch <-chan store.Event) {
-	t.Helper()
-	select {
-	case e := <-ch:
-		t.Fatalf("unexpected event %s on channel", e.ID)
-	default:
-	}
-}
-
-// drainAll reads up to n events from ch.
-func drainAll(t *testing.T, ch <-chan store.Event, n int) []string {
-	t.Helper()
-	var ids []string
-	for i := 0; i < n; i++ {
-		select {
-		case e := <-ch:
-			ids = append(ids, e.ID)
-		case <-time.After(50 * time.Millisecond):
-			return ids
+		var got struct {
+			Version   string `json:"version"`
+			Commit    string `json:"commit"`
+			BuildDate string `json:"build_date"`
 		}
-	}
-	return ids
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, "unknown", got.Version)
+		assert.Equal(t, "unknown", got.Commit)
+		assert.Equal(t, "unknown", got.BuildDate)
+	})
+
+	t.Run("reflects injected build info", func(t *testing.T) {
+		origV, origC, origD := buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate
+		buildinfo.Version = "v1.2.3"
+		buildinfo.Commit = "abc1234"
+		buildinfo.BuildDate = "2026-07-26T00:00:00Z"
+		t.Cleanup(func() {
+			buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate = origV, origC, origD
+		})
+
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/version")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var got struct {
+			Version   string `json:"version"`
+			Commit    string `json:"commit"`
+			BuildDate string `json:"build_date"`
+		}
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, "v1.2.3", got.Version)
+		assert.Equal(t, "abc1234", got.Commit)
+		assert.Equal(t, "2026-07-26T00:00:00Z", got.BuildDate)
+	})
+
+	t.Run("no-store cache header", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/version")
+		assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	})
+
+	t.Run("content type is json", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/version")
+		assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+	})
 }
 
-func TestMetrics_Returns200AndContainsExpectedNames(t *testing.T) {
-	m := metrics.New()
-	// Drive some ingest-like activity so counters/gauge are non-zero and
-	// their metadata lines appear in the registry.
-	m.RecordEventsIngested(5)
-	m.SetLastIngestedLedger(12345)
-	m.SetChainHeadLedger(12400)
-	m.ObserveRPCRequest("getEvents", nil)
-	m.ObserveRPCRequest("getHealth", errors.New("timeout"))
-	m.RecordHTTPRequest("/events", 200, 0.012)
-	m.RecordHTTPRequest("/health", 500, 0.003)
+func TestRequestID(t *testing.T) {
+	tests := []struct {
+		name       string
+		incomingID string
+		wantEcho   bool
+	}{
+		{name: "generated when absent", incomingID: "", wantEcho: false},
+		{name: "echoes incoming ID", incomingID: "test-request-id-123", wantEcho: true},
+		{name: "echoes long ID", incomingID: strings.Repeat("a", 100), wantEcho: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			s := New(&stubStore{}, nil, log, "test-key")
+			srv := httptest.NewServer(s.Router())
+			defer srv.Close()
 
-	st := &stubStore{}
-	s := New(st, &stubRPC{health: rpc.Health{Status: "healthy"}},
-		slog.New(slog.NewTextHandler(io.Discard, nil)), m, NewBroker())
+			req, err := http.NewRequest("GET", srv.URL+"/health", nil)
+			require.NoError(t, err)
+			if tt.incomingID != "" {
+				req.Header.Set("X-Request-ID", tt.incomingID)
+			}
+			resp, err := http.DefaultTransport.RoundTrip(req)
+			require.NoError(t, err)
+			resp.Body.Close()
 
-	resp, body := doGet(t, s, "/metrics")
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	text := string(body)
-	// Verify every required metric name appears.
-	for _, name := range []string{
-		"sorotrail_events_ingested_total",
-		"sorotrail_last_ingested_ledger",
-		"sorotrail_chain_head_ledger",
-		"sorotrail_rpc_requests_total",
-		"sorotrail_http_requests_total",
-		"sorotrail_http_request_duration_seconds",
-	} {
-		assert.Contains(t, text, name, "metrics output must contain %s", name)
+			got := resp.Header.Get("X-Request-ID")
+			require.NotEmpty(t, got)
+			if tt.wantEcho {
+				assert.Equal(t, tt.incomingID, got)
+			}
+			assert.Contains(t, buf.String(), got)
+		})
 	}
 }
