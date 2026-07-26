@@ -17,7 +17,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -178,7 +177,10 @@ func run() error {
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiServer.Router(),
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       cfg.HTTPReadTimeout,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
+		IdleTimeout:       cfg.HTTPIdleTimeout,
+		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
 	}
 	if cfg.APIKey == "" {
 		log.Warn("API_KEY env is unset; watched-contracts endpoints will reject every request with 503")
@@ -234,7 +236,7 @@ func run() error {
 		stop() // one component failed; wind down the others
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Error("http shutdown", "error", err)
