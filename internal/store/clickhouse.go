@@ -118,11 +118,11 @@ func (c *ClickHouse) ListWatchedContracts(ctx context.Context) ([]WatchedContrac
 	return nil, nil
 }
 
-func (c *ClickHouse) AddWatchedContract(ctx context.Context, contractID string) error {
+func (c *ClickHouse) RemoveWatchedContract(ctx context.Context, contractID string) error {
 	return nil
 }
 
-func (c *ClickHouse) RemoveWatchedContract(ctx context.Context, contractID string) error {
+func (c *ClickHouse) AddWatchedContract(ctx context.Context, contractID string) error {
 	return nil
 }
 
