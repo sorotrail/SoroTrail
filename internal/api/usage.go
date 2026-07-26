@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // UsageRecorder accumulates per-tenant consumption in memory and flushes it

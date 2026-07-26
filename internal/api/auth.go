@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // API key authentication (#17) and tenant resolution (#48).
