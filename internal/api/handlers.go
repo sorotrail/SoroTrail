@@ -375,6 +375,14 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	}
 
 	events, cursor, qerr := s.store.QueryEvents(r.Context(), filter)
+	if errors.Is(qerr, store.ErrInvalidCursor) {
+		// A cursor that doesn't decode is client input — most often a cursor
+		// taken from one ordering and replayed against another. Report it as
+		// a bad request rather than a server error.
+		writeError(w, http.StatusBadRequest, fmt.Errorf(
+			"invalid cursor for order_by=%s; use the cursor returned by the same ordering", filter.OrderBy))
+		return
+	}
 	if qerr != nil {
 		loggerFromContext(r.Context()).Error("querying events", "error", qerr)
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
@@ -1101,6 +1109,15 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	default:
 		return f, fmt.Errorf("invalid order %q (want asc or desc)", order)
 	}
+
+	// order_by selects the sort column; order still controls the direction,
+	// so the two combine (e.g. order_by=created_at&order=desc).
+	orderBy := q.Get("order_by")
+	if !store.ValidOrderBy(orderBy) {
+		return f, fmt.Errorf("invalid order_by %q (want %s, %s or %s)",
+			orderBy, store.OrderByID, store.OrderByLedger, store.OrderByCreatedAt)
+	}
+	f.OrderBy = orderBy
 
 	var err error
 	if topic := q.Get("topic"); topic != "" {

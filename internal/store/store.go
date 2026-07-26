@@ -116,17 +116,30 @@ type EventFilter struct {
 	Limit  int
 	// Order is "asc" or "desc", defaults to "asc"
 	Order string
+	// OrderBy selects the sort column: OrderByID (default), OrderByLedger,
+	// or OrderByCreatedAt. Every ordering is made total by appending id as
+	// a tiebreaker, so keyset pagination stays stable when the sort column
+	// has duplicates.
+	OrderBy string
+}
 
-	// Scope is the tenant authorization boundary, ANDed into the generated
-	// SQL alongside the user-supplied filters above. Unlike every other
-	// field on this struct, its zero value is a constraint and not the
-	// absence of one: an unset Scope matches nothing. See the Scope type
-	// for why it fails closed rather than open.
-	//
-	// The API layer populates this from the authenticated request in
-	// exactly one place (filterFromQuery), so no handler decides for
-	// itself whether a caller is entitled to a row.
-	Scope Scope
+// Sort columns accepted in EventFilter.OrderBy. The zero value means
+// OrderByID, which is the historical behavior.
+const (
+	OrderByID        = "id"
+	OrderByLedger    = "ledger"
+	OrderByCreatedAt = "created_at"
+)
+
+// ValidOrderBy reports whether s names a supported sort column. The empty
+// string is valid and means OrderByID.
+func ValidOrderBy(s string) bool {
+	switch s {
+	case "", OrderByID, OrderByLedger, OrderByCreatedAt:
+		return true
+	default:
+		return false
+	}
 }
 
 // IngestionState tracks how far ingestion has progressed.
