@@ -83,6 +83,11 @@ type Config struct {
 	// intermediaries cannot. Defaults to false (the deployment does not
 	// need request-scoped caching).
 	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
+
+	// ShutdownTimeout limits how long the graceful HTTP server drain and
+	// component shutdown may take before the process is killed. Zero means
+	// no timeout (wait indefinitely).
+	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"15s"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -178,6 +183,9 @@ func (c Config) Validate() error {
 	if c.HTTPReadHeaderTimeout < 0 {
 		return fmt.Errorf("HTTP_READ_HEADER_TIMEOUT must be non-negative, got %s", c.HTTPReadHeaderTimeout)
 	}
+	if c.ShutdownTimeout < 0 {
+		return fmt.Errorf("SHUTDOWN_TIMEOUT must be non-negative, got %s", c.ShutdownTimeout)
+	}
 	// Both must be set together: half-configured limits would silently
 	// behave like the disabled case (Enabled returns false when either is
 	// non-positive), which would confuse operators who set one and
@@ -252,6 +260,7 @@ func (c Config) LoggableFields() []any {
 		"http_write_timeout", c.HTTPWriteTimeout,
 		"http_idle_timeout", c.HTTPIdleTimeout,
 		"http_read_header_timeout", c.HTTPReadHeaderTimeout,
+		"shutdown_timeout", c.ShutdownTimeout,
 		"audit_enabled", c.AuditEnabled,
 	}
 }

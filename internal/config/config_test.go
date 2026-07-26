@@ -25,6 +25,7 @@ var envKeys = []string{
 	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
 	"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT",
 	"HTTP_READ_HEADER_TIMEOUT",
+	"SHUTDOWN_TIMEOUT",
 }
 
 func TestLoad(t *testing.T) {
@@ -174,6 +175,43 @@ func TestLoad(t *testing.T) {
 				"HTTP_READ_HEADER_TIMEOUT": "-3s",
 			},
 			wantErr: "HTTP_READ_HEADER_TIMEOUT must be non-negative",
+		},
+		{
+			name: "shutdown timeout defaults to 15s",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, 15*time.Second, c.ShutdownTimeout)
+			},
+		},
+		{
+			name: "shutdown timeout custom value accepted",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"SHUTDOWN_TIMEOUT": "30s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, 30*time.Second, c.ShutdownTimeout)
+			},
+		},
+		{
+			name: "shutdown timeout zero accepted (no timeout)",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"SHUTDOWN_TIMEOUT": "0s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, time.Duration(0), c.ShutdownTimeout)
+			},
+		},
+		{
+			name: "negative shutdown timeout rejected",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"SHUTDOWN_TIMEOUT": "-1s",
+			},
+			wantErr: "SHUTDOWN_TIMEOUT must be non-negative",
 		},
 		{
 			name: "rate limit both set is accepted",
