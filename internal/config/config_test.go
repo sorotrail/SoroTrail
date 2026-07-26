@@ -36,6 +36,8 @@ func TestLoad(t *testing.T) {
 			check: func(t *testing.T, c Config) {
 				assert.Equal(t, "https://soroban-testnet.stellar.org", c.RPCURL)
 				assert.Equal(t, 5*time.Second, c.PollInterval)
+				assert.Equal(t, 25*time.Second, c.APIQueryTimeout)
+				assert.Equal(t, 2*time.Second, c.APISlowQueryThreshold)
 				assert.Equal(t, ":8080", c.HTTPAddr)
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
 				assert.Equal(t, uint32(120960), c.PartitionLedgerSpan)
@@ -75,6 +77,14 @@ func TestLoad(t *testing.T) {
 				"POLL_INTERVAL": "-3s",
 			},
 			wantErr: "POLL_INTERVAL must be positive",
+		},
+		{
+			name: "bad query timeout",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"API_QUERY_TIMEOUT": "0s",
+			},
+			wantErr: "API_QUERY_TIMEOUT",
 		},
 		{
 			name: "bad log level",
