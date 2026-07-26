@@ -178,7 +178,10 @@ func run() error {
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiServer.Router(),
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       cfg.HTTPReadTimeout,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
+		IdleTimeout:       cfg.HTTPIdleTimeout,
+		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
 	}
 	if cfg.APIKey == "" {
 		log.Warn("API_KEY env is unset; watched-contracts endpoints will reject every request with 503")
