@@ -311,9 +311,21 @@ type Stats struct {
 	// Set by the guarded store wrapper; zero when the store is used
 	// directly or when no errors have occurred.
 	QueryErrors uint64 `json:"query_errors"`
+	// RPCErrors counts RPC call failures by method name since the process
+	// started. Populated by the CountingClient wrapper; zero-valued when
+	// the wrapper is not in use.
+	RPCErrors RPCErrorStats `json:"rpc_errors,omitempty"`
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
+}
+
+// RPCErrorStats is a JSON-friendly snapshot of per-method RPC error counts.
+type RPCErrorStats struct {
+	GetEvents        uint64 `json:"getEvents,omitempty"`
+	GetLatestLedger  uint64 `json:"getLatestLedger,omitempty"`
+	GetHealth        uint64 `json:"getHealth,omitempty"`
+	GetLedgerEntries uint64 `json:"getLedgerEntries,omitempty"`
 }
 
 // AuditStats is a JSON-friendly view of audit.Metrics. Defined here so
