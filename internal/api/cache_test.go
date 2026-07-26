@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,20 @@ import (
 
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
+
+// stubEnricher implements Enricher for tests. It marks events as decoded
+// without actually looking up contract specs.
+type stubEnricher struct{}
+
+func (e *stubEnricher) EnrichEvents(_ context.Context, events []store.Event) []store.EnrichedEvent {
+	if len(events) == 0 {
+		return nil
+	}
+	return []store.EnrichedEvent{{
+		Event:   events[0],
+		Decoded: true,
+	}}
+}
 
 // doGetWithHeader is doGet plus a header for conditional requests. The
 // 304 tests use this so the If-None-Match setup reads naturally without
@@ -562,4 +577,28 @@ func TestListEvents_TopicFilterCannotReuseAnothersValidator(t *testing.T) {
 	resp, _ := doGetWithHeader(t, s, transfer, "If-None-Match", mintETag)
 	assert.NotEqual(t, http.StatusNotModified, resp.StatusCode,
 		"a validator minted for a different filter must not produce a 304")
+}
+
+// TestGetEvent_Decoded_Immutable: GET /events/{id}?decoded=true returns
+// the same immutable cache headers as the non-decoded path.
+func TestGetEvent_Decoded_Immutable(t *testing.T) {
+	const id = "0001099511627776-0000000001"
+	st := &stubStore{event: store.Event{ID: id, Ledger: 100}}
+	s := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key", &stubEnricher{})
+
+	resp, _ := doGet(t, s, "/events/"+id+"?decoded=true")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assertImmutable(t, resp, `"`+id+`"`)
+}
+
+// TestGetEvent_DecodedWithXDR_Immutable: GET /events/{id}?decoded=true&include_xdr=true
+// returns the same immutable cache headers.
+func TestGetEvent_DecodedWithXDR_Immutable(t *testing.T) {
+	const id = "0001099511627776-0000000002"
+	st := &stubStore{event: store.Event{ID: id, Ledger: 100}}
+	s := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key", &stubEnricher{})
+
+	resp, _ := doGet(t, s, "/events/"+id+"?decoded=true&include_xdr=true")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assertImmutable(t, resp, `"`+id+`"`)
 }

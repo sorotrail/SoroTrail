@@ -416,6 +416,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {
+			writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
 			if includeXDR {
 				writeJSON(w, http.StatusOK, enrichEventWithXDR(enriched[0]))
 				return
