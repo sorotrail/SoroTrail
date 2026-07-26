@@ -209,7 +209,7 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 	})
 
 	t.Run("by multiple types", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{Types: []string{"contract", "diagnostic"}})
+		got, _, err := st.QueryEvents(ctx, EventFilter{Types: []string{"contract", "diagnostic"}, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, 10)
 	})
@@ -235,6 +235,7 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			Topic0: json.RawMessage(`{"symbol":"transfer"}`),
 			Topic1: json.RawMessage(`{"address":"GABC"}`),
+			Scope:  WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
@@ -579,7 +580,7 @@ func TestRemoveWatchedContract_PreservesEvents(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound)
 
 	// Stored events for the removed contract are intact and queryable.
-	got, _, err := st.QueryEvents(ctx, EventFilter{ContractID: contractA})
+	got, _, err := st.QueryEvents(ctx, EventFilter{ContractID: contractA, Scope: WildcardScope()})
 	require.NoError(t, err)
 	require.Len(t, got, 2, "removal NEVER deletes event rows — history is preserved")
 	assert.Equal(t, int64(100), got[0].Ledger)
