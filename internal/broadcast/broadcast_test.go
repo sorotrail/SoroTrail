@@ -51,7 +51,7 @@ func TestBroadcaster_DeliversMatchingEvents(t *testing.T) {
 
 func TestBroadcaster_FilterByType(t *testing.T) {
 	b := New(10)
-	sub := b.Subscribe(store.EventFilter{Type: "system"})
+	sub := b.Subscribe(store.EventFilter{Types: []string{"system"}})
 	defer sub.Close()
 
 	b.Publish(context.Background(), []store.Event{

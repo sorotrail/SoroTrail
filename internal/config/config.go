@@ -14,15 +14,28 @@ import (
 // Config holds all runtime configuration. Every field is settable via the
 // environment variable named in its `env` tag; see .env.example for docs.
 type Config struct {
-	RPCURL              string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
-	DatabaseURL         string        `env:"DATABASE_URL"`
-	PollInterval        time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
-	HTTPAddr            string        `env:"HTTP_ADDR" envDefault:":8080"`
-	WatchedContracts    []string      `env:"WATCHED_CONTRACTS"`
-	StartLedger         uint32        `env:"START_LEDGER"`
-	RetentionLedgers    uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
-	PartitionLedgerSpan uint32        `env:"PARTITION_LEDGER_SPAN" envDefault:"120960"`
-	LogLevel            string        `env:"LOG_LEVEL" envDefault:"info"`
+	RPCURL                string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
+	DatabaseURL           string        `env:"DATABASE_URL"`
+	PollInterval          time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
+	HTTPAddr              string        `env:"HTTP_ADDR" envDefault:":8080"`
+	WatchedContracts      []string      `env:"WATCHED_CONTRACTS"`
+	StartLedger           uint32        `env:"START_LEDGER"`
+	RetentionLedgers      uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
+	PartitionLedgerSpan   uint32        `env:"PARTITION_LEDGER_SPAN" envDefault:"120960"`
+	LogLevel              string        `env:"LOG_LEVEL" envDefault:"info"`
+	APIQueryTimeout       time.Duration `env:"API_QUERY_TIMEOUT" envDefault:"25s"`
+	APISlowQueryThreshold time.Duration `env:"API_SLOW_QUERY_THRESHOLD" envDefault:"2s"`
+
+	// Horizon backfill configuration. HORIZON_URL is the REST endpoint
+	// the backfill command reads; BACKFILL_RATE_RPS controls how many
+	// requests per second the backfill command issues (env/v11 parses
+	// the float directly). Both are used only by `sorotrail backfill`,
+	// not by the live indexer. The defaults match the documented
+	// public-testnet target and a safe ~10 req/s pace; private
+	// deployments can point HORIZON_URL at themselves and allow a
+	// tighter rate via the flag or env override.
+	HorizonURL      string  `env:"HORIZON_URL" envDefault:"https://horizon-testnet.stellar.org"`
+	BackfillRateRPS float64 `env:"BACKFILL_RATE_RPS" envDefault:"10"`
 
 	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
 	// entirely; the binary behaves exactly like the pre-audit build.
@@ -34,6 +47,15 @@ type Config struct {
 	AuditMaxRPS         float64       `env:"AUDIT_MAX_RPS" envDefault:"10"`
 	AuditMaxRepair      int           `env:"AUDIT_MAX_REPAIR_ATTEMPTS" envDefault:"3"`
 	AuditFindingMaxLgrs uint32        `env:"AUDIT_FINDING_MAX_LEDGERS" envDefault:"100"`
+
+	// HTTP server timeouts. Zero means no timeout for that field.
+	// HTTP_READ_TIMEOUT limits the time to read the full request
+	// (including body); HTTP_READ_HEADER_TIMEOUT limits header reads
+	// only and is the most important defence against slow-client attacks.
+	HTTPReadTimeout       time.Duration `env:"HTTP_READ_TIMEOUT" envDefault:"30s"`
+	HTTPWriteTimeout      time.Duration `env:"HTTP_WRITE_TIMEOUT" envDefault:"30s"`
+	HTTPIdleTimeout       time.Duration `env:"HTTP_IDLE_TIMEOUT" envDefault:"60s"`
+	HTTPReadHeaderTimeout time.Duration `env:"HTTP_READ_HEADER_TIMEOUT" envDefault:"10s"`
 
 	// APIKey, when set, gates the watched-contracts management endpoints
 	// via a constant-time comparison against the X-API-Key request header.
@@ -61,6 +83,11 @@ type Config struct {
 	// intermediaries cannot. Defaults to false (the deployment does not
 	// need request-scoped caching).
 	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
+
+	// ShutdownTimeout limits how long the graceful HTTP server drain and
+	// component shutdown may take before the process is killed. Zero means
+	// no timeout (wait indefinitely).
+	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"15s"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -86,8 +113,17 @@ func (c Config) Validate() error {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return fmt.Errorf("RPC_URL %q is not a valid URL", c.RPCURL)
 	}
+	if u, err := url.Parse(c.HorizonURL); err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("HORIZON_URL %q is not a valid URL", c.HorizonURL)
+	}
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("POLL_INTERVAL must be positive, got %s", c.PollInterval)
+	}
+	if c.APIQueryTimeout <= 0 {
+		return fmt.Errorf("API_QUERY_TIMEOUT must be positive, got %s", c.APIQueryTimeout)
+	}
+	if c.APISlowQueryThreshold <= 0 {
+		return fmt.Errorf("API_SLOW_QUERY_THRESHOLD must be positive, got %s", c.APISlowQueryThreshold)
 	}
 	if c.RetentionLedgers == 0 {
 		return fmt.Errorf("RETENTION_LEDGERS must be positive")
@@ -126,11 +162,29 @@ func (c Config) Validate() error {
 	if c.AuditFindingMaxLgrs == 0 {
 		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
 	}
+	if c.BackfillRateRPS <= 0 {
+		return fmt.Errorf("BACKFILL_RATE_RPS must be positive, got %v", c.BackfillRateRPS)
+	}
 	if c.RateLimitRPS < 0 {
 		return fmt.Errorf("RATE_LIMIT_RPS must be non-negative")
 	}
 	if c.RateLimitBurst < 0 {
 		return fmt.Errorf("RATE_LIMIT_BURST must be non-negative")
+	}
+	if c.HTTPReadTimeout < 0 {
+		return fmt.Errorf("HTTP_READ_TIMEOUT must be non-negative, got %s", c.HTTPReadTimeout)
+	}
+	if c.HTTPWriteTimeout < 0 {
+		return fmt.Errorf("HTTP_WRITE_TIMEOUT must be non-negative, got %s", c.HTTPWriteTimeout)
+	}
+	if c.HTTPIdleTimeout < 0 {
+		return fmt.Errorf("HTTP_IDLE_TIMEOUT must be non-negative, got %s", c.HTTPIdleTimeout)
+	}
+	if c.HTTPReadHeaderTimeout < 0 {
+		return fmt.Errorf("HTTP_READ_HEADER_TIMEOUT must be non-negative, got %s", c.HTTPReadHeaderTimeout)
+	}
+	if c.ShutdownTimeout < 0 {
+		return fmt.Errorf("SHUTDOWN_TIMEOUT must be non-negative, got %s", c.ShutdownTimeout)
 	}
 	// Both must be set together: half-configured limits would silently
 	// behave like the disabled case (Enabled returns false when either is
@@ -202,6 +256,11 @@ func (c Config) LoggableFields() []any {
 		"start_ledger", c.StartLedger,
 		"retention_ledgers", c.RetentionLedgers,
 		"log_level", c.LogLevel,
+		"http_read_timeout", c.HTTPReadTimeout,
+		"http_write_timeout", c.HTTPWriteTimeout,
+		"http_idle_timeout", c.HTTPIdleTimeout,
+		"http_read_header_timeout", c.HTTPReadHeaderTimeout,
+		"shutdown_timeout", c.ShutdownTimeout,
 		"audit_enabled", c.AuditEnabled,
 	}
 }

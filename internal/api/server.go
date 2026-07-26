@@ -1,5 +1,5 @@
 // Package api serves stored events over HTTP. Endpoints are documented in
-// the README's API reference.
+// the OpenAPI spec and the README.
 package api
 
 import (
@@ -17,6 +17,10 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
+
+type ctxKey string
+
+const loggerCtxKey ctxKey = "logger"
 
 // SetAuditor registers the binary's Auditor so /stats can surface its
 // Metrics counters. There is exactly one Auditor per process; its
@@ -45,6 +49,27 @@ func getAuditor() *audit.Auditor {
 	return auditor
 }
 
+// SetRPCCounter registers the CountingClient so /stats can expose
+// per-method RPC error totals. Call this before ListenAndServe.
+// The setter is guarded by a RWMutex so concurrent /stats readers
+// never observe a torn pointer.
+var (
+	rpcCounterMu sync.RWMutex
+	rpcCounter   *rpc.CountingClient
+)
+
+func SetRPCCounter(c *rpc.CountingClient) {
+	rpcCounterMu.Lock()
+	rpcCounter = c
+	rpcCounterMu.Unlock()
+}
+
+func getRPCCounter() *rpc.CountingClient {
+	rpcCounterMu.RLock()
+	defer rpcCounterMu.RUnlock()
+	return rpcCounter
+}
+
 // Enricher is the spec-based event enrichment interface used by the API.
 // Defined here so the API package doesn't import internal/spec directly.
 type Enricher interface {
@@ -53,13 +78,14 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store    store.Store
-	rpc      rpc.Client
-	enricher Enricher
-	log      *slog.Logger
-	apiKey   string
-	limiter  *RateLimiter
-	bcast    *broadcast.Broadcaster
+	store     store.Store
+	rpc       rpc.Client
+	enricher  Enricher
+	log       *slog.Logger
+	apiKey    string
+	limiter   *RateLimiter
+	recoverer *Recoverer
+	bcast     *broadcast.Broadcaster
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -68,7 +94,7 @@ type Server struct {
 // See apiKeyAuth for the exact contract. The trailing enricher is optional —
 // pass nil to disable spec decoding, or one Enricher to enable it.
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey}
+	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log)}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
@@ -92,8 +118,9 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
-	r.Use(middleware.Recoverer)
+	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 	if s.limiter != nil {
 		// Limiter sits inside Timeout and Recoverer so its instant 429
@@ -103,6 +130,7 @@ func (s *Server) Router() http.Handler {
 	}
 
 	r.Get("/health", s.handleHealth)
+	r.Get("/version", s.handleVersion)
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
@@ -136,13 +164,22 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		start := time.Now()
-		next.ServeHTTP(ww, r)
-		s.log.Info("http request",
-			"method", r.Method,
-			"path", r.URL.Path,
+		reqID := middleware.GetReqID(r.Context())
+		log := s.log.With("request_id", reqID, "route", r.Method+" "+r.URL.Path)
+		ctx := context.WithValue(r.Context(), loggerCtxKey, log)
+		ww.Header().Set("X-Request-ID", reqID)
+		next.ServeHTTP(ww, r.WithContext(ctx))
+		log.Info("http request",
 			"status", ww.Status(),
-			"duration", time.Since(start),
-			"remote", r.RemoteAddr,
+			"duration_ms", time.Since(start).Milliseconds(),
 		)
 	})
+}
+
+func loggerFromContext(ctx context.Context) *slog.Logger {
+	log, ok := ctx.Value(loggerCtxKey).(*slog.Logger)
+	if !ok {
+		return slog.Default()
+	}
+	return log
 }
