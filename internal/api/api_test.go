@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,12 +9,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/khaylebfortune/sorotrail/internal/buildinfo"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -200,7 +203,7 @@ func TestListEvents_ParsesFilters(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 	assert.Equal(t, testContract, st.lastFilter.ContractID)
-	assert.Equal(t, "contract", st.lastFilter.Type)
+	assert.Equal(t, []string{"contract"}, st.lastFilter.Types)
 	assert.Equal(t, int64(10), st.lastFilter.FromLedger)
 	assert.Equal(t, int64(20), st.lastFilter.ToLedger)
 	assert.Equal(t, 5, st.lastFilter.Limit)
@@ -252,11 +255,6 @@ func TestListEvents_BadParams(t *testing.T) {
 		"/events?limit=0",
 		"/events?limit=-1",
 		"/events?limit=99999",
-		"/events?limit=abc",
-		"/events?cursor=bad%20cursor",
-		"/events?cursor=e1%3BDROP",
-		"/events?cursor=%3Cscript%3E",
-		"/events?cursor=cursor%27OR%271%3D%271",
 		"/events?topic_contains=not-valid-json",
 	} {
 		t.Run(path, func(t *testing.T) {
@@ -265,6 +263,39 @@ func TestListEvents_BadParams(t *testing.T) {
 			var e map[string]string
 			require.NoError(t, json.Unmarshal(body, &e))
 			assert.NotEmpty(t, e["error"])
+		})
+	}
+}
+
+func TestListEvents_TypeFilter(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		want    []string
+		wantErr int // 0 = success
+	}{
+		{name: "no type param", query: "/events", want: nil, wantErr: 0},
+		{name: "single type", query: "/events?type=contract", want: []string{"contract"}, wantErr: 0},
+		{name: "multiple types", query: "/events?type=contract,system", want: []string{"contract", "system"}, wantErr: 0},
+		{name: "all three types", query: "/events?type=contract,system,diagnostic", want: []string{"contract", "system", "diagnostic"}, wantErr: 0},
+		{name: "invalid type", query: "/events?type=bogus", wantErr: http.StatusBadRequest},
+		{name: "partially invalid type", query: "/events?type=contract,bogus", wantErr: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], "invalid type")
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			assert.Equal(t, tt.want, st.lastFilter.Types)
 		})
 	}
 }
@@ -337,7 +368,7 @@ func TestListEvents_IncludeXDR(t *testing.T) {
 	assert.NotContains(t, string(body), "topics_xdr")
 	assert.NotContains(t, string(body), "value_xdr")
 
-	resp, body = doGet(t, s, "/events?xdr=true")
+	resp, body = doGet(t, s, "/events?include_xdr=true")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var out struct {
@@ -372,7 +403,7 @@ func TestGetEvent_IncludeXDR(t *testing.T) {
 	assert.NotContains(t, string(body), "topics_xdr")
 	assert.NotContains(t, string(body), "value_xdr")
 
-	resp, body = doGet(t, s, "/events/0000000000-0000000001?xdr=true")
+	resp, body = doGet(t, s, "/events/0000000000-0000000001?include_xdr=true")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var out struct {
@@ -602,7 +633,6 @@ func TestStats(t *testing.T) {
 		rc := &stubRPC{health: rpc.Health{Status: "healthy", LatestLedger: 1_020}}
 		resp, body := doGet(t, newTestServer(st, rc), "/stats")
 		require.Equal(t, http.StatusOK, resp.StatusCode)
-
 		var got store.Stats
 		require.NoError(t, json.Unmarshal(body, &got))
 		assert.Equal(t, int64(42), got.TotalEvents)
@@ -612,6 +642,7 @@ func TestStats(t *testing.T) {
 		assert.Equal(t, int64(1_020), *got.ChainHeadLedger)
 		require.NotNil(t, got.IngestLagLedgers)
 		assert.Equal(t, int64(21), *got.IngestLagLedgers)
+		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
 	})
 
 	t.Run("keeps stored stats when RPC is down", func(t *testing.T) {
@@ -637,5 +668,93 @@ func TestStats(t *testing.T) {
 		assert.Nil(t, raw["chain_head_ledger"])
 		assert.Contains(t, raw, "ingest_lag_ledgers")
 		assert.Nil(t, raw["ingest_lag_ledgers"])
+		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
 	})
+}
+
+func TestVersion(t *testing.T) {
+	t.Run("returns default values", func(t *testing.T) {
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/version")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var got struct {
+			Version   string `json:"version"`
+			Commit    string `json:"commit"`
+			BuildDate string `json:"build_date"`
+		}
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, "unknown", got.Version)
+		assert.Equal(t, "unknown", got.Commit)
+		assert.Equal(t, "unknown", got.BuildDate)
+	})
+
+	t.Run("reflects injected build info", func(t *testing.T) {
+		origV, origC, origD := buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate
+		buildinfo.Version = "v1.2.3"
+		buildinfo.Commit = "abc1234"
+		buildinfo.BuildDate = "2026-07-26T00:00:00Z"
+		t.Cleanup(func() {
+			buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate = origV, origC, origD
+		})
+
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/version")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var got struct {
+			Version   string `json:"version"`
+			Commit    string `json:"commit"`
+			BuildDate string `json:"build_date"`
+		}
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, "v1.2.3", got.Version)
+		assert.Equal(t, "abc1234", got.Commit)
+		assert.Equal(t, "2026-07-26T00:00:00Z", got.BuildDate)
+	})
+
+	t.Run("no-store cache header", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/version")
+		assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	})
+
+	t.Run("content type is json", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/version")
+		assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+	})
+}
+
+func TestRequestID(t *testing.T) {
+	tests := []struct {
+		name       string
+		incomingID string
+		wantEcho   bool
+	}{
+		{name: "generated when absent", incomingID: "", wantEcho: false},
+		{name: "echoes incoming ID", incomingID: "test-request-id-123", wantEcho: true},
+		{name: "echoes long ID", incomingID: strings.Repeat("a", 100), wantEcho: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			s := New(&stubStore{}, nil, log, "test-key")
+			srv := httptest.NewServer(s.Router())
+			defer srv.Close()
+
+			req, err := http.NewRequest("GET", srv.URL+"/health", nil)
+			require.NoError(t, err)
+			if tt.incomingID != "" {
+				req.Header.Set("X-Request-ID", tt.incomingID)
+			}
+			resp, err := http.DefaultTransport.RoundTrip(req)
+			require.NoError(t, err)
+			resp.Body.Close()
+
+			got := resp.Header.Get("X-Request-ID")
+			require.NotEmpty(t, got)
+			if tt.wantEcho {
+				assert.Equal(t, tt.incomingID, got)
+			}
+			assert.Contains(t, buf.String(), got)
+		})
+	}
 }

@@ -4,6 +4,7 @@
 // With no arguments it runs the indexer. Subcommands cover maintenance:
 //
 //	sorotrail replay --from-ledger N [--to-ledger M]
+//	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
 package main
 
 import (
@@ -16,7 +17,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -54,6 +54,8 @@ func dispatch(args []string) error {
 	switch args[0] {
 	case "replay":
 		return runReplay(args[1:])
+	case "backfill":
+		return runBackfill(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -71,6 +73,8 @@ With no subcommand, runs the indexer (ingester + HTTP API).
 subcommands:
   replay    re-decode stored events with the current decoder
             (sorotrail replay --help)
+  backfill  ingest historical contract events from Horizon
+            (sorotrail backfill --help)
 `)
 }
 
@@ -89,16 +93,27 @@ func run() error {
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
-	if err != nil {
-		return fmt.Errorf("connecting to postgres: %w", err)
-	}
-	defer pool.Close()
-	if err := pool.Ping(ctx); err != nil {
-		return fmt.Errorf("pinging postgres: %w", err)
-	}
 
-	st := store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+	var (
+		st   store.Store
+		pool *pgxpool.Pool
+	)
+	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
+		st, err = store.NewStoreFromURL(cfg.DatabaseURL)
+		if err != nil {
+			return err
+		}
+	} else {
+		pool, err = pgxpool.New(ctx, cfg.DatabaseURL)
+		if err != nil {
+			return fmt.Errorf("connecting to postgres: %w", err)
+		}
+		defer pool.Close()
+		if err := pool.Ping(ctx); err != nil {
+			return fmt.Errorf("pinging postgres: %w", err)
+		}
+		st = store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+	}
 	for _, id := range cfg.WatchedContracts {
 		if err := st.AddWatchedContract(ctx, id); err != nil {
 			return err
@@ -116,23 +131,13 @@ func run() error {
 	specFetcher := spec.NewFetcher(rpcClient)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
-	// Load decoder plugins when a directory is configured.
-	var pluginMgr *plugins.Manager
-	if cfg.DecoderPluginsDir != "" {
-		mgr, err := plugins.NewManager(ctx, cfg.DecoderPluginsDir, plugins.Limits{
-			Timeout:       int64(cfg.PluginTimeoutMS),
-			MemoryMiB:     cfg.PluginMemoryMiB,
-			OutputCap:     cfg.PluginOutputMaxBytes,
-			FailThreshold: cfg.PluginFailThreshold,
-		}, log)
-		if err != nil {
-			return err
-		}
-		defer mgr.Close(ctx)
-		pluginMgr = mgr
-	}
+	// Wrap the raw RPC client so per-method error totals are tracked and
+	// surfaced via /stats. specFetcher already holds a reference to the
+	// unwrapped client (spec lookups are not counted as ingestion errors).
+	countingClient := rpc.NewCountingClient(rpcClient)
+	api.SetRPCCounter(countingClient)
 
-	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, pluginMgr, log, ingester.Options{
+	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
 		RetentionLedgers: cfg.RetentionLedgers,
@@ -148,7 +153,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		auditClient := audit.NewBudgetedClient(rpcClient, budget)
+		auditClient := audit.NewBudgetedClient(countingClient, budget)
 		aud = audit.New(auditClient, st, ing, log, audit.Options{
 			PollInterval:      cfg.AuditPollInterval,
 			BatchLedgers:      cfg.AuditBatchLedgers,
@@ -168,13 +173,21 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpcClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
+	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
+		Timeout:            cfg.APIQueryTimeout,
+		SlowQueryThreshold: cfg.APISlowQueryThreshold,
+		Logger:             log,
+	})
+	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiServer.Router(),
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       cfg.HTTPReadTimeout,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
+		IdleTimeout:       cfg.HTTPIdleTimeout,
+		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
 	}
 	if cfg.APIKey == "" {
 		log.Warn("API_KEY env is unset; watched-contracts endpoints will reject every request with 503")
@@ -230,7 +243,7 @@ func run() error {
 		stop() // one component failed; wind down the others
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Error("http shutdown", "error", err)
