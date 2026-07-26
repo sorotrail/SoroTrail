@@ -16,6 +16,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
+	"github.com/khaylebfortune/sorotrail/internal/buildinfo"
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -123,6 +124,12 @@ type enrichedEventWithXDR struct {
 type healthResponse struct {
 	Status string            `json:"status"` // ok | degraded
 	Checks map[string]string `json:"checks"`
+}
+
+type versionResponse struct {
+	Version   string `json:"version"`
+	Commit    string `json:"commit"`
+	BuildDate string `json:"build_date"`
 }
 
 // eventFieldNames is the set of JSON keys on store.Event that the ?fields=
@@ -248,6 +255,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, status, resp)
+}
+
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, versionResponse{
+		Version:   buildinfo.Version,
+		Commit:    buildinfo.Commit,
+		BuildDate: buildinfo.BuildDate,
+	})
 }
 
 func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
