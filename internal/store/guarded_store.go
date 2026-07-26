@@ -20,8 +20,6 @@ type guardedStore struct {
 
 type queryNameContextKey struct{}
 
-type statementTimeoutContextKey struct{}
-
 func NewGuardedStore(base Store, opts GuardedStoreOptions) Store {
 	if base == nil {
 		return nil
@@ -41,16 +39,6 @@ func NewGuardedStore(base Store, opts GuardedStoreOptions) Store {
 func (s *guardedStore) wrapContext(ctx context.Context, name string) (context.Context, context.CancelFunc) {
 	ctx = context.WithValue(ctx, queryNameContextKey{}, name)
 	return context.WithTimeout(ctx, s.options.Timeout)
-}
-
-func queryNameFromContext(ctx context.Context) string {
-	if ctx == nil {
-		return "store"
-	}
-	if name, ok := ctx.Value(queryNameContextKey{}).(string); ok && name != "" {
-		return name
-	}
-	return "store"
 }
 
 func (s *guardedStore) logSlowQuery(name string, start time.Time, err error) {
