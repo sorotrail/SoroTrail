@@ -136,6 +136,33 @@ advisory-lock strategy, and the derivation order for dependent tables.
 
 All responses are JSON. Errors look like `{"error": "message"}`.
 
+### Pagination
+
+Every list endpoint uses cursor-based pagination with a consistent contract:
+
+- **Request parameters**: `?cursor=<opaque>&limit=<int>` (both optional)
+- **Response envelope**: each list response includes a `"cursor"` field.
+  When non-empty, more results exist — pass it back as `?cursor=` for
+  the next page. When empty or omitted, the result set is exhausted.
+- **Cursor format**: the cursor is the last row's sort-key value
+  (typically an event ID or integer primary key). It is opaque —
+  clients must never inspect or modify it. Sending an invalid cursor
+  returns `400 Bad Request` with the standard error envelope
+  `{"error": "invalid cursor ..."}`.
+- **Defaults**: `limit` defaults to 50 when unset; the maximum is 200.
+  Values outside `[1,200]` return `400 Bad Request`.
+- **Empty result sets** return an empty array with no `"cursor"` field
+  (or an empty string cursor, depending on the endpoint).
+
+```sh
+# First page
+curl -s 'localhost:8080/events?limit=10'
+# {"events":[...],"cursor":"0001099511627776-0000000009"}
+
+# Next page using the cursor from the previous response
+curl -s 'localhost:8080/events?cursor=0001099511627776-0000000009&limit=10'
+```
+
 ### `GET /health`
 
 Reports the API's view of its dependencies. `200` when both the database and
@@ -599,7 +626,9 @@ in normal operation — so the API serves two distinct cache policies:
   moving ingest frontier: a page whose upper bound (`to_ledger`) sits
   entirely below the last-ingested ledger cannot gain new rows, so the
   response is declared immutable with a strong ETag derived from the
-  filter. Pages that are open-ended (`to_ledger` unset) or have bounds
+  filter — every filter parameter that narrows the result set, so two
+  different queries can never share a validator. Pages that are
+  open-ended (`to_ledger` unset) or have bounds
   at/above the frontier are still growing, so they get
   `Cache-Control: no-cache` — a deliberate "when in doubt, don't
   cache" choice rather than a guess with a short max-age.
