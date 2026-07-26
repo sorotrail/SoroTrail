@@ -1,5 +1,5 @@
 // Package api serves stored events over HTTP. Endpoints are documented in
-// the README's API reference.
+// the OpenAPI spec and the README.
 package api
 
 import (
@@ -19,6 +19,10 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
+
+type ctxKey string
+
+const loggerCtxKey ctxKey = "logger"
 
 // SetAuditor registers the binary's Auditor so /stats can surface its
 // Metrics counters. There is exactly one Auditor per process; its
@@ -95,18 +99,7 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
-	// Mount CORS middleware before the other middleware so it can handle
-	// preflight requests and set headers early in the chain.
-	if len(s.cfg.CORSAllowedOrigins) > 0 {
-		opts := chiCors.Options{
-			AllowedOrigins:   s.cfg.CORSAllowedOrigins,
-			AllowedMethods:   []string{"GET", "OPTIONS"},
-			AllowedHeaders:   []string{"Accept", "Content-Type", "X-Request-ID"},
-			ExposedHeaders:   []string{"X-Request-ID"},
-			AllowCredentials: false,
-		}
-		r.Use(chiCors.New(opts).Handler)
-	}
+	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
@@ -118,6 +111,7 @@ func (s *Server) Router() http.Handler {
 	}
 
 	r.Get("/health", s.handleHealth)
+	r.Get("/version", s.handleVersion)
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
@@ -151,13 +145,22 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		start := time.Now()
-		next.ServeHTTP(ww, r)
-		s.log.Info("http request",
-			"method", r.Method,
-			"path", r.URL.Path,
+		reqID := middleware.GetReqID(r.Context())
+		log := s.log.With("request_id", reqID, "route", r.Method+" "+r.URL.Path)
+		ctx := context.WithValue(r.Context(), loggerCtxKey, log)
+		ww.Header().Set("X-Request-ID", reqID)
+		next.ServeHTTP(ww, r.WithContext(ctx))
+		log.Info("http request",
 			"status", ww.Status(),
-			"duration", time.Since(start),
-			"remote", r.RemoteAddr,
+			"duration_ms", time.Since(start).Milliseconds(),
 		)
 	})
+}
+
+func loggerFromContext(ctx context.Context) *slog.Logger {
+	log, ok := ctx.Value(loggerCtxKey).(*slog.Logger)
+	if !ok {
+		return slog.Default()
+	}
+	return log
 }
