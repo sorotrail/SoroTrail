@@ -88,7 +88,10 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
 	ContractID string
-	Type       string
+	// Types filters by event type. Multiple values are accepted (ANDed
+	// together at the SQL level via type = ANY(...)). An empty or nil
+	// slice means "no constraint".
+	Types []string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic json.RawMessage
@@ -299,18 +302,37 @@ type DeliveryAttempt struct {
 // to match a fresh RPC fetch; 0 means no ledger has been verified yet.
 // Auditor counters are filled in by the API layer when an auditor is wired.
 type Stats struct {
-	TotalEvents           int64      `json:"total_events"`
-	LastIngestedLedger    int64      `json:"last_ingested_ledger"`
-	VerifiedThroughLedger int64      `json:"verified_through_ledger"`
-	OldestStoredLedger    int64      `json:"oldest_stored_ledger"`
-	ChainHeadLedger       *int64     `json:"chain_head_ledger"`
-	IngestLagLedgers      *int64     `json:"ingest_lag_ledgers"`
-	ContractCount         int64      `json:"contract_count"`
-	WatchedContracts      int64      `json:"watched_contracts"`
-	LastSuccessfulPoll    *time.Time `json:"last_successful_poll"`
+	TotalEvents           int64  `json:"total_events"`
+	LastIngestedLedger    int64  `json:"last_ingested_ledger"`
+	VerifiedThroughLedger int64  `json:"verified_through_ledger"`
+	OldestStoredLedger    int64  `json:"oldest_stored_ledger"`
+	ChainHeadLedger       *int64 `json:"chain_head_ledger"`
+	IngestLagLedgers      *int64 `json:"ingest_lag_ledgers"`
+	ContractCount         int64  `json:"contract_count"`
+	WatchedContracts      int64  `json:"watched_contracts"`
+	// QueryErrors is the number of store queries that have returned an
+	// error (timeout, connection failure, etc.) since the process started.
+	// Set by the guarded store wrapper; zero when the store is used
+	// directly or when no errors have occurred.
+	QueryErrors uint64 `json:"query_errors"`
+	// PanicsRecovered is the number of panics the HTTP middleware has
+	// recovered since process start. Set by the API handler.
+	PanicsRecovered uint64 `json:"panics_recovered"`
+	// RPCErrors counts RPC call failures by method name since the process
+	// started. Populated by the CountingClient wrapper; zero-valued when
+	// the wrapper is not in use.
+	RPCErrors RPCErrorStats `json:"rpc_errors,omitempty"`
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
+}
+
+// RPCErrorStats is a JSON-friendly snapshot of per-method RPC error counts.
+type RPCErrorStats struct {
+	GetEvents        uint64 `json:"getEvents,omitempty"`
+	GetLatestLedger  uint64 `json:"getLatestLedger,omitempty"`
+	GetHealth        uint64 `json:"getHealth,omitempty"`
+	GetLedgerEntries uint64 `json:"getLedgerEntries,omitempty"`
 }
 
 // AuditStats is a JSON-friendly view of audit.Metrics. Defined here so

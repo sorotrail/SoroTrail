@@ -203,7 +203,7 @@ func TestListEvents_ParsesFilters(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 	assert.Equal(t, testContract, st.lastFilter.ContractID)
-	assert.Equal(t, "contract", st.lastFilter.Type)
+	assert.Equal(t, []string{"contract"}, st.lastFilter.Types)
 	assert.Equal(t, int64(10), st.lastFilter.FromLedger)
 	assert.Equal(t, int64(20), st.lastFilter.ToLedger)
 	assert.Equal(t, 5, st.lastFilter.Limit)
@@ -263,6 +263,39 @@ func TestListEvents_BadParams(t *testing.T) {
 			var e map[string]string
 			require.NoError(t, json.Unmarshal(body, &e))
 			assert.NotEmpty(t, e["error"])
+		})
+	}
+}
+
+func TestListEvents_TypeFilter(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		want    []string
+		wantErr int // 0 = success
+	}{
+		{name: "no type param", query: "/events", want: nil, wantErr: 0},
+		{name: "single type", query: "/events?type=contract", want: []string{"contract"}, wantErr: 0},
+		{name: "multiple types", query: "/events?type=contract,system", want: []string{"contract", "system"}, wantErr: 0},
+		{name: "all three types", query: "/events?type=contract,system,diagnostic", want: []string{"contract", "system", "diagnostic"}, wantErr: 0},
+		{name: "invalid type", query: "/events?type=bogus", wantErr: http.StatusBadRequest},
+		{name: "partially invalid type", query: "/events?type=contract,bogus", wantErr: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], "invalid type")
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			assert.Equal(t, tt.want, st.lastFilter.Types)
 		})
 	}
 }
@@ -685,6 +718,7 @@ func TestStats(t *testing.T) {
 		assert.Equal(t, int64(1_020), *got.ChainHeadLedger)
 		require.NotNil(t, got.IngestLagLedgers)
 		assert.Equal(t, int64(21), *got.IngestLagLedgers)
+		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
 	})
 
 	t.Run("keeps stored stats when RPC is down", func(t *testing.T) {
@@ -710,6 +744,7 @@ func TestStats(t *testing.T) {
 		assert.Nil(t, raw["chain_head_ledger"])
 		assert.Contains(t, raw, "ingest_lag_ledgers")
 		assert.Nil(t, raw["ingest_lag_ledgers"])
+		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
 	})
 }
 
