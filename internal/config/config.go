@@ -26,18 +26,7 @@ type Config struct {
 	APIQueryTimeout       time.Duration `env:"API_QUERY_TIMEOUT" envDefault:"25s"`
 	APISlowQueryThreshold time.Duration `env:"API_SLOW_QUERY_THRESHOLD" envDefault:"2s"`
 
-	// Horizon backfill configuration. HORIZON_URL is the REST endpoint
-	// the backfill command reads; BACKFILL_RATE_RPS controls how many
-	// requests per second the backfill command issues (env/v11 parses
-	// the float directly). Both are used only by `sorotrail backfill`,
-	// not by the live indexer. The defaults match the documented
-	// public-testnet target and a safe ~10 req/s pace; private
-	// deployments can point HORIZON_URL at themselves and allow a
-	// tighter rate via the flag or env override.
-	HorizonURL      string  `env:"HORIZON_URL" envDefault:"https://horizon-testnet.stellar.org"`
-	BackfillRateRPS float64 `env:"BACKFILL_RATE_RPS" envDefault:"10"`
-
-	// Horizon backfill configuration. HORIZON_URL is the REST endpoint
+		// Horizon backfill configuration. HORIZON_URL is the REST endpoint
 	// the backfill command reads; BACKFILL_RATE_RPS controls how many
 	// requests per second the backfill command issues (env/v11 parses
 	// the float directly). Both are used only by `sorotrail backfill`,
