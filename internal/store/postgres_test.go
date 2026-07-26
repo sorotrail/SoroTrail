@@ -354,6 +354,7 @@ func countEventsInRange(t *testing.T, st *Postgres, fromLedger, toLedger int64) 
 		Limit:      MaxQueryLimit,
 		FromLedger: fromLedger,
 		ToLedger:   toLedger,
+		Scope:      WildcardScope(),
 	})
 	require.NoError(t, err)
 	require.Empty(t, next, "fixture must fit in one max-size page")
