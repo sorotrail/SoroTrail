@@ -167,7 +167,12 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpcClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
+	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
+		Timeout:            cfg.APIQueryTimeout,
+		SlowQueryThreshold: cfg.APISlowQueryThreshold,
+		Logger:             log,
+	})
+	apiServer := api.New(apiStore, rpcClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 
 	server := &http.Server{
