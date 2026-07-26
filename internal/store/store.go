@@ -306,6 +306,11 @@ type Stats struct {
 	IngestLagLedgers      *int64 `json:"ingest_lag_ledgers"`
 	ContractCount         int64  `json:"contract_count"`
 	WatchedContracts      int64  `json:"watched_contracts"`
+	// QueryErrors is the number of store queries that have returned an
+	// error (timeout, connection failure, etc.) since the process started.
+	// Set by the guarded store wrapper; zero when the store is used
+	// directly or when no errors have occurred.
+	QueryErrors uint64 `json:"query_errors"`
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`

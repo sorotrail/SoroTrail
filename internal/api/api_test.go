@@ -609,6 +609,7 @@ func TestStats(t *testing.T) {
 		assert.Equal(t, int64(1_020), *got.ChainHeadLedger)
 		require.NotNil(t, got.IngestLagLedgers)
 		assert.Equal(t, int64(21), *got.IngestLagLedgers)
+		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
 	})
 
 	t.Run("keeps stored stats when RPC is down", func(t *testing.T) {
@@ -634,6 +635,7 @@ func TestStats(t *testing.T) {
 		assert.Nil(t, raw["chain_head_ledger"])
 		assert.Contains(t, raw, "ingest_lag_ledgers")
 		assert.Nil(t, raw["ingest_lag_ledgers"])
+		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
 	})
 }
 
