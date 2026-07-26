@@ -121,6 +121,17 @@ type EventFilter struct {
 	// a tiebreaker, so keyset pagination stays stable when the sort column
 	// has duplicates.
 	OrderBy string
+
+	// Scope is the tenant authorization boundary, ANDed into the generated
+	// SQL alongside the user-supplied filters above. Unlike every other
+	// field on this struct, its zero value is a constraint and not the
+	// absence of one: an unset Scope matches nothing. See the Scope type
+	// for why it fails closed rather than open.
+	//
+	// The API layer populates this from the authenticated request in
+	// exactly one place (filterFromQuery), so no handler decides for
+	// itself whether a caller is entitled to a row.
+	Scope Scope
 }
 
 // Sort columns accepted in EventFilter.OrderBy. The zero value means

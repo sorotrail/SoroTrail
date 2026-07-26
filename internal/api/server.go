@@ -86,6 +86,10 @@ type Server struct {
 	limiter   *RateLimiter
 	recoverer *Recoverer
 	bcast     *broadcast.Broadcaster
+	// compressMinSize is the body size at which responses start being
+	// compressed. The zero value means CompressMinSize, so compression is on
+	// by default; negative disables the middleware entirely.
+	compressMinSize int
 
 	// Multi-tenancy (#48). multiTenant is false by default, which makes
 	// every request run as an untenanted wildcard principal — the exact
@@ -96,6 +100,12 @@ type Server struct {
 	usage           *UsageRecorder
 	maxWatched      int
 	streamScopeSync time.Duration
+}
+
+// SetCompressMinSize overrides the body size at which responses are
+// compressed. Pass a negative value to disable compression.
+func (s *Server) SetCompressMinSize(n int) {
+	s.compressMinSize = n
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -166,6 +176,13 @@ func (s *Server) Router() http.Handler {
 	r.Use(s.requestLogger)
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
+	// Compression sits outside the limiter so a 429 is written through the
+	// same encoding path as any other small response (i.e. sent as-is), and
+	// inside Recoverer so a panic mid-body can't leave a truncated gzip
+	// stream as the last thing the client sees.
+	if s.compressMinSize >= 0 {
+		r.Use(Compress(s.compressMinSize))
+	}
 
 	// Authentication runs before the limiter so the limiter can key on the
 	// resolved tenant rather than on a source IP that several tenants may
@@ -173,6 +190,10 @@ func (s *Server) Router() http.Handler {
 	// installed unconditionally: in single-tenant mode it injects the
 	// wildcard principal, which is what guarantees every handler
 	// downstream can obtain a scope instead of silently denying.
+	//
+	// It sits inside Compress so an auth failure is written through the same
+	// encoding path as any other response; a 401 body is far below the
+	// compression threshold, so in practice it goes out as-is either way.
 	r.Use(s.authenticate)
 	if s.multiTenant {
 		r.Use(s.usageMiddleware)

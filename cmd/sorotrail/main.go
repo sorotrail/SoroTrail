@@ -187,6 +187,7 @@ func run() error {
 	})
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
+	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 
 	if cfg.MultiTenant {
 		// Tenancy lives in tables (tenants, grants, api_keys, usage) that
