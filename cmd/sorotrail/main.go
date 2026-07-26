@@ -142,6 +142,7 @@ func run() error {
 		RetentionLedgers: cfg.RetentionLedgers,
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
+	api.SetIngester(ing)
 
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a

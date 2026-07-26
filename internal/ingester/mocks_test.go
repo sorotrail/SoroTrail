@@ -50,11 +50,12 @@ func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest)
 
 // mockStore is an in-memory Store.
 type mockStore struct {
-	mu       sync.Mutex
-	events   map[string]store.Event
-	state    *store.IngestionState
-	watched  []store.WatchedContract
-	upserted [][]store.Event
+	mu        sync.Mutex
+	events    map[string]store.Event
+	state     *store.IngestionState
+	watched   []store.WatchedContract
+	upserted  [][]store.Event
+	upsertErr error // when non-nil, UpsertEvents returns this error
 }
 
 func newMockStore() *mockStore {
@@ -64,6 +65,9 @@ func newMockStore() *mockStore {
 func (m *mockStore) UpsertEvents(_ context.Context, events []store.Event) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.upsertErr != nil {
+		return 0, m.upsertErr
+	}
 	m.upserted = append(m.upserted, events)
 	var inserted int64
 	for _, e := range events {

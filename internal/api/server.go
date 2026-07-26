@@ -14,6 +14,7 @@ import (
 
 	"github.com/khaylebfortune/sorotrail/internal/audit"
 	"github.com/khaylebfortune/sorotrail/internal/broadcast"
+	"github.com/khaylebfortune/sorotrail/internal/ingester"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
@@ -68,6 +69,27 @@ func getRPCCounter() *rpc.CountingClient {
 	rpcCounterMu.RLock()
 	defer rpcCounterMu.RUnlock()
 	return rpcCounter
+}
+
+// SetIngester registers the Ingester so /stats can surface its
+// EventsIngestedTotal counter. Call this before ListenAndServe.
+// The setter is guarded by a RWMutex so concurrent /stats readers
+// never observe a torn pointer.
+var (
+	ingesterMu sync.RWMutex
+	ing        *ingester.Ingester
+)
+
+func SetIngester(i *ingester.Ingester) {
+	ingesterMu.Lock()
+	ing = i
+	ingesterMu.Unlock()
+}
+
+func getIngester() *ingester.Ingester {
+	ingesterMu.RLock()
+	defer ingesterMu.RUnlock()
+	return ing
 }
 
 // Enricher is the spec-based event enrichment interface used by the API.

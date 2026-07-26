@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"sync/atomic"
 	"time"
 
 	"github.com/khaylebfortune/sorotrail/internal/broadcast"
@@ -68,6 +69,11 @@ type Ingester struct {
 	opts     Options
 	bcast    *broadcast.Broadcaster
 	notifier EventNotifier // optional; nil means no notification
+
+	// eventsIngestedTotal counts every event successfully persisted to the
+	// store. The counter is incremented atomically so concurrent ingestion
+	// passes and /stats readers never observe a torn value.
+	eventsIngestedTotal atomic.Uint64
 }
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
@@ -89,6 +95,12 @@ func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
 // notification is sent — the ingester behaves exactly as before.
 func (ing *Ingester) SetNotifier(n EventNotifier) {
 	ing.notifier = n
+}
+
+// EventsIngestedTotal returns the total number of events successfully
+// persisted since process start. Safe for concurrent use.
+func (ing *Ingester) EventsIngestedTotal() uint64 {
+	return ing.eventsIngestedTotal.Load()
 }
 
 // Run polls until ctx is canceled. Errors are logged and retried with
@@ -380,6 +392,7 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	if err != nil {
 		return err
 	}
+	ing.eventsIngestedTotal.Add(uint64(len(events)))
 	ing.log.Info("ingested events",
 		"count", len(events), "new", inserted,
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
