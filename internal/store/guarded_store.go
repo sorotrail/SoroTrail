@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,7 +16,8 @@ type GuardedStoreOptions struct {
 
 type guardedStore struct {
 	Store
-	options GuardedStoreOptions
+	options     GuardedStoreOptions
+	queryErrors atomic.Uint64
 }
 
 type queryNameContextKey struct{}
@@ -42,6 +44,9 @@ func (s *guardedStore) wrapContext(ctx context.Context, name string) (context.Co
 }
 
 func (s *guardedStore) logSlowQuery(name string, start time.Time, err error) {
+	if err != nil {
+		s.queryErrors.Add(1)
+	}
 	duration := time.Since(start)
 	if duration < s.options.SlowQueryThreshold {
 		return
@@ -320,6 +325,7 @@ func (s *guardedStore) Stats(ctx context.Context) (Stats, error) {
 	start := time.Now()
 	stats, err := s.Store.Stats(ctx)
 	s.logSlowQuery("store.Stats", start, err)
+	stats.QueryErrors = s.queryErrors.Load()
 	return stats, err
 }
 
