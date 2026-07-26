@@ -314,6 +314,9 @@ type Stats struct {
 	// Set by the guarded store wrapper; zero when the store is used
 	// directly or when no errors have occurred.
 	QueryErrors uint64 `json:"query_errors"`
+	// PanicsRecovered is the number of panics the HTTP middleware has
+	// recovered since process start. Set by the API handler.
+	PanicsRecovered uint64 `json:"panics_recovered"`
 	// RPCErrors counts RPC call failures by method name since the process
 	// started. Populated by the CountingClient wrapper; zero-valued when
 	// the wrapper is not in use.
