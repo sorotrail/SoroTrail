@@ -6,7 +6,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "unk
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown")
 
-LDFLAGS := -ldflags="-X github.com/khaylebfortune/sorotrail/internal/buildinfo.Version=$(VERSION) -X github.com/khaylebfortune/sorotrail/internal/buildinfo.Commit=$(COMMIT) -X github.com/khaylebfortune/sorotrail/internal/buildinfo.BuildDate=$(BUILD_DATE)"
+LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$(COMMIT) -X github.com/sorotrail/sorotrail/internal/buildinfo.BuildDate=$(BUILD_DATE)"
 
 .PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down clean bench bench-ci seed
 
