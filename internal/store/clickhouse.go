@@ -193,4 +193,3 @@ func (c *ClickHouse) Stats(ctx context.Context) (Stats, error) {
 func (c *ClickHouse) Ping(ctx context.Context) error {
 	return nil
 }
-
