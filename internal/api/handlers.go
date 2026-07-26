@@ -242,6 +242,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok", "rpc": "ok"}}
 	status := http.StatusOK
 
+	// DB connectivity check: Ping the store to verify the database is reachable.
 	if err := s.store.Ping(ctx); err != nil {
 		resp.Status, resp.Checks["database"] = "degraded", err.Error()
 		status = http.StatusServiceUnavailable
@@ -415,6 +416,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {
+			writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
 			if includeXDR {
 				writeJSON(w, http.StatusOK, enrichEventWithXDR(enriched[0]))
 				return
