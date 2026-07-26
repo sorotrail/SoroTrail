@@ -17,7 +17,25 @@ long after the RPC has forgotten them.
 
 ## Quickstart
 
-### Docker (one command)
+### Published image (fastest)
+
+Tagged releases publish a multi-arch (amd64/arm64) image to GHCR. Point it at
+a Postgres you already have:
+
+```sh
+docker run --rm -p 8080:8080 \
+  -e DATABASE_URL='postgres://user:pass@host:5432/sorotrail?sslmode=disable' \
+  -e RPC_URL='https://soroban-testnet.stellar.org' \
+  ghcr.io/stephaniepez21-art/sorotrail:latest
+```
+
+Pin a specific release with a version tag instead of `latest`, e.g.
+`ghcr.io/stephaniepez21-art/sorotrail:v1.2.0`. See [Configuration](#configuration) for
+the full list of environment variables.
+
+### Docker Compose (full stack)
+
+Brings up Postgres and the indexer together — no external database required:
 
 ```sh
 docker compose up --build
@@ -171,6 +189,33 @@ advisory-lock strategy, and the derivation order for dependent tables.
 ## API reference
 
 All responses are JSON. Errors look like `{"error": "message"}`.
+
+### Pagination
+
+Every list endpoint uses cursor-based pagination with a consistent contract:
+
+- **Request parameters**: `?cursor=<opaque>&limit=<int>` (both optional)
+- **Response envelope**: each list response includes a `"cursor"` field.
+  When non-empty, more results exist — pass it back as `?cursor=` for
+  the next page. When empty or omitted, the result set is exhausted.
+- **Cursor format**: the cursor is the last row's sort-key value
+  (typically an event ID or integer primary key). It is opaque —
+  clients must never inspect or modify it. Sending an invalid cursor
+  returns `400 Bad Request` with the standard error envelope
+  `{"error": "invalid cursor ..."}`.
+- **Defaults**: `limit` defaults to 50 when unset; the maximum is 200.
+  Values outside `[1,200]` return `400 Bad Request`.
+- **Empty result sets** return an empty array with no `"cursor"` field
+  (or an empty string cursor, depending on the endpoint).
+
+```sh
+# First page
+curl -s 'localhost:8080/events?limit=10'
+# {"events":[...],"cursor":"0001099511627776-0000000009"}
+
+# Next page using the cursor from the previous response
+curl -s 'localhost:8080/events?cursor=0001099511627776-0000000009&limit=10'
+```
 
 ### `GET /health`
 
@@ -635,7 +680,9 @@ in normal operation — so the API serves two distinct cache policies:
   moving ingest frontier: a page whose upper bound (`to_ledger`) sits
   entirely below the last-ingested ledger cannot gain new rows, so the
   response is declared immutable with a strong ETag derived from the
-  filter. Pages that are open-ended (`to_ledger` unset) or have bounds
+  filter — every filter parameter that narrows the result set, so two
+  different queries can never share a validator. Pages that are
+  open-ended (`to_ledger` unset) or have bounds
   at/above the frontier are still growing, so they get
   `Cache-Control: no-cache` — a deliberate "when in doubt, don't
   cache" choice rather than a guess with a short max-age.
