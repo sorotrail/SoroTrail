@@ -259,22 +259,17 @@ func TestWatchedContracts_UnionAndRefcounting(t *testing.T) {
 	require.NoError(t, p.AddTenantWatchedContract(ctx, two, contractA, 0))
 	require.NoError(t, p.AddTenantWatchedContract(ctx, two, contractB, 0))
 
-	watched, err := p.ListWatchedContracts(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, []string{contractA, contractB, contractC}, watched,
+	assert.Equal(t, []string{contractA, contractB, contractC}, watchedContractIDs(t, p),
 		"a contract two tenants both want appears once")
 
 	// One tenant drops the shared contract; the other still needs it.
 	require.NoError(t, p.RemoveTenantWatchedContract(ctx, one.ID, contractA))
-	watched, err = p.ListWatchedContracts(ctx)
-	require.NoError(t, err)
-	assert.Contains(t, watched, contractA,
+	assert.Contains(t, watchedContractIDs(t, p), contractA,
 		"a contract another tenant still watches must keep being ingested")
 
 	// The last tenant drops it: now it leaves the union.
 	require.NoError(t, p.RemoveTenantWatchedContract(ctx, two.ID, contractA))
-	watched, err = p.ListWatchedContracts(ctx)
-	require.NoError(t, err)
+	watched := watchedContractIDs(t, p)
 	assert.NotContains(t, watched, contractA)
 	assert.Contains(t, watched, contractB)
 	assert.Contains(t, watched, contractC, "the operator's own list is unaffected")
@@ -294,12 +289,11 @@ func TestDeleteTenant_ReleasesWatchClaims(t *testing.T) {
 
 	require.NoError(t, p.DeleteTenant(ctx, one.ID))
 
-	watched, err := p.ListWatchedContracts(ctx)
-	require.NoError(t, err)
+	watched := watchedContractIDs(t, p)
 	assert.NotContains(t, watched, contractA, "nobody wants A any more")
 	assert.Contains(t, watched, contractB, "B is still wanted by the surviving tenant")
 
-	_, err = p.GetTenant(ctx, one.ID)
+	_, err := p.GetTenant(ctx, one.ID)
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -566,4 +560,20 @@ func TestUsageAccounting(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, usage)
 	})
+}
+
+// watchedContractIDs flattens ListWatchedContracts to just the contract IDs.
+//
+// The union assertions are about which contracts ingestion follows, not when
+// each was claimed — and added_at is aggregated across the operator's list
+// and every tenant's, so it is not a stable thing for a test to pin.
+func watchedContractIDs(t *testing.T, p *Postgres) []string {
+	t.Helper()
+	watched, err := p.ListWatchedContracts(context.Background())
+	require.NoError(t, err)
+	ids := make([]string, 0, len(watched))
+	for _, w := range watched {
+		ids = append(ids, w.ContractID)
+	}
+	return ids
 }
