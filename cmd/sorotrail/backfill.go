@@ -122,15 +122,15 @@ flags:
 	hClient := horizon.NewHTTPClient(hURL, minInterval)
 
 	b := backfill.New(hClient, st, decode.XDRDecoder{}, log, backfill.Options{
-		ContractID:     *contractID,
-		FromLedger:     *fromLedger,
-		ToLedger:       *toLedger,
-		BatchSize:      *batchSize,
-		HorizonURL:     hURL,
-		MinInterval:    minInterval,
-		IncludeFailed:  *includeFail,
-		DryRun:         *dryRun,
-		MaxBackoff:     backfill.DefaultMaxBackoff,
+		ContractID:    *contractID,
+		FromLedger:    *fromLedger,
+		ToLedger:      *toLedger,
+		BatchSize:     *batchSize,
+		HorizonURL:    hURL,
+		MinInterval:   minInterval,
+		IncludeFailed: *includeFail,
+		DryRun:        *dryRun,
+		MaxBackoff:    backfill.DefaultMaxBackoff,
 	})
 	if *restart {
 		// Drop any saved state that's now stale: a fresh Start happens
@@ -237,7 +237,7 @@ func randInt(n int64) int64 {
 // errors worth backing off and retrying. Anything else is fatal so a
 // real bug surfaces immediately.
 func isRetryableBackfillErr(err error) bool {
-	return errors.Is(err, horizon.ErrRateLimited) || errors.Is(err, horizon.ErrNotFound) == false &&
+	return errors.Is(err, horizon.ErrRateLimited) || !errors.Is(err, horizon.ErrNotFound) &&
 		isTransientHTTP(err)
 }
 
