@@ -97,6 +97,30 @@ type enrichedEventsResponse struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
+type eventsWithXDRResponse struct {
+	Events []eventWithXDR `json:"events"`
+	// Cursor is non-empty when another page exists.
+	Cursor string `json:"cursor,omitempty"`
+}
+
+type enrichedEventsWithXDRResponse struct {
+	Events []enrichedEventWithXDR `json:"events"`
+	// Cursor is non-empty when another page exists.
+	Cursor string `json:"cursor,omitempty"`
+}
+
+type eventWithXDR struct {
+	store.Event
+	TopicsXDR []string `json:"topics_xdr"`
+	ValueXDR  *string  `json:"value_xdr"`
+}
+
+type enrichedEventWithXDR struct {
+	eventWithXDR
+	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                        `json:"decoded"`
+}
+
 type healthResponse struct {
 	Status string            `json:"status"` // ok | degraded
 	Checks map[string]string `json:"checks"`
@@ -218,6 +242,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok", "rpc": "ok"}}
 	status := http.StatusOK
 
+	// DB connectivity check: Ping the store to verify the database is reachable.
 	if err := s.store.Ping(ctx); err != nil {
 		resp.Status, resp.Checks["database"] = "degraded", err.Error()
 		status = http.StatusServiceUnavailable
@@ -289,15 +314,28 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	decoded := r.URL.Query().Get("decoded") == "true"
+	writeCacheHeaders(w, policy, immutableMaxAge, etag)
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), events)
+		if includeXDR {
+			writeJSON(w, http.StatusOK, enrichedEventsWithXDRResponse{
+				Events: enrichEventsWithXDR(enriched),
+				Cursor: cursor,
+			})
+			return
+		}
 		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
 		return
 	}
-	writeCacheHeaders(w, policy, immutableMaxAge, etag)
-	// eventsResponse expects []store.Event; when fields projection is active
-	// we wrap the projected maps in a compatible envelope.
+	if includeXDR {
+		writeJSON(w, http.StatusOK, eventsWithXDRResponse{
+			Events: eventsWithXDR(events),
+			Cursor: cursor,
+		})
+		return
+	}
 	if fields == nil {
 		writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
 	} else {
@@ -374,15 +412,61 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	decoded := r.URL.Query().Get("decoded") == "true"
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {
+			writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+			if includeXDR {
+				writeJSON(w, http.StatusOK, enrichEventWithXDR(enriched[0]))
+				return
+			}
 			writeJSON(w, http.StatusOK, enriched[0])
 			return
 		}
 	}
 	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+	if includeXDR {
+		writeJSON(w, http.StatusOK, eventToXDRResponse(event))
+		return
+	}
 	writeJSON(w, http.StatusOK, projectEvent(event, fields))
+}
+
+func eventToXDRResponse(e store.Event) eventWithXDR {
+	var value *string
+	if e.RawValueXDR != "" {
+		value = &e.RawValueXDR
+	}
+	return eventWithXDR{
+		Event:     e,
+		TopicsXDR: e.RawTopicXDR,
+		ValueXDR:  value,
+	}
+}
+
+func eventsWithXDR(events []store.Event) []eventWithXDR {
+	out := make([]eventWithXDR, len(events))
+	for i, event := range events {
+		out[i] = eventToXDRResponse(event)
+	}
+	return out
+}
+
+func enrichEventWithXDR(e store.EnrichedEvent) enrichedEventWithXDR {
+	return enrichedEventWithXDR{
+		eventWithXDR: eventToXDRResponse(e.Event),
+		DecodedEvent: e.DecodedEvent,
+		Decoded:      e.Decoded,
+	}
+}
+
+func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
+	out := make([]enrichedEventWithXDR, len(events))
+	for i, event := range events {
+		out[i] = enrichEventWithXDR(event)
+	}
+	return out
 }
 
 // Stats summarizes what the indexer has stored plus, when the auditor is
@@ -494,11 +578,6 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	modeTransition := ""
 	if len(current) == 0 {
-		// Empty -> non-empty switches the ingester from "all contract
-		// events" to a specific list. The guard exists because the new
-		// filter silently narrows what's indexed going forward — exactly
-		// the kind of change an operator should make on purpose, not by
-		// typo.
 		if r.URL.Query().Get("confirm") != "true" {
 			writeError(w, http.StatusBadRequest, errors.New(
 				"adding the first watched contract would switch ingestion from "+
@@ -532,11 +611,6 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 // handleRemoveWatchedChain stops future ingestion for the named contract
 // without deleting any events already stored. The same empty<->non-empty
 // guard fires when removing the last contract on the list (specific -> all).
-//
-// TOCTOU note: same read-then-write shape as POST — see the comment on
-// handleAddWatchedChain. Two concurrent DELETE/s of the last contract
-// could both pass the guard; only the first actually transitions the
-// list (the second returns ErrNotFound → 404), so no mode claim is wrong.
 func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if !config.ValidContractID(id) {
@@ -554,8 +628,6 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 	modeTransition := ""
 	if len(current) == 1 && current[0].ContractID == id {
-		// Last contract on the list: removing it flips ingestion from
-		// "specific list" back to "all contract events".
 		if r.URL.Query().Get("confirm") != "true" {
 			writeError(w, http.StatusBadRequest, errors.New(
 				"removing the last watched contract would switch ingestion from "+
@@ -582,7 +654,6 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 		ModeTransition:   modeTransition,
 	})
 }
-
 func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
 	if s.rpc == nil {
 		return
