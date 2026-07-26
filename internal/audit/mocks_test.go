@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // testLogger returns a slog.Logger that drops everything.

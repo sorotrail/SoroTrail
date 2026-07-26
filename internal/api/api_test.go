@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -16,9 +17,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/khaylebfortune/sorotrail/internal/buildinfo"
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/buildinfo"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 const testContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
@@ -219,7 +220,7 @@ func TestListEvents_ParsesFilters(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 	assert.Equal(t, testContract, st.lastFilter.ContractID)
-	assert.Equal(t, "contract", st.lastFilter.Type)
+	assert.Equal(t, []string{"contract"}, st.lastFilter.Types)
 	assert.Equal(t, int64(10), st.lastFilter.FromLedger)
 	assert.Equal(t, int64(20), st.lastFilter.ToLedger)
 	assert.Equal(t, 5, st.lastFilter.Limit)
@@ -284,6 +285,39 @@ func TestListEvents_BadParams(t *testing.T) {
 			var e map[string]string
 			require.NoError(t, json.Unmarshal(body, &e))
 			assert.NotEmpty(t, e["error"])
+		})
+	}
+}
+
+func TestListEvents_TypeFilter(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		want    []string
+		wantErr int // 0 = success
+	}{
+		{name: "no type param", query: "/events", want: nil, wantErr: 0},
+		{name: "single type", query: "/events?type=contract", want: []string{"contract"}, wantErr: 0},
+		{name: "multiple types", query: "/events?type=contract,system", want: []string{"contract", "system"}, wantErr: 0},
+		{name: "all three types", query: "/events?type=contract,system,diagnostic", want: []string{"contract", "system", "diagnostic"}, wantErr: 0},
+		{name: "invalid type", query: "/events?type=bogus", wantErr: http.StatusBadRequest},
+		{name: "partially invalid type", query: "/events?type=contract,bogus", wantErr: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], "invalid type")
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			assert.Equal(t, tt.want, st.lastFilter.Types)
 		})
 	}
 }
@@ -630,6 +664,7 @@ func TestStats(t *testing.T) {
 		assert.Equal(t, int64(1_020), *got.ChainHeadLedger)
 		require.NotNil(t, got.IngestLagLedgers)
 		assert.Equal(t, int64(21), *got.IngestLagLedgers)
+		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
 	})
 
 	t.Run("keeps stored stats when RPC is down", func(t *testing.T) {
@@ -655,7 +690,63 @@ func TestStats(t *testing.T) {
 		assert.Nil(t, raw["chain_head_ledger"])
 		assert.Contains(t, raw, "ingest_lag_ledgers")
 		assert.Nil(t, raw["ingest_lag_ledgers"])
+		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
 	})
+}
+
+func TestListEvents_OrderByParses(t *testing.T) {
+	for _, orderBy := range []string{"id", "ledger", "created_at"} {
+		t.Run(orderBy, func(t *testing.T) {
+			st := &stubStore{}
+			resp, body := doGet(t, newTestServer(st, nil), "/events?order_by="+orderBy+"&order=desc")
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			assert.Equal(t, orderBy, st.lastFilter.OrderBy)
+			assert.Equal(t, "desc", st.lastFilter.Order, "order_by and order combine")
+		})
+	}
+}
+
+// Omitting order_by keeps the historical default rather than inventing one.
+func TestListEvents_OrderByDefaultsToEmpty(t *testing.T) {
+	st := &stubStore{}
+	resp, _ := doGet(t, newTestServer(st, nil), "/events")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "", st.lastFilter.OrderBy)
+}
+
+// An unsupported sort column is a 400, not a silently-ignored parameter.
+func TestListEvents_InvalidOrderByIsBadRequest(t *testing.T) {
+	for _, bad := range []string{"tx_hash", "ledger; DROP TABLE events", "LEDGER"} {
+		t.Run(bad, func(t *testing.T) {
+			resp, body := doGet(t, newTestServer(&stubStore{}, nil),
+				"/events?order_by="+url.QueryEscape(bad))
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			var e map[string]string
+			require.NoError(t, json.Unmarshal(body, &e))
+			assert.Contains(t, e["error"], "invalid order_by")
+		})
+	}
+}
+
+// order_by applies to the contract-scoped listing too, since it shares the
+// same filter parsing.
+func TestContractEvents_OrderByParses(t *testing.T) {
+	st := &stubStore{}
+	resp, body := doGet(t, newTestServer(st, nil),
+		"/contracts/"+testContract+"/events?order_by=created_at")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	assert.Equal(t, "created_at", st.lastFilter.OrderBy)
+	assert.Equal(t, testContract, st.lastFilter.ContractID)
+}
+
+// A cursor that doesn't decode under the requested ordering is client error.
+func TestListEvents_InvalidCursorIsBadRequest(t *testing.T) {
+	st := &stubStore{queryErr: store.ErrInvalidCursor}
+	resp, body := doGet(t, newTestServer(st, nil), "/events?order_by=ledger&cursor=bogus")
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var e map[string]string
+	require.NoError(t, json.Unmarshal(body, &e))
+	assert.Contains(t, e["error"], "invalid cursor")
 }
 
 func TestVersion(t *testing.T) {

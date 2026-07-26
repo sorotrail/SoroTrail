@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // stubEnricher implements Enricher for tests. It marks events as decoded
@@ -490,7 +490,7 @@ func TestListETag_CoversEveryFilterField(t *testing.T) {
 		mutate func(f *store.EventFilter)
 	}{
 		{"ContractID", func(f *store.EventFilter) { f.ContractID = testContract }},
-		{"Type", func(f *store.EventFilter) { f.Type = "diagnostic" }},
+		{"Type", func(f *store.EventFilter) { f.Types = []string{"diagnostic"} }},
 		{"Topic", func(f *store.EventFilter) { f.Topic = json.RawMessage(`{"symbol":"transfer"}`) }},
 		{"Topic0", func(f *store.EventFilter) { f.Topic0 = json.RawMessage(`{"symbol":"transfer"}`) }},
 		{"Topic1", func(f *store.EventFilter) { f.Topic1 = json.RawMessage(`{"symbol":"transfer"}`) }},

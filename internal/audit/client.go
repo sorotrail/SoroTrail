@@ -3,7 +3,7 @@ package audit
 import (
 	"context"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/rpc"
 )
 
 // budgetedClient wraps an inner rpc.Client, accounting every call against

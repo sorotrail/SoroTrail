@@ -16,9 +16,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
-	"github.com/khaylebfortune/sorotrail/internal/buildinfo"
-	"github.com/khaylebfortune/sorotrail/internal/config"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/buildinfo"
+	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
@@ -309,6 +309,14 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	}
 
 	events, cursor, qerr := s.store.QueryEvents(r.Context(), filter)
+	if errors.Is(qerr, store.ErrInvalidCursor) {
+		// A cursor that doesn't decode is client input — most often a cursor
+		// taken from one ordering and replayed against another. Report it as
+		// a bad request rather than a server error.
+		writeError(w, http.StatusBadRequest, fmt.Errorf(
+			"invalid cursor for order_by=%s; use the cursor returned by the same ordering", filter.OrderBy))
+		return
+	}
 	if qerr != nil {
 		loggerFromContext(r.Context()).Error("querying events", "error", qerr)
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
@@ -479,6 +487,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.addStatsFreshness(r.Context(), &stats)
+	stats.PanicsRecovered = s.recoverer.PanicsRecovered()
 	if a := getAuditor(); a != nil {
 		m := a.Metrics()
 		stats.Auditor = store.AuditStats{
@@ -489,6 +498,15 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			FindingsUnverifiable:  m.FindingsUnverifiable,
 			FindingsUnrecoverable: m.FindingsUnrecoverable,
 			RPCRequests:           m.RPCRequests,
+		}
+	}
+	if c := getRPCCounter(); c != nil {
+		snap := c.Errors().Snapshot()
+		stats.RPCErrors = store.RPCErrorStats{
+			GetEvents:        snap.GetEvents,
+			GetLatestLedger:  snap.GetLatestLedger,
+			GetHealth:        snap.GetHealth,
+			GetLedgerEntries: snap.GetLedgerEntries,
 		}
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
@@ -757,7 +775,7 @@ func listETag(f store.EventFilter) string {
 	// the fields independently and fails when a new one is not added.
 	key := struct {
 		ContractID    string          `json:"c"`
-		Type          string          `json:"t"`
+		Types         []string        `json:"t"`
 		Topic         json.RawMessage `json:"p,omitempty"`
 		Topic0        json.RawMessage `json:"p0,omitempty"`
 		Topic1        json.RawMessage `json:"p1,omitempty"`
@@ -773,7 +791,7 @@ func listETag(f store.EventFilter) string {
 		Order         string          `json:"o,omitempty"`
 	}{
 		ContractID: f.ContractID,
-		Type:       f.Type,
+		Types:      f.Types,
 		Topic:      f.Topic,
 		// Each positional filter gets its own distinctly named key, so
 		// topic0={x} and topic1={x} — which select different events — cannot
@@ -918,11 +936,16 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
 	}
 
-	switch t := q.Get("type"); t {
-	case "", "contract", "system", "diagnostic":
-		f.Type = t
-	default:
-		return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
+	if raw := q.Get("type"); raw != "" {
+		for _, t := range strings.Split(raw, ",") {
+			t = strings.TrimSpace(t)
+			switch t {
+			case "contract", "system", "diagnostic":
+			default:
+				return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
+			}
+			f.Types = append(f.Types, t)
+		}
 	}
 
 	parseTopic := func(name, raw string) (json.RawMessage, error) {
@@ -947,6 +970,15 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	default:
 		return f, fmt.Errorf("invalid order %q (want asc or desc)", order)
 	}
+
+	// order_by selects the sort column; order still controls the direction,
+	// so the two combine (e.g. order_by=created_at&order=desc).
+	orderBy := q.Get("order_by")
+	if !store.ValidOrderBy(orderBy) {
+		return f, fmt.Errorf("invalid order_by %q (want %s, %s or %s)",
+			orderBy, store.OrderByID, store.OrderByLedger, store.OrderByCreatedAt)
+	}
+	f.OrderBy = orderBy
 
 	var err error
 	if topic := q.Get("topic"); topic != "" {

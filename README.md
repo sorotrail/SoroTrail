@@ -21,11 +21,11 @@ a Postgres you already have:
 docker run --rm -p 8080:8080 \
   -e DATABASE_URL='postgres://user:pass@host:5432/sorotrail?sslmode=disable' \
   -e RPC_URL='https://soroban-testnet.stellar.org' \
-  ghcr.io/stephaniepez21-art/sorotrail:latest
+  ghcr.io/sorotrail/sorotrail:latest
 ```
 
 Pin a specific release with a version tag instead of `latest`, e.g.
-`ghcr.io/stephaniepez21-art/sorotrail:v1.2.0`. See [Configuration](#configuration) for
+`ghcr.io/sorotrail/sorotrail:v1.2.0`. See [Configuration](#configuration) for
 the full list of environment variables.
 
 ### Docker Compose (full stack)
@@ -84,6 +84,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
+| `COMPRESS_MIN_SIZE` | `1400` | Response body size (bytes) at or above which responses are gzip/deflate encoded for clients advertising support. Set negative to disable compression. See [Compression](#compression). |
 
 ## Ingestion behavior
 
@@ -215,6 +216,41 @@ advisory-lock strategy, and the derivation order for dependent tables.
 
 API reference
 All responses are JSON. Errors look like {"error": "message"}.
+## Compression
+
+Responses are gzip- or deflate-encoded when the client advertises support via
+`Accept-Encoding`, which matters most for event listings — a 200-event page is
+largely repetitive JSON keys and compresses well.
+
+Compression is applied per response, not per route, and only once the body
+reaches `COMPRESS_MIN_SIZE` (1400 bytes by default — roughly one Ethernet
+MTU). Below that, encoding costs CPU on both ends and can make the body
+*larger* once the gzip header and trailer are counted, so small responses
+(error envelopes, `/health`, a single event) are sent as-is.
+
+Clients that don't advertise an encoding get the original bytes, byte for
+byte. `gzip` is preferred over `deflate` when both are offered, and
+`gzip;q=0` is honored as a refusal rather than a low ranking.
+
+Some things are deliberately left alone:
+
+- **WebSocket upgrades** (`/events/ws`) bypass the middleware entirely — the
+  response is a `101` and the connection is then taken over.
+- **Streaming responses** that flush before reaching the threshold give up on
+  compression rather than holding bytes back, so a live stream never stalls
+  waiting for a buffer to fill.
+- **`204` and `304`** carry no body, and a `304` with `Content-Encoding`
+  misleads caches.
+- **Non-compressible media types** (images, already-compressed payloads) and
+  bodies a handler already encoded itself.
+
+`Vary: Accept-Encoding` is always set, so a shared cache never serves a
+compressed body to a client that can't decode it. Compressing produces a
+different representation of the same resource, so a strong `ETag` is weakened
+(`"v1"` → `W/"v1"`) when a response is encoded; conditional requests still
+match, since `If-None-Match` comparison ignores the `W/` prefix.
+
+## API reference
 
 GET /health
 Reports the API's view of its dependencies. 200 when both the database and
@@ -263,6 +299,7 @@ Query parameters (all optional, combinable):
 | `contract_id` | `CDLZ...CYSC` | Only events from this contract. |
 | `type` | `contract` | `contract` \| `system` \| `diagnostic`. |
 | `topic` | `{"symbol":"transfer"}` | Exact match against any topic position. A bare word is treated as a JSON string. |
+| `topic_contains` | `[{"address":"G..."}]` | Postgres jsonb containment (`@>`) against the topics array. Pass an array to match one or more topic elements: `[{"address":"G..."}]` matches any event where a topic contains that address; `[{"symbol":"transfer"},{"address":"G..."}]` requires both. Must be parseable JSON (400 otherwise). Uses the GIN index on `topics`. |
 | `topic0` | `{"symbol":"transfer"}` | Exact match against topic position 0. |
 | `topic1` | `{"address":"G..."}` | Exact match against topic position 1. |
 | `topic2` | `{"address":"G..."}` | Exact match against topic position 2. |
@@ -273,14 +310,53 @@ Query parameters (all optional, combinable):
 | `to_time` | `2026-07-22T00:00:00Z` | Inclusive upper `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
 | `limit` | `50` | Page size, 1–200 (default 50). |
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
-| `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
+| `order` | `desc` | `asc` \| `desc`, defaults to asc. Sort direction. |
+| `order_by` | `created_at` | `id` \| `ledger` \| `created_at`, defaults to `id`. Sort column. Anything else is a `400`. |
 | `decoded` | `true` | When `true`, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with `"decoded": false`. |
+| `include_xdr` | `true` | When `true`, includes raw base64 `topics_xdr` and `value_xdr` on each event. Omitted by default to keep responses small. |
 
 Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
+
+#### Ordering and pagination
+
+`order_by` picks the sort column and `order` the direction, so they combine:
+
+```sh
+curl -s 'localhost:8080/events?order_by=created_at&order=desc&limit=100'
+```
+
+Pagination stays correct under every ordering. `ledger` and `created_at` both
+have duplicates — a ledger holds many events, and a batch insert stamps one
+`created_at` on all of them — so those orderings sort by `(column, id)` and
+their cursors carry both halves. That keeps a page boundary landing in the
+middle of a run of equal values from skipping or repeating rows.
+
+Cursors are opaque and tied to the ordering that produced them: feeding a
+cursor from one `order_by` into another returns `400`. Always pass back the
+`cursor` from the previous response with the same `order_by`/`order`. Cursors
+issued for the default `id` ordering are unchanged, so existing clients keep
+working.
 
 ```sh
 curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic={"symbol":"transfer"}&limit=2'
 ```
+
+Containment search (`topic_contains`) lets you filter by partial topic
+structure — e.g. any event involving a specific address, even when you
+don't know the full topic shape:
+
+```sh
+# Events whose topics include a specific address
+curl -s 'localhost:8080/events?topic_contains=[{"address":"GA...5WI"}]&limit=5'
+# Events with both a transfer symbol and a specific address
+curl -s 'localhost:8080/events?topic_contains=[{"symbol":"transfer"},{"address":"GA...5WI"}]&limit=5'
+```
+
+**Semantics**: `topic_contains` uses Postgres jsonb containment (`@>`),
+not substring matching. `topic_contains=[{"address":"G..."}]` means
+"the topics array contains an element that itself jsonb-contains
+`{"address":"G..."}`", so `{"address":"G...","symbol":"transfer"}`
+matches. For exact element equality use `topic` instead.
 
 ```sh
 curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"GABC..."}&topic2={"address":"GDEF..."}'
