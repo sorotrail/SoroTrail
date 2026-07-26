@@ -10,13 +10,8 @@
 -- migration on top of a DB that already has these columns/table (only the
 -- events table itself was reverted to its legacy shape).
 ALTER TABLE events
-<<<<<<<< HEAD:internal/store/migrations/0008_raw_xdr_and_replay.up.sql
-    ADD COLUMN topics_xdr jsonb CHECK (topics_xdr IS NULL OR jsonb_typeof(topics_xdr) = 'array'),
-    ADD COLUMN value_xdr text;
-========
     ADD COLUMN IF NOT EXISTS raw_topic_xdr text[],
     ADD COLUMN IF NOT EXISTS raw_value_xdr text;
->>>>>>>> origin/main:internal/store/migrations/0005_raw_xdr_and_replay.up.sql
 
 -- Single-row progress marker for the replay tool, mirroring ingestion_state.
 -- Updated in the same transaction as each batch's rewrites, so an interrupted

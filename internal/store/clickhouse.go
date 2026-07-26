@@ -114,8 +114,12 @@ func (c *ClickHouse) SaveAuditStateIfGreater(ctx context.Context, ledger int64) 
 	return AuditState{}, nil
 }
 
-func (c *ClickHouse) ListWatchedContracts(ctx context.Context) ([]string, error) {
+func (c *ClickHouse) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	return nil, nil
+}
+
+func (c *ClickHouse) RemoveWatchedContract(ctx context.Context, contractID string) error {
+	return nil
 }
 
 func (c *ClickHouse) AddWatchedContract(ctx context.Context, contractID string) error {
@@ -189,4 +193,3 @@ func (c *ClickHouse) Stats(ctx context.Context) (Stats, error) {
 func (c *ClickHouse) Ping(ctx context.Context) error {
 	return nil
 }
-

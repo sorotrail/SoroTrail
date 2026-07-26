@@ -1,5 +1,5 @@
 // Package api serves stored events over HTTP. Endpoints are documented in
-// the README's API reference.
+// the OpenAPI spec and the README.
 package api
 
 import (
@@ -17,6 +17,10 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
+
+type ctxKey string
+
+const loggerCtxKey ctxKey = "logger"
 
 // SetAuditor registers the binary's Auditor so /stats can surface its
 // Metrics counters. There is exactly one Auditor per process; its
@@ -57,14 +61,18 @@ type Server struct {
 	rpc      rpc.Client
 	enricher Enricher
 	log      *slog.Logger
+	apiKey   string
 	limiter  *RateLimiter
 	bcast    *broadcast.Broadcaster
 }
 
 // New builds the API server. rpcClient is only used by /health.
-// enricher is optional — pass nil to disable spec decoding.
-func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log}
+// apiKey gates the watched-contracts management endpoints; pass "" to
+// fail closed (every request gets a 503 with "API_KEY not configured").
+// See apiKeyAuth for the exact contract. The trailing enricher is optional —
+// pass nil to disable spec decoding, or one Enricher to enable it.
+func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
+	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
@@ -88,6 +96,7 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
@@ -105,8 +114,17 @@ func (s *Server) Router() http.Handler {
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
-	// contributors: new read endpoints go here. Anything that writes (e.g.
-	// managing watched contracts at runtime) should come with auth first.
+	// Watched-contracts management: writes and updates to the runtime
+	// filter list. Always auth-gated, even when AUTH_ENABLED would be
+	// false elsewhere — that asymmetry is intentional and part of the
+	// "writes are never open" contract. GET is gated too so an operator
+	// with the key can confirm the current list without touching /stats.
+	// Routes are absolute (no sub-router) so callers don't need a
+	// trailing slash or chi's RedirectSlashes middleware.
+	watchedMW := apiKeyAuth(s.apiKey)
+	r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
+	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
+	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
 
 	// Subscription CRUD and delivery history.
 	r.Post("/subscriptions", s.handleCreateSubscription)
@@ -123,13 +141,22 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		start := time.Now()
-		next.ServeHTTP(ww, r)
-		s.log.Info("http request",
-			"method", r.Method,
-			"path", r.URL.Path,
+		reqID := middleware.GetReqID(r.Context())
+		log := s.log.With("request_id", reqID, "route", r.Method+" "+r.URL.Path)
+		ctx := context.WithValue(r.Context(), loggerCtxKey, log)
+		ww.Header().Set("X-Request-ID", reqID)
+		next.ServeHTTP(ww, r.WithContext(ctx))
+		log.Info("http request",
 			"status", ww.Status(),
-			"duration", time.Since(start),
-			"remote", r.RemoteAddr,
+			"duration_ms", time.Since(start).Milliseconds(),
 		)
 	})
+}
+
+func loggerFromContext(ctx context.Context) *slog.Logger {
+	log, ok := ctx.Value(loggerCtxKey).(*slog.Logger)
+	if !ok {
+		return slog.Default()
+	}
+	return log
 }

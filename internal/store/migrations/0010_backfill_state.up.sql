@@ -1,4 +1,4 @@
-CREATE TABLE backfill_state (
+CREATE TABLE IF NOT EXISTS backfill_state (
     id                  int PRIMARY KEY CHECK (id = 1),
     contract_id         text NOT NULL,
     from_ledger         bigint NOT NULL,
