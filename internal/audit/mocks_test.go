@@ -380,41 +380,6 @@ func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.D
 	return nil, nil
 }
 
-func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
-	return nil, store.ErrNotFound
-}
-func (m *mockStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
-
-// Subscription stubs for the webhook feature — unused by auditor tests.
-func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
-	sub.ID = 1
-	return sub, nil
-}
-func (m *mockStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
-	return store.Subscription{}, store.ErrNotFound
-}
-func (m *mockStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
-	return nil, nil
-}
-func (m *mockStore) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
-	return sub, nil
-}
-func (m *mockStore) DeleteSubscription(context.Context, int64) error { return nil }
-func (m *mockStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
-	return nil, nil
-}
-func (m *mockStore) IncrementSubscriptionFailures(context.Context, int64, int) (int, bool, error) {
-	return 0, false, nil
-}
-func (m *mockStore) ResetSubscriptionFailures(context.Context, int64) error { return nil }
-func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAttempt) (store.DeliveryAttempt, error) {
-	a.ID = 1
-	return a, nil
-}
-func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
-	return nil, nil
-}
-
 // seedLedgers records pre-existing events in m.events so tests can set up
 // "stored state that diverges from the RPC" without a database. IDs use
 // the same %020d-%05d format as mkEvents, so seeded events and RPC

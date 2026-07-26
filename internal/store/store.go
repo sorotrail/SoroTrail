@@ -170,6 +170,7 @@ type AuditFinding struct {
 // callbacks use to select which events to deliver. Same semantics as
 // GET /events query parameters. An empty (zero-value) filter matches
 // every event.
+
 type SubscriptionFilter struct {
 	ContractID    string          `json:"contract_id,omitempty"`
 	Type          string          `json:"type,omitempty"`
@@ -177,11 +178,6 @@ type SubscriptionFilter struct {
 	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
 	FromLedger    int64           `json:"from_ledger,omitempty"`
 	ToLedger      int64           `json:"to_ledger,omitempty"`
-	ContractID string          `json:"contract_id,omitempty"`
-	Type       string          `json:"type,omitempty"`
-	Topic      json.RawMessage `json:"topic,omitempty"`
-	FromLedger int64           `json:"from_ledger,omitempty"`
-	ToLedger   int64           `json:"to_ledger,omitempty"`
 }
 
 // MatchesEvent reports whether an event passes this filter. Zero fields
@@ -263,9 +259,6 @@ func jsonbContains(container, contained json.RawMessage) bool {
 	// Fallback: exact JSON string match (handles strings, numbers, and
 	// cases where unmarshalling into map failed — e.g. arrays).
 	return string(container) == string(contained)
-}
-
-	return true
 }
 
 // Subscription is one registered webhook callback.

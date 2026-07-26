@@ -621,35 +621,6 @@ func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID str
 	return nil
 }
 
-func (p *Postgres) GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error) {
-	var specJSON []byte
-	err := p.pool.QueryRow(ctx,
-		`SELECT spec_json FROM contract_specs WHERE wasm_hash = $1`, wasmHash,
-	).Scan(&specJSON)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("loading contract spec for wasm_hash %s: %w", wasmHash, err)
-	}
-	return specJSON, nil
-}
-
-func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error {
-	_, err := p.pool.Exec(ctx, `
-		INSERT INTO contract_specs (wasm_hash, contract_id, spec_json, fetched_at)
-		VALUES ($1, $2, $3, now())
-		ON CONFLICT (wasm_hash) DO UPDATE SET
-			spec_json  = EXCLUDED.spec_json,
-			fetched_at = now()`,
-		wasmHash, contractID, specJSON,
-	)
-	if err != nil {
-		return fmt.Errorf("saving contract spec for %s: %w", wasmHash, err)
-	}
-	return nil
-}
-
 func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
 	err := p.pool().QueryRow(ctx, `
 		INSERT INTO audit_findings

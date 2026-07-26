@@ -195,9 +195,6 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 			})
 			return
 		}
-	decoded := r.URL.Query().Get("decoded") == "true"
-	if decoded && s.enricher != nil {
-		enriched := s.enricher.EnrichEvents(r.Context(), events)
 		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
 		return
 	}
@@ -266,10 +263,6 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusOK, enrichEventWithXDR(enriched[0]))
 				return
 			}
-	decoded := r.URL.Query().Get("decoded") == "true"
-	if decoded && s.enricher != nil {
-		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
-		if len(enriched) > 0 {
 			writeJSON(w, http.StatusOK, enriched[0])
 			return
 		}
@@ -613,12 +606,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 			return f, fmt.Errorf("topic_contains must be valid JSON")
 		}
 		f.TopicContains = json.RawMessage(raw)
-		}
-		quoted, err := json.Marshal(raw)
-		if err != nil {
-			return nil, fmt.Errorf("invalid %s: %w", name, err)
-		}
-		return quoted, nil
 	}
 
 	// order controls sort direction for paginated results.
