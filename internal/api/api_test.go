@@ -403,6 +403,82 @@ func TestHealth(t *testing.T) {
 	})
 }
 
+func TestHealthz(t *testing.T) {
+	t.Run("always returns 200", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/healthz")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+	t.Run("returns 200 even when db is down", func(t *testing.T) {
+		st := &stubStore{pingErr: errors.New("connection refused")}
+		resp, _ := doGet(t, newTestServer(st, nil), "/healthz")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+	t.Run("returns 200 even when rpc is down", func(t *testing.T) {
+		rc := &stubRPC{healthErr: errors.New("rpc unreachable")}
+		resp, _ := doGet(t, newTestServer(&stubStore{}, rc), "/healthz")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+}
+
+func TestReadyz(t *testing.T) {
+	tests := []struct {
+		name           string
+		store          *stubStore
+		rpc            *stubRPC
+		wantStatus     int
+		wantChecks     map[string]string
+		wantStatusText string
+	}{
+		{
+			name:           "all healthy",
+			store:          &stubStore{ingestion: store.IngestionState{LastIngestedLedger: 1000}},
+			wantStatus:     http.StatusOK,
+			wantChecks:     map[string]string{"database": "ok", "ingest": "ok"},
+			wantStatusText: "ok",
+		},
+		{
+			name:           "db down",
+			store:          &stubStore{pingErr: errors.New("connection refused"), ingestion: store.IngestionState{LastIngestedLedger: 1000}},
+			wantStatus:     http.StatusServiceUnavailable,
+			wantChecks:     map[string]string{"database": "connection refused", "ingest": "ok"},
+			wantStatusText: "degraded",
+		},
+		{
+			name:           "no ingestion state",
+			store:          &stubStore{ingestionErr: store.ErrNotFound},
+			wantStatus:     http.StatusServiceUnavailable,
+			wantChecks:     map[string]string{"database": "ok", "ingest": "not found"},
+			wantStatusText: "degraded",
+		},
+		{
+			name:           "last ingested ledger is zero",
+			store:          &stubStore{ingestion: store.IngestionState{LastIngestedLedger: 0}},
+			wantStatus:     http.StatusServiceUnavailable,
+			wantChecks:     map[string]string{"database": "ok", "ingest": "no ingested ledgers"},
+			wantStatusText: "degraded",
+		},
+		{
+			name:           "ingestion state error",
+			store:          &stubStore{ingestionErr: errors.New("db error")},
+			wantStatus:     http.StatusServiceUnavailable,
+			wantChecks:     map[string]string{"database": "ok", "ingest": "db error"},
+			wantStatusText: "degraded",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, body := doGet(t, newTestServer(tt.store, nil), "/readyz")
+			assert.Equal(t, tt.wantStatus, resp.StatusCode, string(body))
+
+			var out healthResponse
+			require.NoError(t, json.Unmarshal(body, &out))
+			assert.Equal(t, tt.wantStatusText, out.Status)
+			assert.Equal(t, tt.wantChecks, out.Checks)
+		})
+	}
+}
+
 func TestListEvents_FieldsProjection(t *testing.T) {
 	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	st := &stubStore{

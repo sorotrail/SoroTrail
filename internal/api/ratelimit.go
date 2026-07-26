@@ -49,6 +49,8 @@ import (
 // rate-limit pressure).
 var exemptPaths = map[string]bool{
 	"/health":  true,
+	"/healthz": true,
+	"/readyz":  true,
 	"/metrics": true,
 }
 

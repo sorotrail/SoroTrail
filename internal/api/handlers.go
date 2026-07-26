@@ -226,6 +226,34 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, resp)
 }
 
+func (s *Server) handleLiveness(w http.ResponseWriter, r *http.Request) {
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Checks: map[string]string{}})
+}
+
+func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok", "ingest": "ok"}}
+	status := http.StatusOK
+
+	if err := s.store.Ping(ctx); err != nil {
+		resp.Status, resp.Checks["database"] = "degraded", err.Error()
+		status = http.StatusServiceUnavailable
+	}
+	state, err := s.store.GetIngestionState(ctx)
+	if err != nil {
+		resp.Status, resp.Checks["ingest"] = "degraded", err.Error()
+		status = http.StatusServiceUnavailable
+	} else if state.LastIngestedLedger <= 0 {
+		resp.Status, resp.Checks["ingest"] = "degraded", "no ingested ledgers"
+		status = http.StatusServiceUnavailable
+	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, status, resp)
+}
+
 func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
