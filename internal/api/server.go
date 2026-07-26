@@ -57,13 +57,14 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store    store.Store
-	rpc      rpc.Client
-	enricher Enricher
-	log      *slog.Logger
-	apiKey   string
-	limiter  *RateLimiter
-	bcast    *broadcast.Broadcaster
+	store     store.Store
+	rpc       rpc.Client
+	enricher  Enricher
+	log       *slog.Logger
+	apiKey    string
+	limiter   *RateLimiter
+	recoverer *Recoverer
+	bcast     *broadcast.Broadcaster
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -72,7 +73,7 @@ type Server struct {
 // See apiKeyAuth for the exact contract. The trailing enricher is optional —
 // pass nil to disable spec decoding, or one Enricher to enable it.
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey}
+	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log)}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
@@ -98,7 +99,7 @@ func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
-	r.Use(middleware.Recoverer)
+	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 	if s.limiter != nil {
 		// Limiter sits inside Timeout and Recoverer so its instant 429

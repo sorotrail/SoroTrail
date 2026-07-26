@@ -311,6 +311,9 @@ type Stats struct {
 	// Set by the guarded store wrapper; zero when the store is used
 	// directly or when no errors have occurred.
 	QueryErrors uint64 `json:"query_errors"`
+	// PanicsRecovered is the number of panics the HTTP middleware has
+	// recovered since process start. Set by the API handler.
+	PanicsRecovered uint64 `json:"panics_recovered"`
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
