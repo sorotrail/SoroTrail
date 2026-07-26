@@ -67,23 +67,21 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	batch := &pgx.Batch{}
 	conflict := `ON CONFLICT (id) DO NOTHING`
 	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
-			contract_id        = COALESCE(EXCLUDED.contract_id,        events.contract_id),
-			ledger             = COALESCE(EXCLUDED.ledger,             events.ledger),
-			type               = COALESCE(EXCLUDED.type,               events.type),
-			tx_hash            = COALESCE(EXCLUDED.tx_hash,            events.tx_hash),
-			tx_index           = COALESCE(EXCLUDED.tx_index,           events.tx_index),
-			op_index           = COALESCE(EXCLUDED.op_index,           events.op_index),
-			in_successful_call = COALESCE(EXCLUDED.in_successful_call, events.in_successful_call),
-			topics             = COALESCE(EXCLUDED.topics,             events.topics),
-			value              = COALESCE(EXCLUDED.value,              events.value),
-			created_at         = COALESCE(EXCLUDED.created_at,         events.created_at),
-			topics_xdr         = COALESCE(EXCLUDED.topics_xdr,         events.topics_xdr),
-			value_xdr          = COALESCE(EXCLUDED.value_xdr,          events.value_xdr),
-			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr,      events.raw_topic_xdr),
-			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr,      events.raw_value_xdr)`
+		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
+			contract_id        = EXCLUDED.contract_id,
+			ledger             = EXCLUDED.ledger,
+			type               = EXCLUDED.type,
+			tx_hash            = EXCLUDED.tx_hash,
+			tx_index           = EXCLUDED.tx_index,
+			op_index           = EXCLUDED.op_index,
+			in_successful_call = EXCLUDED.in_successful_call,
+			topics             = EXCLUDED.topics,
+			value              = EXCLUDED.value,
+			created_at         = EXCLUDED.created_at,
+			raw_topic_xdr      = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
-	sql := `
+	stmt := `
 		INSERT INTO events
 			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 			 in_successful_call, topics, value, created_at,
@@ -322,9 +320,17 @@ func nullableStringSlice(s []string) any {
 }
 
 func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
-	row := p.pool.QueryRow(ctx, `SELECT `+eventColumns+` FROM events WHERE id = $1`, id)
-	e, err := scanEvent(row)
-	if errors.Is(err, pgx.ErrNoRows) {
+	var e Event
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `SELECT `+eventColumns+` FROM events WHERE id = $1`, id)
+		var err error
+		e, err = scanEvent(row)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	})
+	if errors.Is(err, ErrNotFound) {
 		return Event{}, ErrNotFound
 	}
 	return e, err
@@ -340,7 +346,9 @@ func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
 // loaded on a real cache miss via GetEvent.
 func (p *Postgres) EventExists(ctx context.Context, id string) (bool, error) {
 	var one int
-	err := p.pool.QueryRow(ctx, `SELECT 1 FROM events WHERE id = $1`, id).Scan(&one)
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT 1 FROM events WHERE id = $1`, id).Scan(&one)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -429,37 +437,46 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	// query += " ORDER BY id ASC LIMIT " + arg(limit+1)
 	query += " ORDER BY id " + orderDir + " LIMIT " + arg(limit+1)
 
-	rows, err := p.pool.Query(ctx, query, args...)
-	if err != nil {
-		return nil, "", fmt.Errorf("querying events: %w", err)
-	}
-	defer rows.Close()
-
-	events := make([]Event, 0, limit)
-	for rows.Next() {
-		e, err := scanEvent(rows)
-		if err != nil {
-			return nil, "", err
-		}
-		events = append(events, e)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, "", fmt.Errorf("reading events: %w", err)
-	}
-
+	var events []Event
 	next := ""
-	if len(events) > limit {
-		events = events[:limit]
-		next = events[limit-1].ID
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("querying events: %w", err)
+		}
+		defer rows.Close()
+
+		events = make([]Event, 0, limit)
+		for rows.Next() {
+			e, err := scanEvent(rows)
+			if err != nil {
+				return err
+			}
+			events = append(events, e)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("reading events: %w", err)
+		}
+
+		if len(events) > limit {
+			events = events[:limit]
+			next = events[limit-1].ID
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
 	}
 	return events, next, nil
 }
 
 func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error) {
 	var s IngestionState
-	err := p.pool.QueryRow(ctx,
-		`SELECT last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE id = 1`,
-	).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.UpdatedAt)
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE id = 1`,
+		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.UpdatedAt)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return IngestionState{}, ErrNotFound
 	}
@@ -487,9 +504,11 @@ func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) err
 
 func (p *Postgres) GetAuditState(ctx context.Context) (AuditState, error) {
 	var s AuditState
-	err := p.pool.QueryRow(ctx,
-		`SELECT verified_through_ledger, updated_at FROM audit_state WHERE id = 1`,
-	).Scan(&s.VerifiedThroughLedger, &s.UpdatedAt)
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT verified_through_ledger, updated_at FROM audit_state WHERE id = 1`,
+		).Scan(&s.VerifiedThroughLedger, &s.UpdatedAt)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuditState{}, ErrNotFound
 	}
@@ -588,15 +607,17 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 	// COUNT(DISTINCT contract_id) scans the contract_id index; fine at MVP
 	// scale. contributors: replace with a maintained summary table if it
 	// becomes a bottleneck on large datasets.
-	err := p.pool.QueryRow(ctx, `
-		SELECT
-			(SELECT count(*) FROM events),
-			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
-			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
-			(SELECT coalesce(min(ledger), 0) FROM events),
-			(SELECT count(DISTINCT contract_id) FROM events),
-			(SELECT count(*) FROM watched_contracts)`,
-	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT
+				(SELECT count(*) FROM events),
+				(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
+				(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
+				(SELECT coalesce(min(ledger), 0) FROM events),
+				(SELECT count(DISTINCT contract_id) FROM events),
+				(SELECT count(*) FROM watched_contracts)`,
+		).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
+	})
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
 	}
@@ -713,6 +734,45 @@ func nullableString(s string) any {
 		return nil
 	}
 	return s
+}
+
+func (p *Postgres) withStatementTimeoutTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin guarded tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if timeout, ok := statementTimeoutFromContext(ctx); ok && timeout > 0 {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = '%dms'", timeout.Milliseconds())); err != nil {
+			return fmt.Errorf("setting statement_timeout: %w", err)
+		}
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit guarded tx: %w", err)
+	}
+	return nil
+}
+
+func statementTimeoutFromContext(ctx context.Context) (time.Duration, bool) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0, false
+	}
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		return 0, false
+	}
+	if timeout < time.Millisecond {
+		return time.Millisecond, true
+	}
+	return timeout, true
 }
 
 func scanEvent(row pgx.Row) (Event, error) {
