@@ -179,6 +179,7 @@ func run() error {
 	})
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
+	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
