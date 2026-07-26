@@ -5,6 +5,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
 	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
@@ -18,6 +19,13 @@ var migrationsFS embed.FS
 // Migrate applies all pending migrations to the database at databaseURL.
 // It is safe to call on every startup; an up-to-date schema is a no-op.
 func Migrate(databaseURL string) error {
+	if strings.HasPrefix(databaseURL, "clickhouse://") {
+		return nil
+	}
+	if !strings.HasPrefix(databaseURL, "postgres://") && !strings.HasPrefix(databaseURL, "postgresql://") {
+		return fmt.Errorf("unsupported database url scheme")
+	}
+
 	src, err := iofs.New(migrationsFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("loading embedded migrations: %w", err)
