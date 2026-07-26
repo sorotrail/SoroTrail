@@ -202,10 +202,16 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 	})
 
 	t.Run("by type", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{Type: "diagnostic"})
+		got, _, err := st.QueryEvents(ctx, EventFilter{Types: []string{"diagnostic"}})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.Equal(t, eventID(3), got[0].ID)
+	})
+
+	t.Run("by multiple types", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{Types: []string{"contract", "diagnostic"}})
+		require.NoError(t, err)
+		require.Len(t, got, 10)
 	})
 
 	t.Run("by topic at any position", func(t *testing.T) {
@@ -250,7 +256,10 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		require.Len(t, all, 10)
+		// Count what is actually in the table rather than hardcoding it:
+		// sibling subtests above insert rows of their own, so a literal
+		// makes this assertion depend on subtest execution order.
+		require.Len(t, all, countEventsInRange(t, st, 101, 110))
 		for i := 1; i < len(all); i++ {
 			assert.Less(t, all[i-1].ID, all[i].ID, "ascending ID order across pages")
 		}
@@ -312,11 +321,31 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		require.Len(t, all, 10)
+		require.Len(t, all, countEventsInRange(t, st, 101, 110))
 		for i := 1; i < len(all); i++ {
 			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
 		}
 	})
+}
+
+// countEventsInRange reports how many events the store holds in a ledger
+// range, so a pagination assertion states the range it walked instead of a
+// literal that silently depends on which sibling subtests ran first.
+//
+// The range matters: sibling subtests insert their own rows outside
+// [101,110], and the keyset walks below are bounded to that window. Counting
+// the whole table instead would compare a bounded walk against an unbounded
+// total.
+func countEventsInRange(t *testing.T, st *Postgres, fromLedger, toLedger int64) int {
+	t.Helper()
+	got, next, err := st.QueryEvents(context.Background(), EventFilter{
+		Limit:      MaxQueryLimit,
+		FromLedger: fromLedger,
+		ToLedger:   toLedger,
+	})
+	require.NoError(t, err)
+	require.Empty(t, next, "fixture must fit in one max-size page")
+	return len(got)
 }
 
 func TestQueryEvents_TimeRange(t *testing.T) {

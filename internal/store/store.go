@@ -88,7 +88,10 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
 	ContractID string
-	Type       string
+	// Types filters by event type. Multiple values are accepted (ANDed
+	// together at the SQL level via type = ANY(...)). An empty or nil
+	// slice means "no constraint".
+	Types []string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic json.RawMessage
@@ -113,6 +116,30 @@ type EventFilter struct {
 	Limit  int
 	// Order is "asc" or "desc", defaults to "asc"
 	Order string
+	// OrderBy selects the sort column: OrderByID (default), OrderByLedger,
+	// or OrderByCreatedAt. Every ordering is made total by appending id as
+	// a tiebreaker, so keyset pagination stays stable when the sort column
+	// has duplicates.
+	OrderBy string
+}
+
+// Sort columns accepted in EventFilter.OrderBy. The zero value means
+// OrderByID, which is the historical behavior.
+const (
+	OrderByID        = "id"
+	OrderByLedger    = "ledger"
+	OrderByCreatedAt = "created_at"
+)
+
+// ValidOrderBy reports whether s names a supported sort column. The empty
+// string is valid and means OrderByID.
+func ValidOrderBy(s string) bool {
+	switch s {
+	case "", OrderByID, OrderByLedger, OrderByCreatedAt:
+		return true
+	default:
+		return false
+	}
 }
 
 // IngestionState tracks how far ingestion has progressed.
@@ -311,9 +338,24 @@ type Stats struct {
 	// Set by the guarded store wrapper; zero when the store is used
 	// directly or when no errors have occurred.
 	QueryErrors uint64 `json:"query_errors"`
+	// PanicsRecovered is the number of panics the HTTP middleware has
+	// recovered since process start. Set by the API handler.
+	PanicsRecovered uint64 `json:"panics_recovered"`
+	// RPCErrors counts RPC call failures by method name since the process
+	// started. Populated by the CountingClient wrapper; zero-valued when
+	// the wrapper is not in use.
+	RPCErrors RPCErrorStats `json:"rpc_errors,omitempty"`
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
+}
+
+// RPCErrorStats is a JSON-friendly snapshot of per-method RPC error counts.
+type RPCErrorStats struct {
+	GetEvents        uint64 `json:"getEvents,omitempty"`
+	GetLatestLedger  uint64 `json:"getLatestLedger,omitempty"`
+	GetHealth        uint64 `json:"getHealth,omitempty"`
+	GetLedgerEntries uint64 `json:"getLedgerEntries,omitempty"`
 }
 
 // AuditStats is a JSON-friendly view of audit.Metrics. Defined here so
