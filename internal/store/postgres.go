@@ -377,8 +377,8 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
-	if f.Type != "" {
-		where = append(where, "type = "+arg(f.Type))
+	if len(f.Types) > 0 {
+		where = append(where, "type = ANY("+arg(f.Types)+")")
 	}
 	if len(f.Topic) > 0 {
 		// Containment on the array matches the topic at any position.

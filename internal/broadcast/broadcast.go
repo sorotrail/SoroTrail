@@ -143,8 +143,17 @@ func eventMatches(ev store.Event, f store.EventFilter) bool {
 	if f.ContractID != "" && ev.ContractID != f.ContractID {
 		return false
 	}
-	if f.Type != "" && ev.Type != f.Type {
-		return false
+	if len(f.Types) > 0 {
+		ok := false
+		for _, t := range f.Types {
+			if ev.Type == t {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
 	}
 	if len(f.Topic) > 0 {
 		if !topicContains(ev.Topics, f.Topic) {
