@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,9 +16,26 @@ import (
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
+	"github.com/khaylebfortune/sorotrail/internal/buildinfo"
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
+
+// decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
+// unknown fields so a typo like {"contractID": "..."} doesn't fall
+// through with an empty contract_id and a confusing 400 from a later
+// check. Returns a typed error string the handler can surface directly.
+func decodeJSONBody(r *http.Request, dst any) error {
+	if r.Body == nil {
+		return errors.New("request body is empty")
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	return nil
+}
 
 // cachePrivate is the package-wide override that flips Cache-Control
 // directives from `public` to `private`. Production code sets it once at
@@ -73,14 +91,14 @@ type eventsResponse struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
-type eventsWithXDRResponse struct {
-	Events []eventWithXDR `json:"events"`
-	// Cursor is non-empty when another page exists; pass it back as ?cursor=.
+type enrichedEventsResponse struct {
+	Events []store.EnrichedEvent `json:"events"`
+	// Cursor is non-empty when another page exists.
 	Cursor string `json:"cursor,omitempty"`
 }
 
-type enrichedEventsResponse struct {
-	Events []store.EnrichedEvent `json:"events"`
+type eventsWithXDRResponse struct {
+	Events []eventWithXDR `json:"events"`
 	// Cursor is non-empty when another page exists.
 	Cursor string `json:"cursor,omitempty"`
 }
@@ -108,6 +126,115 @@ type healthResponse struct {
 	Checks map[string]string `json:"checks"`
 }
 
+type versionResponse struct {
+	Version   string `json:"version"`
+	Commit    string `json:"commit"`
+	BuildDate string `json:"build_date"`
+}
+
+// eventFieldNames is the set of JSON keys on store.Event that the ?fields=
+// allowlist accepts. It is built from the json struct tags so the compiler
+// catches drift when Event gains or renames fields.
+var eventFieldNames = map[string]bool{
+	"id":                 true,
+	"contract_id":        true,
+	"ledger":             true,
+	"type":               true,
+	"tx_hash":            true,
+	"tx_index":           true,
+	"op_index":           true,
+	"in_successful_call": true,
+	"topics":             true,
+	"value":              true,
+	"created_at":         true,
+}
+
+// parseFields splits a comma-separated ?fields= value and returns the
+// allowlist set. Unknown field names are rejected with a 400-style error.
+// An empty or missing raw value returns nil (meaning "return the full object").
+func parseFields(raw string) (map[string]bool, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	set := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		f := strings.TrimSpace(p)
+		if f == "" {
+			continue
+		}
+		if !eventFieldNames[f] {
+			return nil, fmt.Errorf("unknown field %q (valid: id, contract_id, ledger, type, tx_hash, tx_index, op_index, in_successful_call, topics, value, created_at)", f)
+		}
+		set[f] = true
+	}
+	if len(set) == 0 {
+		return nil, nil
+	}
+	return set, nil
+}
+
+// projectEvent returns the event unchanged when fields is nil, or a
+// map[string]any containing only the requested keys.
+func projectEvent(ev store.Event, fields map[string]bool) any {
+	if fields == nil {
+		return ev
+	}
+	return eventToMap(ev, fields)
+}
+
+// projectEvents applies projectEvent to a slice, returning []map[string]any
+// when fields is set, or the original slice when nil.
+func projectEvents(evs []store.Event, fields map[string]bool) any {
+	if fields == nil {
+		return evs
+	}
+	out := make([]map[string]any, len(evs))
+	for i, ev := range evs {
+		out[i] = eventToMap(ev, fields)
+	}
+	return out
+}
+
+// eventToMap builds a map with only the requested fields.
+func eventToMap(ev store.Event, fields map[string]bool) map[string]any {
+	m := make(map[string]any, len(fields))
+	if fields["id"] {
+		m["id"] = ev.ID
+	}
+	if fields["contract_id"] {
+		m["contract_id"] = ev.ContractID
+	}
+	if fields["ledger"] {
+		m["ledger"] = ev.Ledger
+	}
+	if fields["type"] {
+		m["type"] = ev.Type
+	}
+	if fields["tx_hash"] {
+		m["tx_hash"] = ev.TxHash
+	}
+	if fields["tx_index"] {
+		m["tx_index"] = ev.TxIndex
+	}
+	if fields["op_index"] {
+		m["op_index"] = ev.OpIndex
+	}
+	if fields["in_successful_call"] {
+		m["in_successful_call"] = ev.InSuccessfulCall
+	}
+	if fields["topics"] {
+		m["topics"] = ev.Topics
+	}
+	if fields["value"] {
+		m["value"] = ev.Value
+	}
+	if fields["created_at"] {
+		m["created_at"] = ev.CreatedAt
+	}
+	return m
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -130,17 +257,26 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, resp)
 }
 
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, versionResponse{
+		Version:   buildinfo.Version,
+		Commit:    buildinfo.Commit,
+		BuildDate: buildinfo.BuildDate,
+	})
+}
+
 func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
-	filter, err := filterFromQuery(r)
+	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	s.serveEvents(w, r, filter)
+	s.serveEvents(w, r, filter, fields)
 }
 
 func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
-	filter, err := filterFromQuery(r)
+	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -151,7 +287,7 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	filter.ContractID = contractID
-	s.serveEvents(w, r, filter)
+	s.serveEvents(w, r, filter, fields)
 }
 
 // serveEvents is the shared body for /events and /contracts/{id}/events.
@@ -159,13 +295,13 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 // SQL query, so an immutable page with a matching If-None-Match never
 // touches the events table at all — only the cheap ingestion_state row
 // used to read the frontier.
-func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter store.EventFilter) {
+func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter store.EventFilter, fields map[string]bool) {
 	policy, etag, err := s.listCachePolicy(r.Context(), filter)
 	if err != nil {
 		// "When in doubt, don't cache" is the explicit guidance: any
 		// failure to read the frontier falls back to no-cache rather
 		// than guessing the page is safe.
-		s.log.Warn("deciding list cache policy", "error", err)
+		loggerFromContext(r.Context()).Warn("deciding list cache policy", "error", err)
 	} else if etag != "" && ifNoneMatch(r, etag) {
 		writeNotModified(w, etag, policy)
 		return
@@ -173,13 +309,13 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 
 	events, cursor, qerr := s.store.QueryEvents(r.Context(), filter)
 	if qerr != nil {
-		s.log.Error("querying events", "error", qerr)
+		loggerFromContext(r.Context()).Error("querying events", "error", qerr)
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
-
-	decoded := r.URL.Query().Get("decoded") == "true"
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
+	decoded := r.URL.Query().Get("decoded") == "true"
+	writeCacheHeaders(w, policy, immutableMaxAge, etag)
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), events)
 		if includeXDR {
@@ -192,7 +328,6 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
 		return
 	}
-	writeCacheHeaders(w, policy, immutableMaxAge, etag)
 	if includeXDR {
 		writeJSON(w, http.StatusOK, eventsWithXDRResponse{
 			Events: eventsWithXDR(events),
@@ -200,11 +335,39 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
+	if fields == nil {
+		writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
+	} else {
+		m := map[string]any{"events": projectEvents(events, fields)}
+		if cursor != "" {
+			m["cursor"] = cursor
+		}
+		writeJSON(w, http.StatusOK, m)
+	}
+}
+
+// parseFilterAndFields parses the shared filter params plus the optional
+// ?fields= allowlist.
+func parseFilterAndFields(r *http.Request) (store.EventFilter, map[string]bool, error) {
+	filter, err := filterFromQuery(r)
+	if err != nil {
+		return filter, nil, err
+	}
+	fields, err := parseFields(r.URL.Query().Get("fields"))
+	if err != nil {
+		return filter, nil, err
+	}
+	return filter, fields, nil
 }
 
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+
+	fields, err := parseFields(r.URL.Query().Get("fields"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 
 	// Strong ETag: the event ID is itself a perfect validator for an
 	// immutable resource (each ID maps to exactly one row, that row's
@@ -221,7 +384,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	if ifNoneMatch(r, etag) {
 		exists, err := s.store.EventExists(r.Context(), id)
 		if err != nil {
-			s.log.Error("checking event existence", "id", id, "error", err)
+			loggerFromContext(r.Context()).Error("checking event existence", "id", id, "error", err)
 			writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 			return
 		}
@@ -243,11 +406,10 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("loading event", "id", id, "error", err)
+		loggerFromContext(r.Context()).Error("loading event", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
-
 	decoded := r.URL.Query().Get("decoded") == "true"
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
@@ -266,7 +428,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, eventToXDRResponse(event))
 		return
 	}
-	writeJSON(w, http.StatusOK, event)
+	writeJSON(w, http.StatusOK, projectEvent(event, fields))
 }
 
 func eventToXDRResponse(e store.Event) eventWithXDR {
@@ -310,7 +472,7 @@ func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.Stats(r.Context())
 	if err != nil {
-		s.log.Error("loading stats", "error", err)
+		loggerFromContext(r.Context()).Error("loading stats", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
 	}
@@ -331,6 +493,165 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
+// addWatchedRequest is the body for POST /watched-contracts: a single
+// contract ID to add to the runtime watch list.
+type addWatchedRequest struct {
+	ContractID string `json:"contract_id"`
+}
+
+// addWatchedResponse includes the current ingestion cursor so callers
+// know exactly where historical replay starts — events before this ledger
+// are not backfilled by the runtime add (a separate replay tool covers them).
+type addWatchedResponse struct {
+	ContractID        string `json:"contract_id"`
+	AddedAt           string `json:"added_at"`
+	HistoryFromLedger int64  `json:"history_from_ledger"`
+	// ModeTransition is "all_to_specific" when the list was empty before
+	// this add, surfacing the same semantic change the confirm guard
+	// guards. Useful to post-run auditors even when the caller already
+	// confirmed.
+	ModeTransition string `json:"mode_transition,omitempty"`
+}
+
+// removeWatchedResponse explains what removal actually did: stored events
+// are NOT deleted; only future ingestion stops. The message is part of
+// the contract so callers don't have to read the README to find out.
+type removeWatchedResponse struct {
+	ContractID       string `json:"contract_id"`
+	RemovedAt        string `json:"removed_at"`
+	HistoryPreserved bool   `json:"history_preserved"`
+	ModeTransition   string `json:"mode_transition,omitempty"`
+}
+
+// watchedListResponse wraps the GET response in an envelope so the route
+// is easy to extend without breaking JSON shape.
+type watchedListResponse struct {
+	Contracts []store.WatchedContract `json:"contracts"`
+	Count     int                     `json:"count"`
+}
+
+// handleListWatchedChains returns the current watch list in stable
+// (contract_id) order.
+func (s *Server) handleListWatchedChains(w http.ResponseWriter, r *http.Request) {
+	contracts, err := s.store.ListWatchedContracts(r.Context())
+	if err != nil {
+		s.log.Error("listing watched contracts", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
+		return
+	}
+	writeJSON(w, http.StatusOK, watchedListResponse{Contracts: contracts, Count: len(contracts)})
+}
+
+// handleAddWatchedChain adds a contract to the runtime watch list and
+// returns where historical replay for it starts (= the current cursor).
+//
+// Guarded by ?confirm=true when the add would switch the ingester from
+// "all contract events" (empty list) to a specific contract list, since
+// that silently narrows what gets stored going forward.
+//
+// TOCTOU note: the confirm check reads the list and then mutates it
+// without holding a row lock. Two concurrent empty→non-empty POSTs can
+// both pass the guard before either mutates — acceptable because
+// ON CONFLICT DO NOTHING makes a duplicate Add a no-op, and only the
+// first response carries the genuine transition; the second reports one
+// too, but no row state diverges.
+func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
+	var req addWatchedRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if !config.ValidContractID(req.ContractID) {
+		writeError(w, http.StatusBadRequest,
+			fmt.Errorf("invalid contract_id %q (want 56-char C... strkey)", req.ContractID))
+		return
+	}
+
+	current, err := s.store.ListWatchedContracts(r.Context())
+	if err != nil {
+		s.log.Error("listing watched contracts for add", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
+		return
+	}
+
+	modeTransition := ""
+	if len(current) == 0 {
+		if r.URL.Query().Get("confirm") != "true" {
+			writeError(w, http.StatusBadRequest, errors.New(
+				"adding the first watched contract would switch ingestion from "+
+					"'all contract events' to a specific list — pass ?confirm=true to acknowledge"))
+			return
+		}
+		modeTransition = "all_to_specific"
+	}
+
+	state, err := s.store.GetIngestionState(r.Context())
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.log.Error("loading ingestion state for add", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading ingestion state failed"))
+		return
+	}
+
+	if err := s.store.AddWatchedContract(r.Context(), req.ContractID); err != nil {
+		s.log.Error("adding watched contract", "contract_id", req.ContractID, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("adding watched contract failed"))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, addWatchedResponse{
+		ContractID:        req.ContractID,
+		AddedAt:           time.Now().UTC().Format(time.RFC3339),
+		HistoryFromLedger: state.LastIngestedLedger,
+		ModeTransition:    modeTransition,
+	})
+}
+
+// handleRemoveWatchedChain stops future ingestion for the named contract
+// without deleting any events already stored. The same empty<->non-empty
+// guard fires when removing the last contract on the list (specific -> all).
+func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if !config.ValidContractID(id) {
+		writeError(w, http.StatusBadRequest,
+			fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", id))
+		return
+	}
+
+	current, err := s.store.ListWatchedContracts(r.Context())
+	if err != nil {
+		s.log.Error("listing watched contracts for remove", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
+		return
+	}
+
+	modeTransition := ""
+	if len(current) == 1 && current[0].ContractID == id {
+		if r.URL.Query().Get("confirm") != "true" {
+			writeError(w, http.StatusBadRequest, errors.New(
+				"removing the last watched contract would switch ingestion from "+
+					"'a specific list' back to 'all contract events' — pass ?confirm=true to acknowledge"))
+			return
+		}
+		modeTransition = "specific_to_all"
+	}
+
+	if err := s.store.RemoveWatchedContract(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("contract %q is not in the watch list", id))
+			return
+		}
+		s.log.Error("removing watched contract", "contract_id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("removing watched contract failed"))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, removeWatchedResponse{
+		ContractID:       id,
+		RemovedAt:        time.Now().UTC().Format(time.RFC3339),
+		HistoryPreserved: true,
+		ModeTransition:   modeTransition,
+	})
+}
 func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
 	if s.rpc == nil {
 		return
@@ -340,7 +661,7 @@ func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
 
 	health, err := s.rpc.GetHealth(ctx)
 	if err != nil {
-		s.log.Warn("loading RPC health for stats", "error", err)
+		loggerFromContext(ctx).Warn("loading RPC health for stats", "error", err)
 		return
 	}
 	head := int64(health.LatestLedger)
@@ -425,28 +746,48 @@ func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
 // (instead of importing `store`) keeps the cache layer unaware of the
 // store's pagination rules and we re-verify by test.
 func listETag(f store.EventFilter) string {
+	// contributors: every field of EventFilter that narrows the result set
+	// MUST appear here. A filter that is missing produces the same hash for
+	// two requests that return different bodies, which on an immutable page
+	// means a conditional request for one is answered 304 for the other, and
+	// a shared cache pools one filter's body under the other's key — for the
+	// full one-year max-age. TestListETag_CoversEveryFilterField enumerates
+	// the fields independently and fails when a new one is not added.
 	key := struct {
-		ContractID string          `json:"c"`
-		Type       string          `json:"t"`
-		Topic      json.RawMessage `json:"p,omitempty"`
-		FromLedger int64           `json:"fl"`
-		ToLedger   int64           `json:"tl"`
-		FromTime   string          `json:"ft,omitempty"`
-		ToTime     string          `json:"tt,omitempty"`
-		Cursor     string          `json:"cu,omitempty"`
-		Limit      int             `json:"l"`
-		Order      string          `json:"o,omitempty"`
+		ContractID    string          `json:"c"`
+		Type          string          `json:"t"`
+		Topic         json.RawMessage `json:"p,omitempty"`
+		Topic0        json.RawMessage `json:"p0,omitempty"`
+		Topic1        json.RawMessage `json:"p1,omitempty"`
+		Topic2        json.RawMessage `json:"p2,omitempty"`
+		Topic3        json.RawMessage `json:"p3,omitempty"`
+		TopicContains json.RawMessage `json:"pc,omitempty"`
+		FromLedger    int64           `json:"fl"`
+		ToLedger      int64           `json:"tl"`
+		FromTime      string          `json:"ft,omitempty"`
+		ToTime        string          `json:"tt,omitempty"`
+		Cursor        string          `json:"cu,omitempty"`
+		Limit         int             `json:"l"`
+		Order         string          `json:"o,omitempty"`
 	}{
 		ContractID: f.ContractID,
 		Type:       f.Type,
 		Topic:      f.Topic,
-		FromLedger: f.FromLedger,
-		ToLedger:   f.ToLedger,
-		FromTime:   timeOrEmpty(f.FromTime),
-		ToTime:     timeOrEmpty(f.ToTime),
-		Cursor:     f.Cursor,
-		Limit:      resolvedLimit(f.Limit),
-		Order:      resolvedOrder(f.Order),
+		// Each positional filter gets its own distinctly named key, so
+		// topic0={x} and topic1={x} — which select different events — cannot
+		// serialize identically.
+		Topic0:        f.Topic0,
+		Topic1:        f.Topic1,
+		Topic2:        f.Topic2,
+		Topic3:        f.Topic3,
+		TopicContains: f.TopicContains,
+		FromLedger:    f.FromLedger,
+		ToLedger:      f.ToLedger,
+		FromTime:      timeOrEmpty(f.FromTime),
+		ToTime:        timeOrEmpty(f.ToTime),
+		Cursor:        f.Cursor,
+		Limit:         resolvedLimit(f.Limit),
+		Order:         resolvedOrder(f.Order),
 	}
 	b, _ := json.Marshal(key)
 	sum := sha256.Sum256(b)
@@ -571,6 +912,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
 	}
 
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
+	}
+
 	switch t := q.Get("type"); t {
 	case "", "contract", "system", "diagnostic":
 		f.Type = t
@@ -660,10 +1005,12 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if raw := q.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
-		if err != nil || limit <= 0 || limit > store.MaxQueryLimit {
+		if err != nil || limit < 1 || limit > store.MaxQueryLimit {
 			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
 		}
 		f.Limit = limit
+	} else {
+		f.Limit = store.DefaultQueryLimit
 	}
 	return f, nil
 }
@@ -701,7 +1048,7 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filter, err := filterFromQuery(r)
+	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -714,10 +1061,12 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
-		s.log.Error("websocket accept", "error", err)
+		loggerFromContext(r.Context()).Error("websocket accept", "error", err)
 		return
 	}
 	defer c.Close(websocket.StatusNormalClosure, "")
+
+	log := loggerFromContext(r.Context())
 
 	sub := s.bcast.Subscribe(filter)
 	defer sub.Close()
@@ -757,9 +1106,9 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			data, err := json.Marshal(ev)
+			data, err := json.Marshal(projectEvent(ev, fields))
 			if err != nil {
-				s.log.Error("marshal event for ws", "error", err)
+				log.Error("marshal event for ws", "error", err)
 				continue
 			}
 			err = c.Write(ctx, websocket.MessageText, data)
