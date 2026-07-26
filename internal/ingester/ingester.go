@@ -59,6 +59,14 @@ type EventNotifier interface {
 	NotifyEvents(ctx context.Context, events []store.Event)
 }
 
+// IngestionObserver is notified after each successful ingestion pass
+// so external systems can record operational metrics. The two ledger
+// arguments are the latest ledger the RPC reports and the last ledger
+// the ingester persisted, respectively.
+type IngestionObserver interface {
+	SetIngestionLag(latestRPC, lastIngested int64)
+}
+
 // Ingester pages events out of the RPC and into the store.
 type Ingester struct {
 	client   rpc.Client
@@ -67,7 +75,8 @@ type Ingester struct {
 	log      *slog.Logger
 	opts     Options
 	bcast    *broadcast.Broadcaster
-	notifier EventNotifier // optional; nil means no notification
+	notifier EventNotifier    // optional; nil means no notification
+	observer IngestionObserver // optional; nil means no metrics observation
 }
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
@@ -89,6 +98,22 @@ func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
 // notification is sent — the ingester behaves exactly as before.
 func (ing *Ingester) SetNotifier(n EventNotifier) {
 	ing.notifier = n
+}
+
+// SetObserver attaches an optional IngestionObserver that is called
+// after every successful ingestion pass with the latest RPC ledger and
+// the last ingested ledger. When nil (the default) no observation is
+// recorded.
+func (ing *Ingester) SetObserver(o IngestionObserver) {
+	ing.observer = o
+}
+
+// observeLag is a nil-safe helper that reports the ingestion lag to
+// the attached observer, if any.
+func (ing *Ingester) observeLag(latestRPC, lastIngested int64) {
+	if ing.observer != nil {
+		ing.observer.SetIngestionLag(latestRPC, lastIngested)
+	}
 }
 
 // Run polls until ctx is canceled. Errors are logged and retried with
@@ -170,6 +195,7 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 	if err := ing.store.SaveIngestionState(ctx, state); err != nil {
 		return false, err
 	}
+	ing.observeLag(int64(resp.LatestLedger), state.LastIngestedLedger)
 	return caughtUp, nil
 }
 
@@ -361,6 +387,7 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	if err != nil {
 		return false, err
 	}
+	ing.observeLag(int64(health.LatestLedger), lastIngested)
 	return end >= health.LatestLedger, nil
 }
 

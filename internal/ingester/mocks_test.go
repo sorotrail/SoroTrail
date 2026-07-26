@@ -221,3 +221,23 @@ type passthroughDecoder struct{}
 func (passthroughDecoder) DecodeScVal(string) (json.RawMessage, error) {
 	return json.RawMessage(`"decoded"`), nil
 }
+
+// mockObserver records every SetIngestionLag call for test assertions.
+type mockObserver struct {
+	mu    sync.Mutex
+	calls [][2]int64 // each entry is {latestRPC, lastIngested}
+}
+
+func (o *mockObserver) SetIngestionLag(latestRPC, lastIngested int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.calls = append(o.calls, [2]int64{latestRPC, lastIngested})
+}
+
+func (o *mockObserver) getCalls() [][2]int64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	out := make([][2]int64, len(o.calls))
+	copy(out, o.calls)
+	return out
+}

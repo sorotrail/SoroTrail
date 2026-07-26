@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -784,5 +785,38 @@ func TestCORS(t *testing.T) {
 		require.NoError(t, err)
 		resp.Body.Close()
 		assert.Empty(t, resp.Header.Get("Access-Control-Allow-Origin"))
+	})
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	t.Run("returns 200 with prometheus content", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		// Wire a real metrics collector so /metrics is registered.
+		// We import the metrics package indirectly; for this test we
+		// just need any http.Handler that serves Prometheus format.
+		s.SetMetricsHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, `# HELP sorotrail_ingestion_lag_ledgers Difference between the latest RPC ledger and the last ingested ledger.
+# TYPE sorotrail_ingestion_lag_ledgers gauge
+sorotrail_ingestion_lag_ledgers 7`)
+		}))
+		resp, body := doGet(t, s, "/metrics")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Contains(t, string(body), "sorotrail_ingestion_lag_ledgers")
+		assert.Contains(t, string(body), "7")
+	})
+
+	t.Run("404 when metrics handler not wired", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		// No SetMetricsHandler call — /metrics should not exist.
+		srv := httptest.NewServer(s.Router())
+		defer srv.Close()
+		resp, err := http.Get(srv.URL + "/metrics")
+		require.NoError(t, err)
+		resp.Body.Close()
+		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 	})
 }

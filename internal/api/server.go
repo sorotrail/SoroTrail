@@ -57,14 +57,15 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store       store.Store
-	rpc         rpc.Client
-	enricher    Enricher
-	log         *slog.Logger
-	apiKey      string
-	limiter     *RateLimiter
-	bcast       *broadcast.Broadcaster
-	corsOrigins []string
+	store          store.Store
+	rpc            rpc.Client
+	enricher       Enricher
+	log            *slog.Logger
+	apiKey         string
+	limiter        *RateLimiter
+	bcast          *broadcast.Broadcaster
+	corsOrigins    []string
+	metricsHandler http.Handler
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -91,6 +92,12 @@ func (s *Server) SetRateLimiter(l *RateLimiter) {
 // an empty slice to disable CORS headers (the default).
 func (s *Server) SetCORSOrigins(origins []string) {
 	s.corsOrigins = origins
+}
+
+// SetMetricsHandler wires the Prometheus /metrics handler into the
+// router. Pass nil to leave /metrics disabled (the default).
+func (s *Server) SetMetricsHandler(h http.Handler) {
+	s.metricsHandler = h
 }
 
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
@@ -124,6 +131,9 @@ func (s *Server) Router() http.Handler {
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
+	if s.metricsHandler != nil {
+		r.Handle("/metrics", s.metricsHandler)
+	}
 
 	// Watched-contracts management: writes and updates to the runtime
 	// filter list. Always auth-gated, even when AUTH_ENABLED would be

@@ -26,6 +26,7 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/ingester"
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/spec"
 	"github.com/khaylebfortune/sorotrail/internal/store"
@@ -122,6 +123,11 @@ func run() error {
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
 
+	// Prometheus metrics: the collector records the ingestion lag on
+	// every pass and serves it at /metrics for scraping.
+	prom := metrics.New()
+	ing.SetObserver(prom)
+
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a
 	// pre-audit build, so we skip every allocation.
@@ -154,6 +160,7 @@ func run() error {
 	apiServer := api.New(st, rpcClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 	apiServer.SetCORSOrigins(cfg.CORSAllowedOriginsList)
+	apiServer.SetMetricsHandler(prom.Handler())
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,

@@ -415,3 +415,146 @@ func TestIngester_PicksUpRuntimeWatchListRemoval(t *testing.T) {
 		"empty watch list means ingest-all: contractIds must be empty")
 	assert.Equal(t, "contract", req2.Filters[0].Type)
 }
+
+func TestObserver_SinglePage_ReportsLag(t *testing.T) {
+	client := &mockRPC{
+		eventsResps: []rpc.GetEventsResponse{{
+			Events:       []rpc.Event{rpcEvent("e1", 100)},
+			LatestLedger: 150,
+		}},
+	}
+	obs := &mockObserver{}
+	ing := newTestIngester(client, newMockStore(), Options{StartLedger: 100})
+	ing.SetObserver(obs)
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+
+	calls := obs.getCalls()
+	require.Len(t, calls, 1, "observer must be called once per singlePage pass")
+	assert.Equal(t, int64(150), calls[0][0], "latestRPC")
+	assert.Equal(t, int64(100), calls[0][1], "lastIngested")
+}
+
+func TestObserver_WindowSweep_ReportsLag(t *testing.T) {
+	st := newMockStore()
+	for i := 0; i < 12; i++ {
+		st.watched = append(st.watched,
+			store.WatchedContract{ContractID: fmt.Sprintf("C%055d", i)})
+	}
+	client := &mockRPC{
+		health: rpc.Health{Status: "healthy", LatestLedger: 5_000, OldestLedger: 10},
+		eventsResps: []rpc.GetEventsResponse{
+			{Events: []rpc.Event{rpcEvent("e1", 150)}, LatestLedger: 5_000},
+		},
+	}
+	obs := &mockObserver{}
+	ing := newTestIngester(client, st, Options{StartLedger: 100, SweepWindow: 1_000, PageLimit: 100})
+	ing.SetObserver(obs)
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+
+	calls := obs.getCalls()
+	require.Len(t, calls, 1, "observer must be called once per windowSweep pass")
+	assert.Equal(t, int64(5_000), calls[0][0], "latestRPC")
+	assert.Equal(t, int64(1_099), calls[0][1], "lastIngested (end of window, not chain head)")
+}
+
+func TestObserver_Nil_NoPanic(t *testing.T) {
+	client := &mockRPC{
+		eventsResps: []rpc.GetEventsResponse{{
+			Events:       []rpc.Event{rpcEvent("e1", 100)},
+			LatestLedger: 150,
+		}},
+	}
+	ing := newTestIngester(client, newMockStore(), Options{StartLedger: 100})
+	// No SetObserver call — ingester must not panic.
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+}
+
+func TestObserver_MultiplePasses_UpdatesEachTime(t *testing.T) {
+	client := &mockRPC{
+		eventsResps: []rpc.GetEventsResponse{
+			{Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 200},
+			{Events: []rpc.Event{rpcEvent("e2", 200)}, LatestLedger: 300},
+		},
+	}
+	obs := &mockObserver{}
+	ing := newTestIngester(client, newMockStore(), Options{StartLedger: 100, PageLimit: 100})
+	ing.SetObserver(obs)
+
+	// Pass 1: full page, not caught up.
+	caughtUp, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.False(t, caughtUp)
+
+	// Pass 2: short page, caught up.
+	caughtUp, err = ing.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.True(t, caughtUp)
+
+	calls := obs.getCalls()
+	require.Len(t, calls, 2, "observer must be called once per pass")
+	assert.Equal(t, int64(200), calls[0][0])
+	assert.Equal(t, int64(100), calls[0][1])
+	assert.Equal(t, int64(300), calls[1][0])
+	assert.Equal(t, int64(200), calls[1][1])
+}
+
+func TestObserver_TableDriven(t *testing.T) {
+	tests := []struct {
+		name         string
+		health       rpc.Health
+		resp         rpc.GetEventsResponse
+		startLedger  uint32
+		wantLatest   int64
+		wantIngested int64
+	}{
+		{
+			name:         "single event",
+			health:       rpc.Health{LatestLedger: 500},
+			resp:         rpc.GetEventsResponse{Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 500},
+			startLedger:  100,
+			wantLatest:   500,
+			wantIngested: 100,
+		},
+		{
+			name:         "empty page",
+			health:       rpc.Health{LatestLedger: 500},
+			resp:         rpc.GetEventsResponse{LatestLedger: 500},
+			startLedger:  100,
+			wantLatest:   500,
+			wantIngested: 99, // degenerate: startLedger - 1
+		},
+		{
+			name:         "large gap",
+			health:       rpc.Health{LatestLedger: 1_000_000},
+			resp:         rpc.GetEventsResponse{Events: []rpc.Event{rpcEvent("e1", 900_000)}, LatestLedger: 1_000_000},
+			startLedger:  900_000,
+			wantLatest:   1_000_000,
+			wantIngested: 900_000,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mockRPC{
+				health:      tt.health,
+				eventsResps: []rpc.GetEventsResponse{tt.resp},
+			}
+			obs := &mockObserver{}
+			ing := newTestIngester(client, newMockStore(), Options{StartLedger: tt.startLedger, PageLimit: 100})
+			ing.SetObserver(obs)
+
+			_, err := ing.runOnce(context.Background())
+			require.NoError(t, err)
+
+			calls := obs.getCalls()
+			require.Len(t, calls, 1)
+			assert.Equal(t, tt.wantLatest, calls[0][0], "latestRPC")
+			assert.Equal(t, tt.wantIngested, calls[0][1], "lastIngested")
+		})
+	}
+}
