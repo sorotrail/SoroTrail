@@ -171,10 +171,16 @@ func TestUpsertEvents_CreatesPartitionsAndIsIdempotent(t *testing.T) {
 	})
 
 	t.Run("by type", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{Type: "diagnostic"})
+		got, _, err := st.QueryEvents(ctx, EventFilter{Types: []string{"diagnostic"}})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.Equal(t, eventID(3), got[0].ID)
+	})
+
+	t.Run("by multiple types", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{Types: []string{"contract", "diagnostic"}})
+		require.NoError(t, err)
+		require.Len(t, got, 10)
 	})
 
 	t.Run("by topic at any position", func(t *testing.T) {

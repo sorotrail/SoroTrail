@@ -224,6 +224,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok", "rpc": "ok"}}
 	status := http.StatusOK
 
+	// DB connectivity check: Ping the store to verify the database is reachable.
 	if err := s.store.Ping(ctx); err != nil {
 		resp.Status, resp.Checks["database"] = "degraded", err.Error()
 		status = http.StatusServiceUnavailable
@@ -389,6 +390,11 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {
+			writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+			if includeXDR {
+				writeJSON(w, http.StatusOK, enrichEventWithXDR(enriched[0]))
+				return
+			}
 			writeJSON(w, http.StatusOK, enriched[0])
 			return
 		}
@@ -447,6 +453,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.addStatsFreshness(r.Context(), &stats)
+	stats.PanicsRecovered = s.recoverer.PanicsRecovered()
 	if a := getAuditor(); a != nil {
 		m := a.Metrics()
 		stats.Auditor = store.AuditStats{
@@ -457,6 +464,15 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			FindingsUnverifiable:  m.FindingsUnverifiable,
 			FindingsUnrecoverable: m.FindingsUnrecoverable,
 			RPCRequests:           m.RPCRequests,
+		}
+	}
+	if c := getRPCCounter(); c != nil {
+		snap := c.Errors().Snapshot()
+		stats.RPCErrors = store.RPCErrorStats{
+			GetEvents:        snap.GetEvents,
+			GetLatestLedger:  snap.GetLatestLedger,
+			GetHealth:        snap.GetHealth,
+			GetLedgerEntries: snap.GetLedgerEntries,
 		}
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
@@ -725,7 +741,7 @@ func listETag(f store.EventFilter) string {
 	// the fields independently and fails when a new one is not added.
 	key := struct {
 		ContractID    string          `json:"c"`
-		Type          string          `json:"t"`
+		Types         []string        `json:"t"`
 		Topic         json.RawMessage `json:"p,omitempty"`
 		Topic0        json.RawMessage `json:"p0,omitempty"`
 		Topic1        json.RawMessage `json:"p1,omitempty"`
@@ -741,7 +757,7 @@ func listETag(f store.EventFilter) string {
 		Order         string          `json:"o,omitempty"`
 	}{
 		ContractID: f.ContractID,
-		Type:       f.Type,
+		Types:      f.Types,
 		Topic:      f.Topic,
 		// Each positional filter gets its own distinctly named key, so
 		// topic0={x} and topic1={x} — which select different events — cannot
@@ -886,11 +902,16 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
 	}
 
-	switch t := q.Get("type"); t {
-	case "", "contract", "system", "diagnostic":
-		f.Type = t
-	default:
-		return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
+	if raw := q.Get("type"); raw != "" {
+		for _, t := range strings.Split(raw, ",") {
+			t = strings.TrimSpace(t)
+			switch t {
+			case "contract", "system", "diagnostic":
+			default:
+				return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
+			}
+			f.Types = append(f.Types, t)
+		}
 	}
 
 	parseTopic := func(name, raw string) (json.RawMessage, error) {

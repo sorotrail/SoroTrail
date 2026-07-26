@@ -48,6 +48,15 @@ type Config struct {
 	AuditMaxRepair      int           `env:"AUDIT_MAX_REPAIR_ATTEMPTS" envDefault:"3"`
 	AuditFindingMaxLgrs uint32        `env:"AUDIT_FINDING_MAX_LEDGERS" envDefault:"100"`
 
+	// HTTP server timeouts. Zero means no timeout for that field.
+	// HTTP_READ_TIMEOUT limits the time to read the full request
+	// (including body); HTTP_READ_HEADER_TIMEOUT limits header reads
+	// only and is the most important defence against slow-client attacks.
+	HTTPReadTimeout       time.Duration `env:"HTTP_READ_TIMEOUT" envDefault:"30s"`
+	HTTPWriteTimeout      time.Duration `env:"HTTP_WRITE_TIMEOUT" envDefault:"30s"`
+	HTTPIdleTimeout       time.Duration `env:"HTTP_IDLE_TIMEOUT" envDefault:"60s"`
+	HTTPReadHeaderTimeout time.Duration `env:"HTTP_READ_HEADER_TIMEOUT" envDefault:"10s"`
+
 	// APIKey, when set, gates the watched-contracts management endpoints
 	// via a constant-time comparison against the X-API-Key request header.
 	// Empty means the watched-contracts surface starts up rejected (every
@@ -74,18 +83,11 @@ type Config struct {
 	// intermediaries cannot. Defaults to false (the deployment does not
 	// need request-scoped caching).
 	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
-	// HTTP rate limiting (per client). RATE_LIMIT_RPS / RATE_LIMIT_BURST
-	// are both unset (zero) by default, which disables the limiter
-	// entirely — a no-op middleware — so deployments without this turned
-	// on keep today's behavior bit-for-bit.
-	//
-	// RATE_LIMIT_TRUSTED_PROXY defaults to false because X-Forwarded-For
-	// is set by the client itself; enabling it without an upstream proxy
-	// that strips/rewrites the header would let any caller pick their own
-	// rate-limit key and bypass arbitrary per-IP throttling.
-	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
-	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
-	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
+
+	// ShutdownTimeout limits how long the graceful HTTP server drain and
+	// component shutdown may take before the process is killed. Zero means
+	// no timeout (wait indefinitely).
+	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"15s"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -174,11 +176,29 @@ func (c Config) Validate() error {
 	if c.AuditFindingMaxLgrs == 0 {
 		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
 	}
+	if c.BackfillRateRPS <= 0 {
+		return fmt.Errorf("BACKFILL_RATE_RPS must be positive, got %v", c.BackfillRateRPS)
+	}
 	if c.RateLimitRPS < 0 {
 		return fmt.Errorf("RATE_LIMIT_RPS must be non-negative")
 	}
 	if c.RateLimitBurst < 0 {
 		return fmt.Errorf("RATE_LIMIT_BURST must be non-negative")
+	}
+	if c.HTTPReadTimeout < 0 {
+		return fmt.Errorf("HTTP_READ_TIMEOUT must be non-negative, got %s", c.HTTPReadTimeout)
+	}
+	if c.HTTPWriteTimeout < 0 {
+		return fmt.Errorf("HTTP_WRITE_TIMEOUT must be non-negative, got %s", c.HTTPWriteTimeout)
+	}
+	if c.HTTPIdleTimeout < 0 {
+		return fmt.Errorf("HTTP_IDLE_TIMEOUT must be non-negative, got %s", c.HTTPIdleTimeout)
+	}
+	if c.HTTPReadHeaderTimeout < 0 {
+		return fmt.Errorf("HTTP_READ_HEADER_TIMEOUT must be non-negative, got %s", c.HTTPReadHeaderTimeout)
+	}
+	if c.ShutdownTimeout < 0 {
+		return fmt.Errorf("SHUTDOWN_TIMEOUT must be non-negative, got %s", c.ShutdownTimeout)
 	}
 	// Both must be set together: half-configured limits would silently
 	// behave like the disabled case (Enabled returns false when either is
@@ -250,6 +270,11 @@ func (c Config) LoggableFields() []any {
 		"start_ledger", c.StartLedger,
 		"retention_ledgers", c.RetentionLedgers,
 		"log_level", c.LogLevel,
+		"http_read_timeout", c.HTTPReadTimeout,
+		"http_write_timeout", c.HTTPWriteTimeout,
+		"http_idle_timeout", c.HTTPIdleTimeout,
+		"http_read_header_timeout", c.HTTPReadHeaderTimeout,
+		"shutdown_timeout", c.ShutdownTimeout,
 		"audit_enabled", c.AuditEnabled,
 	}
 }
