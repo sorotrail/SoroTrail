@@ -74,9 +74,6 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
 	if onUpdate {
-		// Refresh every column, but never blank out raw XDR: a repair
-		// fetch that came back as JSON (xdrFormat "json") carries no XDR
-		// and must not destroy what an earlier ingest managed to keep.
 		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
 			contract_id        = EXCLUDED.contract_id,
 			ledger             = EXCLUDED.ledger,
@@ -87,6 +84,7 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			in_successful_call = EXCLUDED.in_successful_call,
 			topics             = EXCLUDED.topics,
 			value              = EXCLUDED.value,
+			created_at         = EXCLUDED.created_at,
 			raw_topic_xdr      = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
 			raw_value_xdr      = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
@@ -446,18 +444,30 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	for rows.Next() {
 		e, err := scanEvent(rows)
 		if err != nil {
-			return nil, "", err
+			return fmt.Errorf("querying events: %w", err)
 		}
-		events = append(events, e)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, "", fmt.Errorf("reading events: %w", err)
-	}
+		defer rows.Close()
 
-	next := ""
-	if len(events) > limit {
-		events = events[:limit]
-		next = events[limit-1].ID
+		events = make([]Event, 0, limit)
+		for rows.Next() {
+			e, err := scanEvent(rows)
+			if err != nil {
+				return err
+			}
+			events = append(events, e)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("reading events: %w", err)
+		}
+
+		if len(events) > limit {
+			events = events[:limit]
+			next = events[limit-1].ID
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
 	}
 	return events, next, nil
 }
@@ -724,6 +734,45 @@ func nullableString(s string) any {
 		return nil
 	}
 	return s
+}
+
+func (p *Postgres) withStatementTimeoutTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin guarded tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if timeout, ok := statementTimeoutFromContext(ctx); ok && timeout > 0 {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = '%dms'", timeout.Milliseconds())); err != nil {
+			return fmt.Errorf("setting statement_timeout: %w", err)
+		}
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit guarded tx: %w", err)
+	}
+	return nil
+}
+
+func statementTimeoutFromContext(ctx context.Context) (time.Duration, bool) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0, false
+	}
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		return 0, false
+	}
+	if timeout < time.Millisecond {
+		return time.Millisecond, true
+	}
+	return timeout, true
 }
 
 func scanEvent(row pgx.Row) (Event, error) {

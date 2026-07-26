@@ -93,6 +93,8 @@ All configuration comes from environment variables (see `.env.example`):
 | Variable | Default | Description |
 | --- | --- | --- |
 | `RPC_URL` | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet. |
+| `HORIZON_URL` | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. |
+| `BACKFILL_RATE_RPS` | `10` | Pace against Horizon when backfilling. 10 req/s is the public-instance cap; private deployments can lift this. |
 | `DATABASE_URL` | — (required) | Postgres connection string. |
 | `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. |
 | `HTTP_ADDR` | `:8080` | API listen address. |
@@ -100,6 +102,8 @@ All configuration comes from environment variables (see `.env.example`):
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
+| `API_QUERY_TIMEOUT` | `25s` | Per-request database timeout for API-originated store reads. The timeout is enforced in-process and mirrored to Postgres via `statement_timeout`. |
+| `API_SLOW_QUERY_THRESHOLD` | `2s` | Warn when an API-originated store query takes longer than this threshold; logs include the query name and elapsed duration. |
 | `AUDIT_ENABLED` | `false` | Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build. |
 | `AUDIT_POLL_INTERVAL` | `30s` | Sleep between audit passes. |
 | `AUDIT_BATCH_LEDGERS` | `100` | Ledger range covered by one audit pass. |
@@ -162,6 +166,33 @@ advisory-lock strategy, and the derivation order for dependent tables.
 ## API reference
 
 All responses are JSON. Errors look like `{"error": "message"}`.
+
+### Pagination
+
+Every list endpoint uses cursor-based pagination with a consistent contract:
+
+- **Request parameters**: `?cursor=<opaque>&limit=<int>` (both optional)
+- **Response envelope**: each list response includes a `"cursor"` field.
+  When non-empty, more results exist — pass it back as `?cursor=` for
+  the next page. When empty or omitted, the result set is exhausted.
+- **Cursor format**: the cursor is the last row's sort-key value
+  (typically an event ID or integer primary key). It is opaque —
+  clients must never inspect or modify it. Sending an invalid cursor
+  returns `400 Bad Request` with the standard error envelope
+  `{"error": "invalid cursor ..."}`.
+- **Defaults**: `limit` defaults to 50 when unset; the maximum is 200.
+  Values outside `[1,200]` return `400 Bad Request`.
+- **Empty result sets** return an empty array with no `"cursor"` field
+  (or an empty string cursor, depending on the endpoint).
+
+```sh
+# First page
+curl -s 'localhost:8080/events?limit=10'
+# {"events":[...],"cursor":"0001099511627776-0000000009"}
+
+# Next page using the cursor from the previous response
+curl -s 'localhost:8080/events?cursor=0001099511627776-0000000009&limit=10'
+```
 
 ### `GET /health`
 
@@ -654,7 +685,9 @@ in normal operation — so the API serves two distinct cache policies:
   moving ingest frontier: a page whose upper bound (`to_ledger`) sits
   entirely below the last-ingested ledger cannot gain new rows, so the
   response is declared immutable with a strong ETag derived from the
-  filter. Pages that are open-ended (`to_ledger` unset) or have bounds
+  filter — every filter parameter that narrows the result set, so two
+  different queries can never share a validator. Pages that are
+  open-ended (`to_ledger` unset) or have bounds
   at/above the frontier are still growing, so they get
   `Cache-Control: no-cache` — a deliberate "when in doubt, don't
   cache" choice rather than a guess with a short max-age.

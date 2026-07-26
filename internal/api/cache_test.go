@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -444,4 +446,120 @@ func TestErrors_NoStore(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"),
 		"the eviction path must not let a CDN cache a stale 404 for the immutable max-age")
+}
+
+// TestListETag_CoversEveryFilterField pins the invariant that makes the
+// list ETag a *strong* validator: any filter field that changes the response
+// body must change the validator.
+//
+// The table is written as "every filter that narrows a query", not as "the
+// filters listETag currently hashes", because the failure mode here is a
+// contributor adding a filter and not knowing the validator exists. That is
+// exactly how topic0..topic3 (#64) and topic_contains (#180) each shipped
+// missing from it: two different features, the same omission, neither
+// visible without a test that enumerates the fields independently.
+//
+// The consequence is not theoretical. Two requests that differ only in a
+// missing field hash identically, so on a page below the ingest frontier —
+// where responses are `immutable` with a one-year max-age — a conditional
+// request for one filter is answered 304 for the other, and a shared cache
+// pools one filter's body under the other's key. The filters most affected
+// are the topic ones, whose entire purpose is to return a narrow subset.
+func TestListETag_CoversEveryFilterField(t *testing.T) {
+	base := store.EventFilter{FromLedger: 500, ToLedger: 999}
+	baseETag := listETag(base)
+
+	// Each case mutates exactly one field away from base.
+	cases := []struct {
+		field  string
+		mutate func(f *store.EventFilter)
+	}{
+		{"ContractID", func(f *store.EventFilter) { f.ContractID = testContract }},
+		{"Type", func(f *store.EventFilter) { f.Type = "diagnostic" }},
+		{"Topic", func(f *store.EventFilter) { f.Topic = json.RawMessage(`{"symbol":"transfer"}`) }},
+		{"Topic0", func(f *store.EventFilter) { f.Topic0 = json.RawMessage(`{"symbol":"transfer"}`) }},
+		{"Topic1", func(f *store.EventFilter) { f.Topic1 = json.RawMessage(`{"symbol":"transfer"}`) }},
+		{"Topic2", func(f *store.EventFilter) { f.Topic2 = json.RawMessage(`{"symbol":"transfer"}`) }},
+		{"Topic3", func(f *store.EventFilter) { f.Topic3 = json.RawMessage(`{"symbol":"transfer"}`) }},
+		{"TopicContains", func(f *store.EventFilter) { f.TopicContains = json.RawMessage(`[{"u64":7}]`) }},
+		{"FromLedger", func(f *store.EventFilter) { f.FromLedger = 501 }},
+		{"ToLedger", func(f *store.EventFilter) { f.ToLedger = 998 }},
+		{"FromTime", func(f *store.EventFilter) { f.FromTime = time.Unix(1_000_000, 0).UTC() }},
+		{"ToTime", func(f *store.EventFilter) { f.ToTime = time.Unix(2_000_000, 0).UTC() }},
+		{"Cursor", func(f *store.EventFilter) { f.Cursor = "e1" }},
+		{"Limit", func(f *store.EventFilter) { f.Limit = 7 }},
+		{"Order", func(f *store.EventFilter) { f.Order = "desc" }},
+	}
+
+	seen := map[string]string{baseETag: "base"}
+	for _, tc := range cases {
+		t.Run(tc.field, func(t *testing.T) {
+			f := base
+			tc.mutate(&f)
+
+			got := listETag(f)
+			require.NotEqual(t, baseETag, got,
+				"changing %s changes which events are returned, so it must change the ETag; "+
+					"a filter missing from listETag lets one filter's cached page be served for another",
+				tc.field)
+
+			// And distinct from every other single-field change, so two
+			// different filters cannot collide with each other either.
+			if other, dup := seen[got]; dup {
+				t.Fatalf("%s produces the same ETag as %s", tc.field, other)
+			}
+			seen[got] = tc.field
+		})
+	}
+}
+
+// The positional topic filters address different array positions, so filters
+// that differ only in which position they constrain must not share a
+// validator.
+func TestListETag_PositionalTopicsAreDistinguished(t *testing.T) {
+	value := json.RawMessage(`{"symbol":"transfer"}`)
+	base := store.EventFilter{ToLedger: 999}
+
+	at0, at1 := base, base
+	at0.Topic0 = value
+	at1.Topic1 = value
+
+	assert.NotEqual(t, listETag(at0), listETag(at1),
+		"topic0={x} and topic1={x} select different events and must hash differently")
+
+	// And the any-position filter is distinct from a positional one.
+	any := base
+	any.Topic = value
+	assert.NotEqual(t, listETag(at0), listETag(any))
+}
+
+// End to end: two cacheable requests differing only in a topic filter must
+// not be able to answer each other's conditional request.
+func TestListEvents_TopicFilterCannotReuseAnothersValidator(t *testing.T) {
+	st := &stubStore{
+		events:    []store.Event{{ID: "e1"}},
+		ingestion: store.IngestionState{LastIngestedLedger: 1000},
+	}
+	s := newTestServer(st, nil)
+
+	const (
+		mint     = `/events?to_ledger=999&topic_contains=[{"symbol":"mint"}]`
+		transfer = `/events?to_ledger=999&topic_contains=[{"symbol":"transfer"}]`
+	)
+
+	respMint, _ := doGet(t, s, mint)
+	require.Equal(t, http.StatusOK, respMint.StatusCode)
+	mintETag := respMint.Header.Get("ETag")
+	require.NotEmpty(t, mintETag, "a page below the frontier must be cacheable for this to matter")
+
+	respTransfer, _ := doGet(t, s, transfer)
+	assert.NotEqual(t, mintETag, respTransfer.Header.Get("ETag"),
+		"two different topic filters must not share a validator")
+
+	// Replaying the mint validator against the transfer query must not be
+	// answered 304 — that would serve the mint page for a transfer request,
+	// with a one-year immutable max-age behind it.
+	resp, _ := doGetWithHeader(t, s, transfer, "If-None-Match", mintETag)
+	assert.NotEqual(t, http.StatusNotModified, resp.StatusCode,
+		"a validator minted for a different filter must not produce a 304")
 }
