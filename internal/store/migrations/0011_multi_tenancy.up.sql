@@ -1,12 +1,21 @@
 -- Multi-tenancy (#48): tenants own API keys, contract grants, watch-list
 -- entries and quotas.
 --
+-- Every statement here is idempotent (IF NOT EXISTS / ON CONFLICT). That is
+-- a requirement in this repo, not a stylistic choice:
+-- TestMigrate_UpgradesLegacyEventsTable forces schema_migrations back to an
+-- earlier version and re-runs Migrate, so the whole chain above it is
+-- replayed against a database where it has already been applied. A plain
+-- CREATE TABLE fails there, and a failed migration leaves the database
+-- marked dirty — which then fails every later test in the package with
+-- "Dirty database version", not just the one that replayed.
+--
 -- Upgrade path: every existing deployment is single-tenant. The seeded
 -- "default" tenant is a wildcard admin, and MULTI_TENANT=false makes every
 -- request run as it, so an upgraded instance behaves exactly as before.
 -- Turning MULTI_TENANT=true is what starts enforcing the boundary.
 
-CREATE TABLE tenants (
+CREATE TABLE IF NOT EXISTS tenants (
     id          bigserial PRIMARY KEY,
     name        text NOT NULL UNIQUE,
     -- wildcard tenants read every contract, including ones ingested but
@@ -32,7 +41,7 @@ CREATE TABLE tenants (
 );
 
 -- A tenant reads exactly the contracts listed here (unless wildcard).
-CREATE TABLE tenant_contract_grants (
+CREATE TABLE IF NOT EXISTS tenant_contract_grants (
     tenant_id   bigint NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     contract_id text NOT NULL,
     granted_at  timestamptz NOT NULL DEFAULT now(),
@@ -40,7 +49,7 @@ CREATE TABLE tenant_contract_grants (
 );
 
 -- Reverse lookup: "who can see this contract", used when revoking.
-CREATE INDEX idx_tenant_grants_contract ON tenant_contract_grants (contract_id);
+CREATE INDEX IF NOT EXISTS idx_tenant_grants_contract ON tenant_contract_grants (contract_id);
 
 -- Contracts a tenant has asked to have indexed. Ingestion watches the UNION
 -- of this table and the global watched_contracts table, so two tenants
@@ -48,20 +57,20 @@ CREATE INDEX idx_tenant_grants_contract ON tenant_contract_grants (contract_id);
 -- them does not stop ingestion for the other. Refcounting is implicit: the
 -- union recomputes on read, so a contract stays watched exactly as long as
 -- at least one row anywhere still names it.
-CREATE TABLE tenant_watched_contracts (
+CREATE TABLE IF NOT EXISTS tenant_watched_contracts (
     tenant_id   bigint NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     contract_id text NOT NULL,
     added_at    timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, contract_id)
 );
 
-CREATE INDEX idx_tenant_watched_contract ON tenant_watched_contracts (contract_id);
+CREATE INDEX IF NOT EXISTS idx_tenant_watched_contract ON tenant_watched_contracts (contract_id);
 
 -- API keys (#17). Only the SHA-256 of the key is stored, so a database
 -- disclosure does not yield usable credentials. prefix is the non-secret
 -- lookup handle: it selects the candidate row by index, and the secret half
 -- is then compared in constant time.
-CREATE TABLE api_keys (
+CREATE TABLE IF NOT EXISTS api_keys (
     id           bigserial PRIMARY KEY,
     tenant_id    bigint NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     name         text NOT NULL DEFAULT '',
@@ -74,13 +83,13 @@ CREATE TABLE api_keys (
     revoked_at   timestamptz
 );
 
-CREATE INDEX idx_api_keys_tenant ON api_keys (tenant_id) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys (tenant_id) WHERE revoked_at IS NULL;
 
 -- Usage is aggregated per tenant per UTC day. Per-request rows would grow
 -- without bound and buy nothing: billing and quota questions are asked by
 -- day, and the API server accumulates in memory and flushes on a ticker,
 -- so a busy tenant costs one UPSERT per flush rather than one per request.
-CREATE TABLE tenant_usage (
+CREATE TABLE IF NOT EXISTS tenant_usage (
     tenant_id      bigint NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     day            date NOT NULL,
     requests       bigint NOT NULL DEFAULT 0,
@@ -99,12 +108,13 @@ CREATE TABLE tenant_usage (
 -- NULL means operator-owned — the posture of every subscription created
 -- before this column existed, and of any created in single-tenant mode.
 ALTER TABLE subscriptions
-    ADD COLUMN tenant_id bigint REFERENCES tenants(id) ON DELETE CASCADE;
+    ADD COLUMN IF NOT EXISTS tenant_id bigint REFERENCES tenants(id) ON DELETE CASCADE;
 
-CREATE INDEX idx_subscriptions_tenant ON subscriptions (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_tenant ON subscriptions (tenant_id);
 
 -- The tenant every pre-#48 deployment implicitly ran as. Wildcard + admin so
 -- that an upgraded instance that later flips MULTI_TENANT=true still has a
 -- way in.
 INSERT INTO tenants (name, wildcard, is_admin, enabled)
-VALUES ('default', true, true, true);
+VALUES ('default', true, true, true)
+ON CONFLICT (name) DO NOTHING;

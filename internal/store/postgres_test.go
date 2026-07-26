@@ -246,7 +246,16 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		var all []Event
 		cursor := ""
 		for {
-			page, next, err := st.QueryEvents(ctx, EventFilter{Limit: 3, Cursor: cursor, Scope: WildcardScope()})
+			// Bounded to the original 10 events' ledger range so the extra
+			// rows the "topic0 and topic1 positionally" subtest inserts
+			// above (ledgers 200/201) don't inflate this count.
+			page, next, err := st.QueryEvents(ctx, EventFilter{
+				Limit:      3,
+				Cursor:     cursor,
+				FromLedger: 101,
+				ToLedger:   110,
+				Scope:      WildcardScope(),
+			})
 			require.NoError(t, err)
 			all = append(all, page...)
 			if next == "" {
@@ -307,10 +316,12 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		cursor := ""
 		for {
 			page, next, err := st.QueryEvents(ctx, EventFilter{
-				Limit:  3,
-				Cursor: cursor,
-				Order:  "desc",
-				Scope:  WildcardScope(),
+				Limit:      3,
+				Cursor:     cursor,
+				Order:      "desc",
+				FromLedger: 101,
+				ToLedger:   110,
+				Scope:      WildcardScope(),
 			})
 			require.NoError(t, err)
 			all = append(all, page...)
