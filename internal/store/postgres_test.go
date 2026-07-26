@@ -460,7 +460,9 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		)
 		SELECT
 			id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-			in_successful_call, topics, value, created_at, topics_xdr, value_xdr
+			in_successful_call, topics, value, created_at,
+			to_jsonb(raw_topic_xdr) AS topics_xdr,
+			raw_value_xdr            AS value_xdr
 		FROM events_partitioned
 		ORDER BY ledger, id;
 		DROP TABLE events_partitioned CASCADE;
