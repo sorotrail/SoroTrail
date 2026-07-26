@@ -381,8 +381,8 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
-	if f.Type != "" {
-		where = append(where, "type = "+arg(f.Type))
+	if len(f.Types) > 0 {
+		where = append(where, "type = ANY("+arg(f.Types)+")")
 	}
 	if len(f.Topic) > 0 {
 		// Containment on the array matches the topic at any position.
@@ -472,10 +472,6 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		}
 		defer rows.Close()
 
-	next := ""
-	if len(events) > limit {
-		events = events[:limit]
-		next = EncodeCursor(f.OrderBy, events[limit-1])
 		events = make([]Event, 0, limit)
 		for rows.Next() {
 			e, err := scanEvent(rows)
@@ -490,7 +486,7 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 
 		if len(events) > limit {
 			events = events[:limit]
-			next = events[limit-1].ID
+			next = EncodeCursor(f.OrderBy, events[limit-1])
 		}
 		return nil
 	})
