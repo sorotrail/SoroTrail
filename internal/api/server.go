@@ -49,6 +49,27 @@ func getAuditor() *audit.Auditor {
 	return auditor
 }
 
+// SetRPCCounter registers the CountingClient so /stats can expose
+// per-method RPC error totals. Call this before ListenAndServe.
+// The setter is guarded by a RWMutex so concurrent /stats readers
+// never observe a torn pointer.
+var (
+	rpcCounterMu sync.RWMutex
+	rpcCounter   *rpc.CountingClient
+)
+
+func SetRPCCounter(c *rpc.CountingClient) {
+	rpcCounterMu.Lock()
+	rpcCounter = c
+	rpcCounterMu.Unlock()
+}
+
+func getRPCCounter() *rpc.CountingClient {
+	rpcCounterMu.RLock()
+	defer rpcCounterMu.RUnlock()
+	return rpcCounter
+}
+
 // Enricher is the spec-based event enrichment interface used by the API.
 // Defined here so the API package doesn't import internal/spec directly.
 type Enricher interface {

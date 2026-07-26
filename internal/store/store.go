@@ -88,7 +88,10 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
 	ContractID string
-	Type       string
+	// Types filters by event type. Multiple values are accepted (ANDed
+	// together at the SQL level via type = ANY(...)). An empty or nil
+	// slice means "no constraint".
+	Types []string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic json.RawMessage
@@ -314,9 +317,21 @@ type Stats struct {
 	// PanicsRecovered is the number of panics the HTTP middleware has
 	// recovered since process start. Set by the API handler.
 	PanicsRecovered uint64 `json:"panics_recovered"`
+	// RPCErrors counts RPC call failures by method name since the process
+	// started. Populated by the CountingClient wrapper; zero-valued when
+	// the wrapper is not in use.
+	RPCErrors RPCErrorStats `json:"rpc_errors,omitempty"`
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
+}
+
+// RPCErrorStats is a JSON-friendly snapshot of per-method RPC error counts.
+type RPCErrorStats struct {
+	GetEvents        uint64 `json:"getEvents,omitempty"`
+	GetLatestLedger  uint64 `json:"getLatestLedger,omitempty"`
+	GetHealth        uint64 `json:"getHealth,omitempty"`
+	GetLedgerEntries uint64 `json:"getLedgerEntries,omitempty"`
 }
 
 // AuditStats is a JSON-friendly view of audit.Metrics. Defined here so
