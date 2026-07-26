@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stellar/go/xdr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/khaylebfortune/sorotrail/internal/decode"
 	"github.com/khaylebfortune/sorotrail/internal/horizon"
-	"github.com/stellar/go/xdr"
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
 
@@ -75,20 +75,10 @@ func buildSimpleMeta(t *testing.T, contractSeed string, body xdr.ScVal) string {
 	return b
 }
 
-// scSymbol / scAddress / scU64 produce minimal ScVal types for tests.
+// scSymbol / scU64 produce minimal ScVal types for tests.
 func scSymbol(s string) xdr.ScVal {
 	sym := xdr.ScSymbol(s)
 	return xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &sym}
-}
-
-func scAddress(s string) xdr.ScVal {
-	var cid xdr.ContractId
-	copy(cid[:], []byte(s))
-	addr, err := xdr.NewScAddress(xdr.ScAddressTypeScAddressTypeContract, cid)
-	if err != nil {
-		panic(err)
-	}
-	return xdr.ScVal{Type: xdr.ScValTypeScvAddress, Address: &addr}
 }
 
 func scU64(n uint64) xdr.ScVal {
@@ -99,7 +89,7 @@ func scU64(n uint64) xdr.ScVal {
 func scVec(items ...xdr.ScVal) xdr.ScVal {
 	v := xdr.ScValTypeScvVec
 	vec := xdr.ScVec(items)
-	var p *xdr.ScVec = &vec
+	p := &vec
 	return xdr.ScVal{Type: v, Vec: &p}
 }
 

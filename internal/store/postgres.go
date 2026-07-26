@@ -55,8 +55,8 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
 // ingest, DO NOTHING) and ReplaceEventsInRange (auditor repair, DO UPDATE).
-// Both paths write all 13 columns of the events table so topics_xdr /
-// value_xdr are never silently dropped on the way in; a repair that
+// Both paths write all 13 columns of the events table so raw_topic_xdr /
+// raw_value_xdr are never silently dropped on the way in; a repair that
 // arrives without XDR preserves what was already stored via the coalesce()
 // clauses in the UPDATE branch (`sorotrail replay` relies on that).
 //
@@ -64,10 +64,12 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
-	batch := &pgx.Batch{}
-	conflict := `ON CONFLICT (id) DO NOTHING`
+	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
 	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
+		// Refresh every column, but never blank out raw XDR: a repair
+		// fetch that came back as JSON (xdrFormat "json") carries no XDR
+		// and must not destroy what an earlier ingest managed to keep.
+		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
 			contract_id        = EXCLUDED.contract_id,
 			ledger             = EXCLUDED.ledger,
 			type               = EXCLUDED.type,
@@ -77,25 +79,25 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			in_successful_call = EXCLUDED.in_successful_call,
 			topics             = EXCLUDED.topics,
 			value              = EXCLUDED.value,
-			created_at         = EXCLUDED.created_at,
-			topics_xdr         = COALESCE(EXCLUDED.topics_xdr, events.topics_xdr),
-			value_xdr          = COALESCE(EXCLUDED.value_xdr, events.value_xdr)`
+			raw_topic_xdr      = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
-	sql := `
+	stmt := `
 		INSERT INTO events
 			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 			 in_successful_call, topics, value, created_at,
-			 topics_xdr, value_xdr)
+			 raw_topic_xdr, raw_value_xdr)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		` + conflict
+	batch := &pgx.Batch{}
 	for _, e := range events {
 		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
 		// into SQL NULL so the column has one representation of "absent"
 		// rather than two.
-		batch.Queue(sql,
+		batch.Queue(stmt,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
-			nullableStringSlice(e.RawTopicXDR), nullableText(e.RawValueXDR),
+			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
 	}
 	return batch
@@ -209,10 +211,10 @@ type rawXDR struct {
 // keyed by event ID, so a delete-and-reinsert repair can put it back.
 func rawXDRInRange(ctx context.Context, tx pgx.Tx, fromLedger, toLedger int64) (map[string]rawXDR, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT id, topics_xdr, value_xdr
+		SELECT id, raw_topic_xdr, raw_value_xdr
 		FROM events
 		WHERE ledger BETWEEN $1 AND $2
-		  AND (topics_xdr IS NOT NULL OR value_xdr IS NOT NULL)`,
+		  AND (raw_topic_xdr IS NOT NULL OR raw_value_xdr IS NOT NULL)`,
 		fromLedger, toLedger)
 	if err != nil {
 		return nil, fmt.Errorf("reading raw XDR in ledger range [%d,%d]: %w", fromLedger, toLedger, err)
@@ -300,9 +302,9 @@ func (p *Postgres) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger i
 }
 
 const eventColumns = `id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-	in_successful_call, topics, value, created_at, topics_xdr, value_xdr`
+	in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr`
 
-// nullableText and nullableStringSlice store empty raw-XDR values as SQL NULL
+// nullableText and nullableTextArray store empty raw-XDR values as SQL NULL
 // so "no raw XDR" is one representation, not two.
 func nullableText(s string) any {
 	if s == "" {
@@ -311,7 +313,7 @@ func nullableText(s string) any {
 	return s
 }
 
-func nullableStringSlice(s []string) any {
+func nullableTextArray(s []string) any {
 	if len(s) == 0 {
 		return nil
 	}
@@ -374,17 +376,17 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		// Containment on the array matches the topic at any position.
 		where = append(where, "topics @> "+arg(fmt.Sprintf("[%s]", f.Topic))+"::jsonb")
 	}
-	if len(f.TopicContains) > 0 {
-		// Direct containment — caller controls the shape (object wrapped in
-		// array for element match, multi-element arrays for subset match).
-		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
-	}
 	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
 		if len(topic) == 0 {
 			continue
 		}
 		where = append(where,
 			fmt.Sprintf("topics->%d = %s::jsonb", i, arg(topic)))
+	}
+	if len(f.TopicContains) > 0 {
+		// Direct containment — caller controls the shape (object wrapped in
+		// array for element match, multi-element arrays for subset match).
+		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
 	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))
@@ -530,23 +532,39 @@ func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (A
 	return s, nil
 }
 
-func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]string, error) {
+func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT contract_id FROM watched_contracts ORDER BY contract_id`)
+		`SELECT contract_id, added_at FROM watched_contracts ORDER BY contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
 	defer rows.Close()
 
-	var ids []string
+	var out []WatchedContract
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var wc WatchedContract
+		if err := rows.Scan(&wc.ContractID, &wc.AddedAt); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		out = append(out, wc)
 	}
-	return ids, rows.Err()
+	return out, rows.Err()
+}
+
+// RemoveWatchedContract stops future ingestion for the given contract by
+// removing its row from watched_contracts. It does NOT delete any event
+// rows already in storage — those remain queryable. ErrNotFound signals a
+// typo so the API can respond 404.
+func (p *Postgres) RemoveWatchedContract(ctx context.Context, contractID string) error {
+	tag, err := p.pool.Exec(ctx,
+		`DELETE FROM watched_contracts WHERE contract_id = $1`, contractID)
+	if err != nil {
+		return fmt.Errorf("removing watched contract: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) error {

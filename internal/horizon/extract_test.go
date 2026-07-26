@@ -45,7 +45,7 @@ func scU64(n uint64) xdr.ScVal {
 func scVec(items ...xdr.ScVal) xdr.ScVal {
 	v := xdr.ScValTypeScvVec
 	vec := xdr.ScVec(items)
-	var p *xdr.ScVec = &vec
+	p := &vec
 	return xdr.ScVal{Type: v, Vec: &p}
 }
 
@@ -266,10 +266,10 @@ func TestExtract_FailedResult(t *testing.T) {
 	metaB64 := marshalMeta(t, meta)
 
 	ex, err := ExtractContractEvents(decode.XDRDecoder{}, cid, TxHint{
-		Hash:           "h_fail",
-		Ledger:         400,
-		ResultCode:     "txFailed",
-		ResultMetaXDR:  metaB64,
+		Hash:          "h_fail",
+		Ledger:        400,
+		ResultCode:    "txFailed",
+		ResultMetaXDR: metaB64,
 	})
 	require.NoError(t, err)
 	assert.True(t, ex.Failed)

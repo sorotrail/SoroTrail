@@ -3,13 +3,13 @@
 //
 // Source endpoints (all base URLs are normalized to drop trailing slashes):
 //
-//   GET /accounts/{contract_id}/transactions
-//     cursor-paginated list of transactions involving a contract. Horizon
-//     adds a contract ID to the participants list when it appears in any
-//     operation's footprint, source, or destination — including the
-//     typical pattern where a user account calls a contract via
-//     invokeHostFunction. We use this endpoint to walk every historical
-//     transaction that a contract touched.
+//	GET /accounts/{contract_id}/transactions
+//	  cursor-paginated list of transactions involving a contract. Horizon
+//	  adds a contract ID to the participants list when it appears in any
+//	  operation's footprint, source, or destination — including the
+//	  typical pattern where a user account calls a contract via
+//	  invokeHostFunction. We use this endpoint to walk every historical
+//	  transaction that a contract touched.
 //
 // Cursor pagination is opaque. The `paging_token` field returned in each
 // row is passed back as `?cursor=` to fetch the next page; Horizon decides
@@ -55,19 +55,19 @@ type Link struct {
 // (base64-encoded xdr.TransactionMeta), and `PagingToken` (opaque cursor
 // for the next page).
 type Transaction struct {
-	ID            string `json:"id"`
-	PagingToken   string `json:"paging_token"`
-	Hash          string `json:"hash"`
-	Ledger        int64  `json:"ledger"`
-	CreatedAt     string `json:"created_at"`
-	Account       string `json:"account"`
-	AccountMuxed  string `json:"account_muxed,omitempty"`
-	FeeCharged    string `json:"fee_charged"`
-	MaxFee        string `json:"max_fee"`
-	OperationCount int   `json:"operation_count"`
-	EnvelopeXDR   string `json:"envelope_xdr"`
-	ResultXDR     string `json:"result_xdr"`
-	ResultMetaXDR string `json:"result_meta_xdr"`
-	MemoType      string `json:"memo_type"`
-	ResultCode    string `json:"result_code"`
+	ID             string `json:"id"`
+	PagingToken    string `json:"paging_token"`
+	Hash           string `json:"hash"`
+	Ledger         int64  `json:"ledger"`
+	CreatedAt      string `json:"created_at"`
+	Account        string `json:"account"`
+	AccountMuxed   string `json:"account_muxed,omitempty"`
+	FeeCharged     string `json:"fee_charged"`
+	MaxFee         string `json:"max_fee"`
+	OperationCount int    `json:"operation_count"`
+	EnvelopeXDR    string `json:"envelope_xdr"`
+	ResultXDR      string `json:"result_xdr"`
+	ResultMetaXDR  string `json:"result_meta_xdr"`
+	MemoType       string `json:"memo_type"`
+	ResultCode     string `json:"result_code"`
 }
