@@ -200,7 +200,7 @@ func TestListEvents_ParsesFilters(t *testing.T) {
 	s := newTestServer(st, nil)
 
 	resp, body := doGet(t, s,
-		"/events?contract_id="+testContract+`&type=contract&from_ledger=10&to_ledger=20&limit=5&topic={"symbol":"transfer"}&topic_contains=[{"address":"G..."}]&from_time=2026-07-21T00:00:00Z&to_time=2026-07-22T00:00:00Z`)
+		"/events?contract_id="+testContract+`&type=contract&from_ledger=10&to_ledger=20&limit=5&topic={"symbol":"transfer"}&topic_contains=[{"address":"G..."}]&from_time=2026-07-21T00:00:00Z&to_time=2026-07-22T00:00:00Z&tx_hash=abc123def`)
 
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 	assert.Equal(t, testContract, st.lastFilter.ContractID)
@@ -212,6 +212,7 @@ func TestListEvents_ParsesFilters(t *testing.T) {
 	assert.JSONEq(t, `[{"address":"G..."}]`, string(st.lastFilter.TopicContains))
 	assert.Equal(t, "2026-07-21T00:00:00Z", st.lastFilter.FromTime.Format(time.RFC3339))
 	assert.Equal(t, "2026-07-22T00:00:00Z", st.lastFilter.ToTime.Format(time.RFC3339))
+	assert.Equal(t, "abc123def", st.lastFilter.TxHash)
 }
 
 func TestListEvents_BareTopicBecomesJSONString(t *testing.T) {
@@ -264,6 +265,38 @@ func TestListEvents_BadParams(t *testing.T) {
 			var e map[string]string
 			require.NoError(t, json.Unmarshal(body, &e))
 			assert.NotEmpty(t, e["error"])
+		})
+	}
+}
+
+func TestListEvents_TxHashFilter(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		want    string
+		wantErr int // 0 = success
+	}{
+		{name: "no tx_hash param", query: "/events", want: "", wantErr: 0},
+		{name: "with tx_hash", query: "/events?tx_hash=abc123def", want: "abc123def", wantErr: 0},
+		{name: "empty tx_hash is no-op", query: "/events?tx_hash=", want: "", wantErr: 0},
+		{name: "hex tx_hash", query: "/events?tx_hash=9f5c0e3f2a1b4d6c7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d", want: "9f5c0e3f2a1b4d6c7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d", wantErr: 0},
+		{name: "combined with contract_id", query: "/events?contract_id=" + testContract + "&tx_hash=abc", want: "abc", wantErr: 0},
+		{name: "combined with ledger range", query: "/events?from_ledger=100&to_ledger=200&tx_hash=abc", want: "abc", wantErr: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			assert.Equal(t, tt.want, st.lastFilter.TxHash)
 		})
 	}
 }
@@ -415,6 +448,16 @@ func TestGetEvent_IncludeXDR(t *testing.T) {
 	assert.Equal(t, []string{"topic-xdr"}, out.TopicsXDR)
 	require.NotNil(t, out.ValueXDR)
 	assert.Equal(t, "value-xdr", *out.ValueXDR)
+}
+
+func TestContractEvents_TxHashFilter(t *testing.T) {
+	st := &stubStore{}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s,
+		"/contracts/"+testContract+"/events?tx_hash=abc123")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	assert.Equal(t, testContract, st.lastFilter.ContractID)
+	assert.Equal(t, "abc123", st.lastFilter.TxHash)
 }
 
 func TestContractEvents_ForcesContractFilter(t *testing.T) {
