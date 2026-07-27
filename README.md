@@ -814,8 +814,9 @@ make lint         # golangci-lint
 make migrate-up   # apply migrations manually (needs the migrate CLI)
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture notes and extension
-points.
+See [docs/architecture.md](docs/architecture.md) for the full system architecture
+diagram and component descriptions. [CONTRIBUTING.md](CONTRIBUTING.md) covers extension
+points and development conventions.
 
 ## Roadmap / future work
 
