@@ -92,6 +92,10 @@ type Server struct {
 	// compressed. The zero value means CompressMinSize, so compression is on
 	// by default; negative disables the middleware entirely.
 	compressMinSize int
+	// exportMaxRange caps the ledger span of /contracts/{id}/export.
+	// Zero means unbounded (legacy behavior); config-driven wiring sets
+	// EXPORT_MAX_RANGE so requests default to a sane ceiling.
+	exportMaxRange int64
 }
 
 // SetCompressMinSize overrides the body size at which responses are
@@ -127,6 +131,13 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 	return s
 }
 
+// SetExportMaxRange caps the ledger span a /contracts/{id}/export call
+// may request. Zero means no cap (the handler still validates range fits
+// the requested bound, but won't reject on span alone). The config layer
+// exposes EXPORT_MAX_RANGE; pass it through so an operator can tune
+// analytical workloads without code changes.
+func (s *Server) SetExportMaxRange(n int64) { s.exportMaxRange = n }
+
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
@@ -158,6 +169,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/events/count", s.handleCountEvents)
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
+	r.Get("/contracts/{id}/export", s.handleContractExport)
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
