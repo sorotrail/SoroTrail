@@ -3,7 +3,7 @@ package audit
 import (
 	"context"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/rpc"
 )
 
 // Client is the audit-side view of the RPC. It is the same interface as
