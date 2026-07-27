@@ -17,6 +17,7 @@ import (
 
 	"github.com/khaylebfortune/sorotrail/internal/config"
 	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/khaylebfortune/sorotrail/internal/version"
 )
 
 // cachePrivate is the package-wide override that flips Cache-Control
@@ -84,6 +85,12 @@ type healthResponse struct {
 	Checks map[string]string `json:"checks"`
 }
 
+type versionResponse struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+	Date    string `json:"date"`
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -104,6 +111,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, status, resp)
+}
+
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	resp := versionResponse{
+		Version: version.GetVersion(),
+		Commit:  version.GetCommit(),
+		Date:    version.GetDate(),
+	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {

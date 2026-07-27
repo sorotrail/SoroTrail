@@ -127,6 +127,18 @@ curl -s localhost:8080/health
 {"status":"ok","checks":{"database":"ok","rpc":"ok"}}
 ```
 
+### `GET /version`
+
+Returns the binary's version, commit, and build date.
+
+```sh
+curl -s localhost:8080/version
+```
+
+```json
+{"version":"v0.1.0","commit":"3c691b4","date":"2026-07-24T12:00:00Z"}
+```
+
 ### `GET /events`
 
 Lists stored events in ascending (oldest-first) or descending (newest-first) order. Defaults to ascending.

@@ -29,6 +29,7 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/spec"
 	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/khaylebfortune/sorotrail/internal/version"
 	"github.com/khaylebfortune/sorotrail/internal/webhook"
 )
 
@@ -53,6 +54,10 @@ func dispatch(args []string) error {
 	switch args[0] {
 	case "replay":
 		return runReplay(args[1:])
+	case "version", "--version":
+		fmt.Printf("sorotrail %s (commit: %s, date: %s)\n",
+			version.GetVersion(), version.GetCommit(), version.GetDate())
+		return nil
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -70,6 +75,7 @@ With no subcommand, runs the indexer (ingester + HTTP API).
 subcommands:
   replay    re-decode stored events with the current decoder
             (sorotrail replay --help)
+  version   print version information
 `)
 }
 
@@ -79,6 +85,10 @@ func run() error {
 		return err
 	}
 	log := newLogger(cfg.LogLevel)
+	log.Info("sorotrail starting",
+		"version", version.GetVersion(),
+		"commit", version.GetCommit(),
+		"date", version.GetDate())
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

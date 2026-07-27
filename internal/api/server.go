@@ -16,6 +16,7 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/broadcast"
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/khaylebfortune/sorotrail/internal/version"
 )
 
 // SetAuditor registers the binary's Auditor so /stats can surface its
@@ -99,6 +100,7 @@ func (s *Server) Router() http.Handler {
 	}
 
 	r.Get("/health", s.handleHealth)
+	r.Get("/version", s.handleVersion)
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)

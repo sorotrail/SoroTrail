@@ -297,3 +297,15 @@ func TestStats(t *testing.T) {
 	assert.Equal(t, int64(42), got.TotalEvents)
 	assert.Equal(t, int64(999), got.LastIngestedLedger)
 }
+
+func TestVersion(t *testing.T) {
+	resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/version")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var got versionResponse
+	require.NoError(t, json.Unmarshal(body, &got))
+	// Defaults when unset at build time.
+	assert.Equal(t, "dev", got.Version)
+	assert.Equal(t, "unknown", got.Commit)
+	assert.Equal(t, "unknown", got.Date)
+}

@@ -2,10 +2,18 @@ BINARY := bin/sorotrail
 MIGRATIONS := internal/store/migrations
 DATABASE_URL ?= postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
 
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+DATE    ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+LDFLAGS := -X github.com/khaylebfortune/sorotrail/internal/version.Version=$(VERSION) \
+           -X github.com/khaylebfortune/sorotrail/internal/version.Commit=$(COMMIT) \
+           -X github.com/khaylebfortune/sorotrail/internal/version.Date=$(DATE)
+
 .PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down clean
 
 build:
-	go build -o $(BINARY) ./cmd/sorotrail
+	go build -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/sorotrail
 
 run: build
 	./$(BINARY)
