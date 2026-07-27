@@ -1075,3 +1075,242 @@ func TestRequestID(t *testing.T) {
 		})
 	}
 }
+
+func TestCountEvents(t *testing.T) {
+	tests := []struct {
+		name           string
+		query          string
+		totalCount     int64
+		countErr       error
+		wantStatus     int
+		wantCount      int64
+		wantErrContain string
+		// wantCountFilter checks the filter passed to CountEvents
+		wantContractID string
+		wantFromLedger int64
+		wantToLedger   int64
+	}{
+		{
+			name:       "returns count for all events",
+			query:      "/events/count",
+			totalCount: 42,
+			wantStatus: http.StatusOK,
+			wantCount:  42,
+		},
+		{
+			name:           "passes contract_id filter",
+			query:          "/events/count?contract_id=" + testContract,
+			totalCount:     7,
+			wantStatus:     http.StatusOK,
+			wantCount:      7,
+			wantContractID: testContract,
+		},
+		{
+			name:           "passes ledger range filter",
+			query:          "/events/count?from_ledger=100&to_ledger=200",
+			totalCount:     3,
+			wantStatus:     http.StatusOK,
+			wantCount:      3,
+			wantFromLedger: 100,
+			wantToLedger:   200,
+		},
+		{
+			name:       "zero count",
+			query:      "/events/count",
+			totalCount: 0,
+			wantStatus: http.StatusOK,
+			wantCount:  0,
+		},
+		{
+			name:           "store error returns 500",
+			query:          "/events/count",
+			countErr:       errors.New("db timeout"),
+			wantStatus:     http.StatusInternalServerError,
+			wantErrContain: "counting events failed",
+		},
+		{
+			name:           "bad filter returns 400",
+			query:          "/events/count?type=bogus",
+			wantStatus:     http.StatusBadRequest,
+			wantErrContain: "invalid type",
+		},
+		{
+			name:           "bad contract_id returns 400",
+			query:          "/events/count?contract_id=notvalid",
+			wantStatus:     http.StatusBadRequest,
+			wantErrContain: "invalid contract_id",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{
+				totalCount:     tt.totalCount,
+				countEventsErr: tt.countErr,
+			}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+
+			require.Equal(t, tt.wantStatus, resp.StatusCode, string(body))
+
+			if tt.wantErrContain != "" {
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], tt.wantErrContain)
+				return
+			}
+
+			var got countResponse
+			require.NoError(t, json.Unmarshal(body, &got))
+			assert.Equal(t, tt.wantCount, got.Count)
+
+			// Pagination fields must be stripped before hitting the store.
+			assert.Equal(t, "", st.lastCountFilter.Cursor)
+			assert.Equal(t, "", st.lastCountFilter.Order)
+			assert.Equal(t, "", st.lastCountFilter.OrderBy)
+			assert.Equal(t, 0, st.lastCountFilter.Limit)
+
+			if tt.wantContractID != "" {
+				assert.Equal(t, tt.wantContractID, st.lastCountFilter.ContractID)
+			}
+			if tt.wantFromLedger != 0 {
+				assert.Equal(t, tt.wantFromLedger, st.lastCountFilter.FromLedger)
+			}
+			if tt.wantToLedger != 0 {
+				assert.Equal(t, tt.wantToLedger, st.lastCountFilter.ToLedger)
+			}
+		})
+	}
+}
+
+func TestCountEvents_CacheControl(t *testing.T) {
+	st := &stubStore{totalCount: 5}
+	resp, _ := doGet(t, newTestServer(st, nil), "/events/count")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
+}
+
+func TestCountEvents_ResponseShape(t *testing.T) {
+	st := &stubStore{totalCount: 99}
+	_, body := doGet(t, newTestServer(st, nil), "/events/count")
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	// Must have exactly one key: "count"
+	assert.Len(t, raw, 1)
+	_, hasCount := raw["count"]
+	assert.True(t, hasCount)
+	assert.Equal(t, float64(99), raw["count"])
+}
+
+func TestListEvents_RecentParam(t *testing.T) {
+	events := []store.Event{
+		{ID: "e3", Ledger: 3},
+		{ID: "e2", Ledger: 2},
+		{ID: "e1", Ledger: 1},
+	}
+
+	tests := []struct {
+		name        string
+		query       string
+		wantStatus  int
+		wantOrder   string
+		wantLimit   int
+		wantErrText string
+	}{
+		{
+			name:       "recent=true sets desc order and default limit 20",
+			query:      "/events?recent=true",
+			wantStatus: http.StatusOK,
+			wantOrder:  "desc",
+			wantLimit:  recentDefaultLimit,
+		},
+		{
+			name:       "recent=5 sets desc order and limit 5",
+			query:      "/events?recent=5",
+			wantStatus: http.StatusOK,
+			wantOrder:  "desc",
+			wantLimit:  5,
+		},
+		{
+			name:       "recent=200 (max limit) is accepted",
+			query:      "/events?recent=200",
+			wantStatus: http.StatusOK,
+			wantOrder:  "desc",
+			wantLimit:  200,
+		},
+		{
+			name:        "recent=0 is invalid",
+			query:       "/events?recent=0",
+			wantStatus:  http.StatusBadRequest,
+			wantErrText: "recent must be a positive integer",
+		},
+		{
+			name:        "recent=201 exceeds max",
+			query:       "/events?recent=201",
+			wantStatus:  http.StatusBadRequest,
+			wantErrText: "recent must be a positive integer",
+		},
+		{
+			name:        "recent conflicts with order",
+			query:       "/events?recent=5&order=asc",
+			wantStatus:  http.StatusBadRequest,
+			wantErrText: "recent cannot be combined with order",
+		},
+		{
+			name:        "recent conflicts with order_by",
+			query:       "/events?recent=5&order_by=ledger",
+			wantStatus:  http.StatusBadRequest,
+			wantErrText: "recent cannot be combined with order",
+		},
+		{
+			name:        "recent conflicts with limit",
+			query:       "/events?recent=5&limit=10",
+			wantStatus:  http.StatusBadRequest,
+			wantErrText: "recent cannot be combined with limit",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{events: events}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+
+			require.Equal(t, tt.wantStatus, resp.StatusCode, string(body))
+
+			if tt.wantErrText != "" {
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], tt.wantErrText)
+				return
+			}
+
+			assert.Equal(t, tt.wantOrder, st.lastFilter.Order)
+			assert.Equal(t, tt.wantLimit, st.lastFilter.Limit)
+		})
+	}
+}
+
+func TestListEvents_RecentReturnsNewestFirst(t *testing.T) {
+	// The store returns events in whatever order the filter dictates.
+	// Verify that ?recent=3 passes order=desc to the store and the
+	// response contains events in the order the store returned them.
+	st := &stubStore{
+		events: []store.Event{
+			{ID: "e3", Ledger: 300},
+			{ID: "e2", Ledger: 200},
+			{ID: "e1", Ledger: 100},
+		},
+	}
+	resp, body := doGet(t, newTestServer(st, nil), "/events?recent=3")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "desc", st.lastFilter.Order)
+	assert.Equal(t, 3, st.lastFilter.Limit)
+
+	var out eventsResponse
+	require.NoError(t, json.Unmarshal(body, &out))
+	require.Len(t, out.Events, 3)
+	assert.Equal(t, "e3", out.Events[0].ID)
+	assert.Equal(t, "e2", out.Events[1].ID)
+	assert.Equal(t, "e1", out.Events[2].ID)
+}
