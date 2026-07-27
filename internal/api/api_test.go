@@ -268,6 +268,42 @@ func TestListEvents_BadParams(t *testing.T) {
 	}
 }
 
+func TestListEvents_HasValueFilter(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		want    *bool // nil = not set, true = has value, false = no value
+		wantErr int   // 0 = success
+	}{
+		{name: "no has_value param", query: "/events", want: nil, wantErr: 0},
+		{name: "has_value=true", query: "/events?has_value=true", want: ptr(true), wantErr: 0},
+		{name: "has_value=false", query: "/events?has_value=false", want: ptr(false), wantErr: 0},
+		{name: "empty has_value is no-op", query: "/events?has_value=", want: nil, wantErr: 0},
+		{name: "combined with contract_id", query: "/events?contract_id=" + testContract + "&has_value=true", want: ptr(true), wantErr: 0},
+		{name: "combined with ledger range", query: "/events?from_ledger=100&to_ledger=200&has_value=false", want: ptr(false), wantErr: 0},
+		{name: "invalid value returns 400", query: "/events?has_value=yes", wantErr: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], "has_value")
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			assert.Equal(t, tt.want, st.lastFilter.HasValue)
+		})
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
 func TestListEvents_TypeFilter(t *testing.T) {
 	tests := []struct {
 		name    string
