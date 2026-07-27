@@ -16,9 +16,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
-	"github.com/khaylebfortune/sorotrail/internal/buildinfo"
-	"github.com/khaylebfortune/sorotrail/internal/config"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/buildinfo"
+	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
@@ -884,6 +884,7 @@ func listETag(f store.EventFilter) string {
 		Topic2        json.RawMessage `json:"p2,omitempty"`
 		Topic3        json.RawMessage `json:"p3,omitempty"`
 		TopicContains json.RawMessage `json:"pc,omitempty"`
+		TxHash        string          `json:"th,omitempty"`
 		FromLedger    int64           `json:"fl"`
 		ToLedger      int64           `json:"tl"`
 		FromTime      string          `json:"ft,omitempty"`
@@ -903,6 +904,7 @@ func listETag(f store.EventFilter) string {
 		Topic2:        f.Topic2,
 		Topic3:        f.Topic3,
 		TopicContains: f.TopicContains,
+		TxHash:        f.TxHash,
 		FromLedger:    f.FromLedger,
 		ToLedger:      f.ToLedger,
 		FromTime:      timeOrEmpty(f.FromTime),
@@ -1028,6 +1030,7 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	f := store.EventFilter{
 		ContractID: q.Get("contract_id"),
 		Cursor:     q.Get("cursor"),
+		TxHash:     q.Get("tx_hash"),
 	}
 
 	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {

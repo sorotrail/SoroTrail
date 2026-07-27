@@ -43,9 +43,9 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/khaylebfortune/sorotrail/internal/decode"
-	"github.com/khaylebfortune/sorotrail/internal/horizon"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/horizon"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // DefaultBatchSize is the default Horizon pagination limit. 200 matches
