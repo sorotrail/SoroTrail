@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // testLogger returns a slog.Logger that drops everything.
@@ -199,6 +199,10 @@ func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) 
 
 func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Event, string, error) {
 	return nil, "", nil
+}
+
+func (m *mockStore) CountEvents(context.Context, store.EventFilter) (int64, error) {
+	return 0, nil
 }
 
 func (m *mockStore) LedgerRangeCensus(_ context.Context, from, to int64, idsOnly bool) ([]store.LedgerCensus, error) {
