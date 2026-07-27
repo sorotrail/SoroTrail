@@ -859,6 +859,7 @@ func listETag(f store.EventFilter) string {
 		Topic2        json.RawMessage `json:"p2,omitempty"`
 		Topic3        json.RawMessage `json:"p3,omitempty"`
 		TopicContains json.RawMessage `json:"pc,omitempty"`
+		TxHash        string          `json:"th,omitempty"`
 		FromLedger    int64           `json:"fl"`
 		ToLedger      int64           `json:"tl"`
 		FromTime      string          `json:"ft,omitempty"`
@@ -885,6 +886,7 @@ func listETag(f store.EventFilter) string {
 		Topic2:        f.Topic2,
 		Topic3:        f.Topic3,
 		TopicContains: f.TopicContains,
+		TxHash:        f.TxHash,
 		FromLedger:    f.FromLedger,
 		ToLedger:      f.ToLedger,
 		FromTime:      timeOrEmpty(f.FromTime),

@@ -41,12 +41,9 @@ import (
 // exemptPaths are HTTP paths that bypass the limiter. /health is polled
 // by orchestrators and /metrics is scraped by Prometheus — throttling
 // either of those degrades observability without slowing an abuser.
-//
-// /metrics is included prospectively even though the endpoint does not
-// exist yet, so that when it lands it is exempt by default (Prometheus
-// hammering the scrape target would otherwise generate rate-limit
-// errors against the very metrics that operators rely on to see the
-// rate-limit pressure).
+// Prometheus hammering the scrape target would otherwise generate
+// rate-limit errors against the very metrics operators rely on to see
+// the rate-limit pressure.
 var exemptPaths = map[string]bool{
 	"/health":  true,
 	"/metrics": true,
