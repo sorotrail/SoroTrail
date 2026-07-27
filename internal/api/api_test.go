@@ -310,6 +310,46 @@ func TestListEvents_TxHashFilter(t *testing.T) {
 	}
 }
 
+func TestListEvents_TopicCountFilter(t *testing.T) {
+	tests := []struct {
+		name      string
+		query     string
+		want      *int
+		wantErr   int // 0 = success
+	}{
+		{name: "no topic_count param", query: "/events", want: nil, wantErr: 0},
+		{name: "with topic_count", query: "/events?topic_count=2", want: intPtr(2), wantErr: 0},
+		{name: "zero topic_count", query: "/events?topic_count=0", want: intPtr(0), wantErr: 0},
+		{name: "empty topic_count is no-op", query: "/events?topic_count=", want: nil, wantErr: 0},
+		{name: "combined with contract_id", query: "/events?contract_id=" + testContract + "&topic_count=1", want: intPtr(1), wantErr: 0},
+		{name: "negative topic_count", query: "/events?topic_count=-1", wantErr: http.StatusBadRequest},
+		{name: "non-integer topic_count", query: "/events?topic_count=abc", wantErr: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			if tt.want == nil {
+				assert.Nil(t, st.lastFilter.TopicCount)
+			} else {
+				require.NotNil(t, st.lastFilter.TopicCount)
+				assert.Equal(t, *tt.want, *st.lastFilter.TopicCount)
+			}
+		})
+	}
+}
+
+func intPtr(n int) *int { return &n }
+
 func TestListEvents_TypeFilter(t *testing.T) {
 	tests := []struct {
 		name    string

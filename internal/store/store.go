@@ -107,6 +107,9 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
+	// TopicCount filters events whose topics array has exactly this length.
+	// Nil means no constraint; zero matches events with no topics.
+	TopicCount *int
 	// TxHash filters events emitted by a specific transaction hash.
 	TxHash     string    // hex-encoded transaction hash
 	FromLedger int64     // inclusive

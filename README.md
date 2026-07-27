@@ -271,6 +271,7 @@ Query parameters (all optional, combinable):
 | `topic1` | `{"address":"G..."}` | Exact match against topic position 1. |
 | `topic2` | `{"address":"G..."}` | Exact match against topic position 2. |
 | `topic3` | `{"u64":7}` | Exact match against topic position 3. |
+| `topic_count` | `2` | Exact number of topics in the event's topics array. Zero matches events with no topics. |
 | `from_ledger` | `250000` | Inclusive lower ledger bound. |
 | `to_ledger` | `260000` | Inclusive upper ledger bound. |
 | `from_time` | `2026-07-21T00:00:00Z` | Inclusive lower `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |

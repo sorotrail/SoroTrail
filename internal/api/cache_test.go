@@ -497,6 +497,7 @@ func TestListETag_CoversEveryFilterField(t *testing.T) {
 		{"Topic2", func(f *store.EventFilter) { f.Topic2 = json.RawMessage(`{"symbol":"transfer"}`) }},
 		{"Topic3", func(f *store.EventFilter) { f.Topic3 = json.RawMessage(`{"symbol":"transfer"}`) }},
 		{"TopicContains", func(f *store.EventFilter) { f.TopicContains = json.RawMessage(`[{"u64":7}]`) }},
+		{"TopicCount", func(f *store.EventFilter) { n := 2; f.TopicCount = &n }},
 		{"TxHash", func(f *store.EventFilter) { f.TxHash = "abc123def" }},
 		{"FromLedger", func(f *store.EventFilter) { f.FromLedger = 501 }},
 		{"ToLedger", func(f *store.EventFilter) { f.ToLedger = 998 }},

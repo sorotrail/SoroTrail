@@ -935,6 +935,7 @@ func listETag(f store.EventFilter) string {
 		Topic2        json.RawMessage `json:"p2,omitempty"`
 		Topic3        json.RawMessage `json:"p3,omitempty"`
 		TopicContains json.RawMessage `json:"pc,omitempty"`
+		TopicCount    *int            `json:"tc,omitempty"`
 		TxHash        string          `json:"th,omitempty"`
 		FromLedger    int64           `json:"fl"`
 		ToLedger      int64           `json:"tl"`
@@ -955,6 +956,7 @@ func listETag(f store.EventFilter) string {
 		Topic2:        f.Topic2,
 		Topic3:        f.Topic3,
 		TopicContains: f.TopicContains,
+		TopicCount:    f.TopicCount,
 		TxHash:        f.TxHash,
 		FromLedger:    f.FromLedger,
 		ToLedger:      f.ToLedger,
@@ -1182,6 +1184,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("from_ledger %d is after to_ledger %d", f.FromLedger, f.ToLedger)
 	}
 
+	if f.TopicCount, err = parseTopicCountParam(q.Get("topic_count")); err != nil {
+		return f, err
+	}
+
 	if f.FromTime, err = parseTimeParam(q.Get("from_time"), "from_time"); err != nil {
 		return f, err
 	}
@@ -1235,6 +1241,17 @@ func parseLedgerParam(raw, name string) (int64, error) {
 		return 0, fmt.Errorf("%s must be a positive integer", name)
 	}
 	return n, nil
+}
+
+func parseTopicCountParam(raw string) (*int, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return nil, fmt.Errorf("topic_count must be a non-negative integer")
+	}
+	return &n, nil
 }
 
 // parseTimeParam parses an RFC 3339 timestamp query parameter.
