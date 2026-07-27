@@ -280,11 +280,48 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 	s.serveEvents(w, r, filter, fields)
 }
 
+// countResponse is the JSON body for GET /events/count.
+type countResponse struct {
+	Count int64 `json:"count"`
+}
+
+// handleCountEvents returns the number of events matching the same filters
+// as GET /events. Pagination params (cursor, limit, order, order_by) are
+// accepted in the URL but ignored for the count — only the filter fields
+// that narrow the result set are applied.
+func (s *Server) handleCountEvents(w http.ResponseWriter, r *http.Request) {
+	filter, _, err := parseFilterAndFields(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	// Strip pagination — count is over the full matching set.
+	filter.Cursor = ""
+	filter.Order = ""
+	filter.OrderBy = ""
+	filter.Limit = 0
+
+	total, err := s.store.CountEvents(r.Context(), filter)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("counting events", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("counting events failed"))
+		return
+	}
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, countResponse{Count: total})
+}
+
 // streamBatchSize is the number of events fetched per internal query when
 // streaming NDJSON. It balances query cost against flush frequency: too
 // small wastes round trips; too large buffers too long before a client
 // sees progress.
 const streamBatchSize = 500
+
+// recentDefaultLimit is the number of events returned when ?recent is
+// specified without a numeric value (i.e. ?recent=true). Chosen to be
+// useful at a glance without overwhelming a caller that just wants the
+// latest activity.
+const recentDefaultLimit = 20
 
 func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) {
 	filter, fields, err := parseFilterAndFields(r)
@@ -1165,6 +1202,27 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	} else {
 		f.Limit = store.DefaultQueryLimit
 	}
+
+	// ?recent=N: shorthand for "newest N events" — sets order=desc and
+	// limit=N (default 20). Conflicts with explicit order or limit params.
+	if raw := q.Get("recent"); raw != "" {
+		if q.Get("order") != "" || q.Get("order_by") != "" {
+			return f, fmt.Errorf("recent cannot be combined with order or order_by")
+		}
+		if q.Get("limit") != "" {
+			return f, fmt.Errorf("recent cannot be combined with limit")
+		}
+		n := recentDefaultLimit
+		if raw != "true" {
+			n, err = strconv.Atoi(raw)
+			if err != nil || n < 1 || n > store.MaxQueryLimit {
+				return f, fmt.Errorf("recent must be a positive integer in [1,%d]", store.MaxQueryLimit)
+			}
+		}
+		f.Order = "desc"
+		f.Limit = n
+	}
+
 	return f, nil
 }
 
