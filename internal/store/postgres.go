@@ -395,6 +395,9 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 		// array for element match, multi-element arrays for subset match).
 		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
 	}
+	if f.TxHash != "" {
+		where = append(where, "tx_hash = "+arg(f.TxHash))
+	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))
 	}
