@@ -104,7 +104,7 @@ func (s *Server) SetCompressMinSize(n int) {
 	s.compressMinSize = n
 }
 
-// New builds the API server. rpcClient is only used by /health.
+// New builds the API server. rpcClient is used by /health, /readyz, and /stats.
 // apiKey gates the watched-contracts management endpoints; pass "" to
 // fail closed (every request gets a 503 with "API_KEY not configured").
 // See apiKeyAuth for the exact contract. The trailing enricher is optional —
@@ -161,6 +161,8 @@ func (s *Server) Router() http.Handler {
 	}
 
 	r.Get("/health", s.handleHealth)
+	r.Get("/livez", s.handleLivez)
+	r.Get("/readyz", s.handleReadyz)
 	r.Get("/version", s.handleVersion)
 	r.Handle("/metrics", s.metrics.Handler())
 	r.Get("/events", s.handleListEvents)
