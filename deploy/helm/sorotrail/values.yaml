@@ -3,7 +3,7 @@ replicaCount: 1
 
 image:
   # Container image repository.
-  repository: ghcr.io/khaylebfortune/sorotrail
+  repository: ghcr.io/sorotrail/sorotrail
   pullPolicy: IfNotPresent
   # Overrides the image tag. Defaults to the chart's appVersion.
   tag: ""
