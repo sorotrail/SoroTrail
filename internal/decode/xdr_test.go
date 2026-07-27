@@ -115,6 +115,97 @@ func TestXDRDecoder_UnknownTypeFallback(t *testing.T) {
 	assert.NotEmpty(t, unknown["type"])
 }
 
+func TestXDRDecoder_NestedCollections(t *testing.T) {
+	tests := []struct {
+		name string
+		val  xdr.ScVal
+		want string
+	}{
+		{
+			"vec containing vec",
+			func() xdr.ScVal {
+				inner := xdr.ScVec{scSymbol("inner")}
+				innerPtr := &inner
+				outer := xdr.ScVec{scSymbol("outer"), {Type: xdr.ScValTypeScvVec, Vec: &innerPtr}}
+				outerPtr := &outer
+				return xdr.ScVal{Type: xdr.ScValTypeScvVec, Vec: &outerPtr}
+			}(),
+			`{"vec":[{"symbol":"outer"},{"vec":[{"symbol":"inner"}]}]}`,
+		},
+		{
+			"vec containing map",
+			func() xdr.ScVal {
+				scMap := xdr.ScMap{{Key: scSymbol("key"), Val: scU64(42)}}
+				mapPtr := &scMap
+				vec := xdr.ScVec{scU64(1), {Type: xdr.ScValTypeScvMap, Map: &mapPtr}}
+				vecPtr := &vec
+				return xdr.ScVal{Type: xdr.ScValTypeScvVec, Vec: &vecPtr}
+			}(),
+			`{"vec":[{"u64":1},{"map":[{"key":{"symbol":"key"},"val":{"u64":42}}]}]}`,
+		},
+		{
+			"map containing vec",
+			func() xdr.ScVal {
+				inner := xdr.ScVec{scU64(1), scU64(2)}
+				innerPtr := &inner
+				entry := xdr.ScMapEntry{
+					Key: scSymbol("items"),
+					Val: xdr.ScVal{Type: xdr.ScValTypeScvVec, Vec: &innerPtr},
+				}
+				scMap := xdr.ScMap{entry}
+				mapPtr := &scMap
+				return xdr.ScVal{Type: xdr.ScValTypeScvMap, Map: &mapPtr}
+			}(),
+			`{"map":[{"key":{"symbol":"items"},"val":{"vec":[{"u64":1},{"u64":2}]}}]}`,
+		},
+		{
+			"deep nesting: vec > map > vec",
+			func() xdr.ScVal {
+				deep := xdr.ScVec{scU64(99)}
+				deepPtr := &deep
+				entry := xdr.ScMapEntry{
+					Key: scSymbol("data"),
+					Val: xdr.ScVal{Type: xdr.ScValTypeScvVec, Vec: &deepPtr},
+				}
+				scMap := xdr.ScMap{entry}
+				mapPtr := &scMap
+				outer := xdr.ScVec{{Type: xdr.ScValTypeScvMap, Map: &mapPtr}}
+				outerPtr := &outer
+				return xdr.ScVal{Type: xdr.ScValTypeScvVec, Vec: &outerPtr}
+			}(),
+			`{"vec":[{"map":[{"key":{"symbol":"data"},"val":{"vec":[{"u64":99}]}}]}]}`,
+		},
+		{
+			"empty nested vec",
+			func() xdr.ScVal {
+				inner := xdr.ScVec{}
+				innerPtr := &inner
+				outer := xdr.ScVec{{Type: xdr.ScValTypeScvVec, Vec: &innerPtr}}
+				outerPtr := &outer
+				return xdr.ScVal{Type: xdr.ScValTypeScvVec, Vec: &outerPtr}
+			}(),
+			`{"vec":[{"vec":[]}]}`,
+		},
+		{
+			"empty nested map",
+			func() xdr.ScVal {
+				scMap := xdr.ScMap{}
+				mapPtr := &scMap
+				return xdr.ScVal{Type: xdr.ScValTypeScvMap, Map: &mapPtr}
+			}(),
+			`{"map":[]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := XDRDecoder{}.DecodeScVal(mustBase64(t, tt.val))
+			require.NoError(t, err)
+			assert.JSONEq(t, tt.want, string(got))
+		})
+	}
+}
+
 func TestXDRDecoder_InvalidBase64(t *testing.T) {
 	_, err := XDRDecoder{}.DecodeScVal("not base64!!!")
 	assert.Error(t, err)

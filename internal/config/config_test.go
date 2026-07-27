@@ -16,12 +16,16 @@ const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 // prior test don't leak across cases.
 var envKeys = []string{
 	"RPC_URL", "DATABASE_URL", "POLL_INTERVAL", "HTTP_ADDR",
-	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL",
+	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL", "LOG_FORMAT",
+	"API_QUERY_TIMEOUT", "API_SLOW_QUERY_THRESHOLD",
+	"HORIZON_URL", "BACKFILL_RATE_RPS",
 	"AUDIT_ENABLED", "AUDIT_POLL_INTERVAL", "AUDIT_BATCH_LEDGERS",
 	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
 	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
 	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
-	"CORS_ALLOWED_ORIGINS",
+	"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT",
+	"HTTP_READ_HEADER_TIMEOUT",
+	"SHUTDOWN_TIMEOUT",
 }
 
 func TestLoad(t *testing.T) {
@@ -46,6 +50,11 @@ func TestLoad(t *testing.T) {
 				assert.Zero(t, c.RateLimitRPS, "rate limiter disabled by default")
 				assert.Zero(t, c.RateLimitBurst)
 				assert.False(t, c.RateLimitTrustedProxy)
+
+				assert.Equal(t, 30*time.Second, c.HTTPReadTimeout)
+				assert.Equal(t, 30*time.Second, c.HTTPWriteTimeout)
+				assert.Equal(t, 60*time.Second, c.HTTPIdleTimeout)
+				assert.Equal(t, 10*time.Second, c.HTTPReadHeaderTimeout)
 			},
 		},
 		{
@@ -96,6 +105,34 @@ func TestLoad(t *testing.T) {
 			wantErr: "LOG_LEVEL",
 		},
 		{
+			name: "log format text",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_FORMAT":   "text",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "text", c.LogFormat)
+			},
+		},
+		{
+			name: "log format json",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_FORMAT":   "json",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "json", c.LogFormat)
+			},
+		},
+		{
+			name: "bad log format",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_FORMAT":   "xml",
+			},
+			wantErr: "LOG_FORMAT",
+		},
+		{
 			name: "bad rpc url",
 			env: map[string]string{
 				"DATABASE_URL": "postgres://localhost/db",
@@ -104,46 +141,105 @@ func TestLoad(t *testing.T) {
 			wantErr: "RPC_URL",
 		},
 		{
-			name: "cors allowed origins parsed",
+			name: "http timeouts custom values accepted",
 			env: map[string]string{
-				"DATABASE_URL":          "postgres://localhost/db",
-				"CORS_ALLOWED_ORIGINS": "https://app.example.com,https://admin.example.com",
+				"DATABASE_URL":             "postgres://localhost/db",
+				"HTTP_READ_TIMEOUT":        "15s",
+				"HTTP_WRITE_TIMEOUT":       "20s",
+				"HTTP_IDLE_TIMEOUT":        "90s",
+				"HTTP_READ_HEADER_TIMEOUT": "5s",
 			},
 			check: func(t *testing.T, c Config) {
-				assert.Equal(t, "https://app.example.com,https://admin.example.com", c.CORSAllowedOrigins)
-				assert.Equal(t, []string{"https://app.example.com", "https://admin.example.com"}, c.CORSAllowedOriginsList)
+				assert.Equal(t, 15*time.Second, c.HTTPReadTimeout)
+				assert.Equal(t, 20*time.Second, c.HTTPWriteTimeout)
+				assert.Equal(t, 90*time.Second, c.HTTPIdleTimeout)
+				assert.Equal(t, 5*time.Second, c.HTTPReadHeaderTimeout)
 			},
 		},
 		{
-			name: "cors wildcard accepted",
+			name: "http timeouts zero is accepted (disables timeout)",
 			env: map[string]string{
-				"DATABASE_URL":          "postgres://localhost/db",
-				"CORS_ALLOWED_ORIGINS": "*",
+				"DATABASE_URL":             "postgres://localhost/db",
+				"HTTP_READ_TIMEOUT":        "0s",
+				"HTTP_WRITE_TIMEOUT":       "0s",
+				"HTTP_IDLE_TIMEOUT":        "0s",
+				"HTTP_READ_HEADER_TIMEOUT": "0s",
 			},
 			check: func(t *testing.T, c Config) {
-				assert.Equal(t, "*", c.CORSAllowedOrigins)
-				assert.Equal(t, []string{"*"}, c.CORSAllowedOriginsList)
+				assert.Equal(t, time.Duration(0), c.HTTPReadTimeout)
+				assert.Equal(t, time.Duration(0), c.HTTPWriteTimeout)
+				assert.Equal(t, time.Duration(0), c.HTTPIdleTimeout)
+				assert.Equal(t, time.Duration(0), c.HTTPReadHeaderTimeout)
 			},
 		},
 		{
-			name: "cors defaults to empty",
+			name: "negative http read timeout rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"HTTP_READ_TIMEOUT": "-1s",
+			},
+			wantErr: "HTTP_READ_TIMEOUT must be non-negative",
+		},
+		{
+			name: "negative http write timeout rejected",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"HTTP_WRITE_TIMEOUT": "-5s",
+			},
+			wantErr: "HTTP_WRITE_TIMEOUT must be non-negative",
+		},
+		{
+			name: "negative http idle timeout rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"HTTP_IDLE_TIMEOUT": "-1s",
+			},
+			wantErr: "HTTP_IDLE_TIMEOUT must be non-negative",
+		},
+		{
+			name: "negative http read header timeout rejected",
+			env: map[string]string{
+				"DATABASE_URL":             "postgres://localhost/db",
+				"HTTP_READ_HEADER_TIMEOUT": "-3s",
+			},
+			wantErr: "HTTP_READ_HEADER_TIMEOUT must be non-negative",
+		},
+		{
+			name: "shutdown timeout defaults to 15s",
 			env: map[string]string{
 				"DATABASE_URL": "postgres://localhost/db",
 			},
 			check: func(t *testing.T, c Config) {
-				assert.Empty(t, c.CORSAllowedOrigins)
-				assert.Empty(t, c.CORSAllowedOriginsList)
+				assert.Equal(t, 15*time.Second, c.ShutdownTimeout)
 			},
 		},
 		{
-			name: "cors origins trimmed and empty entries dropped",
+			name: "shutdown timeout custom value accepted",
 			env: map[string]string{
-				"DATABASE_URL":          "postgres://localhost/db",
-				"CORS_ALLOWED_ORIGINS": "https://app.example.com, , https://admin.example.com,",
+				"DATABASE_URL":     "postgres://localhost/db",
+				"SHUTDOWN_TIMEOUT": "30s",
 			},
 			check: func(t *testing.T, c Config) {
-				assert.Equal(t, []string{"https://app.example.com", "https://admin.example.com"}, c.CORSAllowedOriginsList)
+				assert.Equal(t, 30*time.Second, c.ShutdownTimeout)
 			},
+		},
+		{
+			name: "shutdown timeout zero accepted (no timeout)",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"SHUTDOWN_TIMEOUT": "0s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, time.Duration(0), c.ShutdownTimeout)
+			},
+		},
+		{
+			name: "negative shutdown timeout rejected",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"SHUTDOWN_TIMEOUT": "-1s",
+			},
+			wantErr: "SHUTDOWN_TIMEOUT must be non-negative",
 		},
 		{
 			name: "rate limit both set is accepted",
