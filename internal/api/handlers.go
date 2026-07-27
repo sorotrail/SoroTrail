@@ -354,7 +354,9 @@ const recentDefaultLimit = 20
 func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) {
 	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		// Same mapping as the non-streaming path: naming an ungranted
+		// contract is a 403, not a malformed request.
+		writeFilterError(w, err)
 		return
 	}
 
