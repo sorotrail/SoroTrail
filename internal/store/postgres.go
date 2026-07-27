@@ -361,15 +361,10 @@ func (p *Postgres) EventExists(ctx context.Context, id string) (bool, error) {
 	return true, nil
 }
 
-func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
-	limit := f.Limit
-	if limit <= 0 {
-		limit = DefaultQueryLimit
-	}
-	if limit > MaxQueryLimit {
-		limit = MaxQueryLimit
-	}
-
+// buildEventWhereClause builds the WHERE clause and arguments shared by
+// QueryEvents and CountEvents. It does not include cursor, ordering, or
+// limit — those are page-specific concerns.
+func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	var (
 		where []string
 		args  []any
@@ -414,6 +409,23 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	}
 	if !f.ToTime.IsZero() {
 		where = append(where, "created_at <= "+arg(f.ToTime))
+	}
+	return where, args
+}
+
+func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+
+	where, args := buildEventWhereClause(f)
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
 	}
 
 	if !ValidOrderBy(f.OrderBy) {
@@ -497,6 +509,32 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		return nil, "", err
 	}
 	return events, next, nil
+}
+
+// CountEvents returns the total number of rows matching the filter,
+// ignoring pagination (cursor, order, and limit). It reuses the same
+// WHERE clause builder as QueryEvents so the two stay in lockstep.
+func (p *Postgres) CountEvents(ctx context.Context, f EventFilter) (int64, error) {
+	// Strip page-specific fields so the count represents the full match set.
+	f.Cursor = ""
+	f.Order = ""
+	f.OrderBy = ""
+	f.Limit = 0
+
+	where, args := buildEventWhereClause(f)
+	query := `SELECT count(*) FROM events`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+
+	var total int64
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, query, args...).Scan(&total)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("counting events: %w", err)
+	}
+	return total, nil
 }
 
 func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error) {

@@ -33,6 +33,10 @@ type stubStore struct {
 	queryErr   error
 	lastFilter store.EventFilter
 
+	totalCount      int64
+	countEventsErr  error
+	lastCountFilter store.EventFilter
+
 	event    store.Event
 	eventErr error
 
@@ -58,6 +62,11 @@ type stubStore struct {
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
 	s.lastFilter = f
 	return s.events, s.nextCursor, s.queryErr
+}
+
+func (s *stubStore) CountEvents(_ context.Context, f store.EventFilter) (int64, error) {
+	s.lastCountFilter = f
+	return s.totalCount, s.countEventsErr
 }
 
 // LedgerRangeCensus, ReplaceEventsInRange, and the audit_state/findings
@@ -332,6 +341,68 @@ func TestListEvents_TypeFilter(t *testing.T) {
 			assert.Equal(t, tt.want, st.lastFilter.Types)
 		})
 	}
+}
+
+func TestListEvents_TotalCountHeader(t *testing.T) {
+	t.Run("sets X-Total-Count when count succeeds", func(t *testing.T) {
+		st := &stubStore{
+			events:     []store.Event{{ID: "e1"}, {ID: "e2"}},
+			nextCursor: "e2",
+			totalCount: 42,
+		}
+		resp, _ := doGet(t, newTestServer(st, nil), "/events?contract_id="+testContract)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "42", resp.Header.Get("X-Total-Count"))
+	})
+
+	t.Run("count filter excludes pagination fields", func(t *testing.T) {
+		st := &stubStore{
+			events:     []store.Event{{ID: "e1"}},
+			totalCount: 10,
+		}
+		resp, _ := doGet(t, newTestServer(st, nil), "/events?cursor=old&limit=5&order=desc")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		// The count filter must have stripped cursor, order, order_by, and limit.
+		assert.Equal(t, "", st.lastCountFilter.Cursor)
+		assert.Equal(t, "", st.lastCountFilter.Order)
+		assert.Equal(t, "", st.lastCountFilter.OrderBy)
+		assert.Equal(t, 0, st.lastCountFilter.Limit)
+		// But filter conditions like contract_id should still be present.
+		assert.Equal(t, "", st.lastCountFilter.ContractID,
+			"contract_id was not in request, so count filter should not have it")
+	})
+
+	t.Run("count filter preserves query filters", func(t *testing.T) {
+		st := &stubStore{
+			events:     []store.Event{{ID: "e1"}},
+			totalCount: 5,
+		}
+		resp, _ := doGet(t, newTestServer(st, nil),
+			"/events?contract_id="+testContract+"&from_ledger=100&to_ledger=200")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, testContract, st.lastCountFilter.ContractID)
+		assert.Equal(t, int64(100), st.lastCountFilter.FromLedger)
+		assert.Equal(t, int64(200), st.lastCountFilter.ToLedger)
+	})
+
+	t.Run("omits X-Total-Count when count fails", func(t *testing.T) {
+		st := &stubStore{
+			events:         []store.Event{{ID: "e1"}},
+			countEventsErr: errors.New("count timeout"),
+		}
+		resp, _ := doGet(t, newTestServer(st, nil), "/events")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Empty(t, resp.Header.Get("X-Total-Count"))
+	})
+
+	t.Run("total count is zero for empty result set", func(t *testing.T) {
+		st := &stubStore{
+			totalCount: 0,
+		}
+		resp, _ := doGet(t, newTestServer(st, nil), "/events")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "0", resp.Header.Get("X-Total-Count"))
+	})
 }
 
 func TestListEvents_CursorAndLimitValidation(t *testing.T) {
