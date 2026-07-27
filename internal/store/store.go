@@ -87,7 +87,8 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
-	ContractID string
+	ContractID  string
+	ContractIDs []string
 	// Types filters by event type. Multiple values are accepted (ANDed
 	// together at the SQL level via type = ANY(...)). An empty or nil
 	// slice means "no constraint".

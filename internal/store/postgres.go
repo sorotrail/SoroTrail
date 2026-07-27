@@ -374,9 +374,9 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 		return fmt.Sprintf("$%d", len(args))
 	}
 	if len(f.ContractIDs) > 0 {
-		where = append(where, "contract_id = ANY("+arg(f.ContractIDs)+")")
+		where = append(where, "contract_id = ANY(\"+arg(f.ContractIDs)+\")")
 	} else if f.ContractID != "" {
-		where = append(where, "contract_id = "+arg(f.ContractID))
+		where = append(where, "contract_id = \"+arg(f.ContractID)+\"")
 	}
 	if len(f.Types) > 0 {
 		where = append(where, "type = ANY("+arg(f.Types)+")")
