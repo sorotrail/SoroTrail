@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/khaylebfortune/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/decode"
 )
 
 // scSymbol / scAddress / scU64 / scVec / buildContractEvent produce

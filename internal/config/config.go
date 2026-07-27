@@ -23,6 +23,7 @@ type Config struct {
 	RetentionLedgers      uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
 	PartitionLedgerSpan   uint32        `env:"PARTITION_LEDGER_SPAN" envDefault:"120960"`
 	LogLevel              string        `env:"LOG_LEVEL" envDefault:"info"`
+	LogFormat             string        `env:"LOG_FORMAT" envDefault:"text"`
 	APIQueryTimeout       time.Duration `env:"API_QUERY_TIMEOUT" envDefault:"25s"`
 	APISlowQueryThreshold time.Duration `env:"API_SLOW_QUERY_THRESHOLD" envDefault:"2s"`
 
@@ -87,6 +88,12 @@ type Config struct {
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
+
+	// CompressMinSize is the response body size, in bytes, at or above which
+	// responses are gzip/deflate encoded for clients that advertise support.
+	// Negative disables compression entirely; 0 uses api.CompressMinSize.
+	CompressMinSize int `env:"COMPRESS_MIN_SIZE" envDefault:"0"`
+
 	// CachePrivate flips the cacheable endpoints from Cache-Control: public
 	// to Cache-Control: private. Set this when the deployment serves
 	// per-user data behind an auth layer (#17, not yet merged) so shared
@@ -100,6 +107,39 @@ type Config struct {
 	// component shutdown may take before the process is killed. Zero means
 	// no timeout (wait indefinitely).
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"15s"`
+
+	// SweepConcurrency is the maximum number of filter batches that may be
+	// fetched concurrently during a windowSweep pass. The Stellar RPC's
+	// getEvents caps each request chain at 5 filters × 5 contracts = 25
+	// contracts, so anything beyond that needs multiple request chains
+	// paged through one ledger window — this knob lets us fan those out.
+	//
+	// Default is 1: the public RPC's interval limiter (HTTPClient's
+	// ~10 req/s ceiling) already serializes parallel calls, so a higher
+	// value only helps against private RPCs that allow more headroom.
+	// Anything below 1 is invalid.
+	SweepConcurrency int `env:"SWEEP_CONCURRENCY" envDefault:"1"`
+
+	// ReorgConfirmationWindow is the number of ledgers behind the ingest
+	// frontier that get re-scanned on a periodic basis to detect and
+	// repair RPC-side reorgs. Once a ledger is more than this many ledgers
+	// behind the frontier it is considered finalized and never rewritten.
+	// Zero means reorg detection is disabled.
+	ReorgConfirmationWindow uint32 `env:"REORG_CONFIRMATION_WINDOW" envDefault:"64"`
+
+	// ReorgRescanInterval is how often the ingester performs a reorg
+	// re-scan over the recent finalized window. The re-scan is folded
+	// into the existing ingest loop so it shares the RPC rate budget
+	// and never races live ingestion; this knob controls how often the
+	// window gets re-fetched, not how often the ingest loop polls.
+	ReorgRescanInterval time.Duration `env:"REORG_RESCAN_INTERVAL" envDefault:"1m"`
+
+	// ExportMaxRange caps the ledger span a /contracts/{id}/export call
+	// may request. The handler streams events from the store with
+	// chunked transfer encoding, but unbounded spans risk OOM and
+	// uncooperative GC pauses on big results; the cap is configurable so
+	// private deployments can opt for a larger analytical dump.
+	ExportMaxRange int64 `env:"EXPORT_MAX_RANGE" envDefault:"17280"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -147,6 +187,11 @@ func (c Config) Validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		return fmt.Errorf("LOG_LEVEL %q is not one of debug|info|warn|error", c.LogLevel)
+	}
+	switch strings.ToLower(c.LogFormat) {
+	case "text", "json":
+	default:
+		return fmt.Errorf("LOG_FORMAT %q is not one of text|json", c.LogFormat)
 	}
 	for _, id := range c.WatchedContracts {
 		if !ValidContractID(id) {
@@ -197,6 +242,15 @@ func (c Config) Validate() error {
 	}
 	if c.ShutdownTimeout < 0 {
 		return fmt.Errorf("SHUTDOWN_TIMEOUT must be non-negative, got %s", c.ShutdownTimeout)
+	}
+	if c.SweepConcurrency < 1 {
+		return fmt.Errorf("SWEEP_CONCURRENCY must be positive, got %d", c.SweepConcurrency)
+	}
+	if c.ReorgConfirmationWindow > 0 && c.ReorgRescanInterval <= 0 {
+		return fmt.Errorf("REORG_RESCAN_INTERVAL must be positive when REORG_CONFIRMATION_WINDOW is set")
+	}
+	if c.ExportMaxRange <= 0 {
+		return fmt.Errorf("EXPORT_MAX_RANGE must be positive, got %d", c.ExportMaxRange)
 	}
 	// Both must be set together: half-configured limits would silently
 	// behave like the disabled case (Enabled returns false when either is
@@ -273,6 +327,10 @@ func (c Config) LoggableFields() []any {
 		"http_idle_timeout", c.HTTPIdleTimeout,
 		"http_read_header_timeout", c.HTTPReadHeaderTimeout,
 		"shutdown_timeout", c.ShutdownTimeout,
+		"sweep_concurrency", c.SweepConcurrency,
+		"reorg_confirmation_window", c.ReorgConfirmationWindow,
+		"reorg_rescan_interval", c.ReorgRescanInterval,
+		"export_max_range", c.ExportMaxRange,
 		"audit_enabled", c.AuditEnabled,
 	}
 }
