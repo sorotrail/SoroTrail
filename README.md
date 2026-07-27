@@ -393,6 +393,67 @@ remaining query parameters.
 curl -s localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/events?limit=10
 ```
 
+### `GET /contracts/{id}/export`
+
+Streams a contract's stored events for a closed ledger range as an
+`attachment` download. Either `csv` (default) or `ndjson` is supported
+via `?format=csv|ndjson`. Ledger bounds are required; ranges larger
+than `EXPORT_MAX_RANGE` (default `17280` ledgers, roughly 24h) return
+`400` with the bound included in the error.
+
+```sh
+# CSV — id, ledger, type, tx_hash, topics (JSON string), value (JSON string)
+curl -OJ 'localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/export?from_ledger=250000&to_ledger=260000'
+
+# NDJSON — one event object per line, same shape as /events
+curl -OJ 'localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/export?from_ledger=250000&to_ledger=260000&format=ndjson'
+```
+
+The response carries
+`Content-Disposition: attachment; filename="<id>-ledgers-<from>-<to>.<format>"`
+so downloads land under intuitive file names, and `Cache-Control: no-store`
+keeps stale browser caches from freezing a snapshot. The store is queried
+in fixed-size pages (`200` rows, at the `MaxQueryLimit` ceiling), so
+memory usage stays bounded regardless of the ledger span.
+
+### Ingestion behavior additions
+
+- **Parallel sweeps** (`SWEEP_CONCURRENCY`, default `1`): deployments
+  watching more than the per-request 25 contracts split the filter set
+  into multiple request chains paged through each `SweepWindow` ledger
+  span. With the default the chains are still issued sequentially;
+  raise `SWEEP_CONCURRENCY` against a private RPC to fan the chains
+  out via bounded concurrency. The HTTPClient's interval limiter caps
+  total request rate at ~10 req/s regardless, so the parallelism only
+  helps when the RPC has headroom past the public ceiling. The
+  single-batch path (`<=25` watched contracts) is unchanged.
+- **Reorg detection** (`REORG_CONFIRMATION_WINDOW`, default `64`): after
+  every successful ingest cycle the Run loop re-fetches the range
+  `[frontier - REORG_CONFIRMATION_WINDOW, frontier - 1]` and replaces
+  any drift via the auditor's transactional delete + insert repair
+  (`ReplaceEventsInRange`). Rows past the window are treated as
+  **finalized** and never rewritten — once a ledger stays more than
+  `REORG_CONFIRMATION_WINDOW` behind the ingest frontier the re-scan
+  can no longer mutate its rows. Set `REORG_CONFIRMATION_WINDOW=0` to
+  disable the re-scan entirely.
+
+### Graceful shutdown
+
+A SIGINT or SIGTERM cancels the root context, which propagates into:
+
+- The HTTP server: `Shutdown` holds open connections while they finish
+  their current request, bounded by `SHUTDOWN_TIMEOUT` (default `15s`).
+- The ingester: `Run` lets the current `runOnce` cycle wind down to its
+  next iteration boundary, then returns `context.Canceled`.
+  `ingestion_state` is only advanced at the end of a successful cycle,
+  so a cancelled cycle leaves the frontier at the last fully-persisted
+  ledger; restart resumes from there with idempotent upserts covering
+  any in-flight rows on the next pass.
+
+This guarantees no panics and no truncated writes on `Ctrl-C` / `kill`,
+and the cursor is always persisted so the next process picks up exactly
+where the previous one stopped.
+
 ### Webhooks
 
 Consumers can register callback URLs that receive matching events as they are
@@ -825,8 +886,9 @@ make lint         # golangci-lint
 make migrate-up   # apply migrations manually (needs the migrate CLI)
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture notes and extension
-points.
+See [docs/architecture.md](docs/architecture.md) for the full system architecture
+diagram and component descriptions. [CONTRIBUTING.md](CONTRIBUTING.md) covers extension
+points and development conventions.
 
 ## Roadmap / future work
 
@@ -834,9 +896,9 @@ Deliberately out of scope for the MVP, with seams left for contributors:
 
 - Per-standard event decoders (e.g. SEP-41 token transfers) on top of
   `decode.Decoder`.
-- Support for more than 25 watched contracts per request chain is implemented
-  via windowed sweeps; smarter scheduling (parallel sweeps, per-contract
-  cursors) is welcome.
+- Per-contract cursors (mesh-point for the parallel sweep redesign:
+  the scheduler is now parallel but still shares one cursor per
+  window).
 - GraphQL / websocket subscriptions.
 - Metrics (Prometheus) and tracing.
 - Alternative storage backends behind `store.Store`.

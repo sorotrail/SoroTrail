@@ -110,7 +110,7 @@ func (s *Server) SetCompressMinSize(n int) {
 	s.compressMinSize = n
 }
 
-// New builds the API server. rpcClient is only used by /health.
+// New builds the API server. rpcClient is used by /health, /readyz, and /stats.
 // apiKey gates the watched-contracts management endpoints; pass "" to
 // fail closed (every request gets a 503 with "API_KEY not configured").
 // See apiKeyAuth for the exact contract. The trailing enricher is optional —
@@ -171,6 +171,13 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 	return s
 }
 
+// SetExportMaxRange caps the ledger span a /contracts/{id}/export call
+// may request. Zero means no cap (the handler still validates range fits
+// the requested bound, but won't reject on span alone). The config layer
+// exposes EXPORT_MAX_RANGE; pass it through so an operator can tune
+// analytical workloads without code changes.
+func (s *Server) SetExportMaxRange(n int64) { s.exportMaxRange = n }
+
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
@@ -209,12 +216,16 @@ func (s *Server) Router() http.Handler {
 	}
 
 	r.Get("/health", s.handleHealth)
+	r.Get("/livez", s.handleLivez)
+	r.Get("/readyz", s.handleReadyz)
 	r.Get("/version", s.handleVersion)
 	r.Handle("/metrics", s.metrics.Handler())
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/count", s.handleCountEvents)
+	r.Get("/events/{id}/raw", s.handleGetEventRaw)
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
+	r.Get("/contracts/{id}/export", s.handleContractExport)
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
 

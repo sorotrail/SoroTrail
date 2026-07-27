@@ -221,6 +221,15 @@ func (c Config) Validate() error {
 	if c.ShutdownTimeout < 0 {
 		return fmt.Errorf("SHUTDOWN_TIMEOUT must be non-negative, got %s", c.ShutdownTimeout)
 	}
+	if c.SweepConcurrency < 1 {
+		return fmt.Errorf("SWEEP_CONCURRENCY must be positive, got %d", c.SweepConcurrency)
+	}
+	if c.ReorgConfirmationWindow > 0 && c.ReorgRescanInterval <= 0 {
+		return fmt.Errorf("REORG_RESCAN_INTERVAL must be positive when REORG_CONFIRMATION_WINDOW is set")
+	}
+	if c.ExportMaxRange <= 0 {
+		return fmt.Errorf("EXPORT_MAX_RANGE must be positive, got %d", c.ExportMaxRange)
+	}
 	// Both must be set together: half-configured limits would silently
 	// behave like the disabled case (Enabled returns false when either is
 	// non-positive), which would confuse operators who set one and
@@ -312,6 +321,10 @@ func (c Config) LoggableFields() []any {
 		"http_idle_timeout", c.HTTPIdleTimeout,
 		"http_read_header_timeout", c.HTTPReadHeaderTimeout,
 		"shutdown_timeout", c.ShutdownTimeout,
+		"sweep_concurrency", c.SweepConcurrency,
+		"reorg_confirmation_window", c.ReorgConfirmationWindow,
+		"reorg_rescan_interval", c.ReorgRescanInterval,
+		"export_max_range", c.ExportMaxRange,
 		"audit_enabled", c.AuditEnabled,
 	}
 }
