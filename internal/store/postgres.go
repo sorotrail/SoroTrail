@@ -65,6 +65,24 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	batch := &pgx.Batch{}
+	// events PK is (ledger, id) — see migration 0004_partition_events, which
+	// re-keyed the table to satisfy PostgreSQL's partitioned-table requirement
+	// that the partition key be part of any unique/primary constraint.
+	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
+	if onUpdate {
+		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
+			contract_id         = EXCLUDED.contract_id,
+			type                = EXCLUDED.type,
+			tx_hash             = EXCLUDED.tx_hash,
+			tx_index            = EXCLUDED.tx_index,
+			op_index            = EXCLUDED.op_index,
+			in_successful_call  = EXCLUDED.in_successful_call,
+			topics              = EXCLUDED.topics,
+			value               = EXCLUDED.value,
+			created_at          = EXCLUDED.created_at,
+			raw_topic_xdr       = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr       = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+	}
 	sql := `
 		INSERT INTO events
 			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
