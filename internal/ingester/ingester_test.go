@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 func testLogger() *slog.Logger {
@@ -216,12 +216,12 @@ func TestPersistEvents_RetainsRawXDR(t *testing.T) {
 }
 
 func TestFilterBatching(t *testing.T) {
-	watch := func(n int) []string {
-		ids := make([]string, n)
-		for i := range ids {
-			ids[i] = fmt.Sprintf("C%055d", i)
+	watch := func(n int) []store.WatchedContract {
+		out := make([]store.WatchedContract, n)
+		for i := range out {
+			out[i] = store.WatchedContract{ContractID: fmt.Sprintf("C%055d", i)}
 		}
-		return ids
+		return out
 	}
 
 	t.Run("no watched contracts means one match-all filter", func(t *testing.T) {
@@ -262,7 +262,8 @@ func TestFilterBatching(t *testing.T) {
 func TestWindowSweep_MultiBatch(t *testing.T) {
 	st := newMockStore()
 	for i := 0; i < 27; i++ {
-		st.watched = append(st.watched, fmt.Sprintf("C%055d", i))
+		st.watched = append(st.watched,
+			store.WatchedContract{ContractID: fmt.Sprintf("C%055d", i)})
 	}
 	client := &mockRPC{
 		health: rpc.Health{Status: "healthy", LatestLedger: 5_000, OldestLedger: 10},
@@ -324,4 +325,93 @@ func TestRun_StopsOnContextCancel(t *testing.T) {
 	cancel()
 	err := ing.Run(ctx)
 	assert.ErrorIs(t, err, context.Canceled)
+}
+
+// The runtime API mutates the watched_contracts table mid-run. The
+// ingester's next runOnce must re-read the watch list and issue
+// getEvents with the new filter contractIds — no restart required.
+func TestIngester_PicksUpRuntimeWatchListChange(t *testing.T) {
+	contractB := "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+	contractC := "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+
+	// Two scripted responses: first when the watch list contains only A,
+	// then when the runtime POST adds B between passes.
+	client := &mockRPC{
+		eventsResps: []rpc.GetEventsResponse{
+			{Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 100},
+			{Events: []rpc.Event{rpcEvent("e2", 101)}, LatestLedger: 101},
+		},
+	}
+	st := newMockStore()
+	require.NoError(t, st.AddWatchedContract(context.Background(),
+		"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"))
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
+
+	// Pass 1: list has only A.
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+	require.Len(t, client.eventsRequests, 1)
+	req1 := client.eventsRequests[0]
+	require.Len(t, req1.Filters, 1)
+	require.Len(t, req1.Filters[0].ContractIDs, 1)
+	assert.Equal(t,
+		"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		req1.Filters[0].ContractIDs[0],
+		"first pass issues a filter for A only")
+
+	// Operator POSTs B and C; ingester does not know about this directly
+	// — it just re-reads the list on the next pass.
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractB))
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractC))
+	require.NoError(t, st.SaveIngestionState(context.Background(),
+		store.IngestionState{LastIngestedLedger: 100}))
+
+	// Pass 2: list has A, B, C. Without a restart, runOnce should pick
+	// up the new IDs and issue a single batch carrying all three.
+	_, err = ing.runOnce(context.Background())
+	require.NoError(t, err)
+	require.Len(t, client.eventsRequests, 2,
+		"the second pass must issue a fresh getEvents — the previous response was already consumed")
+	req2 := client.eventsRequests[1]
+	require.Len(t, req2.Filters, 1, "three contracts still fit one filter (cap is 5)")
+	assert.ElementsMatch(t,
+		[]string{
+			"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+			contractB, contractC,
+		},
+		req2.Filters[0].ContractIDs,
+		"second pass picks up the newly-added contracts WITHOUT a restart")
+}
+
+// Symmetric coverage in the other direction: removing the only watched
+// contract changes the filter shape from \"specific\" to \"all contracts\".
+func TestIngester_PicksUpRuntimeWatchListRemoval(t *testing.T) {
+	contractA := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	client := &mockRPC{
+		eventsResps: []rpc.GetEventsResponse{
+			{Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 100},
+			{Events: []rpc.Event{rpcEvent("e2", 101)}, LatestLedger: 101},
+		},
+	}
+	st := newMockStore()
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+	require.Len(t, st.watched, 1)
+
+	// Operator DELETE's A; list transitions to empty.
+	require.NoError(t, st.RemoveWatchedContract(context.Background(), contractA))
+	require.NoError(t, st.SaveIngestionState(context.Background(),
+		store.IngestionState{LastIngestedLedger: 100}))
+
+	_, err = ing.runOnce(context.Background())
+	require.NoError(t, err)
+	require.Len(t, client.eventsRequests, 2)
+	req2 := client.eventsRequests[1]
+	require.Len(t, req2.Filters, 1)
+	assert.Empty(t, req2.Filters[0].ContractIDs,
+		"empty watch list means ingest-all: contractIds must be empty")
+	assert.Equal(t, "contract", req2.Filters[0].Type)
 }

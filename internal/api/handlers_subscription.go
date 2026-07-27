@@ -9,7 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // --- Subscription CRUD handlers ---
@@ -49,7 +49,7 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 	}
 	created, err := s.store.CreateSubscription(r.Context(), sub)
 	if err != nil {
-		s.log.Error("creating subscription", "error", err)
+		loggerFromContext(r.Context()).Error("creating subscription", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("creating subscription failed"))
 		return
 	}
@@ -68,7 +68,7 @@ func (s *Server) handleGetSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.log.Error("getting subscription", "id", id, "error", err)
+		loggerFromContext(r.Context()).Error("getting subscription", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("getting subscription failed"))
 		return
 	}
@@ -78,7 +78,7 @@ func (s *Server) handleGetSubscription(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListSubscriptions(w http.ResponseWriter, r *http.Request) {
 	subs, err := s.store.ListSubscriptions(r.Context())
 	if err != nil {
-		s.log.Error("listing subscriptions", "error", err)
+		loggerFromContext(r.Context()).Error("listing subscriptions", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing subscriptions failed"))
 		return
 	}
@@ -105,7 +105,7 @@ func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if err != nil {
-		s.log.Error("getting subscription for update", "id", id, "error", err)
+		loggerFromContext(r.Context()).Error("getting subscription for update", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("getting subscription failed"))
 		return
 	}
@@ -135,7 +135,7 @@ func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request
 
 	updated, err := s.store.UpdateSubscription(r.Context(), existing)
 	if err != nil {
-		s.log.Error("updating subscription", "id", id, "error", err)
+		loggerFromContext(r.Context()).Error("updating subscription", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("updating subscription failed"))
 		return
 	}
@@ -153,7 +153,7 @@ func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusNotFound, fmt.Errorf("subscription %d not found", id))
 			return
 		}
-		s.log.Error("deleting subscription", "id", id, "error", err)
+		loggerFromContext(r.Context()).Error("deleting subscription", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("deleting subscription failed"))
 		return
 	}
@@ -175,11 +175,11 @@ func (s *Server) handleListDeliveries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limit := 50
+	limit := store.DefaultQueryLimit
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		l, err := strconv.Atoi(raw)
-		if err != nil || l <= 0 || l > 200 {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,200]"))
+		if err != nil || l < 1 || l > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
 			return
 		}
 		limit = l
@@ -187,7 +187,7 @@ func (s *Server) handleListDeliveries(w http.ResponseWriter, r *http.Request) {
 
 	attempts, err := s.store.ListDeliveryAttempts(r.Context(), id, limit)
 	if err != nil {
-		s.log.Error("listing delivery attempts", "subscription_id", id, "error", err)
+		loggerFromContext(r.Context()).Error("listing delivery attempts", "subscription_id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing delivery attempts failed"))
 		return
 	}
