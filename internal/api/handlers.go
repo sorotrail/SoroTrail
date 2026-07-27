@@ -258,6 +258,43 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, resp)
 }
 
+// handleLivez is the liveness probe. It returns 200 as long as the process
+// is running. No dependencies are checked — a transient DB or RPC outage
+// must not cause orchestration to kill and restart the pod (readiness is
+// a separate signal).
+func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Checks: map[string]string{"process": "ok"}})
+}
+
+// handleReadyz is the readiness probe. It performs a bounded DB ping and
+// RPC head check. Returns 200 when all dependencies are reachable, 503
+// with a JSON body explaining which dependency is down.
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok", "rpc": "ok"}}
+	status := http.StatusOK
+
+	if err := s.store.Ping(ctx); err != nil {
+		resp.Status = "degraded"
+		resp.Checks["database"] = err.Error()
+		status = http.StatusServiceUnavailable
+	}
+	if health, err := s.rpc.GetHealth(ctx); err != nil {
+		resp.Status = "degraded"
+		resp.Checks["rpc"] = err.Error()
+		status = http.StatusServiceUnavailable
+	} else if health.Status != "healthy" {
+		resp.Status = "degraded"
+		resp.Checks["rpc"] = fmt.Sprintf("rpc reports %q", health.Status)
+		status = http.StatusServiceUnavailable
+	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, status, resp)
+}
+
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, versionResponse{

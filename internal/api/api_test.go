@@ -605,6 +605,86 @@ func TestHealth(t *testing.T) {
 	})
 }
 
+func TestLivez(t *testing.T) {
+	t.Run("always 200", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/livez")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+
+	t.Run("200 even during transient db outage", func(t *testing.T) {
+		st := &stubStore{pingErr: errors.New("connection refused")}
+		resp, _ := doGet(t, newTestServer(st, nil), "/livez")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+
+	t.Run("200 even during transient rpc outage", func(t *testing.T) {
+		rc := &stubRPC{healthErr: errors.New("rpc unreachable")}
+		resp, _ := doGet(t, newTestServer(&stubStore{}, rc), "/livez")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+
+	t.Run("no-store cache header", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/livez")
+		assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	})
+
+	t.Run("returns ok status", func(t *testing.T) {
+		_, body := doGet(t, newTestServer(&stubStore{}, nil), "/livez")
+		var h healthResponse
+		require.NoError(t, json.Unmarshal(body, &h))
+		assert.Equal(t, "ok", h.Status)
+	})
+}
+
+func TestReadyz(t *testing.T) {
+	t.Run("all healthy", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/readyz")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+
+	t.Run("db down returns 503 with reason", func(t *testing.T) {
+		st := &stubStore{pingErr: errors.New("connection refused")}
+		resp, body := doGet(t, newTestServer(st, nil), "/readyz")
+		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+		var h healthResponse
+		require.NoError(t, json.Unmarshal(body, &h))
+		assert.Equal(t, "degraded", h.Status)
+		assert.Contains(t, h.Checks["database"], "connection refused")
+		// RPC is still ok in this test.
+		assert.Equal(t, "ok", h.Checks["rpc"])
+	})
+
+	t.Run("rpc down returns 503 with reason", func(t *testing.T) {
+		rc := &stubRPC{healthErr: errors.New("rpc unreachable")}
+		resp, body := doGet(t, newTestServer(&stubStore{}, rc), "/readyz")
+		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+		var h healthResponse
+		require.NoError(t, json.Unmarshal(body, &h))
+		assert.Equal(t, "degraded", h.Status)
+		assert.Contains(t, h.Checks["rpc"], "rpc unreachable")
+	})
+
+	t.Run("rpc unhealthy status returns 503", func(t *testing.T) {
+		rc := &stubRPC{health: rpc.Health{Status: "unhealthy"}}
+		resp, body := doGet(t, newTestServer(&stubStore{}, rc), "/readyz")
+		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+		var h healthResponse
+		require.NoError(t, json.Unmarshal(body, &h))
+		assert.Equal(t, "degraded", h.Status)
+		assert.Contains(t, h.Checks["rpc"], `rpc reports "unhealthy"`)
+	})
+
+	t.Run("no-store cache header", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/readyz")
+		assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	})
+
+	t.Run("json content type", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/readyz")
+		assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+	})
+}
+
 func TestListEvents_FieldsProjection(t *testing.T) {
 	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	st := &stubStore{
