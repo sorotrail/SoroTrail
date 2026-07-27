@@ -12,11 +12,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
-	"github.com/khaylebfortune/sorotrail/internal/audit"
-	"github.com/khaylebfortune/sorotrail/internal/broadcast"
-	"github.com/khaylebfortune/sorotrail/internal/ingester"
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/audit"
+	"github.com/sorotrail/sorotrail/internal/broadcast"
+	"github.com/sorotrail/sorotrail/internal/metrics"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 type ctxKey string
@@ -108,6 +108,7 @@ type Server struct {
 	limiter   *RateLimiter
 	recoverer *Recoverer
 	bcast     *broadcast.Broadcaster
+	metrics   *metrics.HTTPMetrics
 	// compressMinSize is the body size at which responses start being
 	// compressed. The zero value means CompressMinSize, so compression is on
 	// by default; negative disables the middleware entirely.
@@ -126,7 +127,7 @@ func (s *Server) SetCompressMinSize(n int) {
 // See apiKeyAuth for the exact contract. The trailing enricher is optional —
 // pass nil to disable spec decoding, or one Enricher to enable it.
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log)}
+	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New()}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
@@ -152,6 +153,7 @@ func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
+	r.Use(s.metrics.Middleware)
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 	// Compression sits outside the limiter so a 429 is written through the
@@ -170,6 +172,7 @@ func (s *Server) Router() http.Handler {
 
 	r.Get("/health", s.handleHealth)
 	r.Get("/version", s.handleVersion)
+	r.Handle("/metrics", s.metrics.Handler())
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
