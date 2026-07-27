@@ -1206,6 +1206,7 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	f := store.EventFilter{
 		ContractID: q.Get("contract_id"),
 		Cursor:     q.Get("cursor"),
+		TxHash:     q.Get("tx_hash"),
 		Scope:      scopeFrom(r.Context()),
 	}
 
