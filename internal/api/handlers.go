@@ -522,6 +522,61 @@ func parseFilterAndFields(r *http.Request) (store.EventFilter, map[string]bool, 
 	return filter, fields, nil
 }
 
+// rawEventResponse is the JSON body for GET /events/{id}/raw.
+type rawEventResponse struct {
+	TopicsXDR []string `json:"topics_xdr"`
+	ValueXDR  string   `json:"value_xdr,omitempty"`
+}
+
+// handleGetEventRaw returns the stored raw topic/value XDR for an event.
+// Returns 404 if the event is not found or no raw XDR was stored (e.g. the
+// RPC returned already-decoded JSON for this row).
+func (s *Server) handleGetEventRaw(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	event, err := s.store.GetEvent(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
+		return
+	}
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading event for raw XDR", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
+		return
+	}
+
+	// Return 404 when no raw XDR was stored for this event.
+	if len(event.RawTopicXDR) == 0 && event.RawValueXDR == "" {
+		writeError(w, http.StatusNotFound, fmt.Errorf("event %q has no raw XDR stored", id))
+		return
+	}
+
+	// Strong ETag: the event ID is a perfect validator for an immutable
+	// resource. The same reuse logic as handleGetEvent.
+	etag := `"` + id + `"`
+
+	if ifNoneMatch(r, etag) {
+		exists, err := s.store.EventExists(r.Context(), id)
+		if err != nil {
+			loggerFromContext(r.Context()).Error("checking event existence for raw XDR", "id", id, "error", err)
+			writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
+			return
+		}
+		if !exists {
+			writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
+			return
+		}
+		writeNotModified(w, etag, cacheImmutable)
+		return
+	}
+
+	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+	writeJSON(w, http.StatusOK, rawEventResponse{
+		TopicsXDR: event.RawTopicXDR,
+		ValueXDR:  event.RawValueXDR,
+	})
+}
+
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
