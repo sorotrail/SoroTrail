@@ -273,8 +273,10 @@ Query parameters (all optional, combinable):
 | `topic3` | `{"u64":7}` | Exact match against topic position 3. |
 | `from_ledger` | `250000` | Inclusive lower ledger bound. |
 | `to_ledger` | `260000` | Inclusive upper ledger bound. |
-| `from_time` | `2026-07-21T00:00:00Z` | Inclusive lower `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
-| `to_time` | `2026-07-22T00:00:00Z` | Inclusive upper `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
+| `from_time` | `2026-07-21T00:00:00Z` | Inclusive lower `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. Alias: `created_after`. |
+| `to_time` | `2026-07-22T00:00:00Z` | Inclusive upper `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. Alias: `created_before`. |
+| `created_after` | `2026-07-21T00:00:00Z` | Alias for `from_time` — inclusive lower `created_at` bound (RFC 3339). Cannot be combined with `from_time`. |
+| `created_before` | `2026-07-22T00:00:00Z` | Alias for `to_time` — inclusive upper `created_at` bound (RFC 3339). Cannot be combined with `to_time`. |
 | `limit` | `50` | Page size, 1–200 (default 50). |
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
 | `order` | `desc` | `asc` \| `desc`, defaults to asc. Sort direction. |

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1075,7 +1076,8 @@ func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 }
 
 // filterFromQuery parses the shared event-filter query params:
-// contract_id, type, topic, from_ledger, to_ledger, from_time, to_time, cursor, limit.
+// contract_id, type, topic, from_ledger, to_ledger, from_time, to_time,
+// created_after, created_before, cursor, limit.
 func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	q := r.URL.Query()
 	f := store.EventFilter{
@@ -1182,14 +1184,14 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("from_ledger %d is after to_ledger %d", f.FromLedger, f.ToLedger)
 	}
 
-	if f.FromTime, err = parseTimeParam(q.Get("from_time"), "from_time"); err != nil {
+	if f.FromTime, err = parseTimeFilterParam(q, "from_time", "created_after"); err != nil {
 		return f, err
 	}
-	if f.ToTime, err = parseTimeParam(q.Get("to_time"), "to_time"); err != nil {
+	if f.ToTime, err = parseTimeFilterParam(q, "to_time", "created_before"); err != nil {
 		return f, err
 	}
 	if !f.FromTime.IsZero() && !f.ToTime.IsZero() && f.FromTime.After(f.ToTime) {
-		return f, fmt.Errorf("from_time %s is after to_time %s",
+		return f, fmt.Errorf("created_at lower bound %s is after upper bound %s",
 			f.FromTime.Format(time.RFC3339), f.ToTime.Format(time.RFC3339))
 	}
 
@@ -1235,6 +1237,20 @@ func parseLedgerParam(raw, name string) (int64, error) {
 		return 0, fmt.Errorf("%s must be a positive integer", name)
 	}
 	return n, nil
+}
+
+// parseTimeFilterParam parses an RFC 3339 timestamp from either the primary
+// param name or an alias. Setting both is rejected.
+func parseTimeFilterParam(q url.Values, primary, alias string) (time.Time, error) {
+	primaryRaw := q.Get(primary)
+	aliasRaw := q.Get(alias)
+	if primaryRaw != "" && aliasRaw != "" {
+		return time.Time{}, fmt.Errorf("%s cannot be combined with %s", alias, primary)
+	}
+	if primaryRaw != "" {
+		return parseTimeParam(primaryRaw, primary)
+	}
+	return parseTimeParam(aliasRaw, alias)
 }
 
 // parseTimeParam parses an RFC 3339 timestamp query parameter.
