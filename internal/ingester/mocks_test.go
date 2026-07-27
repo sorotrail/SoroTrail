@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"sync"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // mockRPC scripts getEvents responses in order and records the requests it
@@ -53,7 +53,7 @@ type mockStore struct {
 	mu       sync.Mutex
 	events   map[string]store.Event
 	state    *store.IngestionState
-	watched  []string
+	watched  []store.WatchedContract
 	upserted [][]store.Event
 }
 
@@ -113,6 +113,10 @@ func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Eve
 	return nil, "", nil
 }
 
+func (m *mockStore) CountEvents(context.Context, store.EventFilter) (int64, error) {
+	return 0, nil
+}
+
 // LedgerRangeCensus is unused by ingester tests but needed to satisfy
 // the expanded store.Store interface.
 func (m *mockStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]store.LedgerCensus, error) {
@@ -158,13 +162,23 @@ func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState
 	return nil
 }
 
-func (m *mockStore) ListWatchedContracts(context.Context) ([]string, error) {
+func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return m.watched, nil
 }
 
 func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
-	m.watched = append(m.watched, id)
+	m.watched = append(m.watched, store.WatchedContract{ContractID: id})
 	return nil
+}
+
+func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
+	for i, wc := range m.watched {
+		if wc.ContractID == id {
+			m.watched = append(m.watched[:i], m.watched[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrNotFound
 }
 
 func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
