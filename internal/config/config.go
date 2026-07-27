@@ -23,6 +23,7 @@ type Config struct {
 	RetentionLedgers      uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
 	PartitionLedgerSpan   uint32        `env:"PARTITION_LEDGER_SPAN" envDefault:"120960"`
 	LogLevel              string        `env:"LOG_LEVEL" envDefault:"info"`
+	LogFormat             string        `env:"LOG_FORMAT" envDefault:"text"`
 	APIQueryTimeout       time.Duration `env:"API_QUERY_TIMEOUT" envDefault:"25s"`
 	APISlowQueryThreshold time.Duration `env:"API_SLOW_QUERY_THRESHOLD" envDefault:"2s"`
 
@@ -141,6 +142,11 @@ func (c Config) Validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		return fmt.Errorf("LOG_LEVEL %q is not one of debug|info|warn|error", c.LogLevel)
+	}
+	switch strings.ToLower(c.LogFormat) {
+	case "text", "json":
+	default:
+		return fmt.Errorf("LOG_FORMAT %q is not one of text|json", c.LogFormat)
 	}
 	for _, id := range c.WatchedContracts {
 		if !ValidContractID(id) {
