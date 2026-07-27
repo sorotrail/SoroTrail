@@ -110,8 +110,15 @@ type EventFilter struct {
 	TopicContains json.RawMessage
 	// TxHash filters events emitted by a specific transaction hash.
 	TxHash     string    // hex-encoded transaction hash
+	// TxIndex is an exact-match filter on the transaction index within a
+	// ledger. A nil pointer means "no constraint". Use TxIndexToPtr for
+	// inline construction of a non-nil pointer from a literal.
+	TxIndex    *int32    // exact match on tx index, nil = unset
+	// OpIndex is an exact-match filter on the operation index within a
+	// transaction. A nil pointer means "no constraint".
+	OpIndex    *int32    // exact match on op index, nil = unset
 	FromLedger int64     // inclusive
-	ToLedger   int64     // inclusive
+	ToLedger   int64     // inclusive, zero = no constraint
 	FromTime   time.Time // inclusive, zero = no constraint
 	ToTime     time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.

@@ -586,6 +586,12 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	if f.TxHash != "" {
 		where = append(where, "tx_hash = "+arg(f.TxHash))
 	}
+	if f.TxIndex != nil {
+		where = append(where, "tx_index = "+arg(*f.TxIndex))
+	}
+	if f.OpIndex != nil {
+		where = append(where, "op_index = "+arg(*f.OpIndex))
+	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))
 	}

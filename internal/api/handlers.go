@@ -1236,6 +1236,8 @@ func listETag(f store.EventFilter) string {
 		Topic3        json.RawMessage `json:"p3,omitempty"`
 		TopicContains json.RawMessage `json:"pc,omitempty"`
 		TxHash        string          `json:"th,omitempty"`
+		TxIndex       *int32          `json:"txi,omitempty"`
+		OpIndex       *int32          `json:"opi,omitempty"`
 		FromLedger    int64           `json:"fl"`
 		ToLedger      int64           `json:"tl"`
 		FromTime      string          `json:"ft,omitempty"`
@@ -1256,6 +1258,8 @@ func listETag(f store.EventFilter) string {
 		Topic3:        f.Topic3,
 		TopicContains: f.TopicContains,
 		TxHash:        f.TxHash,
+		TxIndex:       f.TxIndex,
+		OpIndex:       f.OpIndex,
 		FromLedger:    f.FromLedger,
 		ToLedger:      f.ToLedger,
 		FromTime:      timeOrEmpty(f.FromTime),
@@ -1374,6 +1378,10 @@ func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 	w.WriteHeader(http.StatusNotModified)
 }
 
+// int32Ptr is a helper to return a pointer to an int32 value.
+// Used when parsing optional query params that have a valid zero value.
+func int32Ptr(v int32) *int32 { return &v }
+
 // filterFromQuery parses the shared event-filter query params:
 // contract_id, type, topic, from_ledger, to_ledger, from_time, to_time, cursor, limit.
 func filterFromQuery(r *http.Request) (store.EventFilter, error) {
@@ -1390,6 +1398,21 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
 		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
+	}
+
+	if rawTx := q.Get("tx_index"); rawTx != "" {
+		txIdx, err := strconv.Atoi(rawTx)
+		if err != nil || txIdx < 0 {
+			return f, fmt.Errorf("invalid tx_index %q (want a non-negative integer)", rawTx)
+		}
+		f.TxIndex = int32Ptr(int32(txIdx))
+	}
+	if rawOp := q.Get("op_index"); rawOp != "" {
+		opIdx, err := strconv.Atoi(rawOp)
+		if err != nil || opIdx < 0 {
+			return f, fmt.Errorf("invalid op_index %q (want a non-negative integer)", rawOp)
+		}
+		f.OpIndex = int32Ptr(int32(opIdx))
 	}
 
 	if raw := q.Get("type"); raw != "" {
