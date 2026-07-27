@@ -15,6 +15,10 @@ import (
 // ErrNotFound is returned when a lookup matches no rows.
 var ErrNotFound = errors.New("not found")
 
+// ErrInvalidCursor is returned when a pagination cursor is malformed for the
+// requested ordering. It is caller error: the API maps it to 400, not 500.
+var ErrInvalidCursor = errors.New("invalid cursor")
+
 // DefaultQueryLimit applies when EventFilter.Limit is unset; MaxQueryLimit
 // caps requested page sizes.
 const (
@@ -357,15 +361,10 @@ func (p *Postgres) EventExists(ctx context.Context, id string) (bool, error) {
 	return true, nil
 }
 
-func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
-	limit := f.Limit
-	if limit <= 0 {
-		limit = DefaultQueryLimit
-	}
-	if limit > MaxQueryLimit {
-		limit = MaxQueryLimit
-	}
-
+// buildEventWhereClause builds the WHERE clause and arguments shared by
+// QueryEvents and CountEvents. It does not include cursor, ordering, or
+// limit — those are page-specific concerns.
+func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	var (
 		where []string
 		args  []any
@@ -396,6 +395,9 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		// array for element match, multi-element arrays for subset match).
 		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
 	}
+	if f.TxHash != "" {
+		where = append(where, "tx_hash = "+arg(f.TxHash))
+	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))
 	}
@@ -408,10 +410,27 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if !f.ToTime.IsZero() {
 		where = append(where, "created_at <= "+arg(f.ToTime))
 	}
+	return where, args
+}
 
-	// if f.Cursor != "" {
-	// 	where = append(where, "id > "+arg(f.Cursor))
-	// }
+func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+
+	where, args := buildEventWhereClause(f)
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	if !ValidOrderBy(f.OrderBy) {
+		return nil, "", fmt.Errorf("unsupported order_by %q", f.OrderBy)
+	}
 	orderDir := "ASC"
 	cursorOp := ">"
 	if f.Order == "desc" {
@@ -419,8 +438,37 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		cursorOp = "<"
 	}
 
+	// Every ordering ends in id so the sort is total: ledger and created_at
+	// both have duplicates, and without a tiebreaker the database may order
+	// equal rows differently between two queries, which would let keyset
+	// pagination skip or repeat rows at a page boundary.
+	orderCols := "id " + orderDir
+	if f.OrderBy != "" && f.OrderBy != OrderByID {
+		orderCols = f.OrderBy + " " + orderDir + ", id " + orderDir
+	}
+
 	if f.Cursor != "" {
-		where = append(where, "id "+cursorOp+" "+arg(f.Cursor))
+		switch f.OrderBy {
+		case "", OrderByID:
+			where = append(where, "id "+cursorOp+" "+arg(f.Cursor))
+		default:
+			sortValue, id, err := decodeCompositeCursor(f.Cursor)
+			if err != nil {
+				return nil, "", err
+			}
+			// Row-value comparison gives the correct "everything after this
+			// (value, id) pair" semantics in one predicate, and Postgres can
+			// still drive it from an index on (sort column, id).
+			var typed string
+			switch f.OrderBy {
+			case OrderByLedger:
+				typed = arg(sortValue) + "::bigint"
+			case OrderByCreatedAt:
+				typed = arg(sortValue) + "::timestamptz"
+			}
+			where = append(where, fmt.Sprintf("(%s, id) %s (%s, %s)",
+				f.OrderBy, cursorOp, typed, arg(id)))
+		}
 	}
 
 	query := `SELECT ` + eventColumns + ` FROM events`
@@ -428,8 +476,7 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
 	// Fetch one extra row to know whether a next page exists.
-	// query += " ORDER BY id ASC LIMIT " + arg(limit+1)
-	query += " ORDER BY id " + orderDir + " LIMIT " + arg(limit+1)
+	query += " ORDER BY " + orderCols + " LIMIT " + arg(limit+1)
 
 	var events []Event
 	next := ""
@@ -454,7 +501,7 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 
 		if len(events) > limit {
 			events = events[:limit]
-			next = events[limit-1].ID
+			next = EncodeCursor(f.OrderBy, events[limit-1])
 		}
 		return nil
 	})
@@ -462,6 +509,32 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		return nil, "", err
 	}
 	return events, next, nil
+}
+
+// CountEvents returns the total number of rows matching the filter,
+// ignoring pagination (cursor, order, and limit). It reuses the same
+// WHERE clause builder as QueryEvents so the two stay in lockstep.
+func (p *Postgres) CountEvents(ctx context.Context, f EventFilter) (int64, error) {
+	// Strip page-specific fields so the count represents the full match set.
+	f.Cursor = ""
+	f.Order = ""
+	f.OrderBy = ""
+	f.Limit = 0
+
+	where, args := buildEventWhereClause(f)
+	query := `SELECT count(*) FROM events`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+
+	var total int64
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, query, args...).Scan(&total)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("counting events: %w", err)
+	}
+	return total, nil
 }
 
 func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error) {
