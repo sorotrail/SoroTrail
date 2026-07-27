@@ -200,6 +200,10 @@ func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Eve
 	return nil, "", nil
 }
 
+func (m *mockStore) CountEvents(context.Context, store.EventFilter) (int64, error) {
+	return 0, nil
+}
+
 func (m *mockStore) LedgerRangeCensus(_ context.Context, from, to int64, idsOnly bool) ([]store.LedgerCensus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

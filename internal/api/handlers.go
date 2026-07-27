@@ -322,6 +322,20 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
+
+	// Total matching count (ignoring pagination) as a response header.
+	// Failure to count is non-fatal: we log a warning and proceed without
+	// the header rather than dropping a successful page.
+	countFilter := filter
+	countFilter.Cursor = ""
+	countFilter.Order = ""
+	countFilter.OrderBy = ""
+	countFilter.Limit = 0
+	if total, cerr := s.store.CountEvents(r.Context(), countFilter); cerr != nil {
+		loggerFromContext(r.Context()).Warn("counting events for X-Total-Count", "error", cerr)
+	} else {
+		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	decoded := r.URL.Query().Get("decoded") == "true"
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
