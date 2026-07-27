@@ -110,6 +110,7 @@ func TestListEvents_BadParams(t *testing.T) {
 		"/events?from_ledger=20&to_ledger=10",
 		"/events?limit=0",
 		"/events?limit=99999",
+		"/events?in_successful_call=maybe",
 	} {
 		t.Run(path, func(t *testing.T) {
 			resp, body := doGet(t, newTestServer(&stubStore{}, nil), path)
@@ -117,6 +118,36 @@ func TestListEvents_BadParams(t *testing.T) {
 			var e map[string]string
 			require.NoError(t, json.Unmarshal(body, &e))
 			assert.NotEmpty(t, e["error"])
+		})
+	}
+}
+
+func TestListEvents_InSuccessfulCallFilter(t *testing.T) {
+	tests := []struct {
+		name       string
+		param      string
+		wantNil    bool
+		wantValue  bool
+	}{
+		{"true", "true", false, true},
+		{"false", "false", false, false},
+		{"omitted", "", true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			path := "/events"
+			if tt.param != "" {
+				path += "?in_successful_call=" + tt.param
+			}
+			resp, _ := doGet(t, newTestServer(st, nil), path)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			if tt.wantNil {
+				assert.Nil(t, st.lastFilter.InSuccessfulCall)
+			} else {
+				require.NotNil(t, st.lastFilter.InSuccessfulCall)
+				assert.Equal(t, tt.wantValue, *st.lastFilter.InSuccessfulCall)
+			}
 		})
 	}
 }

@@ -34,6 +34,9 @@ type EventFilter struct {
 	Topic      json.RawMessage
 	FromLedger int64 // inclusive
 	ToLedger   int64 // inclusive
+	// InSuccessfulCall filters by whether the event appeared in a successful
+	// transaction call. nil means "no constraint".
+	InSuccessfulCall *bool
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int
