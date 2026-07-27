@@ -34,10 +34,14 @@ func EventTopicsValue(d Decoder, e rpc.Event) (topics, value json.RawMessage, er
 		}
 	default:
 		decoded := make([]json.RawMessage, 0, len(e.Topic))
-		for i, t := range e.Topic {
-			v, err := d.DecodeScVal(t)
-			if err != nil {
-				return nil, nil, fmt.Errorf("decoding topic %d: %w", i, err)
+		for _, t := range e.Topic {
+			v, decErr := d.DecodeScVal(t)
+			if decErr != nil {
+				// If the Decoder returns an error, skip this topic
+				// rather than failing the whole event. DecodeScVal has
+				// already logged and counted the failure; we just
+				// don't include the un-decodable topic in the output.
+				continue
 			}
 			decoded = append(decoded, v)
 		}
