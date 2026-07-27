@@ -382,23 +382,13 @@ func (p *Postgres) EventExists(ctx context.Context, id string, sc Scope) (bool, 
 	return true, nil
 }
 
-func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
-	// The tenant boundary is evaluated before anything else, and an empty
-	// scope returns an empty page without issuing SQL. No user-supplied
-	// filter is consulted first, so no filter can influence whether the
-	// boundary is applied.
-	if f.Scope.DeniesAll() {
-		return nil, "", nil
-	}
-
-	limit := f.Limit
-	if limit <= 0 {
-		limit = DefaultQueryLimit
-	}
-	if limit > MaxQueryLimit {
-		limit = MaxQueryLimit
-	}
-
+// buildEventWhereClause builds the WHERE clause and arguments shared by
+// QueryEvents and CountEvents. It does not include cursor, ordering, or
+// limit — those are page-specific concerns.
+//
+// Callers must reject a denying scope before calling this: an empty scope
+// produces `contract_id = ANY('{}')`, which is correct but still issues SQL.
+func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	var (
 		where []string
 		args  []any
@@ -450,6 +440,31 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	}
 	if !f.ToTime.IsZero() {
 		where = append(where, "created_at <= "+arg(f.ToTime))
+	}
+	return where, args
+}
+
+func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
+	// The tenant boundary is evaluated before anything else, and an empty
+	// scope returns an empty page without issuing SQL. No user-supplied
+	// filter is consulted first, so no filter can influence whether the
+	// boundary is applied.
+	if f.Scope.DeniesAll() {
+		return nil, "", nil
+	}
+
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+
+	where, args := buildEventWhereClause(f)
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
 	}
 
 	if !ValidOrderBy(f.OrderBy) {
@@ -533,6 +548,39 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		return nil, "", err
 	}
 	return events, next, nil
+}
+
+// CountEvents returns the total number of rows matching the filter,
+// ignoring pagination (cursor, order, and limit). It reuses the same
+// WHERE clause builder as QueryEvents so the two stay in lockstep.
+func (p *Postgres) CountEvents(ctx context.Context, f EventFilter) (int64, error) {
+	// Same boundary as QueryEvents, evaluated before any filter: a count is
+	// an aggregate, and an unscoped one tells a tenant how much data exists
+	// outside its grants even though it can read none of it.
+	if f.Scope.DeniesAll() {
+		return 0, nil
+	}
+
+	// Strip page-specific fields so the count represents the full match set.
+	f.Cursor = ""
+	f.Order = ""
+	f.OrderBy = ""
+	f.Limit = 0
+
+	where, args := buildEventWhereClause(f)
+	query := `SELECT count(*) FROM events`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+
+	var total int64
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, query, args...).Scan(&total)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("counting events: %w", err)
+	}
+	return total, nil
 }
 
 func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error) {

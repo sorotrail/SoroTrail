@@ -78,6 +78,22 @@ func (s *scopedStore) QueryEvents(_ context.Context, f store.EventFilter) ([]sto
 	return out, "", nil
 }
 
+// CountEvents applies the same boundary as QueryEvents. A count is an
+// aggregate over rows the caller may not read, so counting the whole table
+// here would leak through X-Total-Count and /events/count even while the
+// event bodies themselves stayed correctly filtered.
+func (s *scopedStore) CountEvents(_ context.Context, f store.EventFilter) (int64, error) {
+	s.record(f.Scope)
+	var n int64
+	for _, e := range s.visible(f.Scope) {
+		if f.ContractID != "" && e.ContractID != f.ContractID {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
 func (s *scopedStore) GetEvent(_ context.Context, id string, sc store.Scope) (store.Event, error) {
 	s.record(sc)
 	for _, e := range s.visible(sc) {
@@ -333,6 +349,21 @@ func TestCrossTenantLeakMatrix(t *testing.T) {
 			wantHidden: []string{contractC},
 		},
 		{
+			// The count is A's two events, not the fixture's four. Asserting
+			// on the exact body catches the case the substring checks below
+			// cannot: a count has no IDs in it, so an unscoped total would
+			// slip through wantHidden untouched.
+			name:        "count is scoped to what the tenant can read",
+			path:        "/events/count",
+			wantStatus:  http.StatusOK,
+			wantVisible: []string{`"count":2`},
+		},
+		{
+			name:       "count naming another tenant's contract is refused",
+			path:       "/events/count?contract_id=" + contractB,
+			wantStatus: http.StatusForbidden,
+		},
+		{
 			name:       "decoded view is filtered too",
 			path:       "/events?decoded=true",
 			wantStatus: http.StatusOK,
@@ -418,6 +449,7 @@ func TestScopeReachesTheStore(t *testing.T) {
 	f := newTenantFixture(t)
 	for _, path := range []string{
 		"/events",
+		"/events/count",
 		"/contracts/" + contractA + "/events",
 		"/events/ev-a1",
 		"/stats",

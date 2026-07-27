@@ -493,6 +493,9 @@ type Store interface {
 	// cursor for the next page ("" when there are no more results).
 	// Default order is ascending (oldest-first) for backward compatibility.
 	QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error)
+	// CountEvents returns the total number of events matching the filter
+	// (ignoring pagination: cursor, order, and limit are not applied).
+	CountEvents(ctx context.Context, f EventFilter) (int64, error)
 	// LedgerRangeCensus returns one LedgerCensus row per ledger in the
 	// inclusive [fromLedger, toLedger] range that contains at least one
 	// event, in ascending ledger order. idsOnly=true populates LedgerCensus.IDs

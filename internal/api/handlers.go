@@ -294,12 +294,153 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("stream") == "true" {
+		s.handleListEventsStream(w, r)
+		return
+	}
 	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
 		writeFilterError(w, err)
 		return
 	}
 	s.serveEvents(w, r, filter, fields)
+}
+
+// countResponse is the JSON body for GET /events/count.
+type countResponse struct {
+	Count int64 `json:"count"`
+}
+
+// handleCountEvents returns the number of events matching the same filters
+// as GET /events. Pagination params (cursor, limit, order, order_by) are
+// accepted in the URL but ignored for the count — only the filter fields
+// that narrow the result set are applied.
+func (s *Server) handleCountEvents(w http.ResponseWriter, r *http.Request) {
+	filter, _, err := parseFilterAndFields(r)
+	if err != nil {
+		// writeFilterError, not a flat 400: a request naming a contract the
+		// tenant lacks is a 403 here for the same reason it is on /events.
+		writeFilterError(w, err)
+		return
+	}
+	// Strip pagination — count is over the full matching set.
+	filter.Cursor = ""
+	filter.Order = ""
+	filter.OrderBy = ""
+	filter.Limit = 0
+
+	total, err := s.store.CountEvents(r.Context(), filter)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("counting events", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("counting events failed"))
+		return
+	}
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, countResponse{Count: total})
+}
+
+// streamBatchSize is the number of events fetched per internal query when
+// streaming NDJSON. It balances query cost against flush frequency: too
+// small wastes round trips; too large buffers too long before a client
+// sees progress.
+const streamBatchSize = 500
+
+// recentDefaultLimit is the number of events returned when ?recent is
+// specified without a numeric value (i.e. ?recent=true). Chosen to be
+// useful at a glance without overwhelming a caller that just wants the
+// latest activity.
+const recentDefaultLimit = 20
+
+func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) {
+	filter, fields, err := parseFilterAndFields(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// Streaming overrides pagination: the limit is an internal batch size.
+	filter.Limit = streamBatchSize
+
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
+	decoded := r.URL.Query().Get("decoded") == "true"
+
+	ctx := r.Context()
+
+	// Fetch the first batch BEFORE writing headers so a query failure
+	// returns a proper error envelope rather than a 200 with an empty
+	// body. On success we write the NDJSON headers and stream out.
+	events, cursor, qerr := s.store.QueryEvents(ctx, filter)
+	if qerr != nil {
+		loggerFromContext(ctx).Error("streaming events (first batch)", "error", qerr)
+		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	w.WriteHeader(http.StatusOK)
+
+	// Grab the flusher before streaming so a non-streamable wrapper is
+	// detected early. The compress middleware's Flush works correctly
+	// for uninflated buffers: it decides not to compress and flushes
+	// the underlying writer.
+	flusher, flushable := w.(http.Flusher)
+
+	enc := json.NewEncoder(w)
+
+	// writeEvents marshals and writes a batch of events as NDJSON lines.
+	writeEvents := func(evs []store.Event) {
+		if decoded && s.enricher != nil {
+			// Batch-enrich like serveEvents: one call per batch, not per event.
+			for _, enrichedEv := range s.enricher.EnrichEvents(ctx, evs) {
+				if includeXDR {
+					_ = enc.Encode(enrichEventWithXDR(enrichedEv))
+				} else {
+					_ = enc.Encode(enrichedEv)
+				}
+			}
+			return
+		}
+		for _, ev := range evs {
+			if includeXDR {
+				_ = enc.Encode(eventToXDRResponse(ev))
+			} else {
+				_ = enc.Encode(projectEvent(ev, fields))
+			}
+		}
+	}
+
+	writeEvents(events)
+
+	// Flush the first batch so the client sees data immediately even
+	// when the entire result set fits in one batch.
+	if flushable {
+		flusher.Flush()
+	}
+
+	for cursor != "" {
+		filter.Cursor = cursor
+		events, cursor, qerr = s.store.QueryEvents(ctx, filter)
+		if qerr != nil {
+			loggerFromContext(ctx).Error("streaming events", "error", qerr)
+			return // connection likely gone; just stop
+		}
+
+		writeEvents(events)
+
+		// Flush after every batch so clients see progress, and so the
+		// compression middleware can push bytes through the compressor.
+		if flushable {
+			flusher.Flush()
+		}
+
+		// Check for client disconnect so we don't keep querying forever.
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
 }
 
 func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
@@ -389,6 +530,21 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		return
 	}
 	s.recordEventsServed(r.Context(), len(events))
+
+	// Total matching count (ignoring pagination) as a response header.
+	// Failure to count is non-fatal: we log a warning and proceed without
+	// the header rather than dropping a successful page.
+	countFilter := filter
+	countFilter.Cursor = ""
+	countFilter.Order = ""
+	countFilter.OrderBy = ""
+	countFilter.Limit = 0
+	if total, cerr := s.store.CountEvents(r.Context(), countFilter); cerr != nil {
+		loggerFromContext(r.Context()).Warn("counting events for X-Total-Count", "error", cerr)
+	} else {
+		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	decoded := r.URL.Query().Get("decoded") == "true"
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
@@ -1177,6 +1333,27 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	} else {
 		f.Limit = store.DefaultQueryLimit
 	}
+
+	// ?recent=N: shorthand for "newest N events" — sets order=desc and
+	// limit=N (default 20). Conflicts with explicit order or limit params.
+	if raw := q.Get("recent"); raw != "" {
+		if q.Get("order") != "" || q.Get("order_by") != "" {
+			return f, fmt.Errorf("recent cannot be combined with order or order_by")
+		}
+		if q.Get("limit") != "" {
+			return f, fmt.Errorf("recent cannot be combined with limit")
+		}
+		n := recentDefaultLimit
+		if raw != "true" {
+			n, err = strconv.Atoi(raw)
+			if err != nil || n < 1 || n > store.MaxQueryLimit {
+				return f, fmt.Errorf("recent must be a positive integer in [1,%d]", store.MaxQueryLimit)
+			}
+		}
+		f.Order = "desc"
+		f.Limit = n
+	}
+
 	return f, nil
 }
 

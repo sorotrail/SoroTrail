@@ -16,7 +16,7 @@ const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 // prior test don't leak across cases.
 var envKeys = []string{
 	"RPC_URL", "DATABASE_URL", "POLL_INTERVAL", "HTTP_ADDR",
-	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL",
+	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL", "LOG_FORMAT",
 	"API_QUERY_TIMEOUT", "API_SLOW_QUERY_THRESHOLD",
 	"HORIZON_URL", "BACKFILL_RATE_RPS",
 	"AUDIT_ENABLED", "AUDIT_POLL_INTERVAL", "AUDIT_BATCH_LEDGERS",
@@ -105,6 +105,34 @@ func TestLoad(t *testing.T) {
 				"LOG_LEVEL":    "loud",
 			},
 			wantErr: "LOG_LEVEL",
+		},
+		{
+			name: "log format text",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_FORMAT":   "text",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "text", c.LogFormat)
+			},
+		},
+		{
+			name: "log format json",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_FORMAT":   "json",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "json", c.LogFormat)
+			},
+		},
+		{
+			name: "bad log format",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_FORMAT":   "xml",
+			},
+			wantErr: "LOG_FORMAT",
 		},
 		{
 			name: "bad rpc url",

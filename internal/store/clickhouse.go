@@ -90,6 +90,10 @@ func (c *ClickHouse) QueryEvents(ctx context.Context, f EventFilter) ([]Event, s
 	return nil, "", nil
 }
 
+func (c *ClickHouse) CountEvents(ctx context.Context, f EventFilter) (int64, error) {
+	return 0, nil
+}
+
 func (c *ClickHouse) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error) {
 	return nil, nil
 }
