@@ -400,12 +400,8 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		// array for element match, multi-element arrays for subset match).
 		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
 	}
-	if f.HasValue != nil {
-		if *f.HasValue {
-			where = append(where, "value IS NOT NULL")
-		} else {
-			where = append(where, "value IS NULL")
-		}
+	if f.TxHash != "" {
+		where = append(where, "tx_hash = "+arg(f.TxHash))
 	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))

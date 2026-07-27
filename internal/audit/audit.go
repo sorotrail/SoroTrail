@@ -26,9 +26,9 @@ import (
 	"math/rand/v2"
 	"time"
 
-	"github.com/khaylebfortune/sorotrail/internal/ingester"
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // Reingester is the surface the auditor needs from the ingester package.

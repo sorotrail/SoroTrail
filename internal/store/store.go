@@ -107,10 +107,8 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	// HasValue filters events by whether they carry a value payload.
-	// nil means no constraint; true means value IS NOT NULL;
-	// false means value IS NULL.
-	HasValue   *bool
+	// TxHash filters events emitted by a specific transaction hash.
+	TxHash     string    // hex-encoded transaction hash
 	FromLedger int64     // inclusive
 	ToLedger   int64     // inclusive
 	FromTime   time.Time // inclusive, zero = no constraint
