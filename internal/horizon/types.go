@@ -3,13 +3,13 @@
 //
 // Source endpoints (all base URLs are normalized to drop trailing slashes):
 //
-// GET /accounts/{contract_id}/transactions
-// cursor-paginated list of transactions involving a contract. Horizon
-// adds a contract ID to the participants list when it appears in any
-// operation's footprint, source, or destination — including the
-// typical pattern where a user account calls a contract via
-// invokeHostFunction. We use this endpoint to walk every historical
-// transaction that a contract touched.
+//	GET /accounts/{contract_id}/transactions
+//	  cursor-paginated list of transactions involving a contract. Horizon
+//	  adds a contract ID to the participants list when it appears in any
+//	  operation's footprint, source, or destination — including the
+//	  typical pattern where a user account calls a contract via
+//	  invokeHostFunction. We use this endpoint to walk every historical
+//	  transaction that a contract touched.
 //
 // Cursor pagination is opaque. The `paging_token` field returned in each
 // row is passed back as `?cursor=` to fetch the next page; Horizon decides

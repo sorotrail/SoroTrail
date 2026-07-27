@@ -7,7 +7,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // fakeStore is an in-memory stand-in for the Postgres replay surface. It
