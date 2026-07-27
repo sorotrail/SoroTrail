@@ -12,10 +12,27 @@ long after the RPC has forgotten them.
 
 text
 
- Stellar RPC ──getEvents──▶ ingester ──▶ Postgres ◀── HTTP API ◀── you
-Quickstart
-Docker (one command)
-Shell
+## Quickstart
+
+### Published image (fastest)
+
+Tagged releases publish a multi-arch (amd64/arm64) image to GHCR. Point it at
+a Postgres you already have:
+
+```sh
+docker run --rm -p 8080:8080 \
+  -e DATABASE_URL='postgres://user:pass@host:5432/sorotrail?sslmode=disable' \
+  -e RPC_URL='https://soroban-testnet.stellar.org' \
+  ghcr.io/sorotrail/sorotrail:latest
+```
+
+Pin a specific release with a version tag instead of `latest`, e.g.
+`ghcr.io/sorotrail/sorotrail:v1.2.0`. See [Configuration](#configuration) for
+the full list of environment variables.
+
+### Docker Compose (full stack)
+
+Brings up Postgres and the indexer together — no external database required:
 
 docker compose up --build
 This starts Postgres and the indexer against the public Stellar testnet RPC.
@@ -42,6 +59,8 @@ All configuration comes from environment variables (see `.env.example`):
 | Variable | Default | Description |
 | --- | --- | --- |
 | `RPC_URL` | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet. |
+| `HORIZON_URL` | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. |
+| `BACKFILL_RATE_RPS` | `10` | Pace against Horizon when backfilling. 10 req/s is the public-instance cap; private deployments can lift this. |
 | `DATABASE_URL` | — (required) | Postgres connection string. |
 | `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. |
 | `HTTP_ADDR` | `:8080` | API listen address. |
@@ -49,6 +68,9 @@ All configuration comes from environment variables (see `.env.example`):
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
+| `LOG_FORMAT` | `text` | `text` \| `json`. JSON emits one JSON object per line, compatible with Loki, CloudWatch, and ELK. |
+| `API_QUERY_TIMEOUT` | `25s` | Per-request database timeout for API-originated store reads. The timeout is enforced in-process and mirrored to Postgres via `statement_timeout`. |
+| `API_SLOW_QUERY_THRESHOLD` | `2s` | Warn when an API-originated store query takes longer than this threshold; logs include the query name and elapsed duration. |
 | `AUDIT_ENABLED` | `false` | Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build. |
 | `AUDIT_POLL_INTERVAL` | `30s` | Sleep between audit passes. |
 | `AUDIT_BATCH_LEDGERS` | `100` | Ledger range covered by one audit pass. |
@@ -57,10 +79,15 @@ All configuration comes from environment variables (see `.env.example`):
 | `AUDIT_MAX_RPS` | `10` | Total request budget (split between ingest and audit). |
 | `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
 | `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
+| `API_KEY` | empty | Required to use the runtime `/watched-contracts` surface; empty means every request there is rejected with 503. This is a placeholder until #17 (real auth) lands — at that point `API_KEY` will be replaced. |
+| `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
+| `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
+| `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
 | `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
+| `COMPRESS_MIN_SIZE` | `1400` | Response body size (bytes) at or above which responses are gzip/deflate encoded for clients advertising support. Set negative to disable compression. See [Compression](#compression). |
 
 ## Ingestion behavior
 
@@ -84,6 +111,43 @@ All configuration comes from environment variables (see `.env.example`):
   decoder can be applied to already-indexed events — see
   [decoder replay](#decoder-replay).
 
+## Backfilling historical events
+
+SoroTrail's live ingester only reaches as far back as the Stellar RPC's
+retention window (typically 24h on the public testnet, up to a couple
+weeks on private deployments). For contracts whose history you care
+about, this leaves a permanent blind spot.
+
+`sorotrail backfill` closes that gap by walking `/accounts/{contract_id}/transactions`
+on a Horizon deployment that retains historical transaction meta,
+decoding each `result_meta_xdr` through the standard pipeline so
+backfilled rows are indistinguishable from live-ingested ones
+(including raw XDR for replay).
+
+```sh
+# First-pass dry run to see what would be written
+sorotrail backfill \
+  --contract CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC \
+  --from-ledger 1 --to-ledger 250000 --dry-run
+
+# Then commit it
+sorotrail backfill \
+  --contract CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC \
+  --from-ledger 1 --to-ledger 250000
+```
+
+It is batched, resumable (Ctrl-C and re-run picks up where it stopped),
+idempotent (re-runs write nothing once finished), and safe alongside
+live ingestion. A single-row `backfill_state` table holds progress so
+resume works across restarts; idempotent upserts make the resume
+overlap harmless.
+
+Source limitations are spelled out in [docs/backfill.md](docs/backfill.md) —
+notably: Horizon must retain historical meta for the target network,
+only Soroban V3/V4 transactions carry events, and the public Stellar
+testnet Horizon retains everything from protocol 17 onward while
+mainnet varies.
+
 ## Decoder replay
 
 Decoders improve over time. `sorotrail replay` re-runs the current decoder
@@ -103,12 +167,72 @@ docs/replay.md
  for flags, the summary output, the
 advisory-lock strategy, and the derivation order for dependent tables.
 
-API reference
-All responses are JSON. Errors look like {"error": "message"}.
+## Compression
 
-GET /health
-Reports the API's view of its dependencies. 200 when both the database and
-the RPC are reachable and healthy, 503 otherwise.
+Responses are gzip- or deflate-encoded when the client advertises support via
+`Accept-Encoding`, which matters most for event listings — a 200-event page is
+largely repetitive JSON keys and compresses well.
+
+Compression is applied per response, not per route, and only once the body
+reaches `COMPRESS_MIN_SIZE` (1400 bytes by default — roughly one Ethernet
+MTU). Below that, encoding costs CPU on both ends and can make the body
+*larger* once the gzip header and trailer are counted, so small responses
+(error envelopes, `/health`, a single event) are sent as-is.
+
+Clients that don't advertise an encoding get the original bytes, byte for
+byte. `gzip` is preferred over `deflate` when both are offered, and
+`gzip;q=0` is honored as a refusal rather than a low ranking.
+
+Some things are deliberately left alone:
+
+- **WebSocket upgrades** (`/events/ws`) bypass the middleware entirely — the
+  response is a `101` and the connection is then taken over.
+- **Streaming responses** that flush before reaching the threshold give up on
+  compression rather than holding bytes back, so a live stream never stalls
+  waiting for a buffer to fill.
+- **`204` and `304`** carry no body, and a `304` with `Content-Encoding`
+  misleads caches.
+- **Non-compressible media types** (images, already-compressed payloads) and
+  bodies a handler already encoded itself.
+
+`Vary: Accept-Encoding` is always set, so a shared cache never serves a
+compressed body to a client that can't decode it. Compressing produces a
+different representation of the same resource, so a strong `ETag` is weakened
+(`"v1"` → `W/"v1"`) when a response is encoded; conditional requests still
+match, since `If-None-Match` comparison ignores the `W/` prefix.
+
+## API reference
+
+All responses are JSON. Errors look like `{"error": "message"}`.
+
+### Pagination
+
+Every list endpoint uses cursor-based pagination with a consistent contract:
+
+- **Request parameters**: `?cursor=<opaque>&limit=<int>` (both optional)
+- **Response envelope**: each list response includes a `"cursor"` field.
+  When non-empty, more results exist — pass it back as `?cursor=` for
+  the next page. When empty or omitted, the result set is exhausted.
+- **Cursor format**: the cursor is the last row's sort-key value
+  (typically an event ID or integer primary key). It is opaque —
+  clients must never inspect or modify it. Sending an invalid cursor
+  returns `400 Bad Request` with the standard error envelope
+  `{"error": "invalid cursor ..."}`.
+- **Defaults**: `limit` defaults to 50 when unset; the maximum is 200.
+  Values outside `[1,200]` return `400 Bad Request`.
+- **Empty result sets** return an empty array with no `"cursor"` field
+  (or an empty string cursor, depending on the endpoint).
+
+```sh
+# First page
+curl -s 'localhost:8080/events?limit=10'
+# {"events":[...],"cursor":"0001099511627776-0000000009"}
+
+# Next page using the cursor from the previous response
+curl -s 'localhost:8080/events?cursor=0001099511627776-0000000009&limit=10'
+```
+
+### `GET /health`
 
 Shell
 
@@ -136,10 +260,31 @@ Query parameters (all optional, combinable):
 | `to_time` | `2026-07-22T00:00:00Z` | Inclusive upper `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
 | `limit` | `50` | Page size, 1–200 (default 50). |
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
-| `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
+| `order` | `desc` | `asc` \| `desc`, defaults to asc. Sort direction. |
+| `order_by` | `created_at` | `id` \| `ledger` \| `created_at`, defaults to `id`. Sort column. Anything else is a `400`. |
 | `decoded` | `true` | When `true`, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with `"decoded": false`. |
 
 Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
+
+#### Ordering and pagination
+
+`order_by` picks the sort column and `order` the direction, so they combine:
+
+```sh
+curl -s 'localhost:8080/events?order_by=created_at&order=desc&limit=100'
+```
+
+Pagination stays correct under every ordering. `ledger` and `created_at` both
+have duplicates — a ledger holds many events, and a batch insert stamps one
+`created_at` on all of them — so those orderings sort by `(column, id)` and
+their cursors carry both halves. That keeps a page boundary landing in the
+middle of a run of equal values from skipping or repeating rows.
+
+Cursors are opaque and tied to the ordering that produced them: feeding a
+cursor from one `order_by` into another returns `400`. Always pass back the
+`cursor` from the previous response with the same `order_by`/`order`. Cursors
+issued for the default `id` ordering are unchanged, so existing clients keep
+working.
 
 ```sh
 curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic={"symbol":"transfer"}&limit=2'
@@ -660,6 +805,21 @@ events have been proven to match a fresh RPC fetch by the auditor. When
 AUDIT_ENABLED=false it stays at 0. See the Data integrity section
 below for the contract the field implies.
 
+### `GET /metrics`
+
+Serves `http_request_duration_seconds`, a Prometheus histogram of HTTP
+request latency labeled by `route` (the matched chi route pattern, e.g.
+`/events/{id}` — never the raw path, so path parameters don't blow up
+cardinality), `method`, and `status`.
+
+```sh
+curl -s localhost:8080/metrics | grep http_request_duration_seconds
+```
+
+Exempt from the rate limiter for the same reason `/health` is: a
+Prometheus scraper polling this endpoint on its own schedule shouldn't be
+throttled like a regular client.
+
 ### `GET /events/ws` (WebSocket live stream)
 
 Pushes ingested events to the client over a single WebSocket connection
@@ -745,23 +905,26 @@ Caching
 Stored events are immutable — a row written by ingest is never rewritten
 in normal operation — so the API serves two distinct cache policies:
 
-GET /events/{id} carries a strong ETag equal to the event ID
-and Cache-Control: public, max-age=31536000, immutable. Clients
-and CDNs can cache the response for a year without revalidating.
-Conditional requests with a matching If-None-Match return
-304 Not Modified without re-serializing the row.
-List endpoints (/events, /contracts/{id}/events) split on a
-moving ingest frontier: a page whose upper bound (to_ledger) sits
-entirely below the last-ingested ledger cannot gain new rows, so the
-response is declared immutable with a strong ETag derived from the
-filter. Pages that are open-ended (to_ledger unset) or have bounds
-at/above the frontier are still growing, so they get
-Cache-Control: no-cache — a deliberate "when in doubt, don't
-cache" choice rather than a guess with a short max-age.
-GET /health and GET /stats are always
-Cache-Control: no-store so monitoring tooling, dashboards, and
-alerting see real state rather than a stale replica.
-All cacheable responses set Vary: Accept-Encoding so a future
+- **`GET /events/{id}`** carries a strong `ETag` equal to the event ID
+  and `Cache-Control: public, max-age=31536000, immutable`. Clients
+  and CDNs can cache the response for a year without revalidating.
+  Conditional requests with a matching `If-None-Match` return
+  `304 Not Modified` without re-serializing the row.
+- **List endpoints** (`/events`, `/contracts/{id}/events`) split on a
+  moving ingest frontier: a page whose upper bound (`to_ledger`) sits
+  entirely below the last-ingested ledger cannot gain new rows, so the
+  response is declared immutable with a strong ETag derived from the
+  filter — every filter parameter that narrows the result set, so two
+  different queries can never share a validator. Pages that are
+  open-ended (`to_ledger` unset) or have bounds
+  at/above the frontier are still growing, so they get
+  `Cache-Control: no-cache` — a deliberate "when in doubt, don't
+  cache" choice rather than a guess with a short max-age.
+- **`GET /health`** and **`GET /stats`** are always
+  `Cache-Control: no-store` so monitoring tooling, dashboards, and
+  alerting see real state rather than a stale replica.
+
+All cacheable responses set `Vary: Accept-Encoding` so a future
 compression middleware (#25) can serve distinct encoded variants
 without reconciling caches that warmed on a non-encoded version.
 
