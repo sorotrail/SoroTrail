@@ -16,9 +16,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
-	"github.com/khaylebfortune/sorotrail/internal/buildinfo"
-	"github.com/khaylebfortune/sorotrail/internal/config"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/buildinfo"
+	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
