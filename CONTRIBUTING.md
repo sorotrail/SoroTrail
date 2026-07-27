@@ -71,6 +71,17 @@ implementations, so each layer is independently testable and replaceable.
 - Keep functions small and packages focused. When in doubt, match the
   surrounding code.
 
+## Dependency management
+
+Dependency updates are handled by Dependabot, which opens grouped weekly PRs
+for Go modules, GitHub Actions, and the Docker base image. PRs with minor or
+patch bumps are grouped together to keep the review stream manageable; major
+version bumps come individually. The `vulncheck` CI job runs
+`govulncheck ./...` and fails if any reachable vulnerability is found, so
+known-vulnerable code paths are surfaced before they ship. Review dependency
+PRs promptly — a green check on `vulncheck` is a good signal that the bump
+can be merged without deep audit.
+
 ## Pull requests
 
 - `go build ./...`, `make test` and `make lint` must pass.

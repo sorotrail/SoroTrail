@@ -9,11 +9,17 @@ DATE    ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS := -X github.com/khaylebfortune/sorotrail/internal/version.Version=$(VERSION) \
            -X github.com/khaylebfortune/sorotrail/internal/version.Commit=$(COMMIT) \
            -X github.com/khaylebfortune/sorotrail/internal/version.Date=$(DATE)
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "unknown")
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown")
+
+LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$(COMMIT) -X github.com/sorotrail/sorotrail/internal/buildinfo.BuildDate=$(BUILD_DATE)"
 
 .PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down clean
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/sorotrail
+	go build $(LDFLAGS) -o $(BINARY) ./cmd/sorotrail
 
 run: build
 	./$(BINARY)

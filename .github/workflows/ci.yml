@@ -5,9 +5,14 @@ on:
     branches: [main]
   pull_request:
 
+# Minimal token scope; CI only reads repo contents and uploads caches.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:16-alpine
@@ -15,36 +20,72 @@ jobs:
           POSTGRES_USER: sorotrail
           POSTGRES_PASSWORD: sorotrail
           POSTGRES_DB: sorotrail
+        # Map to a non-default host port so the runner's own services
+        # (and any pre-installed Postgres on 5432) can't shadow ours.
         ports:
-          - 5432:5432
+          - "5433:5432"
         options: >-
-          --health-cmd "pg_isready -U sorotrail"
+          --health-cmd "pg_isready -U sorotrail -d sorotrail"
           --health-interval 2s
           --health-timeout 2s
-          --health-retries 15
+          --health-retries 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5.5.0
         with:
           go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            **/*.go
+          cache: true
       - name: Build
         run: go build ./...
       - name: Vet
         run: go vet ./...
+      - name: Wait for Postgres
+        # Belt-and-braces: the services healthcheck already gates this, but
+        # a clear error is better than a 30s hang if pg_isready still hiccups.
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h localhost -p 5433 -U sorotrail -d sorotrail; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Postgres did not become ready in time" >&2
+          exit 1
+      # -p 1 serializes packages: the integration tests in internal/store
+      # and internal/replay share one database and truncate the same tables.
+      # -race catches data races inside a single package's test binary.
       - name: Test (with Postgres integration tests)
-        # -p 1 serializes packages: the integration tests in internal/store
-        # and internal/replay share one database and truncate the same tables.
-        run: go test -p 1 ./... -count=1
+        run: go test -p 1 ./... -count=1 -race -timeout=120s
         env:
-          TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
+          TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5433/sorotrail?sslmode=disable
 
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5.5.0
         with:
           go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@v8
+          cache-dependency-path: |
+            go.sum
+            **/*.go
+          cache: true
+      - uses: golangci/golangci-lint-action@v9.3.0
         with:
           version: v2.12.2
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: v3.15.0
+      - name: Helm lint
+        run: helm lint deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db
+      - name: Helm template render
+        run: helm template sorotrail deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db > /dev/null
