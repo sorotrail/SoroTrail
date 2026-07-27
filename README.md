@@ -77,6 +77,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
+| `LOG_FORMAT` | `text` | `text` \| `json`. JSON emits one JSON object per line, compatible with Loki, CloudWatch, and ELK. |
 | `API_QUERY_TIMEOUT` | `25s` | Per-request database timeout for API-originated store reads. The timeout is enforced in-process and mirrored to Postgres via `statement_timeout`. |
 | `API_SLOW_QUERY_THRESHOLD` | `2s` | Warn when an API-originated store query takes longer than this threshold; logs include the query name and elapsed duration. |
 | `AUDIT_ENABLED` | `false` | Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build. |
@@ -661,6 +662,21 @@ the stored fields populated and the RPC-derived freshness fields
 events have been proven to match a fresh RPC fetch by the auditor. When
 `AUDIT_ENABLED=false` it stays at `0`. See the Data integrity section
 below for the contract the field implies.
+
+### `GET /metrics`
+
+Serves `http_request_duration_seconds`, a Prometheus histogram of HTTP
+request latency labeled by `route` (the matched chi route pattern, e.g.
+`/events/{id}` — never the raw path, so path parameters don't blow up
+cardinality), `method`, and `status`.
+
+```sh
+curl -s localhost:8080/metrics | grep http_request_duration_seconds
+```
+
+Exempt from the rate limiter for the same reason `/health` is: a
+Prometheus scraper polling this endpoint on its own schedule shouldn't be
+throttled like a regular client.
 
 ### `GET /events/ws` (WebSocket live stream)
 
