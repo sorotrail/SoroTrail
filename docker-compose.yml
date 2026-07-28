@@ -14,11 +14,15 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
+    restart: unless-stopped
 
   indexer:
     build: .
     depends_on:
       postgres:
+        # Real readiness gating: the indexer doesn't start until
+        # pg_isready reports ok, so a fresh stack never races on
+        # migrations or first-poll errors from a half-up database.
         condition: service_healthy
     environment:
       RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
@@ -29,6 +33,29 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
       - "8080:8080"
+    # Probe `/health` using the same binary already shipped in the
+    # image (the docker HEALTHCHECK directive sets this; repeat it
+    # here so users running against a published image — where the
+    # Dockerfile is authoritative — see the same shape in compose).
+    # Flags mirror the Dockerfile defaults and stay operator-editable.
+    # --addr is intentionally omitted: the probe falls back to
+    # $HTTP_ADDR (rewritten to 127.0.0.1:<port> for the loopback-only
+    # probe) then 127.0.0.1:8080, so the probe follows whichever port
+    # HTTP_ADDR names rather than drifting against a hardcoded one.
+    healthcheck:
+      test:
+        - "CMD"
+        - "sorotrail"
+        - "healthcheck"
+        - "--endpoint"
+        - "/health"
+        - "--timeout"
+        - "3s"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
 
 volumes:
   pgdata:
