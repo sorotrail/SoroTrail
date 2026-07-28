@@ -500,8 +500,8 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 	var s IngestionState
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx,
-			`SELECT last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE id = 1`,
-		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.UpdatedAt)
+			`SELECT last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state WHERE id = 1`,
+		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.LastSuccessfulPoll, &s.UpdatedAt)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return IngestionState{}, ErrNotFound
@@ -509,7 +509,6 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 	if err != nil {
 		return IngestionState{}, fmt.Errorf("loading ingestion state: %w", err)
 	}
-	s.LastSuccessfulPoll = lastSuccessfulPoll
 	return s, nil
 }
 
@@ -632,10 +631,6 @@ func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) er
 
 func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 	var s Stats
-	var lastSuccessfulPoll *time.Time
-	// COUNT(DISTINCT contract_id) scans the contract_id index; fine at MVP
-	// scale. contributors: replace with a maintained summary table if it
-	// becomes a bottleneck on large datasets.
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
 			SELECT
@@ -644,13 +639,13 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 				(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
 				(SELECT coalesce(min(ledger), 0) FROM events),
 				(SELECT count(DISTINCT contract_id) FROM events),
-				(SELECT count(*) FROM watched_contracts)`,
-		).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
+				(SELECT count(*) FROM watched_contracts),
+				(SELECT max(last_successful_poll) FROM ingestion_state)`,
+		).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts, &s.LastSuccessfulPoll)
 	})
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
 	}
-	s.LastSuccessfulPoll = lastSuccessfulPoll
 	return s, nil
 }
 
