@@ -88,7 +88,10 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
 	ContractID string
-	Type       string
+	// Types filters by event type. Multiple values are accepted (ANDed
+	// together at the SQL level via type = ANY(...)). An empty or nil
+	// slice means "no constraint".
+	Types []string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic json.RawMessage
@@ -104,15 +107,41 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	FromLedger    int64     // inclusive
-	ToLedger      int64     // inclusive
-	FromTime      time.Time // inclusive, zero = no constraint
-	ToTime        time.Time // inclusive, zero = no constraint
+	// TxHash filters events emitted by a specific transaction hash.
+	TxHash     string    // hex-encoded transaction hash
+	FromLedger int64     // inclusive
+	ToLedger   int64     // inclusive
+	FromTime   time.Time // inclusive, zero = no constraint
+	ToTime     time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int
 	// Order is "asc" or "desc", defaults to "asc"
 	Order string
+	// OrderBy selects the sort column: OrderByID (default), OrderByLedger,
+	// or OrderByCreatedAt. Every ordering is made total by appending id as
+	// a tiebreaker, so keyset pagination stays stable when the sort column
+	// has duplicates.
+	OrderBy string
+}
+
+// Sort columns accepted in EventFilter.OrderBy. The zero value means
+// OrderByID, which is the historical behavior.
+const (
+	OrderByID        = "id"
+	OrderByLedger    = "ledger"
+	OrderByCreatedAt = "created_at"
+)
+
+// ValidOrderBy reports whether s names a supported sort column. The empty
+// string is valid and means OrderByID.
+func ValidOrderBy(s string) bool {
+	switch s {
+	case "", OrderByID, OrderByLedger, OrderByCreatedAt:
+		return true
+	default:
+		return false
+	}
 }
 
 // IngestionState tracks how far ingestion has progressed.
@@ -306,9 +335,29 @@ type Stats struct {
 	IngestLagLedgers      *int64 `json:"ingest_lag_ledgers"`
 	ContractCount         int64  `json:"contract_count"`
 	WatchedContracts      int64  `json:"watched_contracts"`
+	// QueryErrors is the number of store queries that have returned an
+	// error (timeout, connection failure, etc.) since the process started.
+	// Set by the guarded store wrapper; zero when the store is used
+	// directly or when no errors have occurred.
+	QueryErrors uint64 `json:"query_errors"`
+	// PanicsRecovered is the number of panics the HTTP middleware has
+	// recovered since process start. Set by the API handler.
+	PanicsRecovered uint64 `json:"panics_recovered"`
+	// RPCErrors counts RPC call failures by method name since the process
+	// started. Populated by the CountingClient wrapper; zero-valued when
+	// the wrapper is not in use.
+	RPCErrors RPCErrorStats `json:"rpc_errors,omitempty"`
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
+}
+
+// RPCErrorStats is a JSON-friendly snapshot of per-method RPC error counts.
+type RPCErrorStats struct {
+	GetEvents        uint64 `json:"getEvents,omitempty"`
+	GetLatestLedger  uint64 `json:"getLatestLedger,omitempty"`
+	GetHealth        uint64 `json:"getHealth,omitempty"`
+	GetLedgerEntries uint64 `json:"getLedgerEntries,omitempty"`
 }
 
 // AuditStats is a JSON-friendly view of audit.Metrics. Defined here so
@@ -385,6 +434,9 @@ type Store interface {
 	// cursor for the next page ("" when there are no more results).
 	// Default order is ascending (oldest-first) for backward compatibility.
 	QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error)
+	// CountEvents returns the total number of events matching the filter
+	// (ignoring pagination: cursor, order, and limit are not applied).
+	CountEvents(ctx context.Context, f EventFilter) (int64, error)
 	// LedgerRangeCensus returns one LedgerCensus row per ledger in the
 	// inclusive [fromLedger, toLedger] range that contains at least one
 	// event, in ascending ledger order. idsOnly=true populates LedgerCensus.IDs

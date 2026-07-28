@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,7 +16,8 @@ type GuardedStoreOptions struct {
 
 type guardedStore struct {
 	Store
-	options GuardedStoreOptions
+	options     GuardedStoreOptions
+	queryErrors atomic.Uint64
 }
 
 type queryNameContextKey struct{}
@@ -42,6 +44,9 @@ func (s *guardedStore) wrapContext(ctx context.Context, name string) (context.Co
 }
 
 func (s *guardedStore) logSlowQuery(name string, start time.Time, err error) {
+	if err != nil {
+		s.queryErrors.Add(1)
+	}
 	duration := time.Since(start)
 	if duration < s.options.SlowQueryThreshold {
 		return
@@ -96,6 +101,15 @@ func (s *guardedStore) QueryEvents(ctx context.Context, f EventFilter) ([]Event,
 	events, cursor, err := s.Store.QueryEvents(ctx, f)
 	s.logSlowQuery("store.QueryEvents", start, err)
 	return events, cursor, err
+}
+
+func (s *guardedStore) CountEvents(ctx context.Context, f EventFilter) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.CountEvents")
+	defer cancel()
+	start := time.Now()
+	total, err := s.Store.CountEvents(ctx, f)
+	s.logSlowQuery("store.CountEvents", start, err)
+	return total, err
 }
 
 func (s *guardedStore) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error) {
@@ -320,6 +334,7 @@ func (s *guardedStore) Stats(ctx context.Context) (Stats, error) {
 	start := time.Now()
 	stats, err := s.Store.Stats(ctx)
 	s.logSlowQuery("store.Stats", start, err)
+	stats.QueryErrors = s.queryErrors.Load()
 	return stats, err
 }
 

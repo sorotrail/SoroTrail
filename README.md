@@ -26,11 +26,11 @@ a Postgres you already have:
 docker run --rm -p 8080:8080 \
   -e DATABASE_URL='postgres://user:pass@host:5432/sorotrail?sslmode=disable' \
   -e RPC_URL='https://soroban-testnet.stellar.org' \
-  ghcr.io/stephaniepez21-art/sorotrail:latest
+  ghcr.io/sorotrail/sorotrail:latest
 ```
 
 Pin a specific release with a version tag instead of `latest`, e.g.
-`ghcr.io/stephaniepez21-art/sorotrail:v1.2.0`. See [Configuration](#configuration) for
+`ghcr.io/sorotrail/sorotrail:v1.2.0`. See [Configuration](#configuration) for
 the full list of environment variables.
 
 ### Docker Compose (full stack)
@@ -49,6 +49,18 @@ To watch specific contracts instead of everything:
 ```sh
 WATCHED_CONTRACTS=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC docker compose up --build
 ```
+
+**Container health.** The published image ships with a `HEALTHCHECK` that
+probes `/health` via the in-binary `sorotrail healthcheck` subcommand
+(alpine has no curl/wget — installing curl or shipping a second binary
+would just grow the image; routing the probe through the existing
+binary reuses the `net/http` client that's already linked in for the
+server, so the cost is a few hundred bytes of flag-parsing and a probe
+function). Compose mirrors the same probe so `docker ps` shows an
+honest health status, and combined with `depends_on: condition:
+service_healthy` on Postgres, a fresh `docker compose up --build`
+brings the stack up in the right order instead of hoping the indexer
+wins a race against a half-up database.
 
 ### Bare metal
 
@@ -77,6 +89,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
+| `LOG_FORMAT` | `text` | `text` \| `json`. JSON emits one JSON object per line, compatible with Loki, CloudWatch, and ELK. |
 | `API_QUERY_TIMEOUT` | `25s` | Per-request database timeout for API-originated store reads. The timeout is enforced in-process and mirrored to Postgres via `statement_timeout`. |
 | `API_SLOW_QUERY_THRESHOLD` | `2s` | Warn when an API-originated store query takes longer than this threshold; logs include the query name and elapsed duration. |
 | `AUDIT_ENABLED` | `false` | Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build. |
@@ -95,6 +108,12 @@ All configuration comes from environment variables (see `.env.example`):
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
+| `COMPRESS_MIN_SIZE` | `1400` | Response body size (bytes) at or above which responses are gzip/deflate encoded for clients advertising support. Set negative to disable compression. See [Compression](#compression). |
+| `SHUTDOWN_TIMEOUT` | `15s` | Time the graceful shutdown may wait for in-flight requests and the current ingest cycle to wind down before the process is killed. Zero means wait indefinitely. |
+| `SWEEP_CONCURRENCY` | `1` | Number of filter batches fanned out in parallel during a windowSweep pass. The per-request RPC interval limiter still caps total request rate at ~10 req/s, so raising this helps only against private RPCs with more headroom. The single-batch path (`<=25` watched contracts) is unchanged. |
+| `REORG_CONFIRMATION_WINDOW` | `64` | Number of ledgers behind the ingest frontier re-scanned on a schedule for RPC-side reorgs. Once a ledger is further behind the frontier than this, it is considered finalized and never rewritten. Zero disables reorg detection. |
+| `REORG_RESCAN_INTERVAL` | `1m` | Cadence of the periodic reorg re-scan over the recent finalized window. The re-scan shares the live RPC budget and runs after a successful ingest cycle. |
+| `EXPORT_MAX_RANGE` | `17280` | Maximum ledger span a single `/contracts/{id}/export` call may request (~24h at 5s/ledger). Returns `400` with the bound if exceeded. Raise for dedicated analytical deployments; lower for tighter abuse thresholds. |
 
 ## Ingestion behavior
 
@@ -175,6 +194,40 @@ continues; a Postgres advisory lock prevents two replays at once.
 See [docs/replay.md](docs/replay.md) for flags, the summary output, the
 advisory-lock strategy, and the derivation order for dependent tables.
 
+## Compression
+
+Responses are gzip- or deflate-encoded when the client advertises support via
+`Accept-Encoding`, which matters most for event listings — a 200-event page is
+largely repetitive JSON keys and compresses well.
+
+Compression is applied per response, not per route, and only once the body
+reaches `COMPRESS_MIN_SIZE` (1400 bytes by default — roughly one Ethernet
+MTU). Below that, encoding costs CPU on both ends and can make the body
+*larger* once the gzip header and trailer are counted, so small responses
+(error envelopes, `/health`, a single event) are sent as-is.
+
+Clients that don't advertise an encoding get the original bytes, byte for
+byte. `gzip` is preferred over `deflate` when both are offered, and
+`gzip;q=0` is honored as a refusal rather than a low ranking.
+
+Some things are deliberately left alone:
+
+- **WebSocket upgrades** (`/events/ws`) bypass the middleware entirely — the
+  response is a `101` and the connection is then taken over.
+- **Streaming responses** that flush before reaching the threshold give up on
+  compression rather than holding bytes back, so a live stream never stalls
+  waiting for a buffer to fill.
+- **`204` and `304`** carry no body, and a `304` with `Content-Encoding`
+  misleads caches.
+- **Non-compressible media types** (images, already-compressed payloads) and
+  bodies a handler already encoded itself.
+
+`Vary: Accept-Encoding` is always set, so a shared cache never serves a
+compressed body to a client that can't decode it. Compressing produces a
+different representation of the same resource, so a strong `ETag` is weakened
+(`"v1"` → `W/"v1"`) when a response is encoded; conditional requests still
+match, since `If-None-Match` comparison ignores the `W/` prefix.
+
 ## API reference
 
 All responses are JSON. Errors look like `{"error": "message"}`.
@@ -230,6 +283,7 @@ Query parameters (all optional, combinable):
 | `contract_id` | `CDLZ...CYSC` | Only events from this contract. |
 | `type` | `contract` | `contract` \| `system` \| `diagnostic`. |
 | `topic` | `{"symbol":"transfer"}` | Exact match against any topic position. A bare word is treated as a JSON string. |
+| `topic_contains` | `[{"address":"G..."}]` | Postgres jsonb containment (`@>`) against the topics array. Pass an array to match one or more topic elements: `[{"address":"G..."}]` matches any event where a topic contains that address; `[{"symbol":"transfer"},{"address":"G..."}]` requires both. Must be parseable JSON (400 otherwise). Uses the GIN index on `topics`. |
 | `topic0` | `{"symbol":"transfer"}` | Exact match against topic position 0. |
 | `topic1` | `{"address":"G..."}` | Exact match against topic position 1. |
 | `topic2` | `{"address":"G..."}` | Exact match against topic position 2. |
@@ -240,14 +294,53 @@ Query parameters (all optional, combinable):
 | `to_time` | `2026-07-22T00:00:00Z` | Inclusive upper `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
 | `limit` | `50` | Page size, 1–200 (default 50). |
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
-| `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
+| `order` | `desc` | `asc` \| `desc`, defaults to asc. Sort direction. |
+| `order_by` | `created_at` | `id` \| `ledger` \| `created_at`, defaults to `id`. Sort column. Anything else is a `400`. |
 | `decoded` | `true` | When `true`, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with `"decoded": false`. |
+| `include_xdr` | `true` | When `true`, includes raw base64 `topics_xdr` and `value_xdr` on each event. Omitted by default to keep responses small. |
 
 Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
+
+#### Ordering and pagination
+
+`order_by` picks the sort column and `order` the direction, so they combine:
+
+```sh
+curl -s 'localhost:8080/events?order_by=created_at&order=desc&limit=100'
+```
+
+Pagination stays correct under every ordering. `ledger` and `created_at` both
+have duplicates — a ledger holds many events, and a batch insert stamps one
+`created_at` on all of them — so those orderings sort by `(column, id)` and
+their cursors carry both halves. That keeps a page boundary landing in the
+middle of a run of equal values from skipping or repeating rows.
+
+Cursors are opaque and tied to the ordering that produced them: feeding a
+cursor from one `order_by` into another returns `400`. Always pass back the
+`cursor` from the previous response with the same `order_by`/`order`. Cursors
+issued for the default `id` ordering are unchanged, so existing clients keep
+working.
 
 ```sh
 curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic={"symbol":"transfer"}&limit=2'
 ```
+
+Containment search (`topic_contains`) lets you filter by partial topic
+structure — e.g. any event involving a specific address, even when you
+don't know the full topic shape:
+
+```sh
+# Events whose topics include a specific address
+curl -s 'localhost:8080/events?topic_contains=[{"address":"GA...5WI"}]&limit=5'
+# Events with both a transfer symbol and a specific address
+curl -s 'localhost:8080/events?topic_contains=[{"symbol":"transfer"},{"address":"GA...5WI"}]&limit=5'
+```
+
+**Semantics**: `topic_contains` uses Postgres jsonb containment (`@>`),
+not substring matching. `topic_contains=[{"address":"G..."}]` means
+"the topics array contains an element that itself jsonb-contains
+`{"address":"G..."}`", so `{"address":"G...","symbol":"transfer"}`
+matches. For exact element equality use `topic` instead.
 
 ```sh
 curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"GABC..."}&topic2={"address":"GDEF..."}'
@@ -311,6 +404,67 @@ remaining query parameters.
 ```sh
 curl -s localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/events?limit=10
 ```
+
+### `GET /contracts/{id}/export`
+
+Streams a contract's stored events for a closed ledger range as an
+`attachment` download. Either `csv` (default) or `ndjson` is supported
+via `?format=csv|ndjson`. Ledger bounds are required; ranges larger
+than `EXPORT_MAX_RANGE` (default `17280` ledgers, roughly 24h) return
+`400` with the bound included in the error.
+
+```sh
+# CSV — id, ledger, type, tx_hash, topics (JSON string), value (JSON string)
+curl -OJ 'localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/export?from_ledger=250000&to_ledger=260000'
+
+# NDJSON — one event object per line, same shape as /events
+curl -OJ 'localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/export?from_ledger=250000&to_ledger=260000&format=ndjson'
+```
+
+The response carries
+`Content-Disposition: attachment; filename="<id>-ledgers-<from>-<to>.<format>"`
+so downloads land under intuitive file names, and `Cache-Control: no-store`
+keeps stale browser caches from freezing a snapshot. The store is queried
+in fixed-size pages (`200` rows, at the `MaxQueryLimit` ceiling), so
+memory usage stays bounded regardless of the ledger span.
+
+### Ingestion behavior additions
+
+- **Parallel sweeps** (`SWEEP_CONCURRENCY`, default `1`): deployments
+  watching more than the per-request 25 contracts split the filter set
+  into multiple request chains paged through each `SweepWindow` ledger
+  span. With the default the chains are still issued sequentially;
+  raise `SWEEP_CONCURRENCY` against a private RPC to fan the chains
+  out via bounded concurrency. The HTTPClient's interval limiter caps
+  total request rate at ~10 req/s regardless, so the parallelism only
+  helps when the RPC has headroom past the public ceiling. The
+  single-batch path (`<=25` watched contracts) is unchanged.
+- **Reorg detection** (`REORG_CONFIRMATION_WINDOW`, default `64`): after
+  every successful ingest cycle the Run loop re-fetches the range
+  `[frontier - REORG_CONFIRMATION_WINDOW, frontier - 1]` and replaces
+  any drift via the auditor's transactional delete + insert repair
+  (`ReplaceEventsInRange`). Rows past the window are treated as
+  **finalized** and never rewritten — once a ledger stays more than
+  `REORG_CONFIRMATION_WINDOW` behind the ingest frontier the re-scan
+  can no longer mutate its rows. Set `REORG_CONFIRMATION_WINDOW=0` to
+  disable the re-scan entirely.
+
+### Graceful shutdown
+
+A SIGINT or SIGTERM cancels the root context, which propagates into:
+
+- The HTTP server: `Shutdown` holds open connections while they finish
+  their current request, bounded by `SHUTDOWN_TIMEOUT` (default `15s`).
+- The ingester: `Run` lets the current `runOnce` cycle wind down to its
+  next iteration boundary, then returns `context.Canceled`.
+  `ingestion_state` is only advanced at the end of a successful cycle,
+  so a cancelled cycle leaves the frontier at the last fully-persisted
+  ledger; restart resumes from there with idempotent upserts covering
+  any in-flight rows on the next pass.
+
+This guarantees no panics and no truncated writes on `Ctrl-C` / `kill`,
+and the cursor is always persisted so the next process picks up exactly
+where the previous one stopped.
 
 ### Webhooks
 
@@ -582,6 +736,21 @@ events have been proven to match a fresh RPC fetch by the auditor. When
 `AUDIT_ENABLED=false` it stays at `0`. See the Data integrity section
 below for the contract the field implies.
 
+### `GET /metrics`
+
+Serves `http_request_duration_seconds`, a Prometheus histogram of HTTP
+request latency labeled by `route` (the matched chi route pattern, e.g.
+`/events/{id}` — never the raw path, so path parameters don't blow up
+cardinality), `method`, and `status`.
+
+```sh
+curl -s localhost:8080/metrics | grep http_request_duration_seconds
+```
+
+Exempt from the rate limiter for the same reason `/health` is: a
+Prometheus scraper polling this endpoint on its own schedule shouldn't be
+throttled like a regular client.
+
 ### `GET /events/ws` (WebSocket live stream)
 
 Pushes ingested events to the client over a single WebSocket connection
@@ -723,8 +892,9 @@ make lint         # golangci-lint
 make migrate-up   # apply migrations manually (needs the migrate CLI)
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture notes and extension
-points.
+See [docs/architecture.md](docs/architecture.md) for the full system architecture
+diagram and component descriptions. [CONTRIBUTING.md](CONTRIBUTING.md) covers extension
+points and development conventions.
 
 ## Roadmap / future work
 
@@ -732,9 +902,9 @@ Deliberately out of scope for the MVP, with seams left for contributors:
 
 - Per-standard event decoders (e.g. SEP-41 token transfers) on top of
   `decode.Decoder`.
-- Support for more than 25 watched contracts per request chain is implemented
-  via windowed sweeps; smarter scheduling (parallel sweeps, per-contract
-  cursors) is welcome.
+- Per-contract cursors (mesh-point for the parallel sweep redesign:
+  the scheduler is now parallel but still shares one cursor per
+  window).
 - GraphQL / websocket subscriptions.
 - Metrics (Prometheus) and tracing.
 - Alternative storage backends behind `store.Store`.
