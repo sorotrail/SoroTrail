@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sorotrail
+      POSTGRES_PASSWORD: sorotrail
+      POSTGRES_DB: sorotrail
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sorotrail -d sorotrail"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  mockrpc:
+    build:
+      context: .
+      dockerfile: Dockerfile.mockrpc
+    command: ["-addr", ":8081", "-ledgers-per-second", "2"]
+
+  sorotrail:
+    build:
+      context: .
+      dockerfile: Dockerfile.sorotrail
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mockrpc:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://sorotrail:sorotrail@postgres:5432/sorotrail?sslmode=disable
+      RPC_URL: http://mockrpc:8081
+    ports:
+      - "8080:8080"

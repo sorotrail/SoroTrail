@@ -8,8 +8,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // testLogger returns a slog.Logger that drops everything.
@@ -127,7 +127,7 @@ type mockStore struct {
 	findings []store.AuditFinding
 	nextFID  int64
 
-	watched []string
+	watched []store.WatchedContract
 
 	// ledgers lets assertions check whether a finding record was written.
 	ledgerCensusCalls []struct {
@@ -198,6 +198,10 @@ func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) 
 
 func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Event, string, error) {
 	return nil, "", nil
+}
+
+func (m *mockStore) CountEvents(context.Context, store.EventFilter) (int64, error) {
+	return 0, nil
 }
 
 func (m *mockStore) LedgerRangeCensus(_ context.Context, from, to int64, idsOnly bool) ([]store.LedgerCensus, error) {
@@ -278,13 +282,23 @@ func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, ledger int64) (st
 	return *m.auditState, nil
 }
 
-func (m *mockStore) ListWatchedContracts(context.Context) ([]string, error) {
+func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return m.watched, nil
 }
 
 func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
-	m.watched = append(m.watched, id)
+	m.watched = append(m.watched, store.WatchedContract{ContractID: id})
 	return nil
+}
+
+func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
+	for i, wc := range m.watched {
+		if wc.ContractID == id {
+			m.watched = append(m.watched[:i], m.watched[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrNotFound
 }
 
 func (m *mockStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) (store.AuditFinding, error) {
