@@ -101,9 +101,6 @@ type Server struct {
 	exportMaxRange int64
 }
 
-func (s *Server) SetMetricsEnabled(enabled bool) {
-    s.metricsEnabled = enabled
-}
 
 // SetCompressMinSize overrides the body size at which responses are
 // compressed. Pass a negative value to disable compression.
