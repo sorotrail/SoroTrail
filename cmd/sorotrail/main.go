@@ -82,7 +82,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log := newLogger(cfg.LogLevel)
+	log := newLogger(cfg.LogLevel, cfg.LogFormat)
 
 	log.Info("startup configuration", cfg.LoggableFields()...)
 
@@ -137,9 +137,12 @@ func run() error {
 	api.SetRPCCounter(countingClient)
 
 	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
-		PollInterval:     cfg.PollInterval,
-		StartLedger:      cfg.StartLedger,
-		RetentionLedgers: cfg.RetentionLedgers,
+		PollInterval:            cfg.PollInterval,
+		StartLedger:             cfg.StartLedger,
+		RetentionLedgers:        cfg.RetentionLedgers,
+		SweepConcurrency:        cfg.SweepConcurrency,
+		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
+		ReorgRescanInterval:     cfg.ReorgRescanInterval,
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
 	api.SetIngester(ing)
@@ -181,6 +184,7 @@ func run() error {
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
+	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -258,7 +262,7 @@ func run() error {
 	return firstErr
 }
 
-func newLogger(level string) *slog.Logger {
+func newLogger(level, format string) *slog.Logger {
 	var lvl slog.Level
 	switch strings.ToLower(level) {
 	case "debug":
@@ -270,5 +274,13 @@ func newLogger(level string) *slog.Logger {
 	default:
 		lvl = slog.LevelInfo
 	}
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
+	opts := &slog.HandlerOptions{Level: lvl}
+	var h slog.Handler
+	switch strings.ToLower(format) {
+	case "json":
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	default:
+		h = slog.NewTextHandler(os.Stdout, opts)
+	}
+	return slog.New(h)
 }
