@@ -1,0 +1,69 @@
+name: Feature request
+description: Propose a new feature or change to SoroTrail.
+title: "[feat]: "
+labels: ["enhancement"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests follow the same structure the existing
+        maintainer-managed issues use. Three sections: **Description**,
+        **What "done" looks like**, **Implementation guidance**.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: |
+        What is the feature? Who benefits, and how? Link any prior
+        discussion (issues, PRs, chat threads).
+    validations:
+      required: true
+
+  - type: textarea
+    id: done
+    attributes:
+      label: What "done" looks like
+    description: |
+        Concrete acceptance criteria. Mirror the format used elsewhere
+        in the issue tracker:
+
+        - Bullet list of behaviors that must be observable after the change.
+        - Performance, observability, or operator-experience constraints.
+        - Test coverage expectations (unit, integration, doc).
+        - Anything that would let a reviewer say "this isn't done yet".
+    validations:
+      required: true
+
+  - type: textarea
+    id: guidance
+    attributes:
+      label: Implementation guidance
+    description: |
+        Where the code should live, what interfaces to extend, and any
+        conventions the implementation must respect. Examples:
+        "implement the `store.Store` interface rather than the
+        concrete `store.Postgres`", or "extend the existing
+        `internal/decode` switch rather than introducing a new package".
+        Link the architecture doc when relevant.
+      placeholder: |
+        - Touches: `internal/store/...`
+        - Extends the existing `Store` interface — no new package.
+        - Idempotent: re-running the new code path against the same data
+          must be a no-op.
+        - Add a migration if schema changes; never edit an applied one.
+
+  - type: dropdown
+    id: complexity
+    attributes:
+      label: Estimated complexity
+      description: |
+        Rough size of the change. The maintainers re-prioritize
+        `complexity:trivial` / `complexity:small` items first.
+      options:
+        - complexity:trivial — a few lines, docs, or one-line config
+        - complexity:small — one package, single review cycle
+        - complexity:medium — touches 2-3 packages, design review
+        - complexity:large — multi-package refactor or new module

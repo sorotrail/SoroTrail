@@ -50,6 +50,18 @@ To watch specific contracts instead of everything:
 WATCHED_CONTRACTS=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC docker compose up --build
 ```
 
+**Container health.** The published image ships with a `HEALTHCHECK` that
+probes `/health` via the in-binary `sorotrail healthcheck` subcommand
+(alpine has no curl/wget — installing curl or shipping a second binary
+would just grow the image; routing the probe through the existing
+binary reuses the `net/http` client that's already linked in for the
+server, so the cost is a few hundred bytes of flag-parsing and a probe
+function). Compose mirrors the same probe so `docker ps` shows an
+honest health status, and combined with `depends_on: condition:
+service_healthy` on Postgres, a fresh `docker compose up --build`
+brings the stack up in the right order instead of hoping the indexer
+wins a race against a half-up database.
+
 ### Bare metal
 
 ```sh
