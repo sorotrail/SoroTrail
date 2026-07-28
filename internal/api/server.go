@@ -96,6 +96,15 @@ type Server struct {
 	// Zero means unbounded (legacy behavior); config-driven wiring sets
 	// EXPORT_MAX_RANGE so requests default to a sane ceiling.
 	exportMaxRange int64
+	// graphqlHandler is the GraphQL /graphql handler if wired. When
+	// nil, the /graphql and /graphiql routes are not mounted and a
+	// 404 is returned for any request to those paths. main.go wires
+	// the handler via SetGraphQLHandler.
+	graphqlHandler http.Handler
+	// graphqlPlayground is the dev-mode GraphiQL UI handler. Served
+	// at /graphiql when non-nil; production deployments leave it
+	// nil so /graphiql returns 404.
+	graphqlPlayground http.Handler
 }
 
 // SetCompressMinSize overrides the body size at which responses are
@@ -138,6 +147,20 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 // analytical workloads without code changes.
 func (s *Server) SetExportMaxRange(n int64) { s.exportMaxRange = n }
 
+// SetGraphQLHandler wires the GraphQL transport into the chi router.
+// Passing nil removes the routes — useful for tests and for operators
+// who want only the REST surface.
+//
+// The playground handler, when non-nil, is served at /graphiql so
+// operators and frontend devs can introspect the schema and run
+// exploration queries against a development instance. Production
+// deployments typically leave the playground handler nil; the README
+// documents the env flag.
+func (s *Server) SetGraphQLHandler(handler http.Handler, playground http.Handler) {
+	s.graphqlHandler = handler
+	s.graphqlPlayground = playground
+}
+
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
@@ -173,6 +196,19 @@ func (s *Server) Router() http.Handler {
 	r.Get("/contracts/{id}/export", s.handleContractExport)
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
+
+	// GraphQL transport — read-only, mounts at /graphql and dev-mode
+	// /graphiql. Built by the graphql package; the API server only
+	// owns the route registration so a misconfigured GraphQL handler
+	// shows up as a 404 instead of a confusing 500.
+	if s.graphqlHandler != nil {
+		r.Handle("/graphql", s.graphqlHandler)
+	}
+	if s.graphqlPlayground != nil {
+		r.Get("/graphiql", func(w http.ResponseWriter, req *http.Request) {
+			s.graphqlPlayground.ServeHTTP(w, req)
+		})
+	}
 
 	// Watched-contracts management: writes and updates to the runtime
 	// filter list. Always auth-gated, even when AUTH_ENABLED would be

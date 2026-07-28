@@ -128,6 +128,13 @@ type Config struct {
 	// uncooperative GC pauses on big results; the cap is configurable so
 	// private deployments can opt for a larger analytical dump.
 	ExportMaxRange int64 `env:"EXPORT_MAX_RANGE" envDefault:"17280"`
+
+	// GraphQLPlayground toggles the dev-mode GraphiQL UI served at
+	// /graphiql. The /graphql POST endpoint is always mounted (the
+	// spec doesn't gate the schema) but the playground HTML is
+	// production-inappropriate — defaults to false. Set to true for
+	// development or staging only.
+	GraphQLPlayground bool `env:"GRAPHQL_PLAYGROUND" envDefault:"false"`
 }
 
 // Load reads configuration from the environment and validates it.

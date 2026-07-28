@@ -454,6 +454,189 @@ This guarantees no panics and no truncated writes on `Ctrl-C` / `kill`,
 and the cursor is always persisted so the next process picks up exactly
 where the previous one stopped.
 
+### GraphQL API
+
+Read-only GraphQL endpoint at `POST /graphql`, schema-first with
+Shared query-builder helpers in `internal/api/queries` so REST and
+GraphQL validate filters identically. Same `EventFilter` shape,
+same `Cursor` semantics, no drift between transports.
+
+#### Endpoints
+
+- **`POST /graphql`** — accepts a JSON body
+  `{"query": "...", "variables": {...}, "operationName": "..."}`. Returns
+  the standard GraphQL envelope `{"data": ..., "errors": ...}`.
+- **`GET /graphql?query=...`** — same handler; useful for browser
+  playground GET hits.
+- **`GET /graphiql`** — dev-mode GraphiQL playground. Disabled by
+  default; set `GRAPHQL_PLAYGROUND=true` to serve it.
+
+#### Limits
+
+To prevent abuse, every operation runs through two pre-flight checks
+before any resolver runs:
+
+- **Depth**: 10 (hard cap). Anything deeper is rejected with an
+  `errors[].message` describing the violation.
+- **Complexity**: 1000 (hard cap). Connection-style fields cost 25,
+  leaf fields 1, plus a 5-unit operation overhead. Wide fanout sits
+  comfortably within the cap; a pathological 100k-field request is
+  rejected before SQL touches the events table.
+
+Both limits are configurable in `internal/api/graphql/limits.go`.
+Bumping them requires rebaselining against real client queries.
+
+#### Schema highlights
+
+Queries (read-only, no mutations):
+
+- `events(filter: EventFilterInput, page: PageInput): EventConnection!`
+- `tokenEvents(filter: EventFilterInput, page: PageInput): TokenEventConnection!`
+- `contracts(page: PageInput): ContractConnection!`
+- `event(id: ID!): Event` — single event lookup, null when missing.
+- `contract(id: ID!): Contract` — single watched-contract lookup.
+
+Filter input fields mirror the REST `GET /events` query parameters:
+
+- `contractId`, `types[]`, `topic`, `topics.t0..t3`, `topicContains`,
+  `txHash`, `fromLedger`/`toLedger`, `fromTime`/`toTime`.
+
+Pagination input is Relay-style: `first`/`after` for forward,
+`last`/`before` for backward (currently unsupported and rejected
+with an error message — see `queries.ResolvePage`). Sort: `order`
++ `orderBy` (defaults ASC/id).
+
+#### Example 1 — list events with filter + cursor pagination
+
+```graphql
+query EventsForContract($id: ID!, $first: Int!) {
+  events(
+    filter: { contractId: $id, type: CONTRACT }
+    page: { first: $first, orderBy: LEDGER, order: ASC }
+  ) {
+    edges {
+      cursor
+      node { id contractId ledger type topics value createdAt }
+    }
+    nodes { id ledger createdAt }
+    pageInfo { hasNextPage endCursor }
+    totalCount
+  }
+}
+```
+
+Variables:
+
+```json
+{
+  "id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+  "first": 10
+}
+```
+
+Response (200 OK):
+
+```json
+{
+  "data": {
+    "events": {
+      "edges": [
+        {
+          "cursor": "eyJpZCI6IjAwMDEwOTk1MTE2Mjc3NzYtMDAwMDAwMDAwMSIsIm9yZGVyX2J5IjoiaWQiLCJvcmRlciI6ImFzYyJ9",
+          "node": {
+            "id": "0001099511627776-0000000001",
+            "contractId": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+            "ledger": 256000,
+            "type": "contract",
+            "topics": [{"symbol":"transfer"}, {"address":"G..."}],
+            "value": {"i128":"10000000"},
+            "createdAt": "2026-07-16T12:00:00Z"
+          }
+        }
+      ],
+      "nodes": [
+        {
+          "id": "0001099511627776-0000000001",
+          "ledger": 256000,
+          "createdAt": "2026-07-16T12:00:00Z"
+        }
+      ],
+      "pageInfo": { "hasNextPage": true, "endCursor": "eyJpZCI6..." },
+      "totalCount": 4321
+    }
+  }
+}
+```
+
+Pass `endCursor` back as `page.after` to retrieve the next page.
+Cursors are opaque — base64-JSON `{LastID, OrderBy, Order}` — so
+clients should treat them as strings.
+
+#### Example 2 — list token events with spec decoding
+
+```graphql
+query TokenEvents($id: ID!) {
+  tokenEvents(
+    filter: { contractId: $id, topic: "transfer", topicContains: [{"symbol":"transfer"}] }
+    page: { first: 5, orderBy: LEDGER, order: DESC }
+  ) {
+    edges { cursor node { id ledger } }
+    nodes {
+      id
+      decoded
+      decodedEvent { name fields }
+      topics
+      value
+    }
+    pageInfo { hasNextPage endCursor }
+    totalCount
+  }
+}
+```
+
+Variables:
+
+```json
+{ "id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC" }
+```
+
+Response (200 OK; `decodedEvent.fields` is only populated when
+`decoded == true`):
+
+```json
+{
+  "data": {
+    "tokenEvents": {
+      "edges": [{"cursor": "...", "node": {"id": "...", "ledger": 256100}}],
+      "nodes": [
+        {
+          "id": "0001099511627776-0000000042",
+          "decoded": true,
+          "decodedEvent": {
+            "name": "transfer",
+            "fields": {"from": "G...", "to": "G...", "amount": "10000000"}
+          },
+          "topics": [{"symbol":"transfer"}, {"address":"G..."}, {"address":"G..."}],
+          "value": {"i128":"10000000"}
+        }
+      ],
+      "pageInfo": { "hasNextPage": false, "endCursor": null },
+      "totalCount": 1
+    }
+  }
+}
+```
+
+#### Filter + pagination parity with REST
+
+Both transports share `internal/api/queries`: type whitelists, topic
+positional rules, ledger/time bounds, cursor validation, page-size
+caps are identical. A REST request rejected with `400 invalid cursor`
+returns the same `errors[].message` from GraphQL. Conversely a
+GraphQL topic/topic0 conflict returns the same `errors[].message` as
+the REST `/events?topic=…&topic0=…` handler.
+
+
 ### Webhooks
 
 Consumers can register callback URLs that receive matching events as they are
