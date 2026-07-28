@@ -144,6 +144,137 @@ func TestPagination_FullPageKeepsCursorAndContinues(t *testing.T) {
 	assert.Equal(t, "cursor-e3", state.LastCursor, "caught-up resume prefers the cursor")
 }
 
+// Issue #308: scripted multi-page responses. The scriptedRPC keys
+// responses by the cursor on the inbound request, so a single map
+// literal encodes the resume relationship between pages: page N's
+// Cursor field is the cursor the ingester sends for page N+1.
+func TestPagination_ScriptedMultiPage(t *testing.T) {
+	t.Run("three-page sequence threads cursors correctly", func(t *testing.T) {
+		// Page 1 (no cursor): 2 events, cursor "c1". Page 2 ("c1"):
+		// 2 events, cursor "c2". Page 3 ("c2"): 1 event, no top-level
+		// cursor → ingester falls back to the per-event CursorValue.
+		// Page 3 is short (1 < limit 2) so the runOnce is caught up.
+		client := newScriptedRPC(map[string]rpc.GetEventsResponse{
+			"": {
+				Events:       []rpc.Event{rpcEvent("e1", 100), rpcEvent("e2", 101)},
+				LatestLedger: 500,
+				Cursor:       "c1",
+			},
+			"c1": {
+				Events:       []rpc.Event{rpcEvent("e3", 102), rpcEvent("e4", 103)},
+				LatestLedger: 500,
+				Cursor:       "c2",
+			},
+			"c2": {
+				Events:       []rpc.Event{rpcEvent("e5", 104)},
+				LatestLedger: 500,
+			},
+		})
+		client.health = rpc.Health{Status: "healthy", LatestLedger: 500, OldestLedger: 10}
+		st := newMockStore()
+		ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 2})
+
+		caughtUp, err := ing.runOnce(context.Background())
+		require.NoError(t, err)
+		assert.False(t, caughtUp, "full page means more data likely")
+
+		caughtUp, err = ing.runOnce(context.Background())
+		require.NoError(t, err)
+		assert.False(t, caughtUp)
+
+		caughtUp, err = ing.runOnce(context.Background())
+		require.NoError(t, err)
+		assert.True(t, caughtUp, "short page = caught up")
+
+		// The three requests carry the cursors the script expects.
+		require.Len(t, client.calls, 3)
+		assert.Equal(t, "", paginationCursor(client.calls[0]))
+		assert.Equal(t, "c1", paginationCursor(client.calls[1]))
+		assert.Equal(t, "c2", paginationCursor(client.calls[2]))
+
+		// All five events made it into the store.
+		assert.Len(t, st.events, 5)
+		for _, id := range []string{"e1", "e2", "e3", "e4", "e5"} {
+			assert.Contains(t, st.events, id)
+		}
+
+		// After the short page the saved cursor is the per-event
+		// CursorValue() of the last event (the third response carried
+		// no top-level cursor).
+		state, err := st.GetIngestionState(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "e5", state.LastCursor)
+		assert.Equal(t, int64(104), state.LastIngestedLedger)
+	})
+
+	t.Run("five-page sequence exercises the full resume chain", func(t *testing.T) {
+		// Pages 1–4 are full (PageLimit 1), each carrying a cursor;
+		// page 5 is empty and ends the chain.
+		client := newScriptedRPC(map[string]rpc.GetEventsResponse{
+			"":   {Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 500, Cursor: "c1"},
+			"c1": {Events: []rpc.Event{rpcEvent("e2", 101)}, LatestLedger: 500, Cursor: "c2"},
+			"c2": {Events: []rpc.Event{rpcEvent("e3", 102)}, LatestLedger: 500, Cursor: "c3"},
+			"c3": {Events: []rpc.Event{rpcEvent("e4", 103)}, LatestLedger: 500, Cursor: "c4"},
+			"c4": {LatestLedger: 500},
+		})
+		client.health = rpc.Health{Status: "healthy", LatestLedger: 500, OldestLedger: 10}
+		st := newMockStore()
+		ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 1})
+
+		// Drive five runOnce cycles to drain the scripted chain.
+		var caughtUp bool
+		for i := 0; i < 5; i++ {
+			var err error
+			caughtUp, err = ing.runOnce(context.Background())
+			require.NoErrorf(t, err, "runOnce %d", i)
+		}
+		assert.True(t, caughtUp, "page 5 is short → caught up")
+
+		require.Len(t, client.calls, 5)
+		assert.Equal(t, "", paginationCursor(client.calls[0]))
+		assert.Equal(t, "c1", paginationCursor(client.calls[1]))
+		assert.Equal(t, "c2", paginationCursor(client.calls[2]))
+		assert.Equal(t, "c3", paginationCursor(client.calls[3]))
+		assert.Equal(t, "c4", paginationCursor(client.calls[4]))
+		assert.Len(t, st.events, 4)
+	})
+
+}
+
+// TestPagination_ErrorMidChainAborts asserts the production contract
+// that a failed page mid-pagination leaves the frontier at the last
+// fully-persisted ledger so the next runOnce retries the same page
+// idempotently. Lives next to TestPagination_ScriptedMultiPage for
+// the multi-page context, but does NOT exercise scriptedRPC — the
+// index-based mockRPC is the right tool here because we need to
+// script an error mid-chain that scriptedRPC's happy-path cursor map
+// can't model.
+func TestPagination_ErrorMidChainAborts(t *testing.T) {
+	failing := &mockRPC{
+		health: rpc.Health{Status: "healthy", LatestLedger: 500, OldestLedger: 10},
+		eventsResps: []rpc.GetEventsResponse{
+			{Events: []rpc.Event{rpcEvent("e1", 100)}, LatestLedger: 500, Cursor: "c1"},
+		},
+		eventsErrs: []error{nil, fmt.Errorf("boom")},
+	}
+	ing := newTestIngester(failing, newMockStore(), Options{StartLedger: 100, PageLimit: 1})
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err, "page 1 succeeds")
+	_, err = ing.runOnce(context.Background())
+	require.Error(t, err, "page 2 errors")
+	assert.Contains(t, err.Error(), "boom")
+}
+
+// paginationCursor extracts the cursor from a GetEvents request, or
+// returns "" when pagination is unset (cold start or first call).
+func paginationCursor(req rpc.GetEventsRequest) string {
+	if req.Pagination == nil {
+		return ""
+	}
+	return req.Pagination.Cursor
+}
+
 func TestPagination_LegacyPagingTokenFallback(t *testing.T) {
 	// Old servers return no top-level cursor; the per-event pagingToken of
 	// the last event is used instead.
