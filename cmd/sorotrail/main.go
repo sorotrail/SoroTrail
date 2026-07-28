@@ -197,6 +197,8 @@ func run() error {
 		SlowQueryThreshold: cfg.APISlowQueryThreshold,
 		Logger:             log,
 	})
+	api.SetMaxLimit(cfg.APIMaxLimit)
+
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)

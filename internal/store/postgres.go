@@ -21,10 +21,11 @@ var ErrNotFound = errors.New("not found")
 var ErrInvalidCursor = errors.New("invalid cursor")
 
 // DefaultQueryLimit applies when EventFilter.Limit is unset; MaxQueryLimit
-// caps requested page sizes.
+// caps requested page sizes as a server-side safety net (the API layer
+// enforces its own configurable limit via API_MAX_LIMIT).
 const (
 	DefaultQueryLimit         = 50
-	MaxQueryLimit             = 200
+	MaxQueryLimit             = 500
 	DefaultEventPartitionSpan = 120960
 )
 
