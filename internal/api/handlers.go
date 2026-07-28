@@ -1236,8 +1236,7 @@ func listETag(f store.EventFilter) string {
 		Topic3        json.RawMessage `json:"p3,omitempty"`
 		TopicContains json.RawMessage `json:"pc,omitempty"`
 		TxHash        string          `json:"th,omitempty"`
-		TxIndex       *int32          `json:"txi,omitempty"`
-		OpIndex       *int32          `json:"opi,omitempty"`
+		HasValue      *bool           `json:"hv,omitempty"`
 		FromLedger    int64           `json:"fl"`
 		ToLedger      int64           `json:"tl"`
 		FromTime      string          `json:"ft,omitempty"`
@@ -1258,8 +1257,7 @@ func listETag(f store.EventFilter) string {
 		Topic3:        f.Topic3,
 		TopicContains: f.TopicContains,
 		TxHash:        f.TxHash,
-		TxIndex:       f.TxIndex,
-		OpIndex:       f.OpIndex,
+		HasValue:      f.HasValue,
 		FromLedger:    f.FromLedger,
 		ToLedger:      f.ToLedger,
 		FromTime:      timeOrEmpty(f.FromTime),
@@ -1544,6 +1542,19 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		}
 		f.Order = "desc"
 		f.Limit = n
+	}
+
+	if raw := q.Get("has_value"); raw != "" {
+		switch raw {
+		case "true":
+			t := true
+			f.HasValue = &t
+		case "false":
+			v := false
+			f.HasValue = &v
+		default:
+			return f, fmt.Errorf("has_value must be true or false, got %q", raw)
+		}
 	}
 
 	return f, nil
