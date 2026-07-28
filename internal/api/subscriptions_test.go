@@ -139,7 +139,7 @@ func errorEnvelope(t *testing.T, body []byte) string {
 // slog construction on every line.
 func newServerFromStub(st store.Store) *Server {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(st, nil, log, "test-key")
+	return New(st, nil, log, "test-key", 0)
 }
 
 // TestSubscriptions_ErrorPaths covers every 400/404 branch of the

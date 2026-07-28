@@ -534,6 +534,92 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	return end >= health.LatestLedger, nil
 }
 
+// windowSweepUnwatched delegates to the existing windowSweep that uses the
+// single global ingestion_state row — backward-compatible behavior unchanged.
+func (ing *Ingester) windowSweepUnwatched(ctx context.Context, start uint32, batches [][]rpc.EventFilter) (bool, error) {
+	return ing.windowSweep(ctx, start, batches)
+}
+
+// windowSweepWatched sweeps a ledger window across all watched contracts,
+// advancing each contract's per-contract cursor independently. It also
+// updates the global ingestion_state for backward compatibility with
+// unwatched-mode callers (e.g. the reorg rescan).
+func (ing *Ingester) windowSweepWatched(ctx context.Context, batches [][]rpc.EventFilter) (bool, error) {
+	health, err := ing.client.GetHealth(ctx)
+	if err != nil {
+		return false, fmt.Errorf("getHealth for sweep window: %w", err)
+	}
+	start, err := ing.earliestStartLedger(ctx, health)
+	if err != nil {
+		return false, err
+	}
+	if start > health.LatestLedger {
+		return true, nil // nothing new yet
+	}
+	end := min(start+ing.opts.SweepWindow-1, health.LatestLedger)
+
+	var ledgerOutOfRange atomic.Bool
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(ing.opts.SweepConcurrency)
+	for _, filters := range batches {
+		filters := filters
+		g.Go(func() error {
+			return ing.sweepBatch(gctx, &ledgerOutOfRange, start, end, filters)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		if ledgerOutOfRange.Load() || rpc.IsLedgerOutOfRange(err) {
+			// Collect all watched contract IDs and reclamp.
+			watched, wErr := ing.store.ListWatchedContracts(ctx)
+			if wErr != nil {
+				return false, wErr
+			}
+			ids := make([]string, len(watched))
+			for i, wc := range watched {
+				ids[i] = wc.ContractID
+			}
+			// reclampToOldest saves per-contract cursors.
+			if err := ing.reclampToOldest(ctx, start, ids...); err != nil {
+				return false, err
+			}
+			// Also update global ingestion state so existing callers
+			// (and tests) see the reclamped position.
+			clamped := int64(health.OldestLedger) - 1
+			if err := ing.store.SaveIngestionState(ctx, store.IngestionState{LastIngestedLedger: clamped}); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+		return false, err
+	}
+
+	lastIngested := int64(end)
+	if end >= health.LatestLedger {
+		lastIngested = int64(end) - 1
+	}
+
+	// Save per-contract cursors for every watched contract.
+	watched, err := ing.store.ListWatchedContracts(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, wc := range watched {
+		if err := ing.store.SaveContractCursor(ctx, store.ContractCursor{
+			ContractID:         wc.ContractID,
+			LastIngestedLedger: lastIngested,
+		}); err != nil {
+			return false, fmt.Errorf("saving cursor for contract %s: %w", wc.ContractID, err)
+		}
+	}
+
+	// Also update the global ingestion state for backward compatibility
+	// (existing tests and the reorg rescan rely on it).
+	if err := ing.store.SaveIngestionState(ctx, store.IngestionState{LastIngestedLedger: lastIngested}); err != nil {
+		return false, err
+	}
+	return end >= health.LatestLedger, nil
+}
+
 // sweepBatch pages one filter batch through [start, end]. Errors are
 // returned to the errgroup; ctx cancellation aborts the inner pagination
 // loop (GetEvents respects ctx) so a graceful shutdown doesn't strand

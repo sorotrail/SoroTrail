@@ -178,15 +178,23 @@ func (f *fakeExportStore) GetContractSpec(context.Context, string) ([]byte, erro
 	return nil, store.ErrNotFound
 }
 func (f *fakeExportStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
-func (f *fakeExportStore) Stats(context.Context) (store.Stats, error)                    { return store.Stats{}, nil }
-func (f *fakeExportStore) Ping(context.Context) error                                    { return nil }
+func (f *fakeExportStore) GetContractCursor(context.Context, string) (store.ContractCursor, error) {
+	return store.ContractCursor{}, store.ErrNotFound
+}
+func (f *fakeExportStore) SaveContractCursor(context.Context, store.ContractCursor) error { return nil }
+func (f *fakeExportStore) DeleteContractCursor(context.Context, string) error             { return nil }
+func (f *fakeExportStore) ListContractCursors(context.Context) ([]store.ContractCursor, error) {
+	return nil, nil
+}
+func (f *fakeExportStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
+func (f *fakeExportStore) Ping(context.Context) error                 { return nil }
 
 // testServer wraps a Server with the fake store so handlers can be
 // exercised in isolation without the full chi stack.
 func testServer(t *testing.T, st store.Store, maxRange int64) http.Handler {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := New(st, nil, logger, "")
+	s := New(st, nil, logger, "", 0)
 	s.SetExportMaxRange(maxRange)
 	return s.Router()
 }
