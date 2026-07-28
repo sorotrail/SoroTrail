@@ -1,12 +1,14 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1560,10 +1562,60 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// prettyWriter is implemented by ResponseWriter wrappers that carry the
+// ?pretty flag so writeJSON can optionally indent the output.
+type prettyWriter interface {
+	Pretty() bool
+}
+
+// prettyResponseWriter wraps an http.ResponseWriter to carry the ?pretty flag
+// through the middleware chain. All ResponseWriter methods delegate to the
+// embedded writer so compression, flushing, and hijacking still work.
+type prettyResponseWriter struct {
+	http.ResponseWriter
+	pretty bool
+}
+
+func (w *prettyResponseWriter) Pretty() bool { return w.pretty }
+
+// Flush forwards to the embedded ResponseWriter if it supports flushing.
+// This is required because interface embedding does not promote optional
+// interfaces like http.Flusher — without it, the NDJSON stream handler's
+// w.(http.Flusher) type assertion would fail.
+func (w *prettyResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack forwards to the embedded ResponseWriter if it supports hijacking,
+// matching the pattern used by compressWriter.
+func (w *prettyResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
+}
+
+// prettyMiddleware reads ?pretty=true from the query string and wraps the
+// ResponseWriter with the flag so writeJSON can set indentation when
+// requested. It must be the innermost middleware (closest to the handler)
+// so the type assertion in writeJSON sees the wrapper.
+func prettyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pw := &prettyResponseWriter{ResponseWriter: w, pretty: r.URL.Query().Get("pretty") == "true"}
+		next.ServeHTTP(pw, r)
+	})
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	enc := json.NewEncoder(w)
+	if pw, ok := w.(prettyWriter); ok && pw.Pretty() {
+		enc.SetIndent("", "  ")
+	}
+	_ = enc.Encode(v)
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {
