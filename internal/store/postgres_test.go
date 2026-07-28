@@ -163,6 +163,107 @@ func TestUpsertEvents_CreatesPartitionsAndIsIdempotent(t *testing.T) {
 	assert.NotContains(t, plan, "events_20_29")
 }
 
+// TestPartialIndexForSuccessfulCalls covers migration
+// 0011_partial_index_successful_calls: the partial index over
+// (contract_id, ledger) restricted to in_successful_call = true.
+//
+// It asserts two things. First, that the index exists with the expected
+// shape — indexed columns and partial predicate — by reading its
+// definition straight from the catalog (table-driven over the substrings
+// the definition must contain). Second, that the predicate the index
+// encodes matches query intent: a contract-scoped read filtered to
+// successful calls returns only the successful-call rows and none of the
+// failed-call rows.
+func TestPartialIndexForSuccessfulCalls(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// The migration creates the index on the partitioned parent; read its
+	// definition once and assert the pieces that must be present. Reading
+	// pg_indexes.indexdef (rather than assembling from pg_index columns)
+	// keeps the assertions close to how an operator would eyeball the
+	// schema.
+	var indexDef string
+	err := st.pool.QueryRow(ctx,
+		`SELECT indexdef FROM pg_indexes WHERE indexname = $1`,
+		"idx_events_contract_ledger_successful",
+	).Scan(&indexDef)
+	require.NoError(t, err, "partial index should exist after migration")
+
+	defWantSubstrings := []struct {
+		name string
+		want string
+	}{
+		{"indexed on events", " ON "},
+		{"covers contract_id and ledger in order", "(contract_id, ledger)"},
+		{"partial predicate scopes to successful calls", "WHERE (in_successful_call = true)"},
+	}
+	for _, tc := range defWantSubstrings {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Contains(t, indexDef, tc.want)
+		})
+	}
+
+	// The index must also register as a valid, partial index in the
+	// catalog — a plain (non-partial) index on the same columns would
+	// satisfy the substring checks above if the definition string ever
+	// changed shape, so assert indpred is populated directly.
+	var isValid, isPartial bool
+	err = st.pool.QueryRow(ctx, `
+		SELECT i.indisvalid, i.indpred IS NOT NULL
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		WHERE c.relname = $1`,
+		"idx_events_contract_ledger_successful",
+	).Scan(&isValid, &isPartial)
+	require.NoError(t, err)
+	assert.True(t, isValid, "index should be valid")
+	assert.True(t, isPartial, "index should be partial (have a predicate)")
+
+	// Functional check: seed a mix of successful and failed-call events and
+	// confirm the partial predicate selects exactly the successful subset
+	// for a contract. This is the query shape the index exists to serve.
+	seed := []struct {
+		id         string
+		ledger     int64
+		successful bool
+	}{
+		{eventID(1), 100, true},
+		{eventID(2), 101, false},
+		{eventID(3), 102, true},
+		{eventID(4), 103, false},
+		{eventID(5), 104, true},
+	}
+	events := make([]Event, 0, len(seed))
+	wantSuccessful := make(map[string]bool)
+	for _, s := range seed {
+		e := testEvent(s.id, s.ledger, contractA)
+		e.InSuccessfulCall = s.successful
+		events = append(events, e)
+		if s.successful {
+			wantSuccessful[s.id] = true
+		}
+	}
+	_, err = st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	rows, err := st.pool.Query(ctx,
+		`SELECT id FROM events WHERE contract_id = $1 AND in_successful_call = true ORDER BY id`,
+		contractA)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	got := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		got[id] = true
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, wantSuccessful, got,
+		"query filtered to successful calls should return only successful-call rows")
+}
+
 func TestGetEvent_NotFound(t *testing.T) {
 	st := testStore(t)
 	_, err := st.GetEvent(context.Background(), "missing")
