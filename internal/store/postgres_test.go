@@ -41,8 +41,16 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
-	_, err = pool.Exec(context.Background(),
-		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
+	_, err = pool.Exec(context.Background(), `
+		DO $$DECLARE
+			part text;
+		BEGIN
+			FOR part IN SELECT inhrelid::regclass::text FROM pg_inherits WHERE inhparent = 'events'::regclass LOOP
+				EXECUTE 'DROP TABLE IF EXISTS ' || part || ' CASCADE';
+			END LOOP;
+		END$$;
+		TRUNCATE events, ingestion_state, watched_contracts, replay_state
+	`)
 	require.NoError(t, err)
 	return NewPostgres(pool, span)
 }
@@ -175,6 +183,48 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		assert.Len(t, got, 1)
 	})
 
+	// Pagination tests run BEFORE subtests that insert more events so the
+	// row count stays at 10.
+	t.Run("keyset pagination walks all rows in order", func(t *testing.T) {
+		var all []Event
+		cursor := ""
+		for {
+			page, next, err := st.QueryEvents(ctx, EventFilter{Limit: 3, Cursor: cursor})
+			require.NoError(t, err)
+			all = append(all, page...)
+			if next == "" {
+				break
+			}
+			cursor = next
+		}
+		require.Len(t, all, 10)
+		for i := 1; i < len(all); i++ {
+			assert.Less(t, all[i-1].ID, all[i].ID, "ascending ID order across pages")
+		}
+	})
+
+	t.Run("keyset pagination desc returns newest-first", func(t *testing.T) {
+		var all []Event
+		cursor := ""
+		for {
+			page, next, err := st.QueryEvents(ctx, EventFilter{
+				Limit:  3,
+				Cursor: cursor,
+				Order:  "desc",
+			})
+			require.NoError(t, err)
+			all = append(all, page...)
+			if next == "" {
+				break
+			}
+			cursor = next
+		}
+		require.Len(t, all, 10)
+		for i := 1; i < len(all); i++ {
+			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
+		}
+	})
+
 	t.Run("by topic0 and topic1 positionally", func(t *testing.T) {
 		e1 := testEvent(eventID(100), 200, contractA)
 		e1.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GABC"},{"address":"GDEF"}]`)
@@ -218,24 +268,36 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 	t.Run("by in_successful_call", func(t *testing.T) {
 		e1 := testEvent(eventID(300), 400, contractA)
 		e1.InSuccessfulCall = true
+		e1.TxHash = "isc_test_a"
 		e2 := testEvent(eventID(301), 401, contractA)
 		e2.InSuccessfulCall = false
+		e2.TxHash = "isc_test_b"
 		e3 := testEvent(eventID(302), 402, contractA)
 		e3.InSuccessfulCall = true
+		e3.TxHash = "isc_test_c"
 		_, err := st.UpsertEvents(ctx, []Event{e1, e2, e3})
 		require.NoError(t, err)
 
-		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(true)})
-		require.NoError(t, err)
-		assert.Len(t, got, 2)
-
-		got, _, err = st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(false)})
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TxHash:           "isc_test_a",
+			InSuccessfulCall: ptr(true),
+		})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
+		assert.Equal(t, e1.ID, got[0].ID)
 
-		got, _, err = st.QueryEvents(ctx, EventFilter{InSuccessfulCall: nil})
+		got, _, err = st.QueryEvents(ctx, EventFilter{
+			TxHash:           "isc_test_b",
+			InSuccessfulCall: ptr(false),
+		})
 		require.NoError(t, err)
-		assert.GreaterOrEqual(t, len(got), 3, "nil returns all")
+		assert.Len(t, got, 1)
+		assert.Equal(t, e2.ID, got[0].ID)
+
+		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "isc_test_c"})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.True(t, got[0].InSuccessfulCall)
 	})
 
 	t.Run("by tx_hash and in_successful_call combined", func(t *testing.T) {
@@ -267,45 +329,39 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		assert.Len(t, got, 1)
 		assert.Equal(t, e2.ID, got[0].ID)
 	})
+}
 
-	t.Run("keyset pagination walks all rows in order", func(t *testing.T) {
-		var all []Event
-		cursor := ""
-		for {
-			page, next, err := st.QueryEvents(ctx, EventFilter{Limit: 3, Cursor: cursor})
-			require.NoError(t, err)
-			all = append(all, page...)
-			if next == "" {
-				break
-			}
-			cursor = next
-		}
-		require.Len(t, all, 10)
-		for i := 1; i < len(all); i++ {
-			assert.Less(t, all[i-1].ID, all[i].ID, "ascending ID order across pages")
-		}
+func TestQueryEvents_InSuccessfulCallFilter(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	trueEvent := testEvent(eventID(500), 600, contractA)
+	trueEvent.InSuccessfulCall = true
+
+	falseEvent := testEvent(eventID(501), 601, contractA)
+	falseEvent.InSuccessfulCall = false
+
+	_, err := st.UpsertEvents(ctx, []Event{trueEvent, falseEvent})
+	require.NoError(t, err)
+
+	t.Run("filter by true alone", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(true)})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.True(t, got[0].InSuccessfulCall)
 	})
 
-	t.Run("keyset pagination desc returns newest-first", func(t *testing.T) {
-		var all []Event
-		cursor := ""
-		for {
-			page, next, err := st.QueryEvents(ctx, EventFilter{
-				Limit:  3,
-				Cursor: cursor,
-				Order:  "desc",
-			})
-			require.NoError(t, err)
-			all = append(all, page...)
-			if next == "" {
-				break
-			}
-			cursor = next
-		}
-		require.Len(t, all, 10)
-		for i := 1; i < len(all); i++ {
-			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
-		}
+	t.Run("filter by false alone", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(false)})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.False(t, got[0].InSuccessfulCall)
+	})
+
+	t.Run("nil returns all", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{})
+		require.NoError(t, err)
+		require.Len(t, got, 2)
 	})
 }
 
@@ -380,6 +436,18 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	st := NewPostgres(pool, 10)
 	ctx := context.Background()
 
+	// Drop the default partition that Migrate() created with the production
+	// span so the test's custom span-10 partition setup doesn't collide.
+	_, err = pool.Exec(ctx, `
+		DO $$DECLARE
+			part text;
+		BEGIN
+			FOR part IN SELECT inhrelid::regclass::text FROM pg_inherits WHERE inhparent = 'events'::regclass LOOP
+				EXECUTE 'DROP TABLE IF EXISTS ' || part || ' CASCADE';
+			END LOOP;
+		END$$`)
+	require.NoError(t, err)
+
 	original := testEvent(eventID(1), 100, contractA)
 	original.RawTopicXDR = []string{"AAAADwAAAAh0cmFuc2Zlcg=="}
 	original.RawValueXDR = "AAAACgAAAAAAAAAB"
@@ -388,6 +456,15 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 
 	_, err = pool.Exec(ctx, `
 		ALTER TABLE events RENAME TO events_partitioned;
+		-- Drop indexes inherited by events_partitioned so the same names
+		-- can be used on the replacement events table.
+		DROP INDEX IF EXISTS idx_events_id;
+		DROP INDEX IF EXISTS idx_events_contract_id;
+		DROP INDEX IF EXISTS idx_events_ledger;
+		DROP INDEX IF EXISTS idx_events_contract_ledger;
+		DROP INDEX IF EXISTS idx_events_topics;
+		DROP INDEX IF EXISTS idx_events_created_at;
+		DROP INDEX IF EXISTS idx_events_tx_hash;
 		CREATE TABLE events (
 			id                 text PRIMARY KEY,
 			contract_id        text NOT NULL,
@@ -419,7 +496,12 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		ORDER BY ledger, id;
 		DROP TABLE events_partitioned CASCADE;
 		DROP FUNCTION IF EXISTS ensure_event_partitions(bigint, bigint, bigint);
-		UPDATE schema_migrations SET version = 3, dirty = false;
+		-- Drop tables that later migrations (v7-v8) created — they should
+		-- not exist when we pretend to be at version 5.
+		DROP TABLE IF EXISTS replay_state;
+		DROP TABLE IF EXISTS delivery_attempts;
+		DROP TABLE IF EXISTS subscriptions;
+		UPDATE schema_migrations SET version = 5, dirty = false;
 	`)
 	require.NoError(t, err)
 
@@ -430,6 +512,13 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	assert.Equal(t, original.ContractID, got.ContractID)
 	assert.Equal(t, original.RawTopicXDR, got.RawTopicXDR)
 	assert.Equal(t, original.RawValueXDR, got.RawValueXDR)
+
+	// Drop the default partition created by Migrate() then recreate with
+	// the test's span so the partition-overlap assertion below works.
+	_, err = pool.Exec(ctx, `DROP TABLE IF EXISTS events_0_120959 CASCADE`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `SELECT ensure_event_partitions(100, 100, 10)`)
+	require.NoError(t, err)
 
 	partitions, err := pool.Query(ctx, `SELECT to_regclass('events_100_109'), to_regclass('events_110_119')`)
 	require.NoError(t, err)

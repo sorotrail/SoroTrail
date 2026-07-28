@@ -2,6 +2,20 @@ BEGIN;
 
 ALTER TABLE events RENAME TO events_legacy;
 
+-- Drop legacy indexes whose names would collide with new indexes on the
+-- replacement events table. PostgreSQL enforces unique index names per
+-- schema, so the renamed table's indexes (now on events_legacy) prevent
+-- creating fresh ones with the same names.
+DROP INDEX IF EXISTS idx_events_contract_id;
+DROP INDEX IF EXISTS idx_events_ledger;
+DROP INDEX IF EXISTS idx_events_contract_ledger;
+DROP INDEX IF EXISTS idx_events_topics;
+DROP INDEX IF EXISTS idx_events_created_at;
+-- Also drop the old primary key constraint so the new table's PRIMARY KEY
+-- (which gets the same implicit constraint name "events_pkey") does not
+-- collide with the constraint inherited by events_legacy.
+ALTER TABLE events_legacy DROP CONSTRAINT IF EXISTS events_pkey;
+
 CREATE TABLE events (
     id                 text NOT NULL,
     contract_id        text NOT NULL,
@@ -58,6 +72,12 @@ END;
 $$;
 
 SELECT ensure_event_partitions((SELECT min(ledger) FROM events_legacy), (SELECT max(ledger) FROM events_legacy), 120960);
+
+-- Ensure raw-XDR columns exist on the legacy table; they were absent in
+-- very early schemas (before migration 7 / old 0004_raw_xdr_and_replay).
+ALTER TABLE events_legacy
+    ADD COLUMN IF NOT EXISTS raw_topic_xdr text[],
+    ADD COLUMN IF NOT EXISTS raw_value_xdr text;
 
 INSERT INTO events (
     id, contract_id, ledger, type, tx_hash, tx_index, op_index,

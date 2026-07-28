@@ -65,13 +65,13 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // topic/value drift on the RPC side).
 func onConflictClause(update bool) string {
 	if update {
-		return `ON CONFLICT (id) DO UPDATE SET
+		return `ON CONFLICT (ledger, id) DO UPDATE SET
 			topics             = EXCLUDED.topics,
 			value              = EXCLUDED.value,
 			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
 			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
-	return `ON CONFLICT (id) DO NOTHING`
+	return `ON CONFLICT (ledger, id) DO NOTHING`
 }
 
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {

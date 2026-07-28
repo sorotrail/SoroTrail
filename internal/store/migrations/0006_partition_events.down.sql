@@ -2,6 +2,19 @@ BEGIN;
 
 ALTER TABLE events RENAME TO events_partitioned;
 
+-- Drop partitioned-table indexes whose names would collide with new
+-- indexes on the replacement events table.
+DROP INDEX IF EXISTS idx_events_id;
+DROP INDEX IF EXISTS idx_events_contract_id;
+DROP INDEX IF EXISTS idx_events_ledger;
+DROP INDEX IF EXISTS idx_events_contract_ledger;
+DROP INDEX IF EXISTS idx_events_topics;
+DROP INDEX IF EXISTS idx_events_created_at;
+-- Drop the partitioned table's primary key constraint before creating the
+-- replacement plain table, whose PRIMARY KEY would otherwise collide with
+-- the implicit "events_pkey" inherited by events_partitioned.
+ALTER TABLE events_partitioned DROP CONSTRAINT IF EXISTS events_pkey;
+
 CREATE TABLE events (
     id                 text PRIMARY KEY,
     contract_id        text NOT NULL,
