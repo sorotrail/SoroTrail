@@ -100,6 +100,20 @@ func (s *Server) SetCompressMinSize(n int) {
 	s.compressMinSize = n
 }
 
+// maxLimit is the API's upper bound for page-size parameters (limit and
+// recent). It is set once at startup via SetMaxLimit (driven by the
+// API_MAX_LIMIT env var) before any requests are served so no mutex is
+// needed. Default 500.
+var maxLimit = 500
+
+// SetMaxLimit configures the API's maximum page size for list endpoints.
+// Call once at startup before ListenAndServe. Values ≤0 are ignored.
+func SetMaxLimit(n int) {
+	if n > 0 {
+		maxLimit = n
+	}
+}
+
 // New builds the API server. rpcClient is only used by /health.
 // apiKey gates the watched-contracts management endpoints; pass "" to
 // fail closed (every request gets a 503 with "API_KEY not configured").

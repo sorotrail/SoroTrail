@@ -82,6 +82,12 @@ type Config struct {
 	// Negative disables compression entirely; 0 uses api.CompressMinSize.
 	CompressMinSize int `env:"COMPRESS_MIN_SIZE" envDefault:"0"`
 
+	// APIMaxLimit is the maximum page size accepted by the API for list
+	// endpoints (/events, /subscriptions/{id}/deliveries). Values above
+	// this are rejected with 400; the store still clamps internally as a
+	// safety net. Default 500 (up from the previous hardcoded 200).
+	APIMaxLimit int `env:"API_MAX_LIMIT" envDefault:"500"`
+
 	// CachePrivate flips the cacheable endpoints from Cache-Control: public
 	// to Cache-Control: private. Set this when the deployment serves
 	// per-user data behind an auth layer (#17, not yet merged) so shared
@@ -194,6 +200,9 @@ func (c Config) Validate() error {
 	}
 	if c.HTTPReadHeaderTimeout < 0 {
 		return fmt.Errorf("HTTP_READ_HEADER_TIMEOUT must be non-negative, got %s", c.HTTPReadHeaderTimeout)
+	}
+	if c.APIMaxLimit < 1 {
+		return fmt.Errorf("API_MAX_LIMIT must be positive, got %d", c.APIMaxLimit)
 	}
 	if c.ShutdownTimeout < 0 {
 		return fmt.Errorf("SHUTDOWN_TIMEOUT must be non-negative, got %s", c.ShutdownTimeout)

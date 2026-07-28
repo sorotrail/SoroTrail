@@ -424,12 +424,12 @@ func TestListEvents_CursorAndLimitValidation(t *testing.T) {
 	assert.Equal(t, store.DefaultQueryLimit, st.lastFilter.Limit)
 
 	// Invalid limit returns 400
-	for _, badLimit := range []string{"0", "-5", "201", "xyz"} {
+	for _, badLimit := range []string{"0", "-5", "501", "xyz"} {
 		resp, body := doGet(t, srv, "/events?limit="+badLimit)
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		var errResp map[string]string
 		require.NoError(t, json.Unmarshal(body, &errResp))
-		assert.Contains(t, errResp["error"], "limit must be an integer in [1,200]")
+		assert.Contains(t, errResp["error"], "limit must be an integer in [1,500]")
 	}
 
 	// Malformed cursor returns 400
@@ -1232,11 +1232,11 @@ func TestListEvents_RecentParam(t *testing.T) {
 			wantLimit:  5,
 		},
 		{
-			name:       "recent=200 (max limit) is accepted",
-			query:      "/events?recent=200",
+			name:       "recent=500 (max limit) is accepted",
+			query:      "/events?recent=500",
 			wantStatus: http.StatusOK,
 			wantOrder:  "desc",
-			wantLimit:  200,
+			wantLimit:  500,
 		},
 		{
 			name:        "recent=0 is invalid",
@@ -1245,8 +1245,8 @@ func TestListEvents_RecentParam(t *testing.T) {
 			wantErrText: "recent must be a positive integer",
 		},
 		{
-			name:        "recent=201 exceeds max",
-			query:       "/events?recent=201",
+			name:        "recent=501 exceeds max",
+			query:       "/events?recent=501",
 			wantStatus:  http.StatusBadRequest,
 			wantErrText: "recent must be a positive integer",
 		},
@@ -1313,4 +1313,104 @@ func TestListEvents_RecentReturnsNewestFirst(t *testing.T) {
 	assert.Equal(t, "e3", out.Events[0].ID)
 	assert.Equal(t, "e2", out.Events[1].ID)
 	assert.Equal(t, "e1", out.Events[2].ID)
+}
+
+func TestListEvents_ConfigurableMaxLimit(t *testing.T) {
+	st := &stubStore{events: []store.Event{{ID: "e1"}}}
+
+	tests := []struct {
+		name         string
+		setMax       int // 0 means don't call SetMaxLimit (use default 500)
+		query        string
+		wantStatus   int
+		wantLimit    int    // expected limit in filter (0 = don't check)
+		wantErrMatch string // substring in error, for 4xx cases
+	}{
+		{
+			name:       "default max allows 500",
+			setMax:     0,
+			query:      "/events?limit=500",
+			wantStatus: http.StatusOK,
+			wantLimit:  500,
+		},
+		{
+			name:         "default max rejects 501",
+			setMax:       0,
+			query:        "/events?limit=501",
+			wantStatus:   http.StatusBadRequest,
+			wantErrMatch: "limit must be an integer in [1,500]",
+		},
+		{
+			name:       "custom max 100 allows 100",
+			setMax:     100,
+			query:      "/events?limit=100",
+			wantStatus: http.StatusOK,
+			wantLimit:  100,
+		},
+		{
+			name:         "custom max 100 rejects 101",
+			setMax:       100,
+			query:        "/events?limit=101",
+			wantStatus:   http.StatusBadRequest,
+			wantErrMatch: "limit must be an integer in [1,100]",
+		},
+		{
+			name:       "custom max 100 recent accepts 100",
+			setMax:     100,
+			query:      "/events?recent=100",
+			wantStatus: http.StatusOK,
+			wantLimit:  100,
+		},
+		{
+			name:         "custom max 100 recent rejects 101",
+			setMax:       100,
+			query:        "/events?recent=101",
+			wantStatus:   http.StatusBadRequest,
+			wantErrMatch: "recent must be a positive integer in [1,100]",
+		},
+		{
+			name:       "custom max 10 accepts limit 10",
+			setMax:     10,
+			query:      "/events?limit=10",
+			wantStatus: http.StatusOK,
+			wantLimit:  10,
+		},
+		{
+			name:         "custom max 10 rejects limit 11",
+			setMax:       10,
+			query:        "/events?limit=11",
+			wantStatus:   http.StatusBadRequest,
+			wantErrMatch: "limit must be an integer in [1,10]",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st.lastFilter = store.EventFilter{}
+
+			if tt.setMax > 0 {
+				SetMaxLimit(tt.setMax)
+				t.Cleanup(func() { SetMaxLimit(500) })
+			} else {
+				// Ensure we're using the default 500.
+				SetMaxLimit(500)
+			}
+
+			srv := newTestServer(st, nil)
+			resp, body := doGet(t, srv, tt.query)
+
+			require.Equal(t, tt.wantStatus, resp.StatusCode, string(body))
+
+			if tt.wantErrMatch != "" {
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], tt.wantErrMatch)
+				return
+			}
+
+			if tt.wantLimit > 0 {
+				assert.Equal(t, tt.wantLimit, st.lastFilter.Limit)
+			}
+		})
+	}
 }

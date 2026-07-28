@@ -1195,8 +1195,8 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if raw := q.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
-		if err != nil || limit < 1 || limit > store.MaxQueryLimit {
-			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
+		if err != nil || limit < 1 || limit > maxLimit {
+			return f, fmt.Errorf("limit must be an integer in [1,%d]", maxLimit)
 		}
 		f.Limit = limit
 	} else {
@@ -1215,8 +1215,8 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		n := recentDefaultLimit
 		if raw != "true" {
 			n, err = strconv.Atoi(raw)
-			if err != nil || n < 1 || n > store.MaxQueryLimit {
-				return f, fmt.Errorf("recent must be a positive integer in [1,%d]", store.MaxQueryLimit)
+			if err != nil || n < 1 || n > maxLimit {
+				return f, fmt.Errorf("recent must be a positive integer in [1,%d]", maxLimit)
 			}
 		}
 		f.Order = "desc"
