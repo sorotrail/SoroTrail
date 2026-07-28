@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"time"
@@ -290,6 +291,24 @@ func cleanContractList(in []string) []string {
 		}
 	}
 	return out
+}
+
+// ParseLogLevel normalizes the configured level string into a slog.Level.
+// Unknown or empty values default to slog.LevelInfo for a conservative,
+// backward-compatible baseline.
+func ParseLogLevel(raw string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	case "", "info":
+		return slog.LevelInfo
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // LoggableFields returns the configuration as a map of fields suitable for logging,

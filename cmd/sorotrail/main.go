@@ -275,18 +275,7 @@ func run() error {
 }
 
 func newLogger(level, format string) *slog.Logger {
-	var lvl slog.Level
-	switch strings.ToLower(level) {
-	case "debug":
-		lvl = slog.LevelDebug
-	case "warn":
-		lvl = slog.LevelWarn
-	case "error":
-		lvl = slog.LevelError
-	default:
-		lvl = slog.LevelInfo
-	}
-	opts := &slog.HandlerOptions{Level: lvl}
+	opts := &slog.HandlerOptions{Level: config.ParseLogLevel(level)}
 	var h slog.Handler
 	switch strings.ToLower(format) {
 	case "json":

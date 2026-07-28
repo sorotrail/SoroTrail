@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -302,6 +303,28 @@ func TestLoad(t *testing.T) {
 			if tt.check != nil {
 				tt.check(t, cfg)
 			}
+		})
+	}
+}
+
+func TestParseLogLevel(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  slog.Level
+	}{
+		{name: "debug", input: "debug", want: slog.LevelDebug},
+		{name: "info", input: "info", want: slog.LevelInfo},
+		{name: "warn", input: "warn", want: slog.LevelWarn},
+		{name: "error", input: "error", want: slog.LevelError},
+		{name: "mixed case", input: "DeBuG", want: slog.LevelDebug},
+		{name: "empty defaults to info", input: "", want: slog.LevelInfo},
+		{name: "invalid defaults to info", input: "loud", want: slog.LevelInfo},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, ParseLogLevel(tt.input))
 		})
 	}
 }

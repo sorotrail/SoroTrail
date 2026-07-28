@@ -43,6 +43,7 @@ type stubStore struct {
 	stats            store.Stats
 	pingErr          error
 	watchedList      []store.WatchedContract
+	queryCalls       int
 	watchedListErr   error
 	added            []string
 	removed          []string
@@ -61,6 +62,10 @@ type stubStore struct {
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
 	s.lastFilter = f
+	s.queryCalls++
+	if s.queryCalls > 1 {
+		return s.events, "", s.queryErr
+	}
 	return s.events, s.nextCursor, s.queryErr
 }
 
