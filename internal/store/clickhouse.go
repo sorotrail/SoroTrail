@@ -190,6 +190,14 @@ func (c *ClickHouse) SetContractSpec(ctx context.Context, wasmHash, contractID s
 	return nil
 }
 
+func (c *ClickHouse) DeleteEventsBeforeLedger(ctx context.Context, beforeLedger int64) (int64, error) {
+	return 0, nil
+}
+
+func (c *ClickHouse) MigrationVersion(ctx context.Context) (int, bool, error) {
+	return 0, false, nil
+}
+
 func (c *ClickHouse) Stats(ctx context.Context) (Stats, error) {
 	return Stats{}, nil
 }

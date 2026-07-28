@@ -511,6 +511,16 @@ type Store interface {
 	// and contract_id so subsequent lookups avoid an RPC round trip.
 	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
 
+	// DeleteEventsBeforeLedger deletes all events with a ledger strictly less than
+	// the given ledger number. It returns the number of rows deleted.
+	// This is an admin operation and should be auth-gated at the API layer.
+	DeleteEventsBeforeLedger(ctx context.Context, beforeLedger int64) (int64, error)
+
+	// MigrationVersion returns the currently applied migration version and
+	// whether the schema_migrations table reports a dirty state. When the
+	// migration table does not exist or returns no rows, it returns (0, false, nil).
+	MigrationVersion(ctx context.Context) (version int, dirty bool, err error)
+
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error
 }

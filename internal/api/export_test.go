@@ -178,6 +178,12 @@ func (f *fakeExportStore) GetContractSpec(context.Context, string) ([]byte, erro
 	return nil, store.ErrNotFound
 }
 func (f *fakeExportStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
+func (f *fakeExportStore) DeleteEventsBeforeLedger(context.Context, int64) (int64, error) {
+	return 0, nil
+}
+func (f *fakeExportStore) MigrationVersion(context.Context) (int, bool, error) {
+	return 9, false, nil
+}
 func (f *fakeExportStore) Stats(context.Context) (store.Stats, error)                    { return store.Stats{}, nil }
 func (f *fakeExportStore) Ping(context.Context) error                                    { return nil }
 

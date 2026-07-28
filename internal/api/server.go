@@ -174,6 +174,10 @@ func (s *Server) Router() http.Handler {
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
+	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.
+	adminMW := apiKeyAuth(s.apiKey)
+	r.With(adminMW).Delete("/events", s.handleDeleteEvents)
+
 	// Watched-contracts management: writes and updates to the runtime
 	// filter list. Always auth-gated, even when AUTH_ENABLED would be
 	// false elsewhere — that asymmetry is intentional and part of the
