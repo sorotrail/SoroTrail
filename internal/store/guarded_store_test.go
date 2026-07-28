@@ -116,3 +116,18 @@ func TestGuardedStore_CountsQueryErrors(t *testing.T) {
 		})
 	}
 }
+
+func (m *errorStore) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
+	return nil, "", nil
+}
+func (m *errorStore) CountContracts(context.Context, ContractsFilter) (int64, error) { return 0, nil }
+func (m *errorStore) DeadLetterEvent(context.Context, DeadLetterInput) (DeadLetter, error) {
+	return DeadLetter{}, nil
+}
+func (m *errorStore) ListDeadLetters(context.Context, string, int, string) ([]DeadLetter, string, error) {
+	return nil, "", nil
+}
+func (m *errorStore) GetDeadLetter(context.Context, int64) (DeadLetter, error) {
+	return DeadLetter{}, ErrNotFound
+}
+func (m *errorStore) DeleteDeadLetter(context.Context, int64) error { return nil }
