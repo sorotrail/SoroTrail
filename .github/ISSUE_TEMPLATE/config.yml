@@ -1,0 +1,29 @@
+# GitHub Issue Forms configuration for SoroTrail.
+#
+# blank_issues_enabled: false — every issue filed on this repo must use
+# one of the structured forms below, so a typo in the title doesn't
+# strand a real report behind a blank text box.
+#
+# contact_links — directs reporters to the right surface for
+# security issues and general Q&A. The SECURITY.md link routes
+# vulnerability disclosures to GitHub's private vulnerability
+# reporting flow rather than a public issue.
+
+blank_issues_enabled: false
+
+contact_links:
+  - name: Security advisory
+    url: https://github.com/sorotrail/SoroTrail/security/advisories/new
+    about: |
+      Please report security issues privately via GitHub private
+      vulnerability reporting. **Do not file security issues as
+      public bug reports** — see SECURITY.md for the supported
+      versions and the response-time policy.
+
+  - name: Questions & discussion
+    url: https://github.com/sorotrail/SoroTrail/discussions
+    about: |
+      Open-ended questions, design discussions, and "how do I..."
+      questions belong in GitHub Discussions, not in the issue
+      tracker. The issue tracker is for actionable bug reports and
+      feature requests.
