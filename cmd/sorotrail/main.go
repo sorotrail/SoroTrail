@@ -137,9 +137,12 @@ func run() error {
 	api.SetRPCCounter(countingClient)
 
 	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
-		PollInterval:     cfg.PollInterval,
-		StartLedger:      cfg.StartLedger,
-		RetentionLedgers: cfg.RetentionLedgers,
+		PollInterval:            cfg.PollInterval,
+		StartLedger:             cfg.StartLedger,
+		RetentionLedgers:        cfg.RetentionLedgers,
+		SweepConcurrency:        cfg.SweepConcurrency,
+		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
+		ReorgRescanInterval:     cfg.ReorgRescanInterval,
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
 
@@ -180,6 +183,7 @@ func run() error {
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, cfg.RetentionLedgers, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
+	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
