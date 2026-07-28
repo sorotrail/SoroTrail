@@ -2109,7 +2109,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 
 
-
 	if raw := q.Get("type"); raw != "" {
 
 		for _, t := range strings.Split(raw, ",") {

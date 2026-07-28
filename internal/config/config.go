@@ -38,6 +38,8 @@ type Config struct {
 	HorizonURL      string  `env:"HORIZON_URL" envDefault:"https://horizon-testnet.stellar.org"`
 	BackfillRateRPS float64 `env:"BACKFILL_RATE_RPS" envDefault:"10"`
 
+	MetricsEnabled bool `env:"METRICS_ENABLED" envDefault:"false"`
+
 	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
 	// entirely; the binary behaves exactly like the pre-audit build.
 	AuditEnabled        bool          `env:"AUDIT_ENABLED" envDefault:"false"`
@@ -81,6 +83,10 @@ type Config struct {
 	// responses are gzip/deflate encoded for clients that advertise support.
 	// Negative disables compression entirely; 0 uses api.CompressMinSize.
 	CompressMinSize int `env:"COMPRESS_MIN_SIZE" envDefault:"0"`
+
+
+	// EnableMetrics exposes the Prometheus /metrics endpoint.
+	EnableMetrics bool `env:"ENABLE_METRICS" envDefault:"false"`
 
 	// CachePrivate flips the cacheable endpoints from Cache-Control: public
 	// to Cache-Control: private. Set this when the deployment serves
@@ -303,6 +309,7 @@ func (c Config) LoggableFields() []any {
 
 	return []any{
 		"rpc_url", c.RPCURL,
+		"metrics_enabled", c.MetricsEnabled,
 		"database_url", dbURL,
 		"poll_interval", c.PollInterval,
 		"http_addr", c.HTTPAddr,

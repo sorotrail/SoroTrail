@@ -80,6 +80,7 @@ type Enricher interface {
 // Server holds the API's dependencies.
 type Server struct {
 	store     store.Store
+	enableMetrics bool
 	rpc       rpc.Client
 	enricher  Enricher
 	log       *slog.Logger
@@ -88,6 +89,8 @@ type Server struct {
 	recoverer *Recoverer
 	bcast     *broadcast.Broadcaster
 	metrics   *metrics.HTTPMetrics
+
+	metricsEnabled bool
 	// compressMinSize is the body size at which responses start being
 	// compressed. The zero value means CompressMinSize, so compression is on
 	// by default; negative disables the middleware entirely.
@@ -98,10 +101,21 @@ type Server struct {
 	exportMaxRange int64
 }
 
+func (s *Server) SetMetricsEnabled(enabled bool) {
+    s.metricsEnabled = enabled
+}
+
 // SetCompressMinSize overrides the body size at which responses are
 // compressed. Pass a negative value to disable compression.
 func (s *Server) SetCompressMinSize(n int) {
 	s.compressMinSize = n
+}
+
+
+
+// SetMetricsEnabled enables or disables the /metrics endpoint.
+func (s *Server) SetMetricsEnabled(enabled bool) {
+	s.enableMetrics = enabled
 }
 
 // New builds the API server. rpcClient is used by /health, /readyz, and /stats.
@@ -164,7 +178,11 @@ func (s *Server) Router() http.Handler {
 	r.Get("/livez", s.handleLivez)
 	r.Get("/readyz", s.handleReadyz)
 	r.Get("/version", s.handleVersion)
-	r.Handle("/metrics", s.metrics.Handler())
+
+	if s.metricsEnabled {
+   		 r.Handle("/metrics", s.metrics.Handler())
+	}
+
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/count", s.handleCountEvents)
 	r.Get("/events/{id}/raw", s.handleGetEventRaw)
