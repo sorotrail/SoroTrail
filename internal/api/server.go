@@ -148,6 +148,10 @@ func (s *Server) Router() http.Handler {
 		// a panic inside the limiter can't take down the server.
 		r.Use(s.limiter.Middleware)
 	}
+	// prettyMiddleware must be the innermost wrapper (closest to the handler)
+	// so the type assertion in writeJSON sees the prettyWriter interface.
+	// It reads ?pretty=true from the query and wraps the ResponseWriter.
+	r.Use(prettyMiddleware)
 
 	r.Get("/health", s.handleHealth)
 	r.Get("/version", s.handleVersion)
