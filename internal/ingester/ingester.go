@@ -96,7 +96,12 @@ type Ingester struct {
 	opts     Options
 	bcast    *broadcast.Broadcaster
 	notifier EventNotifier // optional; nil means no notification
+	// deadLetterStore receives events that fail to decode or persist so
+	// a poison event no longer stalls the loop. nil means no
+	// dead-lettering — the cycle aborts on the first error as before.
+	deadLetterStore DeadLetterSink
 }
+
 
 // New wires an Ingester. All dependencies are interfaces so tests can supply
 // mocks.
@@ -117,6 +122,18 @@ func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
 // notification is sent — the ingester behaves exactly as before.
 func (ing *Ingester) SetNotifier(n EventNotifier) {
 	ing.notifier = n
+}
+
+// SetDeadLetterSink wires the store that receives events the ingester
+// fails to persist. nil means dead-lettering is disabled and the
+// pre-issue behavior (fail the cycle) is preserved.
+func (ing *Ingester) SetDeadLetterSink(s DeadLetterSink) { ing.deadLetterStore = s }
+
+// DeadLetterSink is the minimal interface the ingester uses to record
+// dead-letter rows. Decoupled from store.Store because tests need a
+// simpler in-memory implementation.
+type DeadLetterSink interface {
+	DeadLetterEvent(ctx context.Context, ev store.DeadLetterInput) (store.DeadLetter, error)
 }
 
 // Run polls until ctx is canceled. Errors are logged and retried with
@@ -524,7 +541,30 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	for _, re := range rpcEvents {
 		ev, err := ing.toStoreEvent(re)
 		if err != nil {
-			return err
+			// Issue #131: a poison event must not stall the cycle. If a
+			// dead-letter sink is wired, route the failing event + error
+			// through it and continue with the rest of the page; otherwise
+			// fall back to the legacy "abort the cycle" behavior so
+			// unconfigured deployments catch the bug instead of silently
+			// dropping events.
+			if ing.deadLetterStore == nil {
+				return err
+			}
+			dlCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			if _, derr := ing.deadLetterStore.DeadLetterEvent(dlCtx, store.DeadLetterInput{
+				EventID:    re.ID,
+				ContractID: re.ContractID,
+				Ledger:     int64(re.Ledger),
+				Type:       re.Type,
+				TxHash:     re.TxHash,
+				TopicXDR:   re.Topic,
+				ValueXDR:   re.Value,
+				Err:        err,
+			}); derr != nil {
+				ing.log.Warn("dead-lettering failed", "event_id", re.ID, "error", derr)
+			}
+			cancel()
+			continue
 		}
 		events = append(events, ev)
 	}

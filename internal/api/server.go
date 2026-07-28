@@ -96,6 +96,9 @@ type Server struct {
 	// Zero means unbounded (legacy behavior); config-driven wiring sets
 	// EXPORT_MAX_RANGE so requests default to a sane ceiling.
 	exportMaxRange int64
+	// cors is the CORS middleware config. Wired via SetCORS from main so
+	// the API does not import the config package.
+	cors CORSConfig
 }
 
 // SetCompressMinSize overrides the body size at which responses are
@@ -138,12 +141,26 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 // analytical workloads without code changes.
 func (s *Server) SetExportMaxRange(n int64) { s.exportMaxRange = n }
 
+// SetCORSConfig wires the CORS middleware. The default (zero-valued
+// config) is deny-all: no cross-origin browser request receives CORS
+// headers, so the browser blocks the response. Pass the
+// CORSAllowedOrigins / CORSAllowedMethods / CORSAllowedHeaders lists the
+// operator wants; an empty AllowedOrigins is still deny-all (the
+// middleware short-circuits).
+func (s *Server) SetCORSConfig(cfg CORSConfig) { s.cors = cfg }
+
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
 	r.Use(s.metrics.Middleware)
+	// CORS runs before Recoverer/Timeout so a preflight never blocks
+	// nor panics inside the recovery middleware, and so the same-origin
+	// contract (no Origin header) is forwarded as-is. Mounted
+	// unconditionally so an operator can flip the config on without
+	// restarts; CORS() is a no-op when the allowlist is empty.
+	r.Use(CORS(s.cors))
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 	// Compression sits outside the limiter so a 429 is written through the
@@ -171,6 +188,8 @@ func (s *Server) Router() http.Handler {
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/contracts/{id}/export", s.handleContractExport)
+	
+	r.Get("/contracts", s.handleListContracts)
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
@@ -185,6 +204,9 @@ func (s *Server) Router() http.Handler {
 	r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
 	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
 	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
+
+	r.With(watchedMW).Get("/dead-letters", s.handleListDeadLetters)
+	r.With(watchedMW).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)
 
 	// Subscription CRUD and delivery history.
 	r.Post("/subscriptions", s.handleCreateSubscription)

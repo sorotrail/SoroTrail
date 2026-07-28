@@ -428,3 +428,18 @@ func mkEvents(ledger uint32, count int, contractID string) []rpc.Event {
 	}
 	return out
 }
+
+func (m *mockStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) { return 0, nil }
+func (m *mockStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
+	return store.DeadLetter{}, nil
+}
+func (m *mockStore) ListDeadLetters(context.Context, string, int, string) ([]store.DeadLetter, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, error) {
+	return store.DeadLetter{}, store.ErrNotFound
+}
+func (m *mockStore) DeleteDeadLetter(context.Context, int64) error { return nil }
