@@ -569,6 +569,68 @@ func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) err
 	return nil
 }
 
+func (p *Postgres) GetContractCursor(ctx context.Context, contractID string) (ContractCursor, error) {
+	var cc ContractCursor
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT contract_id, last_ingested_ledger, last_cursor, updated_at
+			 FROM contract_cursors WHERE contract_id = $1`,
+			contractID,
+		).Scan(&cc.ContractID, &cc.LastIngestedLedger, &cc.LastCursor, &cc.UpdatedAt)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ContractCursor{}, ErrNotFound
+	}
+	if err != nil {
+		return ContractCursor{}, fmt.Errorf("loading contract cursor for %s: %w", contractID, err)
+	}
+	return cc, nil
+}
+
+func (p *Postgres) SaveContractCursor(ctx context.Context, cc ContractCursor) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO contract_cursors (contract_id, last_ingested_ledger, last_cursor, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (contract_id) DO UPDATE SET
+			last_ingested_ledger = EXCLUDED.last_ingested_ledger,
+			last_cursor          = EXCLUDED.last_cursor,
+			updated_at            = now()`,
+		cc.ContractID, cc.LastIngestedLedger, cc.LastCursor,
+	)
+	if err != nil {
+		return fmt.Errorf("saving contract cursor for %s: %w", cc.ContractID, err)
+	}
+	return nil
+}
+
+func (p *Postgres) DeleteContractCursor(ctx context.Context, contractID string) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM contract_cursors WHERE contract_id = $1`, contractID)
+	if err != nil {
+		return fmt.Errorf("deleting contract cursor for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+func (p *Postgres) ListContractCursors(ctx context.Context) ([]ContractCursor, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT contract_id, last_ingested_ledger, last_cursor, updated_at
+		 FROM contract_cursors ORDER BY contract_id`)
+	if err != nil {
+		return nil, fmt.Errorf("listing contract cursors: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ContractCursor
+	for rows.Next() {
+		var cc ContractCursor
+		if err := rows.Scan(&cc.ContractID, &cc.LastIngestedLedger, &cc.LastCursor, &cc.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, cc)
+	}
+	return out, rows.Err()
+}
+
 func (p *Postgres) GetAuditState(ctx context.Context) (AuditState, error) {
 	var s AuditState
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
@@ -682,8 +744,9 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 				(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
 				(SELECT coalesce(min(ledger), 0) FROM events),
 				(SELECT count(DISTINCT contract_id) FROM events),
-				(SELECT count(*) FROM watched_contracts)`,
-		).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
+				(SELECT count(*) FROM watched_contracts),
+				(SELECT count(*) FROM contract_cursors)`,
+		).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts, &s.ContractCursors)
 	})
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)

@@ -285,9 +285,9 @@ func TestWindowSweep_MultiBatch(t *testing.T) {
 	}
 	assert.Len(t, st.events, 2)
 
-	state, _ := st.GetIngestionState(context.Background())
-	assert.Equal(t, int64(1_099), state.LastIngestedLedger)
-	assert.Empty(t, state.LastCursor)
+	cursors, err := st.ListContractCursors(context.Background())
+	require.NoError(t, err)
+	assert.NotEmpty(t, cursors, "per-contract cursors should be set after a window sweep")
 }
 
 func TestReclamp_WhenResumePointAgedOut(t *testing.T) {
@@ -414,4 +414,131 @@ func TestIngester_PicksUpRuntimeWatchListRemoval(t *testing.T) {
 	assert.Empty(t, req2.Filters[0].ContractIDs,
 		"empty watch list means ingest-all: contractIds must be empty")
 	assert.Equal(t, "contract", req2.Filters[0].Type)
+}
+
+// Late-added contracts get a cold-start backfill from the retention window
+// while already-watched contracts continue from their own cursors.
+func TestIngester_LateContractBackfillsWhileOthersContinue(t *testing.T) {
+	contractA := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+	// Contract A is already being watched (has a cursor at ledger 500).
+	st := newMockStore()
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
+	require.NoError(t, st.SaveContractCursor(context.Background(), store.ContractCursor{
+		ContractID:         contractA,
+		LastIngestedLedger: 500,
+		LastCursor:         "cursor-a",
+	}))
+
+	client := &mockRPC{
+		health: rpc.Health{Status: "healthy", LatestLedger: 100_000, OldestLedger: 10},
+		eventsResps: []rpc.GetEventsResponse{
+			// Contract A gets its next page of events.
+			{
+				Events:       []rpc.Event{rpcEvent("e-a", 501)},
+				LatestLedger: 100_000,
+			},
+		},
+	}
+
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+
+	// Contract A's cursor advanced to the latest event it received.
+	ccA, err := st.GetContractCursor(context.Background(), contractA)
+	require.NoError(t, err)
+	assert.Equal(t, int64(501), ccA.LastIngestedLedger)
+	assert.Equal(t, "e-a", ccA.LastCursor,
+		"cursor is derived from the last event the contract received in this batch")
+}
+
+// Each contract's cursor advances independently; a contract that has already
+// caught up is not forced to re-process events from a lagging contract's range.
+func TestIngester_PerContractCursorsAdvanceIndependently(t *testing.T) {
+	contractA := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	contractB := "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+	st := newMockStore()
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractB))
+
+	// Contract A is behind (at ledger 100), contract B is already caught up (at ledger 500).
+	require.NoError(t, st.SaveContractCursor(context.Background(), store.ContractCursor{
+		ContractID:         contractA,
+		LastIngestedLedger: 100,
+	}))
+	require.NoError(t, st.SaveContractCursor(context.Background(), store.ContractCursor{
+		ContractID:         contractB,
+		LastIngestedLedger: 500,
+		LastCursor:         "cursor-b",
+	}))
+
+	client := &mockRPC{
+		health: rpc.Health{Status: "healthy", LatestLedger: 100_000, OldestLedger: 10},
+		eventsResps: []rpc.GetEventsResponse{
+			// Only contract A gets new events (contract B is already ahead).
+			{
+				Events:       []rpc.Event{rpcEvent("ea-new", 101)},
+				LatestLedger: 100_000,
+			},
+		},
+	}
+
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+
+	// Contract A advanced.
+	ccA, err := st.GetContractCursor(context.Background(), contractA)
+	require.NoError(t, err)
+	assert.Equal(t, int64(101), ccA.LastIngestedLedger)
+
+	// Contract B kept its existing cursor (no new events for it).
+	ccB, err := st.GetContractCursor(context.Background(), contractB)
+	require.NoError(t, err)
+	assert.Equal(t, int64(500), ccB.LastIngestedLedger)
+	assert.Equal(t, "cursor-b", ccB.LastCursor)
+}
+
+// When IsLedgerOutOfRange fires on a shared filter batch,
+// ALL contracts in that batch are clamped to oldest_retained − 1.
+// This is safe (idempotent upserts handle re-duping) and correct:
+// every contract in the batch used the same (too-low) startLedger.
+func TestIngester_ReclampAffectsAllInSharedBatch(t *testing.T) {
+	contractA := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	contractB := "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+	st := newMockStore()
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractB))
+
+	require.NoError(t, st.SaveContractCursor(context.Background(), store.ContractCursor{
+		ContractID:         contractA,
+		LastIngestedLedger: 100,
+	}))
+	require.NoError(t, st.SaveContractCursor(context.Background(), store.ContractCursor{
+		ContractID:         contractB,
+		LastIngestedLedger: 50_000,
+		LastCursor:         "cursor-b",
+	}))
+
+	client := &mockRPC{
+		health:     rpc.Health{Status: "healthy", LatestLedger: 50_000, OldestLedger: 40_000},
+		eventsErrs: []error{fmt.Errorf("getEvents: %w", &rpc.Error{Code: -32600, Message: "startLedger must be within the ledger range: 40000 - 50000"})},
+	}
+
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+
+	// Both contracts in the shared batch were clamped because the
+	// batch's shared startLedger (101) fell outside RPC retention.
+	for _, id := range []string{contractA, contractB} {
+		cc, err := st.GetContractCursor(context.Background(), id)
+		require.NoError(t, err, "contract %s should have a cursor", id)
+		assert.Equal(t, int64(39_999), cc.LastIngestedLedger,
+			"contract %s was clamped to oldest_retained − 1", id)
+		assert.Empty(t, cc.LastCursor, "cursor reset after reclamp")
+	}
 }

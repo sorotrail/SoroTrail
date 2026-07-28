@@ -672,9 +672,9 @@ type addWatchedRequest struct {
 	ContractID string `json:"contract_id"`
 }
 
-// addWatchedResponse includes the current ingestion cursor so callers
-// know exactly where historical replay starts — events before this ledger
-// are not backfilled by the runtime add (a separate replay tool covers them).
+// addWatchedResponse includes the backfill position so callers
+// know exactly where historical replay starts — the per-contract
+// cursor for watched mode, or the global cursor for unwatched mode.
 type addWatchedResponse struct {
 	ContractID        string `json:"contract_id"`
 	AddedAt           string `json:"added_at"`
@@ -748,7 +748,8 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	modeTransition := ""
-	if len(current) == 0 {
+	wasEmpty := len(current) == 0
+	if wasEmpty {
 		if r.URL.Query().Get("confirm") != "true" {
 			writeError(w, http.StatusBadRequest, errors.New(
 				"adding the first watched contract would switch ingestion from "+
@@ -758,11 +759,32 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 		modeTransition = "all_to_specific"
 	}
 
-	state, err := s.store.GetIngestionState(r.Context())
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		s.log.Error("loading ingestion state for add", "error", err)
-		writeError(w, http.StatusInternalServerError, errors.New("loading ingestion state failed"))
-		return
+	// Check whether this contract already exists in the watch list.
+	alreadyWatched := false
+	for _, wc := range current {
+		if wc.ContractID == req.ContractID {
+			alreadyWatched = true
+			break
+		}
+	}
+
+	var historyFromLedger int64
+	if alreadyWatched {
+		// Contract is already watched — return its existing cursor
+		// position so the operator knows the backfill already started.
+		cc, err := s.store.GetContractCursor(r.Context(), req.ContractID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			s.log.Error("loading contract cursor for add", "contract_id", req.ContractID, "error", err)
+			writeError(w, http.StatusInternalServerError, errors.New("loading cursor failed"))
+			return
+		}
+		historyFromLedger = cc.LastIngestedLedger
+	} else {
+		// New contract — compute the cold-start backfill position
+		// (same rules as the ingester's cold start): latest minus
+		// retention, clamped to the RPC's oldest retained ledger and
+		// ledger 2.
+		historyFromLedger = s.coldStartLedger(r.Context())
 	}
 
 	if err := s.store.AddWatchedContract(r.Context(), req.ContractID); err != nil {
@@ -774,9 +796,30 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, addWatchedResponse{
 		ContractID:        req.ContractID,
 		AddedAt:           time.Now().UTC().Format(time.RFC3339),
-		HistoryFromLedger: state.LastIngestedLedger,
+		HistoryFromLedger: historyFromLedger,
 		ModeTransition:    modeTransition,
 	})
+}
+
+// coldStartLedger computes the earliest ledger a new watched
+// contract should backfill from. It mirrors the ingester's cold
+// start rules: latest minus RETENTION_LEDGERS, clamped to the
+// RPC's oldest retained ledger and ledger 2.
+func (s *Server) coldStartLedger(ctx context.Context) int64 {
+	health, err := s.rpc.GetHealth(ctx)
+	if err != nil {
+		// If we can't reach the RPC, fall back to 0 so the
+		// ingester retries on its own cold-start path.
+		return 0
+	}
+	start := int64(health.LatestLedger) - int64(s.retentionLedgers)
+	if oldest := int64(health.OldestLedger); start < oldest {
+		start = oldest
+	}
+	if start < 2 {
+		start = 2
+	}
+	return start
 }
 
 // handleRemoveWatchedChain stops future ingestion for the named contract

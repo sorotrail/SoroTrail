@@ -79,15 +79,16 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store     store.Store
-	rpc       rpc.Client
-	enricher  Enricher
-	log       *slog.Logger
-	apiKey    string
-	limiter   *RateLimiter
-	recoverer *Recoverer
-	bcast     *broadcast.Broadcaster
-	metrics   *metrics.HTTPMetrics
+	store            store.Store
+	rpc              rpc.Client
+	enricher         Enricher
+	log              *slog.Logger
+	apiKey           string
+	limiter          *RateLimiter
+	recoverer        *Recoverer
+	bcast            *broadcast.Broadcaster
+	metrics          *metrics.HTTPMetrics
+	retentionLedgers uint32
 	// compressMinSize is the body size at which responses start being
 	// compressed. The zero value means CompressMinSize, so compression is on
 	// by default; negative disables the middleware entirely.
@@ -105,8 +106,8 @@ func (s *Server) SetCompressMinSize(n int) {
 // fail closed (every request gets a 503 with "API_KEY not configured").
 // See apiKeyAuth for the exact contract. The trailing enricher is optional —
 // pass nil to disable spec decoding, or one Enricher to enable it.
-func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New()}
+func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, retentionLedgers uint32, enricher ...Enricher) *Server {
+	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, retentionLedgers: retentionLedgers, recoverer: NewRecoverer(log), metrics: metrics.New()}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}

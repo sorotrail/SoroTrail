@@ -57,6 +57,9 @@ type stubStore struct {
 
 	ingestion    store.IngestionState
 	ingestionErr error
+
+	contractCursors map[string]store.ContractCursor
+	cursorErr       error
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -140,6 +143,42 @@ func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
 	return s.removeErr
 }
 
+// GetContractCursor / SaveContractCursor are stubs for per-contract
+// cursor support in watched contract API tests.
+func (s *stubStore) GetContractCursor(_ context.Context, id string) (store.ContractCursor, error) {
+	if s.contractCursors == nil {
+		return store.ContractCursor{}, store.ErrNotFound
+	}
+	cc, ok := s.contractCursors[id]
+	if !ok {
+		return store.ContractCursor{}, store.ErrNotFound
+	}
+	return cc, nil
+}
+
+func (s *stubStore) SaveContractCursor(_ context.Context, cc store.ContractCursor) error {
+	if s.contractCursors == nil {
+		s.contractCursors = map[string]store.ContractCursor{}
+	}
+	s.contractCursors[cc.ContractID] = cc
+	return s.cursorErr
+}
+
+func (s *stubStore) DeleteContractCursor(_ context.Context, _ string) error {
+	return nil
+}
+
+func (s *stubStore) ListContractCursors(context.Context) ([]store.ContractCursor, error) {
+	if s.contractCursors == nil {
+		return nil, nil
+	}
+	out := make([]store.ContractCursor, 0, len(s.contractCursors))
+	for _, cc := range s.contractCursors {
+		out = append(out, cc)
+	}
+	return out, nil
+}
+
 // Subscription stubs for the webhook feature.
 func (s *stubStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
 	sub.ID = 1
@@ -181,15 +220,15 @@ func (s *stubRPC) GetHealth(context.Context) (rpc.Health, error) {
 	return s.health, s.healthErr
 }
 
-func newTestServer(st *stubStore, rc *stubRPC) *Server {
-	return newTestServerWithKey(st, rc, "test-key")
-}
-
 func newTestServerWithKey(st *stubStore, rc *stubRPC, apiKey string) *Server {
 	if rc == nil {
 		rc = &stubRPC{health: rpc.Health{Status: "healthy"}}
 	}
-	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), apiKey)
+	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), apiKey, 17280)
+}
+
+func newTestServer(st *stubStore, rc *stubRPC) *Server {
+	return newTestServerWithKey(st, rc, "test-key")
 }
 
 func doGet(t *testing.T, s *Server, path string) (*http.Response, []byte) {
@@ -1053,7 +1092,7 @@ func TestRequestID(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-			s := New(&stubStore{}, nil, log, "test-key")
+			s := New(&stubStore{}, nil, log, "test-key", 17280)
 			srv := httptest.NewServer(s.Router())
 			defer srv.Close()
 

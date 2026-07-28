@@ -127,7 +127,24 @@ func (ing *Ingester) Run(ctx context.Context) error {
 // a single page (resumable via the persisted cursor); with more watched
 // contracts than one request allows it sweeps a bounded ledger window once
 // per filter batch.
+//
+// Unwatched mode (empty WATCHED_CONTRACTS) uses the single global
+// ingestion_state row — backward-compatible behavior unchanged.
+// Watched mode uses per-contract cursors in the contract_cursors table.
 func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
+	watched, err := ing.store.ListWatchedContracts(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(watched) == 0 {
+		return ing.runOnceUnwatched(ctx)
+	}
+	return ing.runOnceWatched(ctx)
+}
+
+// runOnceUnwatched preserves the existing single-cursor behavior for
+// the ingest-everything mode (empty watch list).
+func (ing *Ingester) runOnceUnwatched(ctx context.Context) (caughtUp bool, err error) {
 	startLedger, cursor, err := ing.resolvePosition(ctx)
 	if err != nil {
 		return false, err
@@ -137,14 +154,28 @@ func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
 		return false, err
 	}
 	if len(batches) == 1 {
-		return ing.singlePage(ctx, startLedger, cursor, batches[0])
+		return ing.singlePageUnwatched(ctx, startLedger, cursor, batches[0])
 	}
-	return ing.windowSweep(ctx, startLedger, batches)
+	return ing.windowSweepUnwatched(ctx, startLedger, batches)
 }
 
-// singlePage issues one getEvents call and persists the page plus the resume
+// runOnceWatched advances per-contract cursors. Each watched contract
+// tracks its own resume position; a lagging contract does not delay others.
+func (ing *Ingester) runOnceWatched(ctx context.Context) (bool, error) {
+	batches, err := ing.buildFilterBatches(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(batches) == 1 {
+		return ing.singlePageWatched(ctx, batches[0])
+	}
+	return ing.windowSweepWatched(ctx, batches)
+}
+
+// singlePageUnwatched issues one getEvents call and persists the page plus the resume
 // cursor, so even huge backfills make durable progress request by request.
-func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor string, filters []rpc.EventFilter) (bool, error) {
+// Unwatched mode: uses the single global ingestion_state cursor.
+func (ing *Ingester) singlePageUnwatched(ctx context.Context, startLedger uint32, cursor string, filters []rpc.EventFilter) (bool, error) {
 	resp, err := ing.client.GetEvents(ctx, rpc.GetEventsRequest{
 		StartLedger: startLedger,
 		Filters:     filters,
@@ -170,6 +201,40 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 	if err := ing.store.SaveIngestionState(ctx, state); err != nil {
 		return false, err
 	}
+	return caughtUp, nil
+}
+
+// singlePageWatched issues one getEvents call for a filter batch that
+// may contain multiple watched contracts. It advances each contract's
+// cursor independently based on the events it received.
+func (ing *Ingester) singlePageWatched(ctx context.Context, filters []rpc.EventFilter) (bool, error) {
+	contractIDs := contractIDsFromFilters(filters)
+	startLedger, cursor, err := ing.resolveBatchStart(ctx, contractIDs)
+	if err != nil {
+		return false, err
+	}
+
+	resp, err := ing.client.GetEvents(ctx, rpc.GetEventsRequest{
+		StartLedger: startLedger,
+		Filters:     filters,
+		Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
+	})
+	if rpc.IsLedgerOutOfRange(err) {
+		return false, ing.reclampToOldest(ctx, startLedger, contractIDs...)
+	}
+	if err != nil {
+		return false, fmt.Errorf("getEvents from ledger %d: %w", startLedger, err)
+	}
+
+	if err := ing.persistEvents(ctx, resp.Events, resp.LatestLedger); err != nil {
+		return false, err
+	}
+
+	if err := ing.advanceContractCursors(ctx, resp.Events); err != nil {
+		return false, err
+	}
+
+	caughtUp := uint(len(resp.Events)) < ing.opts.PageLimit
 	return caughtUp, nil
 }
 
@@ -302,12 +367,11 @@ func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState
 	return store.IngestionState{LastIngestedLedger: int64(resp.LatestLedger) - 1}, caughtUp
 }
 
-// windowSweep ingests the ledger window [start, end] by paging each filter
-// batch through it separately, then advances state past the window. One
-// shared cursor can't track several concurrent request chains, so within a
-// window each batch pages to completion in memory; idempotent upserts make
-// re-scanning after a crash harmless.
-func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]rpc.EventFilter) (bool, error) {
+// windowSweepUnwatched processes each filter batch through a bounded
+// ledger window, then advances the global ingestion_state. One shared
+// cursor can't track several concurrent request chains, so within a
+// window each batch pages to completion in memory.
+func (ing *Ingester) windowSweepUnwatched(ctx context.Context, start uint32, batches [][]rpc.EventFilter) (bool, error) {
 	health, err := ing.client.GetHealth(ctx)
 	if err != nil {
 		return false, fmt.Errorf("getHealth for sweep window: %w", err)
@@ -322,7 +386,7 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 		for {
 			resp, err := ing.client.GetEvents(ctx, rpc.GetEventsRequest{
 				StartLedger: start,
-				EndLedger:   end + 1, // endLedger is exclusive
+				EndLedger:   end + 1,
 				Filters:     filters,
 				Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
 			})
@@ -338,8 +402,6 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 			if uint(len(resp.Events)) < ing.opts.PageLimit {
 				break
 			}
-			// Cursor requests can't carry the ledger range, so enforce the
-			// window bound here once a page crosses it.
 			if resp.Events[len(resp.Events)-1].Ledger > end {
 				break
 			}
@@ -349,10 +411,6 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 		}
 	}
 
-	// Resume from end+1 next pass — unless the window reached the chain
-	// head, where end-1 keeps the next startLedger within the server's
-	// retained range (a startLedger past latest is rejected). The one
-	// re-scanned ledger is deduplicated by the idempotent upserts.
 	lastIngested := int64(end)
 	if end >= health.LatestLedger {
 		lastIngested = int64(end) - 1
@@ -361,6 +419,67 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	if err != nil {
 		return false, err
 	}
+	return end >= health.LatestLedger, nil
+}
+
+// windowSweepWatched pages each filter batch through a bounded ledger
+// window, advancing each watched contract's cursor independently.
+// Contracts at the same position share getEvents calls within a batch;
+// contracts behind the others simply re-receive their own events
+// from the earlier startLedger (idempotent upserts handle duplicates).
+func (ing *Ingester) windowSweepWatched(ctx context.Context, batches [][]rpc.EventFilter) (bool, error) {
+	health, err := ing.client.GetHealth(ctx)
+	if err != nil {
+		return false, fmt.Errorf("getHealth for sweep window: %w", err)
+	}
+
+	// Use the earliest startLedger across all watched contracts
+	// so no contract misses events in this window.
+	start, err := ing.earliestStartLedger(ctx, health)
+	if err != nil {
+		return false, err
+	}
+	if start > health.LatestLedger {
+		return true, nil // nothing new yet
+	}
+	end := min(start+ing.opts.SweepWindow-1, health.LatestLedger)
+
+	for _, filters := range batches {
+		contractIDs := contractIDsFromFilters(filters)
+		cursor := ""
+		for {
+			resp, err := ing.client.GetEvents(ctx, rpc.GetEventsRequest{
+				StartLedger: start,
+				EndLedger:   end + 1,
+				Filters:     filters,
+				Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
+			})
+			if rpc.IsLedgerOutOfRange(err) {
+				return false, ing.reclampToOldest(ctx, start, contractIDs...)
+			}
+			if err != nil {
+				return false, fmt.Errorf("getEvents sweep [%d,%d]: %w", start, end, err)
+			}
+			if err := ing.persistEvents(ctx, resp.Events, resp.LatestLedger); err != nil {
+				return false, err
+			}
+			if err := ing.advanceContractCursors(ctx, resp.Events); err != nil {
+				return false, err
+			}
+			if uint(len(resp.Events)) < ing.opts.PageLimit {
+				break
+			}
+			if resp.Events[len(resp.Events)-1].Ledger > end {
+				break
+			}
+			if cursor = resp.Cursor; cursor == "" {
+				cursor = resp.Events[len(resp.Events)-1].CursorValue()
+			}
+		}
+	}
+
+	// No global state to advance — each contract's cursor is tracked
+	// independently. The next runOnce resolves positions per-contract.
 	return end >= health.LatestLedger, nil
 }
 
@@ -432,16 +551,33 @@ func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, c
 
 // reclampToOldest handles a resume point that aged out of the RPC's
 // retention window (e.g. the indexer was down for days): skip ahead to the
-// oldest retained ledger and accept the gap.
-func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) error {
+// oldest retained ledger and accept the gap. In unwatched mode the global
+// ingestion_state row is advanced; in watched mode every contract in the
+// batch gets its per-contract cursor clamped so that nothing is stuck behind
+// the RPC's retention floor.
+func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32, contractIDs ...string) error {
 	health, err := ing.client.GetHealth(ctx)
 	if err != nil {
 		return fmt.Errorf("getHealth while re-clamping: %w", err)
 	}
 	ing.log.Warn("resume ledger fell outside RPC retention window; skipping ahead — events in the gap are lost",
 		"requested_ledger", requested, "oldest_retained", health.OldestLedger)
+	clamped := int64(health.OldestLedger) - 1
+	if len(contractIDs) > 0 {
+		// Watched mode: advance each contract's cursor independently.
+		for _, id := range contractIDs {
+			if err := ing.store.SaveContractCursor(ctx, store.ContractCursor{
+				ContractID:         id,
+				LastIngestedLedger: clamped,
+				LastCursor:         "",
+			}); err != nil {
+				return fmt.Errorf("clamping cursor for %s: %w", id, err)
+			}
+		}
+		return nil
+	}
 	return ing.store.SaveIngestionState(ctx, store.IngestionState{
-		LastIngestedLedger: int64(health.OldestLedger) - 1,
+		LastIngestedLedger: clamped,
 	})
 }
 
@@ -521,4 +657,145 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+// contractIDsFromFilters extracts the unique contract IDs from a filter batch.
+func contractIDsFromFilters(filters []rpc.EventFilter) []string {
+	seen := map[string]struct{}{}
+	var ids []string
+	for _, f := range filters {
+		if f.Type == "contract" {
+			for _, id := range f.ContractIDs {
+				if _, ok := seen[id]; !ok {
+					seen[id] = struct{}{}
+					ids = append(ids, id)
+				}
+			}
+		}
+	}
+	return ids
+}
+
+// resolveContractPosition determines where a specific contract should resume.
+// Returns (startLedger, cursor). The cursor is always "" for watched-mode
+// batches — startLedger-based pagination is used for multi-contract calls.
+// A contract with no cursor row (newly added) gets the cold-start treatment.
+func (ing *Ingester) resolveContractPosition(ctx context.Context, contractID string) (uint32, error) {
+	cc, err := ing.store.GetContractCursor(ctx, contractID)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		// No cursor row → new contract, cold start from retention window.
+		start, err := ing.coldStartPosition(ctx)
+		if err != nil {
+			return 0, err
+		}
+		ing.log.Info("new watched contract — backfill from retention window",
+			"contract_id", contractID, "start_ledger", start)
+		return start, nil
+	case err != nil:
+		return 0, fmt.Errorf("loading contract cursor for %s: %w", contractID, err)
+	}
+
+	if cc.LastIngestedLedger > 0 {
+		return uint32(cc.LastIngestedLedger) + 1, nil
+	}
+	// Has a row but no progress yet — cold start.
+	start, err := ing.coldStartPosition(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return start, nil
+}
+
+// resolveBatchStart finds the earliest start ledger across all contracts
+// in a filter batch. Contracts already ahead are covered by idempotent
+// upserts — they may re-receive some of their own events, which is harmless.
+func (ing *Ingester) resolveBatchStart(ctx context.Context, contractIDs []string) (uint32, string, error) {
+	var earliest uint32
+	earliest = 0
+
+	for _, id := range contractIDs {
+		start, err := ing.resolveContractPosition(ctx, id)
+		if err != nil {
+			return 0, "", err
+		}
+		if earliest == 0 || start < earliest {
+			earliest = start
+		}
+	}
+
+	return earliest, "", nil
+}
+
+// coldStartPosition returns the retention-window start ledger,
+// clamped to RPC retention, same rules as resolvePosition in unwatched mode.
+func (ing *Ingester) coldStartPosition(ctx context.Context) (uint32, error) {
+	startLedger, _, err := ing.resolvePosition(ctx)
+	return startLedger, err
+}
+
+// advanceContractCursors updates each contract's per-contract cursor so its
+// last_in ingested_ledger and last_cursor reflect the latest event it received
+// in the current batch. Contracts with no matching events keep their existing
+// cursor untouched.
+func (ing *Ingester) advanceContractCursors(ctx context.Context, events []rpc.Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Track each contract's latest event in this batch.
+	type latestEvent struct {
+		ledger uint32
+		cursor string
+	}
+	latestByContract := make(map[string]latestEvent)
+
+	for _, e := range events {
+		cur := latestByContract[e.ContractID]
+		if e.Ledger > cur.ledger || (e.Ledger == cur.ledger && e.CursorValue() > cur.cursor) {
+			latestByContract[e.ContractID] = latestEvent{
+				ledger: e.Ledger,
+				cursor: e.CursorValue(),
+			}
+		}
+	}
+
+	// Upsert each contract's cursor.
+	for contractID, info := range latestByContract {
+		cc := store.ContractCursor{
+			ContractID:         contractID,
+			LastIngestedLedger: int64(info.ledger),
+			LastCursor:         info.cursor,
+		}
+		if err := ing.store.SaveContractCursor(ctx, cc); err != nil {
+			return fmt.Errorf("saving cursor for contract %s: %w", contractID, err)
+		}
+	}
+
+	return nil
+}
+
+// earliestStartLedger walks all watched contracts and returns the smallest
+// startLedger across them, driving the window sweep bound. Unwatched mode
+// callers should use resolvePosition instead.
+func (ing *Ingester) earliestStartLedger(ctx context.Context, health rpc.Health) (uint32, error) {
+	watched, err := ing.store.ListWatchedContracts(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var earliest uint32
+	for _, wc := range watched {
+		start, err := ing.resolveContractPosition(ctx, wc.ContractID)
+		if err != nil {
+			return 0, err
+		}
+		if earliest == 0 || start < earliest {
+			earliest = start
+		}
+	}
+	if earliest == 0 {
+		start, _, err := ing.resolvePosition(ctx)
+		return start, err
+	}
+	return earliest, nil
 }

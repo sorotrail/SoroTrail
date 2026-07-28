@@ -50,11 +50,12 @@ func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest)
 
 // mockStore is an in-memory Store.
 type mockStore struct {
-	mu       sync.Mutex
-	events   map[string]store.Event
-	state    *store.IngestionState
-	watched  []store.WatchedContract
-	upserted [][]store.Event
+	mu              sync.Mutex
+	events          map[string]store.Event
+	state           *store.IngestionState
+	watched         []store.WatchedContract
+	upserted        [][]store.Event
+	contractCursors []store.ContractCursor
 }
 
 func newMockStore() *mockStore {
@@ -162,6 +163,48 @@ func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState
 	return nil
 }
 
+func (m *mockStore) GetContractCursor(_ context.Context, contractID string) (store.ContractCursor, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, cc := range m.contractCursors {
+		if cc.ContractID == contractID {
+			return cc, nil
+		}
+	}
+	return store.ContractCursor{}, store.ErrNotFound
+}
+
+func (m *mockStore) SaveContractCursor(_ context.Context, cc store.ContractCursor) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, existing := range m.contractCursors {
+		if existing.ContractID == cc.ContractID {
+			m.contractCursors[i] = cc
+			return nil
+		}
+	}
+	m.contractCursors = append(m.contractCursors, cc)
+	return nil
+}
+
+func (m *mockStore) DeleteContractCursor(_ context.Context, contractID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, cc := range m.contractCursors {
+		if cc.ContractID == contractID {
+			m.contractCursors = append(m.contractCursors[:i], m.contractCursors[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+
+func (m *mockStore) ListContractCursors(context.Context) ([]store.ContractCursor, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]store.ContractCursor(nil), m.contractCursors...), nil
+}
+
 func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return m.watched, nil
 }
@@ -181,8 +224,12 @@ func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
 	return store.ErrNotFound
 }
 
-func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
-func (m *mockStore) Ping(context.Context) error                 { return nil }
+func (m *mockStore) Stats(context.Context) (store.Stats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return store.Stats{WatchedContracts: int64(len(m.watched)), ContractCursors: uint64(len(m.contractCursors))}, nil
+}
+func (m *mockStore) Ping(context.Context) error { return nil }
 
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound

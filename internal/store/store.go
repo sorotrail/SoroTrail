@@ -151,6 +151,17 @@ type IngestionState struct {
 	UpdatedAt          time.Time
 }
 
+// ContractCursor tracks a single watched contract's resume position.
+// The ingester persists one cursor per contract so a lagging contract
+// never delays the others, and a contract added after ingestion has
+// already started automatically backfills from the retention window.
+type ContractCursor struct {
+	ContractID         string
+	LastIngestedLedger int64
+	LastCursor         string
+	UpdatedAt          time.Time
+}
+
 // AuditState tracks how far the background auditor has verified stored
 // ranges against the RPC. VerifiedThroughLedger is the inclusive highest
 // ledger whose stored events have been proven to match a fresh getEvents
@@ -324,7 +335,7 @@ type DeliveryAttempt struct {
 
 // Stats summarizes what the indexer has stored so far. VerifiedThroughLedger
 // is the inclusive highest ledger whose stored events have been confirmed
-// to match a fresh RPC fetch; 0 means no ledger has been verified yet.
+// to match a fresh getEvents fetch; 0 means no ledger has been verified yet.
 // Auditor counters are filled in by the API layer when an auditor is wired.
 type Stats struct {
 	TotalEvents           int64  `json:"total_events"`
@@ -335,6 +346,10 @@ type Stats struct {
 	IngestLagLedgers      *int64 `json:"ingest_lag_ledgers"`
 	ContractCount         int64  `json:"contract_count"`
 	WatchedContracts      int64  `json:"watched_contracts"`
+	// ContractCursors is the number of per-contract cursor rows tracked
+	// for watched-contract mode. Zero means unwatched (ingest-everything)
+	// mode or no watched contracts have been added yet.
+	ContractCursors uint64 `json:"contract_cursors,omitempty"`
 	// QueryErrors is the number of store queries that have returned an
 	// error (timeout, connection failure, etc.) since the process started.
 	// Set by the guarded store wrapper; zero when the store is used
@@ -446,6 +461,12 @@ type Store interface {
 
 	GetIngestionState(ctx context.Context) (IngestionState, error)
 	SaveIngestionState(ctx context.Context, s IngestionState) error
+
+	// ContractCursor persistence for per-contract watched-mode ingestion.
+	GetContractCursor(ctx context.Context, contractID string) (ContractCursor, error)
+	SaveContractCursor(ctx context.Context, cc ContractCursor) error
+	DeleteContractCursor(ctx context.Context, contractID string) error
+	ListContractCursors(ctx context.Context) ([]ContractCursor, error)
 
 	GetAuditState(ctx context.Context) (AuditState, error)
 	SaveAuditState(ctx context.Context, s AuditState) error
