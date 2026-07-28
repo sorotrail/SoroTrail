@@ -68,7 +68,8 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
-	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
+	batch := &pgx.Batch{}
+	clause := "ON CONFLICT (id) DO NOTHING"
 	if onUpdate {
 		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
 			contract_id        = EXCLUDED.contract_id,

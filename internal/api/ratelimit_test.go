@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -106,12 +105,12 @@ func TestRateLimit_OverLimitReturns429(t *testing.T) {
 	defer r2.Body.Close()
 	require.Equal(t, http.StatusTooManyRequests, r2.StatusCode)
 
-	// Standard error envelope.
+	// Standard error envelope: nested {"error": {"code": "...", "message": "..."}}.
 	body, err := io.ReadAll(r2.Body)
 	require.NoError(t, err)
-	var env map[string]string
-	require.NoError(t, json.Unmarshal(body, &env))
-	assert.NotEmpty(t, env["error"], "429 must include error envelope")
+	code, msg := parseErrorBody(t, body)
+	assert.Equal(t, ErrorCodeRateLimited, code, "429 must use rate_limited code")
+	assert.NotEmpty(t, msg, "429 must include error message")
 
 	// Retry-After is a positive integer in seconds (RFC 7231 §7.1.3).
 	ra := r2.Header.Get("Retry-After")

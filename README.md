@@ -230,7 +230,25 @@ match, since `If-None-Match` comparison ignores the `W/` prefix.
 
 ## API reference
 
-All responses are JSON. Errors look like `{"error": "message"}`.
+All responses are JSON. Every error response uses a consistent structured
+envelope:
+
+```json
+{"error": {"code": "bad_request", "message": "invalid contract_id \"nope\" (want a C... strkey, 56 characters)"}}
+```
+
+### Error codes
+
+| HTTP status | Error code | Meaning |
+| --- | --- | --- |
+| `400` | `bad_request` | Invalid or unrecognised input (bad params, unknown query keys, etc.) |
+| `404` | `not_found` | Requested resource does not exist |
+| `429` | `rate_limited` | Per-client rate limit exceeded; retry after the `Retry-After` header |
+| `500` | `internal_error` | Genuine server fault — retry later or contact the operator |
+| `501` | `not_implemented` | The endpoint exists but the required component (e.g. broadcaster) is not wired |
+
+All error responses carry `Cache-Control: no-store` so proxies never pool
+error payloads behind a success response's validator.
 
 ### Pagination
 

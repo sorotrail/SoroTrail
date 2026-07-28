@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -80,10 +79,6 @@ const (
 	// shareable across users or even across requests on the same box.
 	cacheNoStore
 )
-
-type errorResponse struct {
-	Error string `json:"error"`
-}
 
 type eventsResponse struct {
 	Events []store.Event `json:"events"`
@@ -459,8 +454,8 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contractID := chi.URLParam(r, "id")
-	if !config.ValidContractID(contractID) {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid contract ID %q", contractID))
+	if err := ValidateContractID(contractID); err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	filter.ContractID = contractID
@@ -1347,7 +1342,7 @@ func parseTimeParam(raw, name string) (time.Time, error) {
 
 func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	if s.bcast == nil {
-		http.Error(w, "streaming not configured", http.StatusNotImplemented)
+		writeErrorString(w, http.StatusNotImplemented, "streaming not configured")
 		return
 	}
 
@@ -1426,14 +1421,4 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
-}
-
-func writeError(w http.ResponseWriter, status int, err error) {
-	// Every error response is marked no-store so neither CDNs nor
-	// browsers can pool a 4xx/5xx behind a success response's
-	// validator. The prime motivator is the 404-on-eviction path in
-	// handleGetEvent: a stale cache otherwise keeps returning "not
-	// found" for an event that briefly aged out but never came back.
-	writeCacheHeaders(w, cacheNoStore, 0, "")
-	writeJSON(w, status, errorResponse{Error: err.Error()})
 }
