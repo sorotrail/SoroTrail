@@ -73,6 +73,8 @@ subcommands:
 `)
 }
 
+var errInterrupted = errors.New("interrupted")
+
 func run() error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -86,16 +88,48 @@ func run() error {
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+
+	// Create the initial connection pool with health check configuration
+	poolConfig, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("parsing database URL: %w", err)
+	}
+
+	// Configure pool settings for reliability
+	poolConfig.MaxConns = 20
+	poolConfig.MinConns = 5
+	poolConfig.MaxConnLifetime = time.Hour
+	poolConfig.MaxConnIdleTime = 30 * time.Minute
+	poolConfig.HealthCheckPeriod = cfg.DBHealthCheckInterval
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return fmt.Errorf("connecting to postgres: %w", err)
 	}
 	defer pool.Close()
-	if err := pool.Ping(ctx); err != nil {
-		return fmt.Errorf("pinging postgres: %w", err)
+
+	// Wait for initial connection
+	pingCtx, pingCancel := context.WithTimeout(ctx, cfg.DBHealthCheckTimeout)
+	defer pingCancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		log.Warn("initial database ping failed, will retry in background", "error", err)
+		// Don't exit - the health checker will retry
 	}
 
-	st := store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+	// Create the store with health checking and auto-reconnect
+	st := store.NewPostgresWithConfig(pool, store.PostgresConfig{
+		PartitionSpan:        []int64{int64(cfg.PartitionLedgerSpan)},
+		CheckInterval:        cfg.DBHealthCheckInterval,
+		CheckTimeout:         cfg.DBHealthCheckTimeout,
+		InitialBackoff:       cfg.DBReconnectInitialBackoff,
+		MaxBackoff:           cfg.DBReconnectMaxBackoff,
+		MaxReconnectAttempts: cfg.DBReconnectMaxAttempts,
+		DatabaseURL:          cfg.DatabaseURL,
+	})
+
+	// Ensure the store is closed on shutdown
+	defer st.Close()
+
 	for _, id := range cfg.WatchedContracts {
 		if err := st.AddWatchedContract(ctx, id); err != nil {
 			return err

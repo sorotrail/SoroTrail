@@ -55,6 +55,13 @@ type Config struct {
 	// intermediaries cannot. Defaults to false (the deployment does not
 	// need request-scoped caching).
 	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
+
+	// Database health check configuration
+	DBHealthCheckInterval     time.Duration `env:"DB_HEALTH_CHECK_INTERVAL" envDefault:"30s"`
+	DBHealthCheckTimeout      time.Duration `env:"DB_HEALTH_CHECK_TIMEOUT" envDefault:"5s"`
+	DBReconnectInitialBackoff time.Duration `env:"DB_RECONNECT_INITIAL_BACKOFF" envDefault:"1s"`
+	DBReconnectMaxBackoff     time.Duration `env:"DB_RECONNECT_MAX_BACKOFF" envDefault:"60s"`
+	DBReconnectMaxAttempts    int           `env:"DB_RECONNECT_MAX_ATTEMPTS" envDefault:"0"` // 0 = unlimited
 }
 
 // Load reads configuration from the environment and validates it.
@@ -132,6 +139,21 @@ func (c Config) Validate() error {
 	// expected throttling to kick in.
 	if (c.RateLimitRPS > 0) != (c.RateLimitBurst > 0) {
 		return fmt.Errorf("RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
+	}
+	if c.DBHealthCheckInterval <= 0 {
+		return fmt.Errorf("DB_HEALTH_CHECK_INTERVAL must be positive")
+	}
+	if c.DBHealthCheckTimeout <= 0 {
+		return fmt.Errorf("DB_HEALTH_CHECK_TIMEOUT must be positive")
+	}
+	if c.DBReconnectInitialBackoff <= 0 {
+		return fmt.Errorf("DB_RECONNECT_INITIAL_BACKOFF must be positive")
+	}
+	if c.DBReconnectMaxBackoff <= 0 {
+		return fmt.Errorf("DB_RECONNECT_MAX_BACKOFF must be positive")
+	}
+	if c.DBReconnectMaxAttempts < 0 {
+		return fmt.Errorf("DB_RECONNECT_MAX_ATTEMPTS must be non-negative")
 	}
 	return nil
 }
