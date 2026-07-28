@@ -103,6 +103,15 @@ func (s *guardedStore) QueryEvents(ctx context.Context, f EventFilter) ([]Event,
 	return events, cursor, err
 }
 
+func (s *guardedStore) CountEvents(ctx context.Context, f EventFilter) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.CountEvents")
+	defer cancel()
+	start := time.Now()
+	total, err := s.Store.CountEvents(ctx, f)
+	s.logSlowQuery("store.CountEvents", start, err)
+	return total, err
+}
+
 func (s *guardedStore) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.LedgerRangeCensus")
 	defer cancel()

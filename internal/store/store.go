@@ -107,10 +107,12 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	FromLedger    int64     // inclusive
-	ToLedger      int64     // inclusive
-	FromTime      time.Time // inclusive, zero = no constraint
-	ToTime        time.Time // inclusive, zero = no constraint
+	// TxHash filters events emitted by a specific transaction hash.
+	TxHash     string    // hex-encoded transaction hash
+	FromLedger int64     // inclusive
+	ToLedger   int64     // inclusive
+	FromTime   time.Time // inclusive, zero = no constraint
+	ToTime     time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int
@@ -434,6 +436,9 @@ type Store interface {
 	// cursor for the next page ("" when there are no more results).
 	// Default order is ascending (oldest-first) for backward compatibility.
 	QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error)
+	// CountEvents returns the total number of events matching the filter
+	// (ignoring pagination: cursor, order, and limit are not applied).
+	CountEvents(ctx context.Context, f EventFilter) (int64, error)
 	// LedgerRangeCensus returns one LedgerCensus row per ledger in the
 	// inclusive [fromLedger, toLedger] range that contains at least one
 	// event, in ascending ledger order. idsOnly=true populates LedgerCensus.IDs

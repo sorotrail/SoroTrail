@@ -20,16 +20,16 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/khaylebfortune/sorotrail/internal/api"
-	"github.com/khaylebfortune/sorotrail/internal/audit"
-	"github.com/khaylebfortune/sorotrail/internal/broadcast"
-	"github.com/khaylebfortune/sorotrail/internal/config"
-	"github.com/khaylebfortune/sorotrail/internal/decode"
-	"github.com/khaylebfortune/sorotrail/internal/ingester"
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/spec"
-	"github.com/khaylebfortune/sorotrail/internal/store"
-	"github.com/khaylebfortune/sorotrail/internal/webhook"
+	"github.com/sorotrail/sorotrail/internal/api"
+	"github.com/sorotrail/sorotrail/internal/audit"
+	"github.com/sorotrail/sorotrail/internal/broadcast"
+	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/spec"
+	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/webhook"
 )
 
 func main() {
@@ -55,6 +55,17 @@ func dispatch(args []string) error {
 		return runReplay(args[1:])
 	case "backfill":
 		return runBackfill(args[1:])
+	case "healthcheck":
+		// The healthcheck subcommand manages its own exit codes
+		// (0 healthy, 1 unhealthy, 2 usage error) — the docker
+		// HEALTHCHECK directive inspects them directly, so we
+		// hand control to os.Exit here rather than letting the
+		// main switch collapse everything into 1-with-a-prefix.
+		code := runHealthcheck(args[1:])
+		if code != 0 {
+			os.Exit(code)
+		}
+		return nil
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -70,10 +81,12 @@ func usage() {
 With no subcommand, runs the indexer (ingester + HTTP API).
 
 subcommands:
-  replay    re-decode stored events with the current decoder
-            (sorotrail replay --help)
-  backfill  ingest historical contract events from Horizon
-            (sorotrail backfill --help)
+  replay       re-decode stored events with the current decoder
+               (sorotrail replay --help)
+  backfill     ingest historical contract events from Horizon
+               (sorotrail backfill --help)
+  healthcheck  probe /health and exit (used by docker HEALTHCHECK)
+               (sorotrail healthcheck --help)
 `)
 }
 
@@ -82,7 +95,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log := newLogger(cfg.LogLevel)
+	log := newLogger(cfg.LogLevel, cfg.LogFormat)
 
 	log.Info("startup configuration", cfg.LoggableFields()...)
 
@@ -137,9 +150,12 @@ func run() error {
 	api.SetRPCCounter(countingClient)
 
 	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
-		PollInterval:     cfg.PollInterval,
-		StartLedger:      cfg.StartLedger,
-		RetentionLedgers: cfg.RetentionLedgers,
+		PollInterval:            cfg.PollInterval,
+		StartLedger:             cfg.StartLedger,
+		RetentionLedgers:        cfg.RetentionLedgers,
+		SweepConcurrency:        cfg.SweepConcurrency,
+		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
+		ReorgRescanInterval:     cfg.ReorgRescanInterval,
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
 
@@ -180,6 +196,7 @@ func run() error {
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
+	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -257,7 +274,7 @@ func run() error {
 	return firstErr
 }
 
-func newLogger(level string) *slog.Logger {
+func newLogger(level, format string) *slog.Logger {
 	var lvl slog.Level
 	switch strings.ToLower(level) {
 	case "debug":
@@ -269,5 +286,13 @@ func newLogger(level string) *slog.Logger {
 	default:
 		lvl = slog.LevelInfo
 	}
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
+	opts := &slog.HandlerOptions{Level: lvl}
+	var h slog.Handler
+	switch strings.ToLower(format) {
+	case "json":
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	default:
+		h = slog.NewTextHandler(os.Stdout, opts)
+	}
+	return slog.New(h)
 }

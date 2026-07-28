@@ -26,11 +26,11 @@ a Postgres you already have:
 docker run --rm -p 8080:8080 \
   -e DATABASE_URL='postgres://user:pass@host:5432/sorotrail?sslmode=disable' \
   -e RPC_URL='https://soroban-testnet.stellar.org' \
-  ghcr.io/stephaniepez21-art/sorotrail:latest
+  ghcr.io/sorotrail/sorotrail:latest
 ```
 
 Pin a specific release with a version tag instead of `latest`, e.g.
-`ghcr.io/stephaniepez21-art/sorotrail:v1.2.0`. See [Configuration](#configuration) for
+`ghcr.io/sorotrail/sorotrail:v1.2.0`. See [Configuration](#configuration) for
 the full list of environment variables.
 
 ### Docker Compose (full stack)
@@ -49,6 +49,18 @@ To watch specific contracts instead of everything:
 ```sh
 WATCHED_CONTRACTS=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC docker compose up --build
 ```
+
+**Container health.** The published image ships with a `HEALTHCHECK` that
+probes `/health` via the in-binary `sorotrail healthcheck` subcommand
+(alpine has no curl/wget — installing curl or shipping a second binary
+would just grow the image; routing the probe through the existing
+binary reuses the `net/http` client that's already linked in for the
+server, so the cost is a few hundred bytes of flag-parsing and a probe
+function). Compose mirrors the same probe so `docker ps` shows an
+honest health status, and combined with `depends_on: condition:
+service_healthy` on Postgres, a fresh `docker compose up --build`
+brings the stack up in the right order instead of hoping the indexer
+wins a race against a half-up database.
 
 ### Bare metal
 
@@ -77,6 +89,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
+| `LOG_FORMAT` | `text` | `text` \| `json`. JSON emits one JSON object per line, compatible with Loki, CloudWatch, and ELK. |
 | `API_QUERY_TIMEOUT` | `25s` | Per-request database timeout for API-originated store reads. The timeout is enforced in-process and mirrored to Postgres via `statement_timeout`. |
 | `API_SLOW_QUERY_THRESHOLD` | `2s` | Warn when an API-originated store query takes longer than this threshold; logs include the query name and elapsed duration. |
 | `AUDIT_ENABLED` | `false` | Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build. |
@@ -96,6 +109,11 @@ All configuration comes from environment variables (see `.env.example`):
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
 | `COMPRESS_MIN_SIZE` | `1400` | Response body size (bytes) at or above which responses are gzip/deflate encoded for clients advertising support. Set negative to disable compression. See [Compression](#compression). |
+| `SHUTDOWN_TIMEOUT` | `15s` | Time the graceful shutdown may wait for in-flight requests and the current ingest cycle to wind down before the process is killed. Zero means wait indefinitely. |
+| `SWEEP_CONCURRENCY` | `1` | Number of filter batches fanned out in parallel during a windowSweep pass. The per-request RPC interval limiter still caps total request rate at ~10 req/s, so raising this helps only against private RPCs with more headroom. The single-batch path (`<=25` watched contracts) is unchanged. |
+| `REORG_CONFIRMATION_WINDOW` | `64` | Number of ledgers behind the ingest frontier re-scanned on a schedule for RPC-side reorgs. Once a ledger is further behind the frontier than this, it is considered finalized and never rewritten. Zero disables reorg detection. |
+| `REORG_RESCAN_INTERVAL` | `1m` | Cadence of the periodic reorg re-scan over the recent finalized window. The re-scan shares the live RPC budget and runs after a successful ingest cycle. |
+| `EXPORT_MAX_RANGE` | `17280` | Maximum ledger span a single `/contracts/{id}/export` call may request (~24h at 5s/ledger). Returns `400` with the bound if exceeded. Raise for dedicated analytical deployments; lower for tighter abuse thresholds. |
 
 ## Ingestion behavior
 
@@ -387,6 +405,67 @@ remaining query parameters.
 curl -s localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/events?limit=10
 ```
 
+### `GET /contracts/{id}/export`
+
+Streams a contract's stored events for a closed ledger range as an
+`attachment` download. Either `csv` (default) or `ndjson` is supported
+via `?format=csv|ndjson`. Ledger bounds are required; ranges larger
+than `EXPORT_MAX_RANGE` (default `17280` ledgers, roughly 24h) return
+`400` with the bound included in the error.
+
+```sh
+# CSV — id, ledger, type, tx_hash, topics (JSON string), value (JSON string)
+curl -OJ 'localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/export?from_ledger=250000&to_ledger=260000'
+
+# NDJSON — one event object per line, same shape as /events
+curl -OJ 'localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/export?from_ledger=250000&to_ledger=260000&format=ndjson'
+```
+
+The response carries
+`Content-Disposition: attachment; filename="<id>-ledgers-<from>-<to>.<format>"`
+so downloads land under intuitive file names, and `Cache-Control: no-store`
+keeps stale browser caches from freezing a snapshot. The store is queried
+in fixed-size pages (`200` rows, at the `MaxQueryLimit` ceiling), so
+memory usage stays bounded regardless of the ledger span.
+
+### Ingestion behavior additions
+
+- **Parallel sweeps** (`SWEEP_CONCURRENCY`, default `1`): deployments
+  watching more than the per-request 25 contracts split the filter set
+  into multiple request chains paged through each `SweepWindow` ledger
+  span. With the default the chains are still issued sequentially;
+  raise `SWEEP_CONCURRENCY` against a private RPC to fan the chains
+  out via bounded concurrency. The HTTPClient's interval limiter caps
+  total request rate at ~10 req/s regardless, so the parallelism only
+  helps when the RPC has headroom past the public ceiling. The
+  single-batch path (`<=25` watched contracts) is unchanged.
+- **Reorg detection** (`REORG_CONFIRMATION_WINDOW`, default `64`): after
+  every successful ingest cycle the Run loop re-fetches the range
+  `[frontier - REORG_CONFIRMATION_WINDOW, frontier - 1]` and replaces
+  any drift via the auditor's transactional delete + insert repair
+  (`ReplaceEventsInRange`). Rows past the window are treated as
+  **finalized** and never rewritten — once a ledger stays more than
+  `REORG_CONFIRMATION_WINDOW` behind the ingest frontier the re-scan
+  can no longer mutate its rows. Set `REORG_CONFIRMATION_WINDOW=0` to
+  disable the re-scan entirely.
+
+### Graceful shutdown
+
+A SIGINT or SIGTERM cancels the root context, which propagates into:
+
+- The HTTP server: `Shutdown` holds open connections while they finish
+  their current request, bounded by `SHUTDOWN_TIMEOUT` (default `15s`).
+- The ingester: `Run` lets the current `runOnce` cycle wind down to its
+  next iteration boundary, then returns `context.Canceled`.
+  `ingestion_state` is only advanced at the end of a successful cycle,
+  so a cancelled cycle leaves the frontier at the last fully-persisted
+  ledger; restart resumes from there with idempotent upserts covering
+  any in-flight rows on the next pass.
+
+This guarantees no panics and no truncated writes on `Ctrl-C` / `kill`,
+and the cursor is always persisted so the next process picks up exactly
+where the previous one stopped.
+
 ### Webhooks
 
 Consumers can register callback URLs that receive matching events as they are
@@ -657,6 +736,21 @@ events have been proven to match a fresh RPC fetch by the auditor. When
 `AUDIT_ENABLED=false` it stays at `0`. See the Data integrity section
 below for the contract the field implies.
 
+### `GET /metrics`
+
+Serves `http_request_duration_seconds`, a Prometheus histogram of HTTP
+request latency labeled by `route` (the matched chi route pattern, e.g.
+`/events/{id}` — never the raw path, so path parameters don't blow up
+cardinality), `method`, and `status`.
+
+```sh
+curl -s localhost:8080/metrics | grep http_request_duration_seconds
+```
+
+Exempt from the rate limiter for the same reason `/health` is: a
+Prometheus scraper polling this endpoint on its own schedule shouldn't be
+throttled like a regular client.
+
 ### `GET /events/ws` (WebSocket live stream)
 
 Pushes ingested events to the client over a single WebSocket connection
@@ -798,8 +892,9 @@ make lint         # golangci-lint
 make migrate-up   # apply migrations manually (needs the migrate CLI)
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture notes and extension
-points.
+See [docs/architecture.md](docs/architecture.md) for the full system architecture
+diagram and component descriptions. [CONTRIBUTING.md](CONTRIBUTING.md) covers extension
+points and development conventions.
 
 ## Roadmap / future work
 
@@ -807,9 +902,9 @@ Deliberately out of scope for the MVP, with seams left for contributors:
 
 - Per-standard event decoders (e.g. SEP-41 token transfers) on top of
   `decode.Decoder`.
-- Support for more than 25 watched contracts per request chain is implemented
-  via windowed sweeps; smarter scheduling (parallel sweeps, per-contract
-  cursors) is welcome.
+- Per-contract cursors (mesh-point for the parallel sweep redesign:
+  the scheduler is now parallel but still shares one cursor per
+  window).
 - GraphQL / websocket subscriptions.
 - Metrics (Prometheus) and tracing.
 - Alternative storage backends behind `store.Store`.
