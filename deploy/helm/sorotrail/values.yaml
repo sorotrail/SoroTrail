@@ -1,0 +1,128 @@
+# Number of pod replicas.
+replicaCount: 1
+
+image:
+  # Container image repository.
+  repository: ghcr.io/sorotrail/sorotrail
+  pullPolicy: IfNotPresent
+  # Overrides the image tag. Defaults to the chart's appVersion.
+  tag: ""
+
+# Secrets for pulling images from private registries.
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Create a dedicated ServiceAccount for the pod.
+  create: true
+  annotations: {}
+  # Use an existing ServiceAccount instead of creating one.
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+# CPU/memory requests and limits.
+# ref: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+resources: {}
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # limits:
+  #   cpu: 500m
+  #   memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# ── SoroTrail application configuration ──────────────────────────────────────
+
+config:
+  # Stellar RPC endpoint (JSON-RPC 2.0).
+  # For mainnet use a provider URL; public mainnet nodes are rate-limited.
+  rpcUrl: "https://soroban-testnet.stellar.org"
+
+  # How often to poll for new events once the indexer has caught up.
+  pollInterval: "5s"
+
+  # HTTP API listen address. Must match the container port (8080).
+  httpAddr: ":8080"
+
+  # Optional: comma-separated contract IDs (C...) to watch.
+  # Leave empty to ingest all contract events.
+  watchedContracts: ""
+
+  # Optional: force ingestion to start from this ledger sequence number.
+  # When unset, ingestion starts from (latest ledger - retentionLedgers).
+  startLedger: ""
+
+  # How far back to reach on cold start, in ledgers (~5 s each).
+  # 17280 ≈ 24 h.
+  retentionLedgers: "17280"
+
+  # Partition width for the events table, in ledgers.
+  # 120960 ≈ 7 days.
+  partitionLedgerSpan: "120960"
+
+  # Log verbosity: debug | info | warn | error
+  logLevel: "info"
+
+  # Per-client-IP rate limiting. Both rps and burst must be set to enable;
+  # leaving either empty disables the middleware entirely.
+  rateLimitRps: ""
+  rateLimitBurst: ""
+
+  # Honor X-Forwarded-For for client IP detection.
+  # Only enable behind a trusted proxy that strips/rewrites the header.
+  rateLimitTrustedProxy: ""
+
+# ── Database ──────────────────────────────────────────────────────────────────
+#
+# SoroTrail requires an EXTERNAL PostgreSQL instance.
+# The chart intentionally does NOT bundle Postgres to keep the indexer
+# stateless and let operators manage the database lifecycle independently
+# (backups, HA, upgrades). Recommended operators:
+#   • CloudNativePG  https://cloudnative-pg.io
+#   • Zalando Postgres Operator  https://github.com/zalando/postgres-operator
+#
+database:
+  # Name of an existing Secret that contains the connection string.
+  # When set, the chart mounts this secret directly and ignores `url` below.
+  existingSecret: ""
+  # Key within the existing secret that holds the DATABASE_URL value.
+  existingSecretKey: "DATABASE_URL"
+  # Inline connection string stored in a chart-managed Secret.
+  # Ignored when existingSecret is set.
+  url: ""
+
+# ── Prometheus ServiceMonitor ─────────────────────────────────────────────────
+#
+# Requires the prometheus-operator CRDs to be installed in the cluster.
+# Enable only if a /metrics endpoint is exposed by the application.
+#
+serviceMonitor:
+  enabled: false
+  # Namespace for the ServiceMonitor resource. Defaults to the release namespace.
+  namespace: ""
+  # Extra labels added to the ServiceMonitor (e.g. to match a Prometheus selector).
+  additionalLabels: {}
+  interval: "30s"
+  scrapeTimeout: "10s"
+  path: /metrics

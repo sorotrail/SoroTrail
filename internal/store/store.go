@@ -88,16 +88,27 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
 	ContractID string
-	Type       string
+	// Types filters by event type. Multiple values are accepted (ANDed
+	// together at the SQL level via type = ANY(...)). An empty or nil
+	// slice means "no constraint".
+	Types []string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic json.RawMessage
 	// Topic0-Topic3 match the exact JSON value at that specific topic array
 	// position. Unspecified positions are wildcards.
-	Topic0     json.RawMessage
-	Topic1     json.RawMessage
-	Topic2     json.RawMessage
-	Topic3     json.RawMessage
+	Topic0 json.RawMessage
+	Topic1 json.RawMessage
+	Topic2 json.RawMessage
+	Topic3 json.RawMessage
+	// TopicContains matches events whose topics array jsonb-contains this
+	// value (Postgres @> operator). Unlike Topic, the value is passed
+	// directly without array-wrapping, so callers can use multi-element
+	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
+	// Uses the GIN index on events.topics.
+	TopicContains json.RawMessage
+	// TxHash filters events emitted by a specific transaction hash.
+	TxHash     string    // hex-encoded transaction hash
 	FromLedger int64     // inclusive
 	ToLedger   int64     // inclusive
 	FromTime   time.Time // inclusive, zero = no constraint
@@ -107,6 +118,30 @@ type EventFilter struct {
 	Limit  int
 	// Order is "asc" or "desc", defaults to "asc"
 	Order string
+	// OrderBy selects the sort column: OrderByID (default), OrderByLedger,
+	// or OrderByCreatedAt. Every ordering is made total by appending id as
+	// a tiebreaker, so keyset pagination stays stable when the sort column
+	// has duplicates.
+	OrderBy string
+}
+
+// Sort columns accepted in EventFilter.OrderBy. The zero value means
+// OrderByID, which is the historical behavior.
+const (
+	OrderByID        = "id"
+	OrderByLedger    = "ledger"
+	OrderByCreatedAt = "created_at"
+)
+
+// ValidOrderBy reports whether s names a supported sort column. The empty
+// string is valid and means OrderByID.
+func ValidOrderBy(s string) bool {
+	switch s {
+	case "", OrderByID, OrderByLedger, OrderByCreatedAt:
+		return true
+	default:
+		return false
+	}
 }
 
 // IngestionState tracks how far ingestion has progressed.
@@ -123,6 +158,15 @@ type IngestionState struct {
 type AuditState struct {
 	VerifiedThroughLedger int64
 	UpdatedAt             time.Time
+}
+
+// WatchedContract is one entry of the watch list: a contract ID and the
+// time it was added (either by env seeding on startup, or by a runtime
+// POST). The API uses this to render the GET response; the ingester reads
+// only ContractID for its filter batches.
+type WatchedContract struct {
+	ContractID string    `json:"contract_id"`
+	AddedAt    time.Time `json:"added_at"`
 }
 
 // LedgerCensus is one row of a per-ledger census over a contiguous range.
@@ -165,11 +209,12 @@ type AuditFinding struct {
 // GET /events query parameters. An empty (zero-value) filter matches
 // every event.
 type SubscriptionFilter struct {
-	ContractID string          `json:"contract_id,omitempty"`
-	Type       string          `json:"type,omitempty"`
-	Topic      json.RawMessage `json:"topic,omitempty"`
-	FromLedger int64           `json:"from_ledger,omitempty"`
-	ToLedger   int64           `json:"to_ledger,omitempty"`
+	ContractID    string          `json:"contract_id,omitempty"`
+	Type          string          `json:"type,omitempty"`
+	Topic         json.RawMessage `json:"topic,omitempty"`
+	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
+	FromLedger    int64           `json:"from_ledger,omitempty"`
+	ToLedger      int64           `json:"to_ledger,omitempty"`
 }
 
 // MatchesEvent reports whether an event passes this filter. Zero fields
@@ -205,7 +250,52 @@ func (f SubscriptionFilter) MatchesEvent(e Event) bool {
 			return false
 		}
 	}
+	if len(f.TopicContains) > 0 && len(e.Topics) > 0 {
+		var topics []json.RawMessage
+		if err := json.Unmarshal(e.Topics, &topics); err != nil {
+			return false
+		}
+		// Unwrap a single-element array so topic_contains=[{...}] works
+		// the same way in-memory as it does in Postgres @> containment.
+		needle := f.TopicContains
+		var arr []json.RawMessage
+		if err := json.Unmarshal(f.TopicContains, &arr); err == nil && len(arr) == 1 {
+			needle = arr[0]
+		}
+		matched := false
+		for _, t := range topics {
+			if jsonbContains(t, needle) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
 	return true
+}
+
+// jsonbContains reports whether the container jsonb-contains the contained
+// value. For objects it checks that every key in contained exists with the
+// same raw JSON value in container; for scalars/arrays it falls back to
+// direct byte comparison (JSON string equality). This mirrors the Postgres
+// @> operator's semantics for the topic-matching use case.
+func jsonbContains(container, contained json.RawMessage) bool {
+	// If both are objects, check key-value subset.
+	var cMap, dMap map[string]json.RawMessage
+	if json.Unmarshal(container, &cMap) == nil && json.Unmarshal(contained, &dMap) == nil {
+		for k, v := range dMap {
+			cv, ok := cMap[k]
+			if !ok || string(cv) != string(v) {
+				return false
+			}
+		}
+		return true
+	}
+	// Fallback: exact JSON string match (handles strings, numbers, and
+	// cases where unmarshalling into map failed — e.g. arrays).
+	return string(container) == string(contained)
 }
 
 // Subscription is one registered webhook callback.
@@ -237,14 +327,37 @@ type DeliveryAttempt struct {
 // to match a fresh RPC fetch; 0 means no ledger has been verified yet.
 // Auditor counters are filled in by the API layer when an auditor is wired.
 type Stats struct {
-	TotalEvents           int64 `json:"total_events"`
-	LastIngestedLedger    int64 `json:"last_ingested_ledger"`
-	VerifiedThroughLedger int64 `json:"verified_through_ledger"`
-	ContractCount         int64 `json:"contract_count"`
-	WatchedContracts      int64 `json:"watched_contracts"`
+	TotalEvents           int64  `json:"total_events"`
+	LastIngestedLedger    int64  `json:"last_ingested_ledger"`
+	VerifiedThroughLedger int64  `json:"verified_through_ledger"`
+	OldestStoredLedger    int64  `json:"oldest_stored_ledger"`
+	ChainHeadLedger       *int64 `json:"chain_head_ledger"`
+	IngestLagLedgers      *int64 `json:"ingest_lag_ledgers"`
+	ContractCount         int64  `json:"contract_count"`
+	WatchedContracts      int64  `json:"watched_contracts"`
+	// QueryErrors is the number of store queries that have returned an
+	// error (timeout, connection failure, etc.) since the process started.
+	// Set by the guarded store wrapper; zero when the store is used
+	// directly or when no errors have occurred.
+	QueryErrors uint64 `json:"query_errors"`
+	// PanicsRecovered is the number of panics the HTTP middleware has
+	// recovered since process start. Set by the API handler.
+	PanicsRecovered uint64 `json:"panics_recovered"`
+	// RPCErrors counts RPC call failures by method name since the process
+	// started. Populated by the CountingClient wrapper; zero-valued when
+	// the wrapper is not in use.
+	RPCErrors RPCErrorStats `json:"rpc_errors,omitempty"`
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
+}
+
+// RPCErrorStats is a JSON-friendly snapshot of per-method RPC error counts.
+type RPCErrorStats struct {
+	GetEvents        uint64 `json:"getEvents,omitempty"`
+	GetLatestLedger  uint64 `json:"getLatestLedger,omitempty"`
+	GetHealth        uint64 `json:"getHealth,omitempty"`
+	GetLedgerEntries uint64 `json:"getLedgerEntries,omitempty"`
 }
 
 // AuditStats is a JSON-friendly view of audit.Metrics. Defined here so
@@ -321,6 +434,9 @@ type Store interface {
 	// cursor for the next page ("" when there are no more results).
 	// Default order is ascending (oldest-first) for backward compatibility.
 	QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error)
+	// CountEvents returns the total number of events matching the filter
+	// (ignoring pagination: cursor, order, and limit are not applied).
+	CountEvents(ctx context.Context, f EventFilter) (int64, error)
 	// LedgerRangeCensus returns one LedgerCensus row per ledger in the
 	// inclusive [fromLedger, toLedger] range that contains at least one
 	// event, in ascending ledger order. idsOnly=true populates LedgerCensus.IDs
@@ -340,8 +456,19 @@ type Store interface {
 	// HWM even if they race.
 	SaveAuditStateIfGreater(ctx context.Context, ledger int64) (AuditState, error)
 
-	ListWatchedContracts(ctx context.Context) ([]string, error)
+	// ListWatchedContracts returns every watched contract in stable
+	// (contract_id) order, with its add timestamp. An empty result means
+	// the watch list is empty, and the ingester interprets that as
+	// "ingest all contract events" — distinct from "ingest nothing".
+	ListWatchedContracts(ctx context.Context) ([]WatchedContract, error)
 	AddWatchedContract(ctx context.Context, contractID string) error
+	// RemoveWatchedContract stops future ingestion for the given contract
+	// by removing its row from watched_contracts. It does NOT delete any
+	// (event) rows already in storage — removal is "stop watching", not
+	// "drop history", so a removed contract's events stay queryable.
+	// ErrNotFound is returned when no row matches the given ID, so the
+	// API can surface 404 for typos.
+	RemoveWatchedContract(ctx context.Context, contractID string) error
 
 	// RecordAuditFinding persists a new finding (status "open") and
 	// returns it with its assigned ID populated.
@@ -376,6 +503,7 @@ type Store interface {
 	// ListDeliveryAttempts returns delivery attempts for a subscription,
 	// newest first.
 	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
+
 	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
 	// or ErrNotFound when no spec is cached for that hash.
 	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)

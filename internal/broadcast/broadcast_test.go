@@ -10,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 func mkEvent(id, contractID string, ledger int64) store.Event {
@@ -51,7 +51,7 @@ func TestBroadcaster_DeliversMatchingEvents(t *testing.T) {
 
 func TestBroadcaster_FilterByType(t *testing.T) {
 	b := New(10)
-	sub := b.Subscribe(store.EventFilter{Type: "system"})
+	sub := b.Subscribe(store.EventFilter{Types: []string{"system"}})
 	defer sub.Close()
 
 	b.Publish(context.Background(), []store.Event{
