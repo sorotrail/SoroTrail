@@ -2,6 +2,15 @@ BEGIN;
 
 ALTER TABLE events RENAME TO events_legacy;
 
+-- Drop indexes from the renamed table so the same index names can be
+-- created on the new partitioned table without conflict.
+DROP INDEX IF EXISTS idx_events_id;
+DROP INDEX IF EXISTS idx_events_contract_id;
+DROP INDEX IF EXISTS idx_events_ledger;
+DROP INDEX IF EXISTS idx_events_contract_ledger;
+DROP INDEX IF EXISTS idx_events_topics;
+DROP INDEX IF EXISTS idx_events_created_at;
+
 CREATE TABLE events (
     id                 text NOT NULL,
     contract_id        text NOT NULL,
@@ -58,6 +67,13 @@ END;
 $$;
 
 SELECT ensure_event_partitions((SELECT min(ledger) FROM events_legacy), (SELECT max(ledger) FROM events_legacy), 120960);
+
+-- Ensure the legacy table has the XDR columns that the new partitioned table
+-- already declares; on a fresh install events_legacy comes from 0001_init
+-- which predates raw XDR, so the columns may not exist yet.
+ALTER TABLE events_legacy
+    ADD COLUMN IF NOT EXISTS topics_xdr jsonb,
+    ADD COLUMN IF NOT EXISTS value_xdr text;
 
 INSERT INTO events (
     id, contract_id, ledger, type, tx_hash, tx_index, op_index,

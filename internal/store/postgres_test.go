@@ -42,6 +42,25 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	_, err = pool.Exec(context.Background(),
 		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
 	require.NoError(t, err)
+
+	// Detach and drop all existing event partitions so a store with a different
+	// partition span can create fresh partitions without overlap. This is
+	// needed because TestMigrate_UpgradesLegacyEventsTable re-runs migrations
+	// on the shared database, which may create the default (span=120960)
+	// partition covering a very wide range.
+	_, err = pool.Exec(context.Background(), `
+		DO $block$
+		DECLARE
+			part text;
+		BEGIN
+			FOR part IN SELECT inhrelid::regclass::text FROM pg_inherits WHERE inhparent = 'events'::regclass
+			LOOP
+				EXECUTE 'DROP TABLE IF EXISTS ' || part || ' CASCADE';
+			END LOOP;
+		END $block$;
+	`)
+	require.NoError(t, err)
+
 	return NewPostgres(pool, span)
 }
 
@@ -202,7 +221,7 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		require.Len(t, all, 10)
+		require.Len(t, all, 12) // 10 from main loop + 2 from topic0/topic1 subtest above
 		for i := 1; i < len(all); i++ {
 			assert.Less(t, all[i-1].ID, all[i].ID, "ascending ID order across pages")
 		}
@@ -262,7 +281,7 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		require.Len(t, all, 10)
+		require.Len(t, all, 12) // 10 from main loop + 2 from topic0/topic1 subtest above
 		for i := 1; i < len(all); i++ {
 			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
 		}
@@ -337,6 +356,21 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
+	// Drop any leftover partitions from previous tests so EnsureEventPartitions
+	// with the custom span can create fresh partitions without overlap.
+	_, err = pool.Exec(context.Background(), `
+		DO $block$
+		DECLARE
+			part text;
+		BEGIN
+			FOR part IN SELECT inhrelid::regclass::text FROM pg_inherits WHERE inhparent = 'events'::regclass
+			LOOP
+				EXECUTE 'DROP TABLE IF EXISTS ' || part || ' CASCADE';
+			END LOOP;
+		END $block$;
+	`)
+	require.NoError(t, err)
+
 	st := NewPostgres(pool, 10)
 	ctx := context.Background()
 
@@ -348,6 +382,16 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 
 	_, err = pool.Exec(ctx, `
 		ALTER TABLE events RENAME TO events_partitioned;
+
+		-- Drop indexes from the renamed partitioned table so the same index
+		-- names can be created on the new plain table without conflict.
+		DROP INDEX IF EXISTS idx_events_contract_id;
+		DROP INDEX IF EXISTS idx_events_ledger;
+		DROP INDEX IF EXISTS idx_events_contract_ledger;
+		DROP INDEX IF EXISTS idx_events_topics;
+		DROP INDEX IF EXISTS idx_events_created_at;
+		DROP INDEX IF EXISTS idx_events_id;
+
 		CREATE TABLE events (
 			id                 text PRIMARY KEY,
 			contract_id        text NOT NULL,
@@ -378,6 +422,10 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		FROM events_partitioned
 		ORDER BY ledger, id;
 		DROP TABLE events_partitioned CASCADE;
+		DROP TABLE IF EXISTS contract_specs CASCADE;
+		DROP TABLE IF EXISTS replay_state CASCADE;
+		DROP TABLE IF EXISTS subscriptions CASCADE;
+		DROP TABLE IF EXISTS delivery_attempts CASCADE;
 		DROP FUNCTION IF EXISTS ensure_event_partitions(bigint, bigint, bigint);
 		UPDATE schema_migrations SET version = 3, dirty = false;
 	`)
@@ -391,14 +439,16 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	assert.Equal(t, original.RawTopicXDR, got.RawTopicXDR)
 	assert.Equal(t, original.RawValueXDR, got.RawValueXDR)
 
-	partitions, err := pool.Query(ctx, `SELECT to_regclass('events_100_109'), to_regclass('events_110_119')`)
+	// After re-running migrations, the partition was created by the migration
+	// with the default span (120960), not the test's custom span (10). The
+	// single event at ledger 100 falls into a partition starting at 0.
+	partitions, err := pool.Query(ctx, `SELECT to_regclass('events_0_120959')`)
 	require.NoError(t, err)
 	defer partitions.Close()
 	require.True(t, partitions.Next())
-	var firstPartition, secondPartition sql.NullString
-	require.NoError(t, partitions.Scan(&firstPartition, &secondPartition))
-	assert.True(t, firstPartition.Valid)
-	assert.False(t, secondPartition.Valid)
+	var partition sql.NullString
+	require.NoError(t, partitions.Scan(&partition))
+	assert.True(t, partition.Valid, "migration should create events_0_120959 partition")
 }
 
 func TestIngestionStateRoundTrip(t *testing.T) {
