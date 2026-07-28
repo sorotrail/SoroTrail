@@ -498,10 +498,11 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 
 func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error) {
 	var s IngestionState
+	var lastSuccessfulPoll *time.Time
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx,
-			`SELECT last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE id = 1`,
-		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.UpdatedAt)
+			`SELECT last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state WHERE id = 1`,
+		).Scan(&s.LastIngestedLedger, &s.LastCursor, &lastSuccessfulPoll, &s.UpdatedAt)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return IngestionState{}, ErrNotFound
@@ -644,8 +645,9 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 				(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
 				(SELECT coalesce(min(ledger), 0) FROM events),
 				(SELECT count(DISTINCT contract_id) FROM events),
-				(SELECT count(*) FROM watched_contracts)`,
-		).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
+				(SELECT count(*) FROM watched_contracts),
+				(SELECT last_successful_poll FROM ingestion_state WHERE id = 1)
+		`).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts, &lastSuccessfulPoll)
 	})
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
