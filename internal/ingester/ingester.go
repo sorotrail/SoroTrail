@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/decode"
@@ -33,6 +36,23 @@ type Options struct {
 	// list needs more than one getEvents request (see buildFilterBatches).
 	// Default 1000 ledgers.
 	SweepWindow uint32
+	// SweepConcurrency is the maximum number of filter batches a
+	// windowSweep will fetch in parallel. Default 1 (sequential), so
+	// deployment with >25 watched contracts keeps the existing linear
+	// latency profile unless an operator opts into concurrency. The
+	// per-client RPC interval limiter still governs total request rate,
+	// so a higher value helps only against private RPCs that have
+	// headroom past the public ceiling.
+	SweepConcurrency int
+	// ReorgConfirmationWindow is the number of ledgers behind the ingest
+	// frontier that the Run loop periodically re-scans for RPC-side
+	// reorgs. Zero disables reorg repair entirely. Default 64.
+	ReorgConfirmationWindow uint32
+	// ReorgRescanInterval is how often the Run loop re-scans the recent
+	// finalized window for reorg repair. Default 1 minute. Smaller
+	// values mean replays-of-truth are caught faster at the cost of
+	// extra RPC requests per idle cycle.
+	ReorgRescanInterval time.Duration
 }
 
 func (o *Options) applyDefaults() {
@@ -50,6 +70,14 @@ func (o *Options) applyDefaults() {
 	}
 	if o.SweepWindow == 0 {
 		o.SweepWindow = 1000
+	}
+	if o.SweepConcurrency < 1 {
+		o.SweepConcurrency = 1
+	}
+	// 0 is the documented "disabled" sentinel for the reorg window, so we
+	// only fill in the default rescan interval when the feature is on.
+	if o.ReorgConfirmationWindow > 0 && o.ReorgRescanInterval <= 0 {
+		o.ReorgRescanInterval = time.Minute
 	}
 }
 
@@ -93,8 +121,24 @@ func (ing *Ingester) SetNotifier(n EventNotifier) {
 
 // Run polls until ctx is canceled. Errors are logged and retried with
 // exponential backoff; the only terminal condition is context cancellation.
+//
+// On a clean cycle the loop also performs an optional reorg re-scan over
+// the ledger range [frontier-confWindow, frontier-1] using the existing
+// ReingestRange plumbing, so RPC-side revisions in that window are
+// upsert-replaced before they can drift away from a long cwd.
+//
+// Graceful shutdown: ctx cancellation propagates into the RPC and store
+// layers via context-aware calls, so an in-flight page finishes its
+// round trip or fails cleanly. The ingester's Run loop returns
+// ctx.Err() at the next iteration boundary; ingestion_state is only
+// advanced at the end of a successful runOnce, so a cancelled cycle
+// leaves the frontier at the last fully-persisted ledger — restart
+// resumes from there with idempotent upserts covering any half-done
+// batch. There is no place in the loop where a partial state lands in
+// the store, so a tranquil Ctrl-C / SIGTERM never truncates a write.
 func (ing *Ingester) Run(ctx context.Context) error {
 	backoff := time.Second
+	lastReorgRescanAt := time.Time{}
 	for {
 		caughtUp, err := ing.runOnce(ctx)
 		switch {
@@ -118,8 +162,62 @@ func (ing *Ingester) Run(ctx context.Context) error {
 					return ctx.Err()
 				}
 			}
+			// Reorg rescan: only on successful cycles, and gated by the
+			// configured cadence. The timestamp advances on every attempt
+			// (success or fail) so a flapping RPC doesn't make every
+			// subsequent cycle retry the rescan — the next interval
+			// decides. Runs synchronously because reorg repair is bounded
+			// by the confirmation window (small by default) and trivial
+			// overlapping with ingest is acceptable. Cancelled mid-rescan
+			// is just an early return; partial ReplaceEventsInRange is
+			// undone by its transactional delete+insert pair.
+			if ing.opts.ReorgConfirmationWindow > 0 &&
+				time.Since(lastReorgRescanAt) >= ing.opts.ReorgRescanInterval {
+				lastReorgRescanAt = time.Now()
+				if rerr := ing.rescanForReorg(ctx); rerr != nil {
+					if ctx.Err() == nil {
+						ing.log.Warn("reorg rescan failed; will retry next interval", "error", rerr)
+					}
+				}
+			}
 		}
 	}
+}
+
+// rescanForReorg performs one reorg-detection pass over the recent
+// finalized window. It uses ReingestRange, which fans out across the
+// ingester's filter batches, re-fetches events for the closed range
+// [frontier-confWindow, frontier-1], then calls ReplaceEventsInRange
+// so orphans are deleted and same-ID rows are updated. Returns the
+// number of events the RPC reported for the range as the "evidence
+// the RPC has something to say"; the actual row mutation is opaque to
+// the caller. A no-op return is fine: it means there's not yet enough
+// history to have a finalized window.
+func (ing *Ingester) rescanForReorg(ctx context.Context) error {
+	state, err := ing.store.GetIngestionState(ctx)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("loading ingestion state for reorg rescan: %w", err)
+	}
+	if state.LastIngestedLedger <= 0 {
+		return nil
+	}
+	// Frontier must be at least confWindow+1 ledgers in so we have a
+	// non-empty finalized window behind it.
+	frontier := uint32(state.LastIngestedLedger)
+	if frontier <= ing.opts.ReorgConfirmationWindow {
+		return nil
+	}
+	to := frontier - 1
+	from := to - ing.opts.ReorgConfirmationWindow + 1
+	ing.log.Debug("reorg rescan starting", "from", from, "to", to)
+	n, err := ing.ReingestRange(ctx, ing.client, from, to)
+	if err != nil {
+		return fmt.Errorf("ReingestRange [%d,%d]: %w", from, to, err)
+	}
+	if n > 0 {
+		ing.log.Info("reorg rescan rewrote", "from", from, "to", to, "events_observed", n)
+	}
+	return nil
 }
 
 // runOnce advances ingestion by one step and reports whether we are caught
@@ -307,6 +405,26 @@ func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState
 // shared cursor can't track several concurrent request chains, so within a
 // window each batch pages to completion in memory; idempotent upserts make
 // re-scanning after a crash harmless.
+//
+// Concurrency: when SweepConcurrency > 1 the batches are fanned out via
+// errgroup.SetLimit so a deployment watching 100 contracts no longer pays
+// linear latency in the number of request chains. The HTTPClient's
+// interval limiter still serializes the actual RPC round trips, so total
+// request rate is unchanged — a higher value helps only when the RPC has
+// headroom past the public ceiling. SweepConcurrency=1 keeps the
+// historical sequential behavior bit-for-bit.
+//
+// Failure modes:
+//   - one batch failing fails the whole sweep (errgroup returns the first
+//     error); the window is NOT marked complete so the next runOnce retries
+//     the entire [start, end] window. Events already persisted by
+//     completed batches are rewritten idempotently.
+//   - one batch hitting IsLedgerOutOfRange fails the sweep the same way:
+//     we can't trust the prefix of the window without the rest, and the
+//     retry-after-reclamp behavior belongs at the parent level. Cancelled
+//     mid-sweep leaves the frontier at the last fully-completed window so
+//     restart resumes from there (idempotent upserts cover the in-flight
+//     rows on the next pass).
 func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]rpc.EventFilter) (bool, error) {
 	health, err := ing.client.GetHealth(ctx)
 	if err != nil {
@@ -317,36 +435,27 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	}
 	end := min(start+ing.opts.SweepWindow-1, health.LatestLedger)
 
+	// When SweepConcurrency > 1, two batches run in parallel. If one
+	// returns IsLedgerOutOfRange, errgroup cancels the others and the
+	// first goroutine to surface an error to g.Wait() wins — which means
+	// a still-in-flight batch's ctx.Canceled can mask a sibling's
+	// IsLedgerOutOfRange signal and we'd skip the reclamp. Flag the
+	// condition out-of-band so the post-Wait check sees it regardless
+	// of which error races out first.
+	var ledgerOutOfRange atomic.Bool
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(ing.opts.SweepConcurrency)
 	for _, filters := range batches {
-		cursor := ""
-		for {
-			resp, err := ing.client.GetEvents(ctx, rpc.GetEventsRequest{
-				StartLedger: start,
-				EndLedger:   end + 1, // endLedger is exclusive
-				Filters:     filters,
-				Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
-			})
-			if rpc.IsLedgerOutOfRange(err) {
-				return false, ing.reclampToOldest(ctx, start)
-			}
-			if err != nil {
-				return false, fmt.Errorf("getEvents sweep [%d,%d]: %w", start, end, err)
-			}
-			if err := ing.persistEvents(ctx, resp.Events, resp.LatestLedger); err != nil {
-				return false, err
-			}
-			if uint(len(resp.Events)) < ing.opts.PageLimit {
-				break
-			}
-			// Cursor requests can't carry the ledger range, so enforce the
-			// window bound here once a page crosses it.
-			if resp.Events[len(resp.Events)-1].Ledger > end {
-				break
-			}
-			if cursor = resp.Cursor; cursor == "" {
-				cursor = resp.Events[len(resp.Events)-1].CursorValue()
-			}
+		filters := filters
+		g.Go(func() error {
+			return ing.sweepBatch(gctx, &ledgerOutOfRange, start, end, filters)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		if ledgerOutOfRange.Load() || rpc.IsLedgerOutOfRange(err) {
+			return false, ing.reclampToOldest(ctx, start)
 		}
+		return false, err
 	}
 
 	// Resume from end+1 next pass — unless the window reached the chain
@@ -362,6 +471,49 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 		return false, err
 	}
 	return end >= health.LatestLedger, nil
+}
+
+// sweepBatch pages one filter batch through [start, end]. Errors are
+// returned to the errgroup; ctx cancellation aborts the inner pagination
+// loop (GetEvents respects ctx) so a graceful shutdown doesn't strand
+// half-paged batches.
+//
+// ledgerOutOfRange is a side-channel for IsLedgerOutOfRange that survives
+// the errgroup canceling sibling goroutines — see windowSweep's comment.
+func (ing *Ingester) sweepBatch(ctx context.Context, ledgerOutOfRange *atomic.Bool, start, end uint32, filters []rpc.EventFilter) error {
+	cursor := ""
+	for {
+		resp, err := ing.client.GetEvents(ctx, rpc.GetEventsRequest{
+			StartLedger: start,
+			EndLedger:   end + 1, // endLedger is exclusive
+			Filters:     filters,
+			Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
+		})
+		if rpc.IsLedgerOutOfRange(err) {
+			ledgerOutOfRange.Store(true)
+			return err
+		}
+		if err != nil {
+			return fmt.Errorf("getEvents sweep [%d,%d]: %w", start, end, err)
+		}
+		if err := ing.persistEvents(ctx, resp.Events, resp.LatestLedger); err != nil {
+			return err
+		}
+		if uint(len(resp.Events)) < ing.opts.PageLimit {
+			return nil
+		}
+		// Cursor requests can't carry the ledger range, so enforce the
+		// window bound here once a page crosses it.
+		if resp.Events[len(resp.Events)-1].Ledger > end {
+			return nil
+		}
+		if cursor = resp.Cursor; cursor == "" {
+			cursor = resp.Events[len(resp.Events)-1].CursorValue()
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
 }
 
 func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, latestLedger uint32) error {
