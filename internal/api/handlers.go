@@ -1,12 +1,14 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -614,6 +616,74 @@ func (s *Server) handleGetEventRaw(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleGetEventTransaction returns all sibling events from the same
+// transaction as the event with the given {id}. The referenced event
+// itself is excluded from the response. Returns 404 when the event is
+// not found; returns an empty list when the transaction has no other
+// events.
+func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	// Validate ?fields= before touching the store.
+	fields, err := parseFields(r.URL.Query().Get("fields"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	event, err := s.store.GetEvent(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
+		return
+	}
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading event for transaction siblings", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
+		return
+	}
+
+	// If the event has no transaction hash (should not normally happen),
+	// return an empty list rather than erroring — the event is valid but
+	// has no siblings.
+	if event.TxHash == "" {
+		writeCacheHeaders(w, cacheImmutable, immutableMaxAge, `"`+id+`:tx"`)
+		writeJSON(w, http.StatusOK, eventsResponse{Events: []store.Event{}})
+		return
+	}
+
+	siblings, err := s.store.GetEventsByTxHash(r.Context(), event.TxHash, id)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading transaction siblings", "tx_hash", event.TxHash, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading transaction events failed"))
+		return
+	}
+
+	decoded := r.URL.Query().Get("decoded") == "true"
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
+
+	etag := `"` + id + `:tx"`
+	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+
+	if decoded && s.enricher != nil {
+		enriched := s.enricher.EnrichEvents(r.Context(), siblings)
+		if includeXDR {
+			writeJSON(w, http.StatusOK, enrichedEventsWithXDRResponse{Events: enrichEventsWithXDR(enriched)})
+			return
+		}
+		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched})
+		return
+	}
+	if includeXDR {
+		writeJSON(w, http.StatusOK, eventsWithXDRResponse{Events: eventsWithXDR(siblings)})
+		return
+	}
+	if fields == nil {
+		writeJSON(w, http.StatusOK, eventsResponse{Events: siblings})
+	} else {
+		writeJSON(w, http.StatusOK, map[string]any{"events": projectEvents(siblings, fields)})
+	}
+}
+
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
@@ -724,6 +794,144 @@ func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
 
 // Stats summarizes what the indexer has stored plus, when the auditor is
 // running, the post-processing counters it has accumulated.
+
+// contractListResponse is the JSON body for GET /contracts.
+type contractListResponse struct {
+	Contracts []store.ContractSummary `json:"contracts"`
+	Count     int                     `json:"count"`
+	Cursor    string                  `json:"cursor,omitempty"`
+}
+
+// handleListContracts returns one ContractSummary per indexed contract,
+// paginated, default-sorted by event_count desc (the most active
+// contracts first). The endpoint is intentionally READ-ONLY and
+// unauthenticated: a contract listing has no surface area for
+// cross-tenant data leakage (a contract_id is opaque), and gating it
+// behind API_KEY would force every browser dashboard to log in.
+//
+// Cache-Control is no-cache: a brand-new contract can be ingested at
+// any time, and a stale cache would hide it from a freshly-launched
+// explorer.
+func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
+	f := store.ContractsFilter{
+		ContractIDPrefix: r.URL.Query().Get("contract_id"),
+		SortKey:          r.URL.Query().Get("sort"),
+		Order:            r.URL.Query().Get("order"),
+		Cursor:           r.URL.Query().Get("cursor"),
+	}
+	if !store.ValidContractsSortKey(f.SortKey) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf(
+			"invalid sort %q (want %s, %s, %s, or %s)",
+			f.SortKey,
+			store.SortByActivity, store.SortByFirstLedger,
+			store.SortByLastLedger, store.SortByLastSeen))
+		return
+	}
+	if f.Order != "" && f.Order != "asc" && f.Order != "desc" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid order %q (want asc or desc)", f.Order))
+		return
+	}
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid cursor %q", f.Cursor))
+		return
+	}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		f.Limit = n
+	} else {
+		f.Limit = store.DefaultQueryLimit
+	}
+	items, cursor, err := s.store.ListContracts(r.Context(), f)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("listing contracts", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
+		return
+	}
+	total, cerr := s.store.CountContracts(r.Context(), f)
+	if cerr != nil {
+		loggerFromContext(r.Context()).Warn("counting contracts for X-Total-Count", "error", cerr)
+	} else if total > 0 {
+		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, contractListResponse{
+		Contracts: items,
+		Count:     len(items),
+		Cursor:    cursor,
+	})
+}
+
+// deadLetterListResponse is the JSON body for GET /dead-letters.
+type deadLetterListResponse struct {
+	DeadLetters []store.DeadLetter `json:"dead_letters"`
+	Count       int                `json:"count"`
+	Cursor      string             `json:"cursor,omitempty"`
+}
+
+// handleListDeadLetters returns the poison-event queue newest-first.
+// Like the watched-contracts surface, this is gated behind API_KEY —
+// dead-letter rows contain raw RPC payloads, and disclosing them on a
+// public endpoint would leak every event the indexer failed to decode.
+func (s *Server) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
+	f := struct {
+		ContractID string
+		Limit      int
+		Cursor     string
+	}{
+		ContractID: r.URL.Query().Get("contract_id"),
+		Cursor:     r.URL.Query().Get("cursor"),
+	}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		f.Limit = n
+	}
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid cursor %q", f.Cursor))
+		return
+	}
+	items, cursor, err := s.store.ListDeadLetters(r.Context(), f.ContractID, f.Limit, f.Cursor)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("listing dead letters", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("listing dead letters failed"))
+		return
+	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, deadLetterListResponse{
+		DeadLetters: items,
+		Count:       len(items),
+		Cursor:      cursor,
+	})
+}
+
+// handleDeleteDeadLetter removes a single dead-letter row by id.
+// Idempotent: calling again returns 404.
+func (s *Server) handleDeleteDeadLetter(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("dead-letter id must be a positive integer, got %q", idStr))
+		return
+	}
+	if err := s.store.DeleteDeadLetter(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("dead letter %d not found", id))
+			return
+		}
+		loggerFromContext(r.Context()).Error("deleting dead letter", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("deleting dead letter failed"))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.Stats(r.Context())
 	if err != nil {
@@ -1422,10 +1630,60 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// prettyWriter is implemented by ResponseWriter wrappers that carry the
+// ?pretty flag so writeJSON can optionally indent the output.
+type prettyWriter interface {
+	Pretty() bool
+}
+
+// prettyResponseWriter wraps an http.ResponseWriter to carry the ?pretty flag
+// through the middleware chain. All ResponseWriter methods delegate to the
+// embedded writer so compression, flushing, and hijacking still work.
+type prettyResponseWriter struct {
+	http.ResponseWriter
+	pretty bool
+}
+
+func (w *prettyResponseWriter) Pretty() bool { return w.pretty }
+
+// Flush forwards to the embedded ResponseWriter if it supports flushing.
+// This is required because interface embedding does not promote optional
+// interfaces like http.Flusher — without it, the NDJSON stream handler's
+// w.(http.Flusher) type assertion would fail.
+func (w *prettyResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack forwards to the embedded ResponseWriter if it supports hijacking,
+// matching the pattern used by compressWriter.
+func (w *prettyResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
+}
+
+// prettyMiddleware reads ?pretty=true from the query string and wraps the
+// ResponseWriter with the flag so writeJSON can set indentation when
+// requested. It must be the innermost middleware (closest to the handler)
+// so the type assertion in writeJSON sees the wrapper.
+func prettyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pw := &prettyResponseWriter{ResponseWriter: w, pretty: r.URL.Query().Get("pretty") == "true"}
+		next.ServeHTTP(pw, r)
+	})
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	enc := json.NewEncoder(w)
+	if pw, ok := w.(prettyWriter); ok && pw.Pretty() {
+		enc.SetIndent("", "  ")
+	}
+	_ = enc.Encode(v)
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {

@@ -40,6 +40,11 @@ type stubStore struct {
 	event    store.Event
 	eventErr error
 
+	txSiblings    []store.Event
+	txSiblingsErr error
+	lastTxHash    string
+	lastExcludeID string
+
 	stats            store.Stats
 	pingErr          error
 	watchedList      []store.WatchedContract
@@ -99,6 +104,12 @@ func (s *stubStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 
 func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
 	return s.event, s.eventErr
+}
+
+func (s *stubStore) GetEventsByTxHash(_ context.Context, txHash, excludeID string) ([]store.Event, error) {
+	s.lastTxHash = txHash
+	s.lastExcludeID = excludeID
+	return s.txSiblings, s.txSiblingsErr
 }
 
 func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
@@ -1507,3 +1518,20 @@ func TestListEvents_RecentReturnsNewestFirst(t *testing.T) {
 	assert.Equal(t, "e2", out.Events[1].ID)
 	assert.Equal(t, "e1", out.Events[2].ID)
 }
+
+func (m *stubStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	return nil, "", nil
+}
+func (m *stubStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
+	return 0, nil
+}
+func (m *stubStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
+	return store.DeadLetter{}, nil
+}
+func (m *stubStore) ListDeadLetters(context.Context, string, int, string) ([]store.DeadLetter, string, error) {
+	return nil, "", nil
+}
+func (m *stubStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, error) {
+	return store.DeadLetter{}, store.ErrNotFound
+}
+func (m *stubStore) DeleteDeadLetter(context.Context, int64) error { return nil }
