@@ -31,7 +31,7 @@ jobs:
           --health-retries 30
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v5.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -67,7 +67,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v5.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: |
