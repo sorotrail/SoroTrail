@@ -40,6 +40,11 @@ type stubStore struct {
 	event    store.Event
 	eventErr error
 
+	txSiblings    []store.Event
+	txSiblingsErr error
+	lastTxHash    string
+	lastExcludeID string
+
 	stats            store.Stats
 	pingErr          error
 	watchedList      []store.WatchedContract
@@ -99,6 +104,12 @@ func (s *stubStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 
 func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
 	return s.event, s.eventErr
+}
+
+func (s *stubStore) GetEventsByTxHash(_ context.Context, txHash, excludeID string) ([]store.Event, error) {
+	s.lastTxHash = txHash
+	s.lastExcludeID = excludeID
+	return s.txSiblings, s.txSiblingsErr
 }
 
 func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
@@ -1506,4 +1517,208 @@ func TestListEvents_RecentReturnsNewestFirst(t *testing.T) {
 	assert.Equal(t, "e3", out.Events[0].ID)
 	assert.Equal(t, "e2", out.Events[1].ID)
 	assert.Equal(t, "e1", out.Events[2].ID)
+}
+
+func TestGetEventTransaction_Success(t *testing.T) {
+	eventID := "0000000001-0000000002"
+	txHash := "abc123def456"
+
+	tests := []struct {
+		name       string
+		query      string
+		event      store.Event
+		eventErr   error
+		siblings   []store.Event
+		siblingErr error
+		wantStatus int
+		wantCount  int
+		wantErr    string
+		wantIDs    []string
+	}{
+		{
+			name:       "returns sibling events from same transaction",
+			query:      "/events/" + eventID + "/transaction",
+			event:      store.Event{ID: eventID, TxHash: txHash},
+			siblings:   []store.Event{{ID: "e1", TxHash: txHash}, {ID: "e3", TxHash: txHash}},
+			wantStatus: http.StatusOK,
+			wantCount:  2,
+			wantIDs:    []string{"e1", "e3"},
+		},
+		{
+			name:       "empty siblings when transaction has only one event",
+			query:      "/events/" + eventID + "/transaction",
+			event:      store.Event{ID: eventID, TxHash: txHash},
+			siblings:   []store.Event{},
+			wantStatus: http.StatusOK,
+			wantCount:  0,
+			wantIDs:    []string{},
+		},
+		{
+			name:       "event not found returns 404",
+			query:      "/events/0000000000-0000000000/transaction",
+			eventErr:   store.ErrNotFound,
+			wantStatus: http.StatusNotFound,
+			wantErr:    "not found",
+		},
+		{
+			name:       "store error returns 500",
+			query:      "/events/" + eventID + "/transaction",
+			event:      store.Event{ID: eventID, TxHash: txHash},
+			siblingErr: errors.New("db timeout"),
+			wantStatus: http.StatusInternalServerError,
+			wantErr:    "loading transaction events failed",
+		},
+		{
+			name:       "GetEvent non-NotFound error returns 500",
+			query:      "/events/" + eventID + "/transaction",
+			eventErr:   errors.New("db connection lost"),
+			wantStatus: http.StatusInternalServerError,
+			wantErr:    "loading event failed",
+		},
+		{
+			name:       "event without tx_hash returns empty list",
+			query:      "/events/" + eventID + "/transaction",
+			event:      store.Event{ID: eventID, TxHash: ""},
+			wantStatus: http.StatusOK,
+			wantCount:  0,
+		},
+		{
+			name:       "referenced event excluded from siblings",
+			query:      "/events/" + eventID + "/transaction",
+			event:      store.Event{ID: eventID, TxHash: txHash},
+			siblings:   []store.Event{{ID: "e1", TxHash: txHash}},
+			wantStatus: http.StatusOK,
+			wantCount:  1,
+			wantIDs:    []string{"e1"},
+		},
+		{
+			name:       "supports fields projection",
+			query:      "/events/" + eventID + "/transaction?fields=id,tx_hash",
+			event:      store.Event{ID: eventID, TxHash: txHash, Ledger: 42},
+			siblings:   []store.Event{{ID: "e1", TxHash: txHash, Ledger: 100}},
+			wantStatus: http.StatusOK,
+			wantCount:  1,
+		},
+		{
+			name:       "unknown field returns 400",
+			query:      "/events/" + eventID + "/transaction?fields=id,bogus",
+			event:      store.Event{ID: eventID, TxHash: txHash},
+			siblings:   []store.Event{},
+			wantStatus: http.StatusBadRequest,
+			wantErr:    "unknown field",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{
+				event:         tt.event,
+				eventErr:      tt.eventErr,
+				txSiblings:    tt.siblings,
+				txSiblingsErr: tt.siblingErr,
+			}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+
+			require.Equal(t, tt.wantStatus, resp.StatusCode, string(body))
+
+			if tt.wantErr != "" {
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], tt.wantErr)
+				return
+			}
+
+			// Verify excludeID was passed to store
+			if tt.eventErr == nil && tt.event.TxHash != "" {
+				assert.Equal(t, tt.event.TxHash, st.lastTxHash)
+				assert.Equal(t, tt.event.ID, st.lastExcludeID)
+			}
+
+			// Parse response
+			if tt.wantIDs != nil {
+				var out eventsResponse
+				require.NoError(t, json.Unmarshal(body, &out))
+				require.Len(t, out.Events, tt.wantCount)
+				// No cursor on this endpoint — it returns all siblings at once.
+				assert.Empty(t, out.Cursor)
+				for i, wantID := range tt.wantIDs {
+					assert.Equal(t, wantID, out.Events[i].ID)
+				}
+				return
+			}
+
+			if tt.wantCount == 0 {
+				var out eventsResponse
+				require.NoError(t, json.Unmarshal(body, &out))
+				assert.Len(t, out.Events, 0)
+				assert.Empty(t, out.Cursor)
+				return
+			}
+
+			// fields projection check
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(body, &raw))
+			require.Contains(t, raw, "events")
+			arr, ok := raw["events"].([]any)
+			require.True(t, ok)
+			assert.Len(t, arr, tt.wantCount)
+		})
+	}
+}
+
+func TestGetEventTransaction_IncludeXDR(t *testing.T) {
+	eventID := "0000000001-0000000002"
+	txHash := "abc123"
+
+	st := &stubStore{
+		event: store.Event{ID: eventID, TxHash: txHash},
+		txSiblings: []store.Event{{
+			ID:          "e1",
+			TxHash:      txHash,
+			RawTopicXDR: []string{"topic-xdr"},
+			RawValueXDR: "value-xdr",
+		}},
+	}
+	s := newTestServer(st, nil)
+
+	// Without include_xdr
+	resp, body := doGet(t, s, "/events/"+eventID+"/transaction")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.NotContains(t, string(body), "topics_xdr")
+	assert.NotContains(t, string(body), "value_xdr")
+
+	// With include_xdr
+	resp, body = doGet(t, s, "/events/"+eventID+"/transaction?include_xdr=true")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out struct {
+		Events []struct {
+			TopicsXDR []string `json:"topics_xdr"`
+			ValueXDR  *string  `json:"value_xdr"`
+		} `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal(body, &out))
+	require.Len(t, out.Events, 1)
+	assert.Equal(t, []string{"topic-xdr"}, out.Events[0].TopicsXDR)
+	require.NotNil(t, out.Events[0].ValueXDR)
+	assert.Equal(t, "value-xdr", *out.Events[0].ValueXDR)
+}
+
+func TestGetEventTransaction_CacheHeaders(t *testing.T) {
+	eventID := "0000000001-0000000002"
+	txHash := "abc123"
+
+	st := &stubStore{
+		event:      store.Event{ID: eventID, TxHash: txHash},
+		txSiblings: []store.Event{{ID: "e1", TxHash: txHash}},
+	}
+	s := newTestServer(st, nil)
+
+	resp, _ := doGet(t, s, "/events/"+eventID+"/transaction")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	cc := resp.Header.Get("Cache-Control")
+	assert.Contains(t, cc, "immutable")
+	etag := resp.Header.Get("ETag")
+	assert.Contains(t, etag, eventID+":tx")
 }

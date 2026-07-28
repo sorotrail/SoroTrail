@@ -196,6 +196,18 @@ func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) 
 	return e, nil
 }
 
+func (m *mockStore) GetEventsByTxHash(_ context.Context, txHash, excludeID string) ([]store.Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []store.Event
+	for _, e := range m.events {
+		if e.TxHash == txHash && e.ID != excludeID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
 func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Event, string, error) {
 	return nil, "", nil
 }

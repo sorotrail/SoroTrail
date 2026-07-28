@@ -114,6 +114,9 @@ func (f *fakeExportStore) ReplaceEventsInRange(context.Context, []store.Event, i
 func (f *fakeExportStore) GetEvent(context.Context, string) (store.Event, error) {
 	return store.Event{}, store.ErrNotFound
 }
+func (f *fakeExportStore) GetEventsByTxHash(context.Context, string, string) ([]store.Event, error) {
+	return nil, nil
+}
 func (f *fakeExportStore) EventExists(context.Context, string) (bool, error) {
 	return false, nil
 }
