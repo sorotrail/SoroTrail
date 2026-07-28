@@ -144,6 +144,13 @@ func ValidOrderBy(s string) bool {
 	}
 }
 
+// AggregateBucket is one entry in an AggregateEvents result:
+// a bucket label and the number of events in that bucket.
+type AggregateBucket struct {
+	Bucket string `json:"bucket"`
+	Count  int64  `json:"count"`
+}
+
 // IngestionState tracks how far ingestion has progressed.
 type IngestionState struct {
 	LastIngestedLedger int64
@@ -437,6 +444,10 @@ type Store interface {
 	// CountEvents returns the total number of events matching the filter
 	// (ignoring pagination: cursor, order, and limit are not applied).
 	CountEvents(ctx context.Context, f EventFilter) (int64, error)
+	// AggregateEvents returns event counts grouped by ledger or by a
+	// time interval. Buckets with zero events are omitted. Filters
+	// (contract_id, type, etc.) are applied to the aggregation query.
+	AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error)
 	// LedgerRangeCensus returns one LedgerCensus row per ledger in the
 	// inclusive [fromLedger, toLedger] range that contains at least one
 	// event, in ascending ledger order. idsOnly=true populates LedgerCensus.IDs

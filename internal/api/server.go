@@ -167,6 +167,7 @@ func (s *Server) Router() http.Handler {
 	r.Handle("/metrics", s.metrics.Handler())
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/count", s.handleCountEvents)
+	r.Get("/events/aggregate", s.handleAggregateEvents)
 	r.Get("/events/{id}/raw", s.handleGetEventRaw)
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)

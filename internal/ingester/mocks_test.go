@@ -129,6 +129,10 @@ func (m *mockStore) CountEvents(context.Context, store.EventFilter) (int64, erro
 	return 0, nil
 }
 
+func (m *mockStore) AggregateEvents(context.Context, store.EventFilter, string) ([]store.AggregateBucket, error) {
+	return nil, nil
+}
+
 // LedgerRangeCensus is unused by ingester tests but needed to satisfy
 // the expanded store.Store interface.
 func (m *mockStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]store.LedgerCensus, error) {

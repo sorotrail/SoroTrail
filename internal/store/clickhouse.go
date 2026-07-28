@@ -98,6 +98,10 @@ func (c *ClickHouse) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger
 	return nil, nil
 }
 
+func (c *ClickHouse) AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error) {
+	return nil, nil
+}
+
 func (c *ClickHouse) GetIngestionState(ctx context.Context) (IngestionState, error) {
 	return IngestionState{}, nil
 }

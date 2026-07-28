@@ -348,6 +348,55 @@ func (s *Server) handleCountEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, countResponse{Count: total})
 }
 
+// bucketResponse is the JSON body for GET /events/aggregate.
+type bucketResponse struct {
+	Buckets []AggregateBucket `json:"buckets"`
+}
+
+// AggregateBucket is one bucket in an aggregation result.
+type AggregateBucket = store.AggregateBucket
+
+// handleAggregateEvents returns event counts grouped by ledger or
+// by a time interval. The ?bucket parameter controls the grouping
+// and accepts "ledger" or a Go duration string (e.g. "1h", "1d").
+// All other event filter params (contract_id, type, from_ledger,
+// to_ledger, from_time, to_time, topic, topic0..topic3,
+// topic_contains, tx_hash) are accepted and applied to the
+// aggregation. Pagination params (cursor, limit, order, order_by)
+// are accepted in the URL but ignored.
+func (s *Server) handleAggregateEvents(w http.ResponseWriter, r *http.Request) {
+	filter, _, err := parseFilterAndFields(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	filter.Cursor = ""
+	filter.Order = ""
+	filter.OrderBy = ""
+	filter.Limit = 0
+
+	bucket := r.URL.Query().Get("bucket")
+	if bucket == "" {
+		writeError(w, http.StatusBadRequest, errors.New("bucket parameter is required"))
+		return
+	}
+	if bucket != "ledger" {
+		if _, err := time.ParseDuration(bucket); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid bucket %q: must be \"ledger\" or a duration", bucket))
+			return
+		}
+	}
+
+	buckets, err := s.store.AggregateEvents(r.Context(), filter, bucket)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("aggregating events", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("aggregating events failed"))
+		return
+	}
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, bucketResponse{Buckets: buckets})
+}
+
 // streamBatchSize is the number of events fetched per internal query when
 // streaming NDJSON. It balances query cost against flush frequency: too
 // small wastes round trips; too large buffers too long before a client

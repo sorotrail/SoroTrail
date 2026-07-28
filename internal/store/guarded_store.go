@@ -121,6 +121,15 @@ func (s *guardedStore) LedgerRangeCensus(ctx context.Context, fromLedger, toLedg
 	return census, err
 }
 
+func (s *guardedStore) AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.AggregateEvents")
+	defer cancel()
+	start := time.Now()
+	buckets, err := s.Store.AggregateEvents(ctx, f, bucket)
+	s.logSlowQuery("store.AggregateEvents", start, err)
+	return buckets, err
+}
+
 func (s *guardedStore) GetIngestionState(ctx context.Context) (IngestionState, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.GetIngestionState")
 	defer cancel()

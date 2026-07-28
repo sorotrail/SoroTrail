@@ -405,6 +405,84 @@ func TestQueryEvents_TimeRange(t *testing.T) {
 	})
 }
 
+func TestAggregateEvents_ByLedger(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	var events []Event
+	for i := 1; i <= 5; i++ {
+		e := testEvent(eventID(i), int64(100+(i-1)/2), contractA)
+		e.CreatedAt = time.Date(2026, 7, 20+i, 12, 0, 0, 0, time.UTC)
+		events = append(events, e)
+	}
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	got, err := st.AggregateEvents(ctx, EventFilter{FromLedger: 100, ToLedger: 102}, "ledger")
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+	assert.Equal(t, "100", got[0].Bucket)
+	assert.Equal(t, int64(2), got[0].Count) // events 1,2 on ledger 100
+	assert.Equal(t, "101", got[1].Bucket)
+	assert.Equal(t, int64(2), got[1].Count) // events 3,4 on ledger 101
+	assert.Equal(t, "102", got[2].Bucket)
+	assert.Equal(t, int64(1), got[2].Count) // event 5 on ledger 102
+}
+
+func TestAggregateEvents_ByTime(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	var events []Event
+	for i := 1; i <= 4; i++ {
+		e := testEvent(eventID(i), int64(100+i), contractA)
+		e.CreatedAt = time.Date(2026, 7, 20, i*6, 0, 0, 0, time.UTC) // 06:00, 12:00, 18:00, 24:00
+		events = append(events, e)
+	}
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	got, err := st.AggregateEvents(ctx, EventFilter{FromLedger: 101, ToLedger: 104}, "24h")
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "2026-07-20T00:00:00", got[0].Bucket)
+	assert.Equal(t, int64(4), got[0].Count)
+}
+
+func TestAggregateEvents_Filters(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	events := []Event{
+		testEvent(eventID(1), 100, contractA), // contract A
+		testEvent(eventID(2), 101, contractB), // contract B
+		testEvent(eventID(3), 101, contractA), // contract A again
+	}
+	for i := range events {
+		events[i].Type = "contract"
+	}
+	events[1].Type = "system"
+
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	// contract_id filter
+	got, err := st.AggregateEvents(ctx, EventFilter{ContractID: contractA}, "ledger")
+	require.NoError(t, err)
+	assert.Len(t, got, 2) // ledgers 100 and 101
+	totalA := int64(0)
+	for _, b := range got {
+		totalA += b.Count
+	}
+	assert.Equal(t, int64(2), totalA)
+
+	// type filter
+	got, err = st.AggregateEvents(ctx, EventFilter{Types: []string{"system"}}, "ledger")
+	require.NoError(t, err)
+	assert.Len(t, got, 1)
+	assert.Equal(t, int64(1), got[0].Count)
+}
+
 func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
