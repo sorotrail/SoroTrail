@@ -396,6 +396,9 @@ type DeliveryAttempt struct {
 // Stats summarizes what the indexer has stored so far. VerifiedThroughLedger
 // is the inclusive highest ledger whose stored events have been confirmed
 // to match a fresh RPC fetch; 0 means no ledger has been verified yet.
+// TableSizeBytes is the approximate on-disk size of the events table
+// (including its partitions, indexes, and TOAST) reported by PostgreSQL's
+// pg_total_relation_size; it is 0 on backends that don't report it.
 // Auditor counters are filled in by the API layer when an auditor is wired.
 type Stats struct {
 	TotalEvents           int64  `json:"total_events"`
@@ -406,6 +409,10 @@ type Stats struct {
 	IngestLagLedgers      *int64 `json:"ingest_lag_ledgers"`
 	ContractCount         int64  `json:"contract_count"`
 	WatchedContracts      int64  `json:"watched_contracts"`
+	// TableSizeBytes is the approximate on-disk size of the events table
+	// (including partitions, indexes, and TOAST). 0 when the backend does
+	// not report it.
+	TableSizeBytes int64 `json:"table_size_bytes"`
 	// QueryErrors is the number of store queries that have returned an
 	// error (timeout, connection failure, etc.) since the process started.
 	// Set by the guarded store wrapper; zero when the store is used
