@@ -198,6 +198,30 @@ func (c *ClickHouse) Stats(ctx context.Context) (Stats, error) {
 	return Stats{}, nil
 }
 
+func (c *ClickHouse) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
+	return nil, "", nil
+}
+
+func (c *ClickHouse) CountContracts(context.Context, ContractsFilter) (int64, error) {
+	return 0, nil
+}
+
+func (c *ClickHouse) DeadLetterEvent(context.Context, DeadLetterInput) (DeadLetter, error) {
+	return DeadLetter{}, nil
+}
+
+func (c *ClickHouse) ListDeadLetters(context.Context, string, int, string) ([]DeadLetter, string, error) {
+	return nil, "", nil
+}
+
+func (c *ClickHouse) GetDeadLetter(context.Context, int64) (DeadLetter, error) {
+	return DeadLetter{}, ErrNotFound
+}
+
+func (c *ClickHouse) DeleteDeadLetter(context.Context, int64) error {
+	return nil
+}
+
 func (c *ClickHouse) Ping(ctx context.Context) error {
 	return nil
 }

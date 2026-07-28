@@ -128,6 +128,25 @@ type Config struct {
 	// uncooperative GC pauses on big results; the cap is configurable so
 	// private deployments can opt for a larger analytical dump.
 	ExportMaxRange int64 `env:"EXPORT_MAX_RANGE" envDefault:"17280"`
+
+	// CORS configuration. Default policy is deny-all: an empty
+	// CORSAllowedOrigins list means no browser cross-origin request gets
+	// CORS headers, so the browser blocks the response. Allowing a single
+	// origin ("https://app.example.com") sets Access-Control-Allow-Origin
+	// to that exact value on every request with a matching Origin header;
+	// "*" is a special case that allows any origin (and intentionally
+	// voids the Vary: Origin contract because the response is identical
+	// regardless of origin — see parseAllowedOrigins).
+	//
+	// CORSAllowedMethods and CORSAllowedHeaders are returned on the
+	// preflight (OPTIONS) response so a browser knowing the allowed
+	// methods/headers can complete a non-simple cross-origin request.
+	// The defaults cover the surface this API actually exposes; operators
+	// adding custom routes (e.g. application/json PATCH) should extend
+	// these.
+	CORSAllowedOrigins []string `env:"CORS_ALLOWED_ORIGINS" envDefault:""`
+	CORSAllowedMethods []string `env:"CORS_ALLOWED_METHODS" envDefault:"GET,POST,PUT,DELETE,OPTIONS"`
+	CORSAllowedHeaders []string `env:"CORS_ALLOWED_HEADERS" envDefault:"Content-Type,X-API-Key,Accept"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -240,6 +259,9 @@ func (c Config) Validate() error {
 	if c.ExportMaxRange <= 0 {
 		return fmt.Errorf("EXPORT_MAX_RANGE must be positive, got %d", c.ExportMaxRange)
 	}
+	if err := validateCORSOrigins(c.CORSAllowedOrigins); err != nil {
+		return err
+	}
 	// Both must be set together: half-configured limits would silently
 	// behave like the disabled case (Enabled returns false when either is
 	// non-positive), which would confuse operators who set one and
@@ -292,6 +314,31 @@ func cleanContractList(in []string) []string {
 	return out
 }
 
+// validateCORSOrigins rejects origin entries that can't be safely compared
+// to a browser-supplied Origin header. Rejecting "null" matters because
+// browsers send Origin: null for sandboxed iframes / file:// pages /
+// redirects — accepting it would mean any third-party page could call
+// the API with credentials if X-API-Key happened to be known.
+//
+// "*" is a valid literal but documented separately as a special case the
+// middleware recognizes (see API CORS handler).
+func validateCORSOrigins(in []string) error {
+	for _, o := range in {
+		o = strings.TrimSpace(o)
+		if o == "" || o == "*" {
+			continue
+		}
+		if strings.EqualFold(o, "null") {
+			return fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q is not allowed (sandboxed Origin: null is a credentialed-origin bypass)", o)
+		}
+		u, err := url.Parse(o)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q is not a valid origin (want scheme://host[:port])", o)
+		}
+	}
+	return nil
+}
+
 // LoggableFields returns the configuration as a map of fields suitable for logging,
 // with credentials redacted (e.g., from DATABASE_URL).
 func (c Config) LoggableFields() []any {
@@ -319,6 +366,7 @@ func (c Config) LoggableFields() []any {
 		"reorg_confirmation_window", c.ReorgConfirmationWindow,
 		"reorg_rescan_interval", c.ReorgRescanInterval,
 		"export_max_range", c.ExportMaxRange,
+		"cors_allowed_origins", len(c.CORSAllowedOrigins),
 		"audit_enabled", c.AuditEnabled,
 	}
 }
