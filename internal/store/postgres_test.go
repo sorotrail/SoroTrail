@@ -163,6 +163,107 @@ func TestUpsertEvents_CreatesPartitionsAndIsIdempotent(t *testing.T) {
 	assert.NotContains(t, plan, "events_20_29")
 }
 
+// TestPartialIndexForSuccessfulCalls covers migration
+// 0011_partial_index_successful_calls: the partial index over
+// (contract_id, ledger) restricted to in_successful_call = true.
+//
+// It asserts two things. First, that the index exists with the expected
+// shape — indexed columns and partial predicate — by reading its
+// definition straight from the catalog (table-driven over the substrings
+// the definition must contain). Second, that the predicate the index
+// encodes matches query intent: a contract-scoped read filtered to
+// successful calls returns only the successful-call rows and none of the
+// failed-call rows.
+func TestPartialIndexForSuccessfulCalls(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// The migration creates the index on the partitioned parent; read its
+	// definition once and assert the pieces that must be present. Reading
+	// pg_indexes.indexdef (rather than assembling from pg_index columns)
+	// keeps the assertions close to how an operator would eyeball the
+	// schema.
+	var indexDef string
+	err := st.pool.QueryRow(ctx,
+		`SELECT indexdef FROM pg_indexes WHERE indexname = $1`,
+		"idx_events_contract_ledger_successful",
+	).Scan(&indexDef)
+	require.NoError(t, err, "partial index should exist after migration")
+
+	defWantSubstrings := []struct {
+		name string
+		want string
+	}{
+		{"indexed on events", " ON "},
+		{"covers contract_id and ledger in order", "(contract_id, ledger)"},
+		{"partial predicate scopes to successful calls", "WHERE (in_successful_call = true)"},
+	}
+	for _, tc := range defWantSubstrings {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Contains(t, indexDef, tc.want)
+		})
+	}
+
+	// The index must also register as a valid, partial index in the
+	// catalog — a plain (non-partial) index on the same columns would
+	// satisfy the substring checks above if the definition string ever
+	// changed shape, so assert indpred is populated directly.
+	var isValid, isPartial bool
+	err = st.pool.QueryRow(ctx, `
+		SELECT i.indisvalid, i.indpred IS NOT NULL
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		WHERE c.relname = $1`,
+		"idx_events_contract_ledger_successful",
+	).Scan(&isValid, &isPartial)
+	require.NoError(t, err)
+	assert.True(t, isValid, "index should be valid")
+	assert.True(t, isPartial, "index should be partial (have a predicate)")
+
+	// Functional check: seed a mix of successful and failed-call events and
+	// confirm the partial predicate selects exactly the successful subset
+	// for a contract. This is the query shape the index exists to serve.
+	seed := []struct {
+		id         string
+		ledger     int64
+		successful bool
+	}{
+		{eventID(1), 100, true},
+		{eventID(2), 101, false},
+		{eventID(3), 102, true},
+		{eventID(4), 103, false},
+		{eventID(5), 104, true},
+	}
+	events := make([]Event, 0, len(seed))
+	wantSuccessful := make(map[string]bool)
+	for _, s := range seed {
+		e := testEvent(s.id, s.ledger, contractA)
+		e.InSuccessfulCall = s.successful
+		events = append(events, e)
+		if s.successful {
+			wantSuccessful[s.id] = true
+		}
+	}
+	_, err = st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	rows, err := st.pool.Query(ctx,
+		`SELECT id FROM events WHERE contract_id = $1 AND in_successful_call = true ORDER BY id`,
+		contractA)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	got := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		got[id] = true
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, wantSuccessful, got,
+		"query filtered to successful calls should return only successful-call rows")
+}
+
 func TestGetEvent_NotFound(t *testing.T) {
 	st := testStore(t)
 	_, err := st.GetEvent(context.Background(), "missing")
@@ -202,10 +303,16 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 	})
 
 	t.Run("by type", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{Type: "diagnostic"})
+		got, _, err := st.QueryEvents(ctx, EventFilter{Types: []string{"diagnostic"}})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.Equal(t, eventID(3), got[0].ID)
+	})
+
+	t.Run("by multiple types", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{Types: []string{"contract", "diagnostic"}})
+		require.NoError(t, err)
+		require.Len(t, got, 10)
 	})
 
 	t.Run("by topic at any position", func(t *testing.T) {
@@ -250,7 +357,10 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		require.Len(t, all, 10)
+		// Count what is actually in the table rather than hardcoding it:
+		// sibling subtests above insert rows of their own, so a literal
+		// makes this assertion depend on subtest execution order.
+		require.Len(t, all, countEventsInRange(t, st, 101, 110))
 		for i := 1; i < len(all); i++ {
 			assert.Less(t, all[i-1].ID, all[i].ID, "ascending ID order across pages")
 		}
@@ -312,11 +422,31 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		require.Len(t, all, 10)
+		require.Len(t, all, countEventsInRange(t, st, 101, 110))
 		for i := 1; i < len(all); i++ {
 			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
 		}
 	})
+}
+
+// countEventsInRange reports how many events the store holds in a ledger
+// range, so a pagination assertion states the range it walked instead of a
+// literal that silently depends on which sibling subtests ran first.
+//
+// The range matters: sibling subtests insert their own rows outside
+// [101,110], and the keyset walks below are bounded to that window. Counting
+// the whole table instead would compare a bounded walk against an unbounded
+// total.
+func countEventsInRange(t *testing.T, st *Postgres, fromLedger, toLedger int64) int {
+	t.Helper()
+	got, next, err := st.QueryEvents(context.Background(), EventFilter{
+		Limit:      MaxQueryLimit,
+		FromLedger: fromLedger,
+		ToLedger:   toLedger,
+	})
+	require.NoError(t, err)
+	require.Empty(t, next, "fixture must fit in one max-size page")
+	return len(got)
 }
 
 func TestQueryEvents_TimeRange(t *testing.T) {
@@ -446,6 +576,8 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 			topics             jsonb NOT NULL DEFAULT '[]'::jsonb,
 			value              jsonb,
 			created_at         timestamptz NOT NULL DEFAULT now(),
+			topics_xdr         jsonb CHECK (topics_xdr IS NULL OR jsonb_typeof(topics_xdr) = 'array'),
+			value_xdr          text,
 			raw_topic_xdr      text[],
 			raw_value_xdr      text
 		);
@@ -456,11 +588,16 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		CREATE INDEX idx_events_created_at ON events (created_at);
 		INSERT INTO events (
 			id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-			in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr
+			in_successful_call, topics, value, created_at,
+			topics_xdr, value_xdr, raw_topic_xdr, raw_value_xdr
 		)
 		SELECT
 			id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-			in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr
+			in_successful_call, topics, value, created_at,
+			to_jsonb(raw_topic_xdr) AS topics_xdr,
+			raw_value_xdr            AS value_xdr,
+			raw_topic_xdr,
+			raw_value_xdr
 		FROM events_partitioned
 		ORDER BY ledger, id;
 		DROP TABLE events_partitioned CASCADE;
