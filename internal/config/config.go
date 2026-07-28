@@ -53,8 +53,16 @@ type Config struct {
 	// caches (CDN/proxy) cannot leak responses across keys. Browsers can
 	// still cache the response for the same authenticated user; CDNs and
 	// intermediaries cannot. Defaults to false (the deployment does not
-	// need request-scoped caching).
+	// need request-scoping).
 	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
+
+	// CORSAllowedOrigins is a comma-separated list of origins allowed to
+	// make cross-origin requests. "*" permits any origin. When empty (the
+	// default) no CORS headers are emitted, preserving the pre-CORS
+	// behavior. Each non-wildcard entry must be a valid URL with a scheme
+	// and host (e.g. "https://app.example.com"); invalid values are
+	// rejected at startup.
+	CORSAllowedOrigins []string `env:"CORS_ALLOWED_ORIGINS"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -65,6 +73,7 @@ func Load() (Config, error) {
 	}
 	// env/v11 splits on "," but keeps empty entries and whitespace.
 	cfg.WatchedContracts = cleanContractList(cfg.WatchedContracts)
+	cfg.CORSAllowedOrigins = cleanStringList(cfg.CORSAllowedOrigins)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -133,6 +142,15 @@ func (c Config) Validate() error {
 	if (c.RateLimitRPS > 0) != (c.RateLimitBurst > 0) {
 		return fmt.Errorf("RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
 	}
+	for _, origin := range c.CORSAllowedOrigins {
+		if origin == "*" {
+			continue
+		}
+		u, err := url.Parse(origin)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q is not a valid origin (want scheme://host)", origin)
+		}
+	}
 	return nil
 }
 
@@ -151,6 +169,16 @@ func ValidContractID(s string) bool {
 }
 
 func cleanContractList(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func cleanStringList(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
 		if s = strings.TrimSpace(s); s != "" {

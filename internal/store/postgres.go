@@ -64,6 +64,21 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
+	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
+	if onUpdate {
+		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
+			contract_id        = EXCLUDED.contract_id,
+			type               = EXCLUDED.type,
+			tx_hash            = EXCLUDED.tx_hash,
+			tx_index           = EXCLUDED.tx_index,
+			op_index           = EXCLUDED.op_index,
+			in_successful_call = EXCLUDED.in_successful_call,
+			topics             = EXCLUDED.topics,
+			value              = EXCLUDED.value,
+			created_at         = EXCLUDED.created_at,
+			raw_topic_xdr      = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+	}
 	batch := &pgx.Batch{}
 	sql := `
 		INSERT INTO events

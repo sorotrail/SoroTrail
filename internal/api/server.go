@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 
 	"github.com/khaylebfortune/sorotrail/internal/audit"
 	"github.com/khaylebfortune/sorotrail/internal/broadcast"
@@ -53,12 +54,13 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store    store.Store
-	rpc      rpc.Client
-	enricher Enricher
-	log      *slog.Logger
-	limiter  *RateLimiter
-	bcast    *broadcast.Broadcaster
+	store       store.Store
+	rpc         rpc.Client
+	enricher    Enricher
+	log         *slog.Logger
+	limiter     *RateLimiter
+	bcast       *broadcast.Broadcaster
+	corsOrigins []string
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -85,9 +87,29 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 	return s
 }
 
+// SetCORSOrigins configures the allowed origins for CORS. When non-empty,
+// a CORS middleware is mounted before all other middleware. Pass nil or an
+// empty slice to disable CORS headers (the default).
+func (s *Server) SetCORSOrigins(origins []string) {
+	s.corsOrigins = origins
+}
+
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
+
+	// CORS must sit outermost so preflight OPTIONS responses are sent
+	// before any auth, rate-limiting, or timeout middleware runs.
+	if len(s.corsOrigins) > 0 {
+		r.Use(cors.Handler(cors.Options{
+			AllowedOrigins: s.corsOrigins,
+			AllowedMethods: []string{"GET", "OPTIONS"},
+			AllowedHeaders: []string{"Accept", "Content-Type"},
+			ExposedHeaders: []string{"X-Request-ID"},
+			MaxAge:         300, // 5 minutes
+		}))
+	}
+
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))

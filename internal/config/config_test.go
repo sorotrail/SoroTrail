@@ -21,6 +21,7 @@ var envKeys = []string{
 	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
 	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
 	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
+	"CORS_ALLOWED_ORIGINS",
 }
 
 func TestLoad(t *testing.T) {
@@ -129,6 +130,41 @@ func TestLoad(t *testing.T) {
 				"RATE_LIMIT_RPS": "-1",
 			},
 			wantErr: "RATE_LIMIT_RPS must be non-negative",
+		},
+		{
+			name: "cors allowed origins parsed",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "https://app.example.com, https://staging.example.com",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{"https://app.example.com", "https://staging.example.com"}, c.CORSAllowedOrigins)
+			},
+		},
+		{
+			name: "cors wildcard accepted",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "*",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{"*"}, c.CORSAllowedOrigins)
+			},
+		},
+		{
+			name: "cors invalid origin rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "not-a-url",
+			},
+			wantErr: "CORS_ALLOWED_ORIGINS entry",
+		},
+		{
+			name: "cors empty default",
+			env:  map[string]string{"DATABASE_URL": "postgres://localhost/db"},
+			check: func(t *testing.T, c Config) {
+				assert.Empty(t, c.CORSAllowedOrigins)
+			},
 		},
 	}
 

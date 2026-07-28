@@ -151,6 +151,7 @@ func run() error {
 
 	apiServer := api.New(st, rpcClient, log, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
+	apiServer.SetCORSOrigins(cfg.CORSAllowedOrigins)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
