@@ -188,7 +188,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/contracts/{id}/export", s.handleContractExport)
-	
+
 	r.Get("/contracts", s.handleListContracts)
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)

@@ -948,7 +948,6 @@ func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, fromLedger, toLe
 	return f, nil
 }
 
-
 // DeadLetterEvent records a poison event into the dead_letters table.
 // Re-submitting the same event ID is treated as a retry: the existing
 // row's attempts counter is incremented, last_attempt and error
@@ -1027,7 +1026,7 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, contractID string, limit
 	if cursor != "" {
 		sv, err := base64.RawURLEncoding.DecodeString(cursor)
 		if err != nil {
-			return nil, "", fmt.Errorf("%w: dead letter cursor", InvalidContractsCursor)
+			return nil, "", fmt.Errorf("%w: dead letter cursor", ErrInvalidContractsCursor)
 		}
 		idIdx := len(args) + 1
 		args = append(args, string(sv))

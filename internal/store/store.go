@@ -220,9 +220,9 @@ const (
 	SortByLastSeen    = "last_seen"
 )
 
-// InvalidContractsCursor is returned when the pagination cursor cannot
+// ErrInvalidContractsCursor is returned when the pagination cursor cannot
 // be decoded for the requested sort. The API maps it to 400.
-var InvalidContractsCursor = errors.New("invalid contracts cursor")
+var ErrInvalidContractsCursor = errors.New("invalid contracts cursor")
 
 // DeadLetter is one event that the ingester could not persist into the
 // events table. It carries enough context (raw XDR + the error) for an
@@ -613,7 +613,6 @@ type Store interface {
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error
 }
-
 
 // DeadLetterInput is the payload handed to Store.DeadLetterEvent. The
 // RPC event is captured at the moment of failure (raw XDR if the RPC

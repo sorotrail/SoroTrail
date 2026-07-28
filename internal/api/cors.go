@@ -48,13 +48,13 @@ type CORSConfig struct {
 //     browser call is rejected by the browser itself; no point in
 //     adding response overhead).
 //   - For any other request with an Origin header:
-//     - If Origin matches an allowed origin (exact match), the response
-//       gets Access-Control-Allow-Origin=<origin>, Vary: Origin, and
-//       (for OPTIONS) Access-Control-Allow-Methods / -Headers.
-//     - If Origin does NOT match any allowed origin, the middleware
-//       passes the request through with no CORS headers. The browser
-//       rejects the response because the required
-//       Access-Control-Allow-Origin header is missing.
+//   - If Origin matches an allowed origin (exact match), the response
+//     gets Access-Control-Allow-Origin=<origin>, Vary: Origin, and
+//     (for OPTIONS) Access-Control-Allow-Methods / -Headers.
+//   - If Origin does NOT match any allowed origin, the middleware
+//     passes the request through with no CORS headers. The browser
+//     rejects the response because the required
+//     Access-Control-Allow-Origin header is missing.
 //   - For OPTIONS requests with a matching origin, the middleware
 //     short-circuits with 204 No Content so the underlying handler
 //     never sees a preflight.

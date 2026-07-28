@@ -102,7 +102,6 @@ type Ingester struct {
 	deadLetterStore DeadLetterSink
 }
 
-
 // New wires an Ingester. All dependencies are interfaces so tests can supply
 // mocks.
 func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, opts Options) *Ingester {

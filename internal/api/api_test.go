@@ -1511,7 +1511,9 @@ func TestListEvents_RecentReturnsNewestFirst(t *testing.T) {
 func (m *stubStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
 	return nil, "", nil
 }
-func (m *stubStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) { return 0, nil }
+func (m *stubStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
+	return 0, nil
+}
 func (m *stubStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
 	return store.DeadLetter{}, nil
 }

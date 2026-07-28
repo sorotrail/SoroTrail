@@ -121,7 +121,7 @@ func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest)
 
 // mockStore is an in-memory Store.
 type mockStore struct {
-	mu       sync.Mutex
+	mu          sync.Mutex
 	events      map[string]store.Event
 	state       *store.IngestionState
 	watched     []store.WatchedContract
@@ -288,7 +288,6 @@ func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
-
 
 func (m *mockStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
 	return nil, "", nil

@@ -76,7 +76,7 @@ func EncodeContractsCursor(sortAs, sortValue, contractID string) string {
 func DecodeContractsCursor(cursor string) (sortValue, contractID string, err error) {
 	sortValue, contractID, err = decodeCompositeCursor(cursor)
 	if err != nil {
-		err = fmt.Errorf("%w: contracts cursor", InvalidContractsCursor)
+		err = fmt.Errorf("%w: contracts cursor", ErrInvalidContractsCursor)
 	}
 	return
 }
