@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -274,6 +275,157 @@ func restoreRawXDR(events []Event, kept map[string]rawXDR) []Event {
 // counts only (cheap path for the common "all good" sweep); idsOnly=true
 // → per-ledger sorted ID list (used to diff a ledger whose count
 // disagrees with the RPC).
+func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+	if !ValidContractsSortKey(f.SortKey) {
+		return nil, "", fmt.Errorf("unsupported sort_key %q", f.SortKey)
+	}
+	orderDir := "DESC"
+	cursorOp := "<"
+	if strings.EqualFold(f.Order, "asc") {
+		orderDir = "ASC"
+		cursorOp = ">"
+	}
+	sortCol, sortExpr, sortType := contractsSortParts(f.SortKey)
+	args := []any{}
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	where := []string{}
+	if f.ContractIDPrefix != "" {
+		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
+	}
+	if f.Cursor != "" {
+		sortValue, contractID, err := DecodeContractsCursor(f.Cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		typed := arg(sortValue)
+		switch sortType {
+		case "bigint":
+			typed += "::bigint"
+		case "timestamptz":
+			typed += "::timestamptz"
+		}
+		where = append(where,
+			fmt.Sprintf("(%s, contract_id) %s (%s, %s)",
+				sortCol, cursorOp, typed, arg(contractID)))
+	}
+	query := fmt.Sprintf(`
+		SELECT contract_id, count(*) AS event_count,
+		       min(ledger) AS first_ledger, max(ledger) AS last_ledger,
+		       max(created_at) AS last_seen
+		FROM events
+		%s
+		GROUP BY contract_id
+		ORDER BY %s %s, contract_id %s
+		LIMIT %d`,
+		contractsWhere(where),
+		sortExpr, orderDir, orderDir,
+		limit+1,
+	)
+	var out []ContractSummary
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("listing contracts: %w", err)
+		}
+		defer rows.Close()
+		out = make([]ContractSummary, 0, limit)
+		for rows.Next() {
+			var c ContractSummary
+			if err := rows.Scan(&c.ContractID, &c.EventCount,
+				&c.FirstLedger, &c.LastLedger, &c.LastSeen); err != nil {
+				return err
+			}
+			out = append(out, c)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("reading contracts: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(out) > limit {
+		last := out[limit-1]
+		out = out[:limit]
+		next = EncodeContractsCursor(f.SortKey, contractSortValue(last, f.SortKey), last.ContractID)
+	}
+	return out, next, nil
+}
+
+func (p *Postgres) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
+	args := []any{}
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	where := []string{}
+	if f.ContractIDPrefix != "" {
+		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
+	}
+	q := `SELECT count(*) FROM (SELECT contract_id FROM events ` + contractsWhere(where) + ` GROUP BY contract_id) AS sub`
+	var total int64
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, q, args...).Scan(&total)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("counting contracts: %w", err)
+	}
+	return total, nil
+}
+
+func ValidContractsSortKey(s string) bool {
+	switch s {
+	case "", SortByActivity, SortByFirstLedger, SortByLastLedger, SortByLastSeen:
+		return true
+	}
+	return false
+}
+
+func contractsSortParts(sortKey string) (col, expr, typ string) {
+	switch sortKey {
+	case SortByFirstLedger:
+		return "min(ledger)", "min(ledger)", "bigint"
+	case SortByLastLedger:
+		return "max(ledger)", "max(ledger)", "bigint"
+	case SortByLastSeen:
+		return "max(created_at)", "max(created_at)", "timestamptz"
+	default:
+		return "count(*)", "count(*)", ""
+	}
+}
+
+func contractSortValue(c ContractSummary, sortKey string) string {
+	switch sortKey {
+	case SortByFirstLedger:
+		return fmt.Sprint(c.FirstLedger)
+	case SortByLastLedger:
+		return fmt.Sprint(c.LastLedger)
+	case SortByLastSeen:
+		return c.LastSeen.UTC().Format(time.RFC3339Nano)
+	default:
+		return fmt.Sprint(c.EventCount)
+	}
+}
+
+func contractsWhere(parts []string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	return " WHERE " + strings.Join(parts, " AND ")
+}
+
 func (p *Postgres) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error) {
 	rows, err := p.pool.Query(ctx, `
 		SELECT ledger, count(*)::int, array_agg(id ORDER BY id)
@@ -797,6 +949,174 @@ func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, fromLedger, toLe
 		f.LastAttemptedAt = *lastAttempted
 	}
 	return f, nil
+}
+
+// DeadLetterEvent records a poison event into the dead_letters table.
+// Re-submitting the same event ID is treated as a retry: the existing
+// row's attempts counter is incremented, last_attempt and error
+// columns are updated, and the row's raw payload is overwritten with
+// the most recent attempt (the latest error message is the most
+// useful context for debugging).
+func (p *Postgres) DeadLetterEvent(ctx context.Context, in DeadLetterInput) (DeadLetter, error) {
+	errStr := ""
+	if in.Err != nil {
+		errStr = in.Err.Error()
+	}
+	var d DeadLetter
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			INSERT INTO dead_letters
+			    (event_id, contract_id, ledger, type, tx_hash,
+			     topic_xdr, value_xdr, error, attempts, last_attempt)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, now())
+			ON CONFLICT (event_id) DO UPDATE SET
+			    error        = EXCLUDED.error,
+			    attempts     = dead_letters.attempts + 1,
+			    last_attempt = now(),
+			    topic_xdr    = EXCLUDED.topic_xdr,
+			    value_xdr    = EXCLUDED.value_xdr
+			RETURNING id, event_id, contract_id, ledger, type, tx_hash,
+			          topic_xdr, value_xdr, error, attempts, last_attempt, created_at`,
+			in.EventID, in.ContractID, in.Ledger, in.Type, nullableText(in.TxHash),
+			nullableStringSlice(in.TopicXDR), nullableText(in.ValueXDR), errStr,
+		)
+		var txHash *string
+		var valueXDR *string
+		scanErr := row.Scan(&d.ID, &d.EventID, &d.ContractID, &d.Ledger, &d.Type, &txHash,
+			&d.TopicXDR, &valueXDR, &d.Error, &d.Attempts, &d.LastAttempt, &d.CreatedAt)
+		if scanErr != nil {
+			return scanErr
+		}
+		if txHash != nil {
+			d.TxHash = *txHash
+		}
+		if valueXDR != nil {
+			d.ValueXDR = *valueXDR
+		}
+		return nil
+	})
+	if err != nil {
+		// The ON CONFLICT clause targets event_id, and the migration
+		// adds a UNIQUE constraint on event_id so the retry path
+		// emits a row-level conflict instead of crashing.
+		return DeadLetter{}, fmt.Errorf("recording dead letter: %w", err)
+	}
+	return d, nil
+}
+
+// ListDeadLetters returns dead-letter rows newest-first. contractID ""
+// means all contracts; limit==0 means DefaultQueryLimit.
+//
+// Pagination is keyset by id (the bigserial primary key). The cursor
+// is the encoded id of the last row from the previous page; passing ""
+// resumes from the newest.
+func (p *Postgres) ListDeadLetters(ctx context.Context, contractID string, limit int, cursor string) ([]DeadLetter, string, error) {
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+	args := []any{}
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	where := []string{}
+	if contractID != "" {
+		where = append(where, "contract_id = "+arg(contractID))
+	}
+	if cursor != "" {
+		sv, err := base64.RawURLEncoding.DecodeString(cursor)
+		if err != nil {
+			return nil, "", fmt.Errorf("%w: dead letter cursor", ErrInvalidContractsCursor)
+		}
+		idIdx := len(args) + 1
+		args = append(args, string(sv))
+		where = append(where, fmt.Sprintf("dead_letters.id < $%d", idIdx))
+	}
+	query := `SELECT id, event_id, contract_id, ledger, type, tx_hash,
+	                 topic_xdr, value_xdr, error, attempts, last_attempt, created_at
+	          FROM dead_letters`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY id DESC LIMIT " + arg(limit+1)
+	var rows []DeadLetter
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		r, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("listing dead letters: %w", err)
+		}
+		defer r.Close()
+		for r.Next() {
+			var d DeadLetter
+			var txh *string
+			var vxdr *string
+			if err := r.Scan(&d.ID, &d.EventID, &d.ContractID, &d.Ledger,
+				&d.Type, &txh, &d.TopicXDR, &vxdr, &d.Error, &d.Attempts,
+				&d.LastAttempt, &d.CreatedAt); err != nil {
+				return err
+			}
+			if txh != nil {
+				d.TxHash = *txh
+			}
+			if vxdr != nil {
+				d.ValueXDR = *vxdr
+			}
+			rows = append(rows, d)
+		}
+		return r.Err()
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(rows) > limit {
+		last := rows[limit-1]
+		rows = rows[:limit]
+		next = base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprint(last.ID)))
+	}
+	return rows, next, nil
+}
+
+func (p *Postgres) GetDeadLetter(ctx context.Context, id int64) (DeadLetter, error) {
+	var d DeadLetter
+	var txHash *string
+	var valueXDR *string
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT id, event_id, contract_id, ledger, type, tx_hash,
+			       topic_xdr, value_xdr, error, attempts, last_attempt, created_at
+			FROM dead_letters WHERE id = $1`,
+			id,
+		).Scan(&d.ID, &d.EventID, &d.ContractID, &d.Ledger, &d.Type, &txHash,
+			&d.TopicXDR, &valueXDR, &d.Error, &d.Attempts, &d.LastAttempt, &d.CreatedAt)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DeadLetter{}, ErrNotFound
+	}
+	if err != nil {
+		return DeadLetter{}, fmt.Errorf("loading dead letter %d: %w", id, err)
+	}
+	if txHash != nil {
+		d.TxHash = *txHash
+	}
+	if valueXDR != nil {
+		d.ValueXDR = *valueXDR
+	}
+	return d, nil
+}
+
+func (p *Postgres) DeleteDeadLetter(ctx context.Context, id int64) error {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM dead_letters WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("deleting dead letter %d: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func nullableString(s string) any {

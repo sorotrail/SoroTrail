@@ -4,6 +4,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 )
 
@@ -176,6 +177,76 @@ type LedgerCensus struct {
 	Ledger int64
 	Count  int
 	IDs    []string
+}
+
+// ContractSummary is one row of the indexed-contract listing: a contract
+// ID alongside the aggregate metrics the /contracts endpoint exposes.
+// FirstLedger and LastLedger bracket the contract's known activity;
+// LastSeen is the wall-clock time of the most recent event ingested
+// for it. EventCount is the total number of events for the contract.
+type ContractSummary struct {
+	ContractID  string    `json:"contract_id"`
+	EventCount  int64     `json:"event_count"`
+	FirstLedger int64     `json:"first_ledger"`
+	LastLedger  int64     `json:"last_ledger"`
+	LastSeen    time.Time `json:"last_seen"`
+}
+
+// ContractsFilter narrows a ListContracts call.
+//
+// SortKey selects the column that names activity. Defaults to "count"
+// (so the most active contracts come first). Order still controls the
+// direction; the comparison pair (SortValue, ContractID) is total
+// because ContractID is unique, so keyset pagination stays stable.
+//
+// ContractIDPrefix, when set, constrains the result to contracts whose
+// ID starts with the prefix. Indexed lookups (the contract_id index)
+// can serve this directly; no full scan.
+type ContractsFilter struct {
+	ContractIDPrefix string
+	SortKey          string // "" | "count" | "first_ledger" | "last_ledger" | "last_seen"
+	Order            string // "asc" | "desc"; "" defaults to "desc"
+	Cursor           string
+	Limit            int
+}
+
+// SortKey constants for ContractsFilter.SortKey. The zero value
+// (empty string) is treated as SortByActivity; the API surface
+// exists to make a future "by first seen" view trivial to add.
+const (
+	SortByActivity    = "count"
+	SortByFirstLedger = "first_ledger"
+	SortByLastLedger  = "last_ledger"
+	SortByLastSeen    = "last_seen"
+)
+
+// ErrInvalidContractsCursor is returned when the pagination cursor cannot
+// be decoded for the requested sort. The API maps it to 400.
+var ErrInvalidContractsCursor = errors.New("invalid contracts cursor")
+
+// DeadLetter is one event that the ingester could not persist into the
+// events table. It carries enough context (raw XDR + the error) for an
+// operator to inspect the row, hand-replay it through a future
+// decoder, and DELETE it once it's been dealt with.
+//
+// The row is intentionally distinct from the events table: events are
+// append-only and immutable, while dead letters are a working queue.
+// The same event ID can be dead-lettered more than once across runs,
+// so the row's primary key is a fresh bigserial ID rather than the
+// TOID-based event ID.
+type DeadLetter struct {
+	ID          int64     `json:"id"`
+	EventID     string    `json:"event_id"`
+	ContractID  string    `json:"contract_id"`
+	Ledger      int64     `json:"ledger"`
+	Type        string    `json:"type"`
+	TxHash      string    `json:"tx_hash"`
+	TopicXDR    []string  `json:"topic_xdr,omitempty"`
+	ValueXDR    string    `json:"value_xdr,omitempty"`
+	Error       string    `json:"error"`
+	Attempts    int       `json:"attempts"`
+	LastAttempt time.Time `json:"last_attempt"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // Finding statuses the auditor records in audit_findings.
@@ -451,6 +522,34 @@ type Store interface {
 	// the cheap path used for the common "all good" verify sweep.
 	LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error)
 
+	// ListContracts returns one ContractSummary per indexed contract
+	// matching f, plus a cursor for the next page ("" when there are no
+	// more results). Pagination is keyset over (SortValue, ContractID);
+	// the cursor encodes both halves so pages land at stable boundaries.
+	ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error)
+	// CountContracts returns the total number of indexed contracts
+	// matching f (ignoring pagination: cursor, order, and limit).
+	CountContracts(ctx context.Context, f ContractsFilter) (int64, error)
+
+	// DeadLetterEvent records a single event the ingester could not
+	// persist (decode failure, constraint violation, etc.) along with
+	// the original RPC payload and the error that dropped it. Retry-safe:
+	// re-submitting the same rpc.Event with a different err text
+	// increments `attempts` and updates last_attempt + error.
+	DeadLetterEvent(ctx context.Context, ev DeadLetterInput) (DeadLetter, error)
+	// ListDeadLetters returns one DeadLetter per row, newest first,
+	// filtered by contractID ("" means all). Pagination is keyset: the
+	// returned cursor encodes the last row's id so a follow-up call
+	// resumes cleanly.
+	ListDeadLetters(ctx context.Context, contractID string, limit int, cursor string) ([]DeadLetter, string, error)
+	// GetDeadLetter returns a single row by id, or ErrNotFound.
+	GetDeadLetter(ctx context.Context, id int64) (DeadLetter, error)
+	// DeleteDeadLetter removes a row (call after the row has been
+	// inspected and replayed manually). ErrNotFound when no row matches.
+	DeleteDeadLetter(ctx context.Context, id int64) error
+
+	// Ping(ctx context.Context) error
+
 	GetIngestionState(ctx context.Context) (IngestionState, error)
 	SaveIngestionState(ctx context.Context, s IngestionState) error
 
@@ -520,4 +619,20 @@ type Store interface {
 
 	Stats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error
+}
+
+// DeadLetterInput is the payload handed to Store.DeadLetterEvent. The
+// RPC event is captured at the moment of failure (raw XDR if the RPC
+// delivered it, JSON shapes) so a replay from this row reproduces the
+// exact bytes the ingester saw. Err is the failure message; the row's
+// error column always reflects the most recent attempt.
+type DeadLetterInput struct {
+	EventID    string
+	ContractID string
+	Ledger     int64
+	Type       string
+	TxHash     string
+	TopicXDR   []string
+	ValueXDR   string
+	Err        error
 }

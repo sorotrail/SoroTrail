@@ -726,6 +726,144 @@ func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
 
 // Stats summarizes what the indexer has stored plus, when the auditor is
 // running, the post-processing counters it has accumulated.
+
+// contractListResponse is the JSON body for GET /contracts.
+type contractListResponse struct {
+	Contracts []store.ContractSummary `json:"contracts"`
+	Count     int                     `json:"count"`
+	Cursor    string                  `json:"cursor,omitempty"`
+}
+
+// handleListContracts returns one ContractSummary per indexed contract,
+// paginated, default-sorted by event_count desc (the most active
+// contracts first). The endpoint is intentionally READ-ONLY and
+// unauthenticated: a contract listing has no surface area for
+// cross-tenant data leakage (a contract_id is opaque), and gating it
+// behind API_KEY would force every browser dashboard to log in.
+//
+// Cache-Control is no-cache: a brand-new contract can be ingested at
+// any time, and a stale cache would hide it from a freshly-launched
+// explorer.
+func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
+	f := store.ContractsFilter{
+		ContractIDPrefix: r.URL.Query().Get("contract_id"),
+		SortKey:          r.URL.Query().Get("sort"),
+		Order:            r.URL.Query().Get("order"),
+		Cursor:           r.URL.Query().Get("cursor"),
+	}
+	if !store.ValidContractsSortKey(f.SortKey) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf(
+			"invalid sort %q (want %s, %s, %s, or %s)",
+			f.SortKey,
+			store.SortByActivity, store.SortByFirstLedger,
+			store.SortByLastLedger, store.SortByLastSeen))
+		return
+	}
+	if f.Order != "" && f.Order != "asc" && f.Order != "desc" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid order %q (want asc or desc)", f.Order))
+		return
+	}
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid cursor %q", f.Cursor))
+		return
+	}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		f.Limit = n
+	} else {
+		f.Limit = store.DefaultQueryLimit
+	}
+	items, cursor, err := s.store.ListContracts(r.Context(), f)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("listing contracts", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
+		return
+	}
+	total, cerr := s.store.CountContracts(r.Context(), f)
+	if cerr != nil {
+		loggerFromContext(r.Context()).Warn("counting contracts for X-Total-Count", "error", cerr)
+	} else if total > 0 {
+		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, contractListResponse{
+		Contracts: items,
+		Count:     len(items),
+		Cursor:    cursor,
+	})
+}
+
+// deadLetterListResponse is the JSON body for GET /dead-letters.
+type deadLetterListResponse struct {
+	DeadLetters []store.DeadLetter `json:"dead_letters"`
+	Count       int                `json:"count"`
+	Cursor      string             `json:"cursor,omitempty"`
+}
+
+// handleListDeadLetters returns the poison-event queue newest-first.
+// Like the watched-contracts surface, this is gated behind API_KEY —
+// dead-letter rows contain raw RPC payloads, and disclosing them on a
+// public endpoint would leak every event the indexer failed to decode.
+func (s *Server) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
+	f := struct {
+		ContractID string
+		Limit      int
+		Cursor     string
+	}{
+		ContractID: r.URL.Query().Get("contract_id"),
+		Cursor:     r.URL.Query().Get("cursor"),
+	}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		f.Limit = n
+	}
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid cursor %q", f.Cursor))
+		return
+	}
+	items, cursor, err := s.store.ListDeadLetters(r.Context(), f.ContractID, f.Limit, f.Cursor)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("listing dead letters", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("listing dead letters failed"))
+		return
+	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, deadLetterListResponse{
+		DeadLetters: items,
+		Count:       len(items),
+		Cursor:      cursor,
+	})
+}
+
+// handleDeleteDeadLetter removes a single dead-letter row by id.
+// Idempotent: calling again returns 404.
+func (s *Server) handleDeleteDeadLetter(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("dead-letter id must be a positive integer, got %q", idStr))
+		return
+	}
+	if err := s.store.DeleteDeadLetter(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("dead letter %d not found", id))
+			return
+		}
+		loggerFromContext(r.Context()).Error("deleting dead letter", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("deleting dead letter failed"))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.Stats(r.Context())
 	if err != nil {
