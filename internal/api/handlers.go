@@ -258,6 +258,47 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, resp)
 }
 
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Checks: map[string]string{}})
+}
+
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	resp := healthResponse{Status: "ok", Checks: map[string]string{}}
+	status := http.StatusOK
+
+	if err := s.store.Ping(ctx); err != nil {
+		resp.Status = "degraded"
+		resp.Checks["database"] = err.Error()
+		status = http.StatusServiceUnavailable
+	} else {
+		resp.Checks["database"] = "ok"
+	}
+
+	state, err := s.store.GetIngestionState(ctx)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			resp.Checks["ingest"] = "not found"
+		} else {
+			resp.Checks["ingest"] = err.Error()
+		}
+		resp.Status = "degraded"
+		status = http.StatusServiceUnavailable
+	} else if state.LastIngestedLedger <= 0 {
+		resp.Checks["ingest"] = "no ingested ledgers"
+		resp.Status = "degraded"
+		status = http.StatusServiceUnavailable
+	} else {
+		resp.Checks["ingest"] = "ok"
+	}
+
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, status, resp)
+}
+
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, versionResponse{
