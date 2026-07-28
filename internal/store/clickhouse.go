@@ -194,7 +194,6 @@ func (c *ClickHouse) Stats(ctx context.Context) (Stats, error) {
 	return Stats{}, nil
 }
 
-
 func (c *ClickHouse) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
 	return nil, "", nil
 }

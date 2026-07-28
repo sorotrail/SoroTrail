@@ -307,7 +307,9 @@ func TestExport_RejectsInvalidContractID(t *testing.T) {
 func (m *fakeExportStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
 	return nil, "", nil
 }
-func (m *fakeExportStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) { return 0, nil }
+func (m *fakeExportStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
+	return 0, nil
+}
 func (m *fakeExportStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
 	return store.DeadLetter{}, nil
 }
