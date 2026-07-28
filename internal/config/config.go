@@ -58,6 +58,7 @@ type Config struct {
 }
 
 // Load reads configuration from the environment and validates it.
+// All validation failures are aggregated into a single error.
 func Load() (Config, error) {
 	var cfg Config
 	if err := env.Parse(&cfg); err != nil {
@@ -65,7 +66,7 @@ func Load() (Config, error) {
 	}
 	// env/v11 splits on "," but keeps empty entries and whitespace.
 	cfg.WatchedContracts = cleanContractList(cfg.WatchedContracts)
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.ValidateAll(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
