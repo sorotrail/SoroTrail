@@ -42,11 +42,23 @@ type stubStore struct {
 
 	stats   store.Stats
 	pingErr error
+
+	contracts           []store.ContractSummary
+	contractsNext       string
+	contractsErr        error
+	lastContractsCursor string
+	lastContractsLimit  int
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
 	s.lastFilter = f
 	return s.events, s.nextCursor, s.queryErr
+}
+
+func (s *stubStore) ListContracts(_ context.Context, cursor string, limit int) ([]store.ContractSummary, string, error) {
+	s.lastContractsCursor = cursor
+	s.lastContractsLimit = limit
+	return s.contracts, s.contractsNext, s.contractsErr
 }
 
 // LedgerRangeCensus, ReplaceEventsInRange, and the audit_state/findings
@@ -296,4 +308,74 @@ func TestStats(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &got))
 	assert.Equal(t, int64(42), got.TotalEvents)
 	assert.Equal(t, int64(999), got.LastIngestedLedger)
+}
+
+func TestListContracts(t *testing.T) {
+	t.Run("empty database", func(t *testing.T) {
+		st := &stubStore{}
+		resp, body := doGet(t, newTestServer(st, nil), "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, store.DefaultQueryLimit, st.lastContractsLimit)
+		assert.Empty(t, st.lastContractsCursor)
+
+		var out struct {
+			Contracts []store.ContractSummary `json:"contracts"`
+			Cursor    string                  `json:"cursor"`
+		}
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.NotNil(t, out.Contracts)
+		assert.Empty(t, out.Contracts)
+		assert.Empty(t, out.Cursor)
+	})
+
+	t.Run("returns contracts and pagination cursor", func(t *testing.T) {
+		st := &stubStore{
+			contracts: []store.ContractSummary{
+				{ContractID: testContract, EventCount: 100, FirstLedger: 10, LastLedger: 20},
+			},
+			contractsNext: testContract,
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/contracts?limit=10&cursor=C123")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, 10, st.lastContractsLimit)
+		assert.Equal(t, "C123", st.lastContractsCursor)
+
+		var out struct {
+			Contracts []store.ContractSummary `json:"contracts"`
+			Cursor    string                  `json:"cursor"`
+		}
+		require.NoError(t, json.Unmarshal(body, &out))
+		require.Len(t, out.Contracts, 1)
+		assert.Equal(t, testContract, out.Contracts[0].ContractID)
+		assert.Equal(t, int64(100), out.Contracts[0].EventCount)
+		assert.Equal(t, int64(10), out.Contracts[0].FirstLedger)
+		assert.Equal(t, int64(20), out.Contracts[0].LastLedger)
+		assert.Equal(t, testContract, out.Cursor)
+	})
+
+	t.Run("bad limit params", func(t *testing.T) {
+		for _, path := range []string{
+			"/contracts?limit=0",
+			"/contracts?limit=-1",
+			"/contracts?limit=201",
+			"/contracts?limit=abc",
+		} {
+			t.Run(path, func(t *testing.T) {
+				resp, body := doGet(t, newTestServer(&stubStore{}, nil), path)
+				assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], "limit must be an integer in [1,200]")
+			})
+		}
+	})
+
+	t.Run("store error", func(t *testing.T) {
+		st := &stubStore{contractsErr: errors.New("db error")}
+		resp, body := doGet(t, newTestServer(st, nil), "/contracts")
+		assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+		var e map[string]string
+		require.NoError(t, json.Unmarshal(body, &e))
+		assert.Equal(t, "listing contracts failed", e["error"])
+	})
 }

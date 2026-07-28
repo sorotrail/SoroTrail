@@ -411,3 +411,59 @@ func TestStats(t *testing.T) {
 	assert.Equal(t, int64(2), stats.ContractCount)
 	assert.Equal(t, int64(1), stats.WatchedContracts)
 }
+
+func TestListContracts(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	t.Run("empty database", func(t *testing.T) {
+		contracts, next, err := st.ListContracts(ctx, "", 50)
+		require.NoError(t, err)
+		assert.Empty(t, contracts)
+		assert.Empty(t, next)
+	})
+
+	t.Run("lists contracts with counts, ledger ranges, and pagination", func(t *testing.T) {
+		// contractA: 2 events at ledgers 100 and 150
+		// contractB: 3 events at ledgers 200, 250, 300
+		_, err := st.UpsertEvents(ctx, []Event{
+			testEvent(eventID(1), 100, contractA),
+			testEvent(eventID(2), 150, contractA),
+			testEvent(eventID(3), 200, contractB),
+			testEvent(eventID(4), 250, contractB),
+			testEvent(eventID(5), 300, contractB),
+		})
+		require.NoError(t, err)
+
+		// Full list
+		contracts, next, err := st.ListContracts(ctx, "", 50)
+		require.NoError(t, err)
+		require.Len(t, contracts, 2)
+		assert.Empty(t, next)
+
+		// Sorted by contract_id ASC (contractA < contractB)
+		assert.Equal(t, contractA, contracts[0].ContractID)
+		assert.Equal(t, int64(2), contracts[0].EventCount)
+		assert.Equal(t, int64(100), contracts[0].FirstLedger)
+		assert.Equal(t, int64(150), contracts[0].LastLedger)
+
+		assert.Equal(t, contractB, contracts[1].ContractID)
+		assert.Equal(t, int64(3), contracts[1].EventCount)
+		assert.Equal(t, int64(200), contracts[1].FirstLedger)
+		assert.Equal(t, int64(300), contracts[1].LastLedger)
+
+		// Paginated page 1
+		page1, next1, err := st.ListContracts(ctx, "", 1)
+		require.NoError(t, err)
+		require.Len(t, page1, 1)
+		assert.Equal(t, contractA, page1[0].ContractID)
+		assert.Equal(t, contractA, next1)
+
+		// Paginated page 2 using cursor
+		page2, next2, err := st.ListContracts(ctx, next1, 1)
+		require.NoError(t, err)
+		require.Len(t, page2, 1)
+		assert.Equal(t, contractB, page2[0].ContractID)
+		assert.Empty(t, next2)
+	})
+}

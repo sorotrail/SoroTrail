@@ -113,6 +113,10 @@ func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Eve
 	return nil, "", nil
 }
 
+func (m *mockStore) ListContracts(context.Context, string, int) ([]store.ContractSummary, string, error) {
+	return nil, "", nil
+}
+
 // LedgerRangeCensus is unused by ingester tests but needed to satisfy
 // the expanded store.Store interface.
 func (m *mockStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]store.LedgerCensus, error) {

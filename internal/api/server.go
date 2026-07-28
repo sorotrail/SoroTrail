@@ -107,6 +107,7 @@ func (s *Server) Router() http.Handler {
 
 	// contributors: new read endpoints go here. Anything that writes (e.g.
 	// managing watched contracts at runtime) should come with auth first.
+	r.Get("/contracts", s.handleListContracts)
 
 	// Subscription CRUD and delivery history.
 	r.Post("/subscriptions", s.handleCreateSubscription)

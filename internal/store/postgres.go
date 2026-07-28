@@ -65,6 +65,22 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	batch := &pgx.Batch{}
+	conflict := "ON CONFLICT (id) DO NOTHING"
+	if onUpdate {
+		conflict = `ON CONFLICT (id) DO UPDATE SET
+			contract_id = EXCLUDED.contract_id,
+			ledger = EXCLUDED.ledger,
+			type = EXCLUDED.type,
+			tx_hash = EXCLUDED.tx_hash,
+			tx_index = EXCLUDED.tx_index,
+			op_index = EXCLUDED.op_index,
+			in_successful_call = EXCLUDED.in_successful_call,
+			topics = EXCLUDED.topics,
+			value = EXCLUDED.value,
+			created_at = EXCLUDED.created_at,
+			raw_topic_xdr = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+	}
 	sql := `
 		INSERT INTO events
 			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
@@ -536,6 +552,62 @@ func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) er
 		return fmt.Errorf("adding watched contract: %w", err)
 	}
 	return nil
+}
+
+func (p *Postgres) ListContracts(ctx context.Context, cursor string, limit int) ([]ContractSummary, string, error) {
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+
+	var (
+		where []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	if cursor != "" {
+		where = append(where, "contract_id > "+arg(cursor))
+	}
+
+	// contributors: COUNT(*), MIN(ledger), MAX(ledger) GROUP BY contract_id scans
+	// the events table; fine at MVP scale. Replace with a maintained summary table
+	// if it becomes a bottleneck on large datasets.
+	query := `SELECT contract_id, count(*)::bigint, min(ledger), max(ledger) FROM events`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY contract_id ORDER BY contract_id ASC LIMIT " + arg(limit+1)
+
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("listing contracts: %w", err)
+	}
+	defer rows.Close()
+
+	contracts := make([]ContractSummary, 0, limit)
+	for rows.Next() {
+		var c ContractSummary
+		if err := rows.Scan(&c.ContractID, &c.EventCount, &c.FirstLedger, &c.LastLedger); err != nil {
+			return nil, "", fmt.Errorf("scanning contract summary: %w", err)
+		}
+		contracts = append(contracts, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("reading contracts: %w", err)
+	}
+
+	next := ""
+	if len(contracts) > limit {
+		contracts = contracts[:limit]
+		next = contracts[limit-1].ContractID
+	}
+	return contracts, next, nil
 }
 
 func (p *Postgres) Stats(ctx context.Context) (Stats, error) {

@@ -232,6 +232,14 @@ type DeliveryAttempt struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
+// ContractSummary represents aggregate statistics for a contract observed by SoroTrail.
+type ContractSummary struct {
+	ContractID  string `json:"contract_id"`
+	EventCount  int64  `json:"event_count"`
+	FirstLedger int64  `json:"first_ledger"`
+	LastLedger  int64  `json:"last_ledger"`
+}
+
 // Stats summarizes what the indexer has stored so far. VerifiedThroughLedger
 // is the inclusive highest ledger whose stored events have been confirmed
 // to match a fresh RPC fetch; 0 means no ledger has been verified yet.
@@ -342,6 +350,10 @@ type Store interface {
 
 	ListWatchedContracts(ctx context.Context) ([]string, error)
 	AddWatchedContract(ctx context.Context, contractID string) error
+
+	// ListContracts returns a page of contract summaries ordered by contract_id,
+	// plus a cursor for the next page ("" when there are no more results).
+	ListContracts(ctx context.Context, cursor string, limit int) ([]ContractSummary, string, error)
 
 	// RecordAuditFinding persists a new finding (status "open") and
 	// returns it with its assigned ID populated.

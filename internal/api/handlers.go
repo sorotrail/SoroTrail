@@ -73,6 +73,12 @@ type eventsResponse struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
+type contractsResponse struct {
+	Contracts []store.ContractSummary `json:"contracts"`
+	// Cursor is non-empty when another page exists; pass it back as ?cursor=.
+	Cursor string `json:"cursor,omitempty"`
+}
+
 type enrichedEventsResponse struct {
 	Events []store.EnrichedEvent `json:"events"`
 	// Cursor is non-empty when another page exists.
@@ -128,6 +134,35 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	filter.ContractID = contractID
 	s.serveEvents(w, r, filter)
+}
+
+func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	cursor := q.Get("cursor")
+	limit := store.DefaultQueryLimit
+
+	if raw := q.Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || parsed > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		limit = parsed
+	}
+
+	contracts, next, err := s.store.ListContracts(r.Context(), cursor, limit)
+	if err != nil {
+		s.log.Error("listing contracts", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
+		return
+	}
+
+	if contracts == nil {
+		contracts = []store.ContractSummary{}
+	}
+
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, contractsResponse{Contracts: contracts, Cursor: next})
 }
 
 // serveEvents is the shared body for /events and /contracts/{id}/events.

@@ -202,6 +202,38 @@ Fetch a single event by its ID (the TOID-based identifier from the RPC).
 curl -s localhost:8080/events/0001099511627776-0000000001
 ```
 
+### `GET /contracts`
+
+Lists contracts indexed by SoroTrail along with event count, first ledger, and last ledger. Ordered by `contract_id`.
+
+Query parameters (all optional):
+
+| Param | Example | Meaning |
+| --- | --- | --- |
+| `limit` | `50` | Page size, 1–200 (default 50). |
+| `cursor` | `CDLZ...CYSC` | Opaque pagination cursor from a previous response. |
+
+```sh
+curl -s 'localhost:8080/contracts?limit=50'
+```
+
+```json
+{
+  "contracts": [
+    {
+      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "event_count": 1204,
+      "first_ledger": 250010,
+      "last_ledger": 260123
+    }
+  ],
+  "cursor": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+}
+```
+
+`cursor` is present when more results exist; pass it back as `?cursor=` for
+the next page.
+
 ### `GET /contracts/{id}/events`
 
 Convenience wrapper for `GET /events?contract_id={id}`; accepts the same
