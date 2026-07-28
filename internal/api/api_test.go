@@ -40,6 +40,11 @@ type stubStore struct {
 	event    store.Event
 	eventErr error
 
+	txSiblings    []store.Event
+	txSiblingsErr error
+	lastTxHash    string
+	lastExcludeID string
+
 	stats            store.Stats
 	pingErr          error
 	watchedList      []store.WatchedContract
@@ -99,6 +104,12 @@ func (s *stubStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 
 func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
 	return s.event, s.eventErr
+}
+
+func (s *stubStore) GetEventsByTxHash(_ context.Context, txHash, excludeID string) ([]store.Event, error) {
+	s.lastTxHash = txHash
+	s.lastExcludeID = excludeID
+	return s.txSiblings, s.txSiblingsErr
 }
 
 func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
