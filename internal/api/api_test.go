@@ -1507,3 +1507,161 @@ func TestListEvents_RecentReturnsNewestFirst(t *testing.T) {
 	assert.Equal(t, "e2", out.Events[1].ID)
 	assert.Equal(t, "e1", out.Events[2].ID)
 }
+
+func TestPrettyPrint(t *testing.T) {
+	t.Run("?pretty=true indents JSON", func(t *testing.T) {
+		st := &stubStore{
+			events:     []store.Event{{ID: "e1"}, {ID: "e2"}},
+			nextCursor: "e2",
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/events?pretty=true")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+		// Pretty output must contain indentation (newline + two spaces).
+		// Encoder.Encode always appends a trailing \n; indented output
+		// has additional \n sequences with leading spaces.
+		assert.Contains(t, string(body), "\n  ")
+		// Still valid JSON.
+		assert.True(t, json.Valid(body))
+	})
+
+	t.Run("default is compact (no indent)", func(t *testing.T) {
+		st := &stubStore{
+			events:     []store.Event{{ID: "e1"}, {ID: "e2"}},
+			nextCursor: "e2",
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/events")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		// Compact output: no indentation (Encoder.Encode appends one
+		// trailing \n but no lines start with spaces).
+		assert.NotContains(t, string(body), "\n  ")
+		assert.True(t, json.Valid(body))
+	})
+
+	t.Run("?pretty=false is compact", func(t *testing.T) {
+		st := &stubStore{
+			events:     []store.Event{{ID: "e1"}},
+			nextCursor: "e1",
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/events?pretty=false")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.NotContains(t, string(body), "\n  ")
+		assert.True(t, json.Valid(body))
+	})
+
+	t.Run("?pretty=anything_else is compact", func(t *testing.T) {
+		st := &stubStore{
+			events:     []store.Event{{ID: "e1"}},
+			nextCursor: "e1",
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/events?pretty=1")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.NotContains(t, string(body), "\n  ")
+		assert.True(t, json.Valid(body))
+	})
+}
+
+func TestPrettyPrint_ErrorResponses(t *testing.T) {
+	t.Run("?pretty=true indents error JSON", func(t *testing.T) {
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil),
+			"/events?limit=99999&pretty=true")
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Contains(t, string(body), "\n  ")
+		assert.True(t, json.Valid(body))
+		var e map[string]string
+		require.NoError(t, json.Unmarshal(body, &e))
+		assert.NotEmpty(t, e["error"])
+	})
+
+	t.Run("compact error when pretty not set", func(t *testing.T) {
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil),
+			"/events?limit=99999")
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.NotContains(t, string(body), "\n  ")
+		assert.True(t, json.Valid(body))
+	})
+}
+
+func TestPrettyPrint_HealthEndpoint(t *testing.T) {
+	t.Run("?pretty=true indents health response", func(t *testing.T) {
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil),
+			"/health?pretty=true")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Contains(t, string(body), "\n  ")
+		assert.True(t, json.Valid(body))
+	})
+}
+
+func TestPrettyPrint_VersionEndpoint(t *testing.T) {
+	t.Run("?pretty=true indents version response", func(t *testing.T) {
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil),
+			"/version?pretty=true")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Contains(t, string(body), "\n  ")
+		assert.True(t, json.Valid(body))
+	})
+}
+
+func TestPrettyPrint_CountEndpoint(t *testing.T) {
+	t.Run("?pretty=true indents count response", func(t *testing.T) {
+		st := &stubStore{totalCount: 5}
+		resp, body := doGet(t, newTestServer(st, nil),
+			"/events/count?pretty=true")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Contains(t, string(body), "\n  ")
+		assert.True(t, json.Valid(body))
+	})
+}
+
+func TestPrettyPrint_StatsEndpoint(t *testing.T) {
+	t.Run("?pretty=true indents stats response", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{TotalEvents: 42}}
+		resp, body := doGet(t, newTestServer(st, nil),
+			"/stats?pretty=true")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Contains(t, string(body), "\n  ")
+		assert.True(t, json.Valid(body))
+	})
+}
+
+func TestPrettyPrint_SingleEventEndpoint(t *testing.T) {
+	t.Run("?pretty=true indents single event response", func(t *testing.T) {
+		st := &stubStore{event: store.Event{
+			ID:         "0000000001-0000000001",
+			ContractID: testContract,
+			Ledger:     1,
+			Type:       "contract",
+			TxHash:     "abc",
+			TxIndex:    0,
+			OpIndex:    0,
+			CreatedAt:  time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC),
+		}}
+		resp, body := doGet(t, newTestServer(st, nil),
+			"/events/0000000001-0000000001?pretty=true")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Contains(t, string(body), "\n  ")
+		assert.True(t, json.Valid(body))
+	})
+}
+
+func TestPrettyPrint_StreamNDJSONUnaffected(t *testing.T) {
+	// NDJSON streaming must NOT be pretty-printed: each line must stay
+	// a single compact JSON object, newline-delimited.
+	st := &stubStore{
+		events: []store.Event{
+			{ID: "e1", TxHash: "abc"},
+			{ID: "e2", TxHash: "def"},
+		},
+	}
+	resp, body := doGet(t, newTestServer(st, nil),
+		"/events?stream=true&pretty=true")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "application/x-ndjson", resp.Header.Get("Content-Type"))
+	// Each line must be a compact JSON object.
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	assert.Len(t, lines, 2)
+	for _, line := range lines {
+		assert.True(t, json.Valid([]byte(line)))
+		assert.NotContains(t, line, "  ", "NDJSON lines must stay compact even with ?pretty=true")
+	}
+}
