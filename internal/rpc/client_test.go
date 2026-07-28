@@ -6,7 +6,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -136,4 +139,46 @@ func TestGetHealthAndLatestLedger(t *testing.T) {
 	l, err := c.GetLatestLedger(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, uint32(500), l.Sequence)
+}
+
+// TestIntervalLimiter_SerializesParallelCalls is issue #4's acceptance
+// criterion: "The existing rate limiter still governs total request rate
+// (~10/s to match public endpoint limits) — parallelism must not bypass it."
+//
+// In production the ingester fans batches out via errgroup.SetLimit
+// (SWEEP_CONCURRENCY). Each goroutine still issues its GetEvents
+// through the same HTTPClient, whose call() invokes the limiter's
+// Wait() before the HTTP round trip. This test exercises that same
+// limiter directly: N goroutines each call Wait() concurrently, the
+// limiter must space them at the configured interval, so total elapsed
+// time stays serialization-bound (≥ (N-1) * interval), not
+// parallel-bound (~ interval). Without this guarantee, raising
+// SWEEP_CONCURRENCY would effectively raise the request rate past the
+// 10 req/s public ceiling.
+func TestIntervalLimiter_SerializesParallelCalls(t *testing.T) {
+	const interval = 50 * time.Millisecond
+	const goroutines = 4
+	l := newIntervalLimiter(interval)
+
+	var wg sync.WaitGroup
+	starts := make([]time.Time, goroutines)
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			if err := l.Wait(context.Background()); err != nil {
+				t.Errorf("limiter wait: %v", err)
+			}
+			starts[i] = time.Now()
+		}()
+	}
+	wg.Wait()
+
+	sort.Slice(starts, func(i, j int) bool { return starts[i].Before(starts[j]) })
+	for i := 1; i < len(starts); i++ {
+		gap := starts[i].Sub(starts[i-1])
+		assert.GreaterOrEqual(t, gap, interval-5*time.Millisecond,
+			"calls %d→%d elapsed=%v must be ≥ %v (interval)", i-1, i, gap, interval)
+	}
 }

@@ -11,7 +11,7 @@ import (
 	"github.com/stellar/go/strkey"
 	"github.com/stellar/go/xdr"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/rpc"
 )
 
 // WasmCustomSectionName is the custom Wasm section name that carries the
@@ -182,7 +182,7 @@ func (f *Fetcher) fetchAndParseWasmSpec(ctx context.Context, wasmHash string) (*
 		return nil, fmt.Errorf("decoding contract code entry: %w", err)
 	}
 
-	wasmBytes := []byte(codeEntry.Data.ContractCode.Code)
+	wasmBytes := codeEntry.Data.ContractCode.Code
 	if len(wasmBytes) == 0 {
 		return nil, fmt.Errorf("empty wasm blob for hash %s", wasmHash)
 	}
@@ -378,13 +378,13 @@ func convertScSpecEntry(entry xdr.ScSpecEntry) []EventSpec {
 			return nil
 		}
 		ev := EventSpec{
-			Name: string(entry.UdtStructV0.Name),
-			Doc:  string(entry.UdtStructV0.Doc),
+			Name: entry.UdtStructV0.Name,
+			Doc:  entry.UdtStructV0.Doc,
 		}
 		if entry.UdtStructV0.Fields != nil {
 			for _, f := range entry.UdtStructV0.Fields {
 				ev.TopicSpecs = append(ev.TopicSpecs, FieldSpec{
-					Name: string(f.Name),
+					Name: f.Name,
 					Type: typeDefName(f.Type),
 				})
 			}
