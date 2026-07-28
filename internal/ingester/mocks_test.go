@@ -18,11 +18,15 @@ type mockRPC struct {
 	eventsResps    []rpc.GetEventsResponse
 	eventsErrs     []error
 	eventsRequests []rpc.GetEventsRequest
+	// firstCycle, when non-nil, receives on the FIRST GetEvents call.
+	// Tests that need a "first cycle completed" signal without reading
+	// eventsRequests directly (which would race with the writer under
+	// -race) pass a buffered channel here.
+	firstCycle chan struct{}
 }
 
 func (m *mockRPC) GetEvents(_ context.Context, req rpc.GetEventsRequest) (rpc.GetEventsResponse, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.eventsRequests = append(m.eventsRequests, req)
 	i := len(m.eventsRequests) - 1
 	var err error
@@ -32,6 +36,14 @@ func (m *mockRPC) GetEvents(_ context.Context, req rpc.GetEventsRequest) (rpc.Ge
 	var resp rpc.GetEventsResponse
 	if i < len(m.eventsResps) {
 		resp = m.eventsResps[i]
+	}
+	firstCycle := m.firstCycle
+	m.mu.Unlock()
+	if firstCycle != nil && i == 0 {
+		select {
+		case firstCycle <- struct{}{}:
+		default:
+		}
 	}
 	return resp, err
 }

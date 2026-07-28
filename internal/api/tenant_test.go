@@ -364,6 +364,21 @@ func TestCrossTenantLeakMatrix(t *testing.T) {
 			wantStatus: http.StatusForbidden,
 		},
 		{
+			// A bulk export is the highest-volume read there is, so it is
+			// the worst place for the scope to go missing.
+			name:        "export of own contract",
+			path:        "/contracts/" + contractA + "/export?from_ledger=1&to_ledger=1000",
+			wantStatus:  http.StatusOK,
+			wantVisible: []string{"ev-a1", "ev-a2"},
+			wantHidden:  []string{"ev-b1", "ev-c1"},
+		},
+		{
+			name:       "export of another tenant's contract is refused",
+			path:       "/contracts/" + contractB + "/export?from_ledger=1&to_ledger=1000",
+			wantStatus: http.StatusForbidden,
+			wantHidden: []string{"ev-b1"},
+		},
+		{
 			name:       "decoded view is filtered too",
 			path:       "/events?decoded=true",
 			wantStatus: http.StatusOK,
@@ -451,6 +466,7 @@ func TestScopeReachesTheStore(t *testing.T) {
 		"/events",
 		"/events/count",
 		"/contracts/" + contractA + "/events",
+		"/contracts/" + contractA + "/export?from_ledger=1&to_ledger=1000",
 		"/events/ev-a1",
 		"/stats",
 	} {
