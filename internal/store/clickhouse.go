@@ -82,6 +82,10 @@ func (c *ClickHouse) GetEvent(ctx context.Context, id string) (Event, error) {
 	return Event{}, ErrNotFound
 }
 
+func (c *ClickHouse) GetEventsByTxHash(ctx context.Context, txHash, excludeID string) ([]Event, error) {
+	return nil, nil
+}
+
 func (c *ClickHouse) EventExists(ctx context.Context, id string) (bool, error) {
 	return false, nil
 }
