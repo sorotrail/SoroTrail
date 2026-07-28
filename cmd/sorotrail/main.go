@@ -158,7 +158,10 @@ func run() error {
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
-	api.SetIngester(ing)
+	// Wire the same store as the dead-letter sink: events that fail to
+	// decode/persist land in the dead_letters table instead of
+	// stalling the cycle (issue #131).
+	ing.SetDeadLetterSink(st)
 
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a
@@ -194,10 +197,17 @@ func run() error {
 		SlowQueryThreshold: cfg.APISlowQueryThreshold,
 		Logger:             log,
 	})
+	api.SetMaxLimit(cfg.APIMaxLimit)
+
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
+	apiServer.SetCORSConfig(api.CORSConfig{
+		AllowedOrigins: cfg.CORSAllowedOrigins,
+		AllowedMethods: cfg.CORSAllowedMethods,
+		AllowedHeaders: cfg.CORSAllowedHeaders,
+	})
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
