@@ -154,11 +154,19 @@ func scopeFrom(ctx context.Context) store.Scope {
 	return p.Scope
 }
 
-// publicPaths bypass authentication even in multi-tenant mode. /health is
-// polled by orchestrators that hold no credential, and it reports only
-// liveness of the process and its dependencies — no tenant data.
+// publicPaths bypass authentication even in multi-tenant mode. These are
+// polled by orchestrators that hold no credential, and they report only
+// liveness/readiness of the process and its dependencies — no tenant data.
+//
+// /livez and /readyz belong here for a concrete operational reason: a
+// kubelet probe carries no API key, so gating them would leave the pod
+// failing readiness forever the moment MULTI_TENANT is turned on. They
+// are also the only endpoints where a 401 is indistinguishable from a
+// genuinely unhealthy process.
 var publicPaths = map[string]bool{
 	"/health": true,
+	"/livez":  true,
+	"/readyz": true,
 }
 
 // authenticate resolves the request's principal and rejects unauthenticated

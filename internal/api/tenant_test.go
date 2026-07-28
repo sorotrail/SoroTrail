@@ -379,6 +379,15 @@ func TestCrossTenantLeakMatrix(t *testing.T) {
 			wantHidden: []string{"ev-b1"},
 		},
 		{
+			// The raw view is a second projection of the same row, so it
+			// needs the same 404 — otherwise it reads bodies /events/{id}
+			// refuses.
+			name:       "another tenant's event raw XDR is indistinguishable from absent",
+			path:       "/events/ev-b1/raw",
+			wantStatus: http.StatusNotFound,
+			wantHidden: []string{contractB},
+		},
+		{
 			name:       "decoded view is filtered too",
 			path:       "/events?decoded=true",
 			wantStatus: http.StatusOK,
@@ -455,6 +464,21 @@ func TestTenantWithNoGrantsSeesNothing(t *testing.T) {
 
 	rec = f.get(t, f.keyNone, "/events/ev-a1")
 	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// Orchestrator probes carry no credential. If enabling MULTI_TENANT gated
+// them, every pod would fail readiness on rollout and the deployment would
+// stall — a failure that looks like an unhealthy process rather than a
+// misconfigured one. They expose no tenant data, so they stay open.
+func TestProbesStayPublicInMultiTenantMode(t *testing.T) {
+	f := newTenantFixture(t)
+	for _, path := range []string{"/health", "/livez", "/readyz"} {
+		t.Run(path, func(t *testing.T) {
+			rec := f.get(t, "", path) // no API key at all
+			assert.NotEqual(t, http.StatusUnauthorized, rec.Code,
+				"%s must not require a credential", path)
+		})
+	}
 }
 
 // The scope must actually reach the store. Asserting on bodies alone would
