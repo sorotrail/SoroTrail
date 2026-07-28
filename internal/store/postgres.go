@@ -682,8 +682,11 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 				(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
 				(SELECT coalesce(min(ledger), 0) FROM events),
 				(SELECT count(DISTINCT contract_id) FROM events),
-				(SELECT count(*) FROM watched_contracts)`,
-		).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
+				(SELECT count(*) FROM watched_contracts),
+				(SELECT coalesce(sum(pg_total_relation_size(inhrelid)), 0)
+				 FROM pg_inherits
+				 WHERE inhparent = 'events'::regclass)`,
+		).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts, &s.TableSizeBytes)
 	})
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
