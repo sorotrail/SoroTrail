@@ -3,11 +3,70 @@ package ingester
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
+
+// scriptedRPC scripts getEvents responses by the cursor value the
+// request carries. The key "" (empty cursor) is the first-call response —
+// the one for a cold start or a warm resume with no pagination cursor yet.
+// Subsequent pages are keyed by the Cursor they expect to see on the
+// inbound request, mirroring how the ingester's singlePage / windowSweep
+// resume pagination: the Cursor field on page N is the cursor the
+// ingester sends for page N+1.
+//
+// Use it in tests that need to express a deterministic N-page sequence
+// in a single literal, rather than threading an eventsResps slice and
+// counting call indices. The map shape also documents the resume
+// relationship at a glance — every page key (except the first) is a
+// Cursor value some prior page returned.
+//
+// Calls are recorded in order; an error is returned for unknown
+// cursors so a missed entry surfaces as a test failure rather than a
+// silent empty page that would pass.
+type scriptedRPC struct {
+	mu     sync.Mutex
+	health rpc.Health
+	// pages is the cursor → response mapping. The "" key answers the
+	// first call.
+	pages map[string]rpc.GetEventsResponse
+	// calls records every GetEvents request received, in order.
+	calls []rpc.GetEventsRequest
+}
+
+func newScriptedRPC(pages map[string]rpc.GetEventsResponse) *scriptedRPC {
+	return &scriptedRPC{pages: pages}
+}
+
+func (m *scriptedRPC) GetEvents(_ context.Context, req rpc.GetEventsRequest) (rpc.GetEventsResponse, error) {
+	m.mu.Lock()
+	m.calls = append(m.calls, req)
+	var cursor string
+	if req.Pagination != nil {
+		cursor = req.Pagination.Cursor
+	}
+	resp, ok := m.pages[cursor]
+	m.mu.Unlock()
+	if !ok {
+		return rpc.GetEventsResponse{}, fmt.Errorf("scriptedRPC: no page scripted for cursor %q", cursor)
+	}
+	return resp, nil
+}
+
+func (m *scriptedRPC) GetLatestLedger(context.Context) (rpc.LatestLedger, error) {
+	return rpc.LatestLedger{Sequence: m.health.LatestLedger}, nil
+}
+
+func (m *scriptedRPC) GetHealth(context.Context) (rpc.Health, error) {
+	return m.health, nil
+}
+
+func (m *scriptedRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+	return rpc.GetLedgerEntriesResponse{}, nil
+}
 
 // mockRPC scripts getEvents responses in order and records the requests it
 // received.
@@ -18,11 +77,15 @@ type mockRPC struct {
 	eventsResps    []rpc.GetEventsResponse
 	eventsErrs     []error
 	eventsRequests []rpc.GetEventsRequest
+	// firstCycle, when non-nil, receives on the FIRST GetEvents call.
+	// Tests that need a "first cycle completed" signal without reading
+	// eventsRequests directly (which would race with the writer under
+	// -race) pass a buffered channel here.
+	firstCycle chan struct{}
 }
 
 func (m *mockRPC) GetEvents(_ context.Context, req rpc.GetEventsRequest) (rpc.GetEventsResponse, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.eventsRequests = append(m.eventsRequests, req)
 	i := len(m.eventsRequests) - 1
 	var err error
@@ -32,6 +95,14 @@ func (m *mockRPC) GetEvents(_ context.Context, req rpc.GetEventsRequest) (rpc.Ge
 	var resp rpc.GetEventsResponse
 	if i < len(m.eventsResps) {
 		resp = m.eventsResps[i]
+	}
+	firstCycle := m.firstCycle
+	m.mu.Unlock()
+	if firstCycle != nil && i == 0 {
+		select {
+		case firstCycle <- struct{}{}:
+		default:
+		}
 	}
 	return resp, err
 }
@@ -50,11 +121,12 @@ func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest)
 
 // mockStore is an in-memory Store.
 type mockStore struct {
-	mu       sync.Mutex
-	events   map[string]store.Event
-	state    *store.IngestionState
-	watched  []string
-	upserted [][]store.Event
+	mu          sync.Mutex
+	events      map[string]store.Event
+	state       *store.IngestionState
+	watched     []store.WatchedContract
+	upserted    [][]store.Event
+	deadLetters []store.DeadLetterInput
 }
 
 func newMockStore() *mockStore {
@@ -99,6 +171,18 @@ func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) 
 	return e, nil
 }
 
+func (m *mockStore) GetEventsByTxHash(_ context.Context, txHash, excludeID string) ([]store.Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []store.Event
+	for _, e := range m.events {
+		if e.TxHash == txHash && e.ID != excludeID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
 // EventExists is the cheap existence probe added to the Store interface
 // for the API's 304 path. Unused by ingester tests but needed to
 // satisfy the interface.
@@ -111,6 +195,10 @@ func (m *mockStore) EventExists(_ context.Context, id string) (bool, error) {
 
 func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Event, string, error) {
 	return nil, "", nil
+}
+
+func (m *mockStore) CountEvents(context.Context, store.EventFilter) (int64, error) {
+	return 0, nil
 }
 
 // LedgerRangeCensus is unused by ingester tests but needed to satisfy
@@ -158,13 +246,23 @@ func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState
 	return nil
 }
 
-func (m *mockStore) ListWatchedContracts(context.Context) ([]string, error) {
+func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return m.watched, nil
 }
 
 func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
-	m.watched = append(m.watched, id)
+	m.watched = append(m.watched, store.WatchedContract{ContractID: id})
 	return nil
+}
+
+func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
+	for i, wc := range m.watched {
+		if wc.ContractID == id {
+			m.watched = append(m.watched[:i], m.watched[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrNotFound
 }
 
 func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
@@ -183,9 +281,7 @@ func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription
 func (m *mockStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
 	return store.Subscription{}, store.ErrNotFound
 }
-func (m *mockStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
-	return nil, nil
-}
+func (m *mockStore) ListSubscriptions(context.Context) ([]store.Subscription, error) { return nil, nil }
 func (m *mockStore) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
 	return sub, nil
 }
@@ -204,6 +300,26 @@ func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
+
+func (m *mockStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
+	return 0, nil
+}
+func (m *mockStore) DeadLetterEvent(_ context.Context, in store.DeadLetterInput) (store.DeadLetter, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deadLetters = append(m.deadLetters, in)
+	return store.DeadLetter{ID: int64(len(m.deadLetters)), EventID: in.EventID, ContractID: in.ContractID, Ledger: in.Ledger, Type: in.Type, TxHash: in.TxHash, TopicXDR: in.TopicXDR, ValueXDR: in.ValueXDR, Error: in.Err.Error()}, nil
+}
+func (m *mockStore) ListDeadLetters(context.Context, string, int, string) ([]store.DeadLetter, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, error) {
+	return store.DeadLetter{}, store.ErrNotFound
+}
+func (m *mockStore) DeleteDeadLetter(context.Context, int64) error { return nil }
 
 // passthroughDecoder avoids XDR fixtures in ingester tests.
 type passthroughDecoder struct{}
