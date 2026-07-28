@@ -64,21 +64,6 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // value_xdr are never silently dropped on the way in; a repair that
 // arrives without XDR preserves what was already stored via the coalesce()
 // clauses in the UPDATE branch (`sorotrail replay` relies on that).
-//
-// onUpdate=false → ON CONFLICT DO NOTHING (idempotent ingest);
-// onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
-// topic/value drift on the RPC side).
-func onConflictClause(update bool) string {
-	if update {
-		return `ON CONFLICT (ledger, id) DO UPDATE SET
-			topics             = EXCLUDED.topics,
-			value              = EXCLUDED.value,
-			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
-			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
-	}
-	return `ON CONFLICT (ledger, id) DO NOTHING`
-}
-
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
 	if onUpdate {
@@ -598,9 +583,6 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 		// Direct containment — caller controls the shape (object wrapped in
 		// array for element match, multi-element arrays for subset match).
 		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
-	}
-	if f.TxHash != "" {
-		where = append(where, "tx_hash = "+arg(f.TxHash))
 	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))
