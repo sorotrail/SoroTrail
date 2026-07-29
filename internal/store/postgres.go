@@ -1469,3 +1469,166 @@ func scanEvent(row pgx.Row) (Event, error) {
 	}
 	return e, nil
 }
+
+// UpsertAddressRefs inserts address→event index rows idempotently.
+// Duplicate (address, event_id, role) combinations are silently ignored
+// by the ON CONFLICT DO NOTHING clause, so re-ingesting an event never
+// duplicates its address rows.
+func (p *Postgres) UpsertAddressRefs(ctx context.Context, refs []AddressRef) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, r := range refs {
+		batch.Queue(`
+			INSERT INTO event_addresses (address, event_id, role)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (address, event_id, role) DO NOTHING`,
+			r.Address, r.EventID, r.Role)
+	}
+	results := p.pool.SendBatch(ctx, batch)
+	defer results.Close()
+	for range refs {
+		if _, err := results.Exec(); err != nil {
+			return fmt.Errorf("upserting address refs: %w", err)
+		}
+	}
+	return nil
+}
+
+// QueryAddressEvents returns events involving the given address, in
+// chronological order (by event_id), cursor-paginated. Supports the same
+// filter params as the main events listing (contract_id, type, ledger range
+// via from_ledger/to_ledger).
+func (p *Postgres) QueryAddressEvents(ctx context.Context, address string, f EventFilter) ([]Event, string, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+
+	var (
+		where []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	// Join with event_addresses to find events for this address.
+	where = append(where, "ea.address = "+arg(address))
+	where = append(where, "e.id = ea.event_id")
+
+	if f.ContractID != "" {
+		where = append(where, "e.contract_id = "+arg(f.ContractID))
+	}
+	if len(f.Types) > 0 {
+		where = append(where, "e.type = ANY("+arg(f.Types)+")")
+	}
+	if f.FromLedger > 0 {
+		where = append(where, "e.ledger >= "+arg(f.FromLedger))
+	}
+	if f.ToLedger > 0 {
+		where = append(where, "e.ledger <= "+arg(f.ToLedger))
+	}
+
+	// Cursor: event_id-based pagination (paging by event ID in chronological order).
+	orderDir := "ASC"
+	cursorOp := ">"
+	if f.Order == "desc" {
+		orderDir = "DESC"
+		cursorOp = "<"
+	}
+	orderCols := "e.id " + orderDir
+
+	if f.Cursor != "" {
+		where = append(where, "e.id "+cursorOp+" "+arg(f.Cursor))
+	}
+
+	query := `SELECT ` + eventColumns + `
+		FROM events e
+		INNER JOIN event_addresses ea ON ea.event_id = e.id`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY " + orderCols + " LIMIT " + arg(limit+1)
+
+	var events []Event
+	next := ""
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("querying address events for %s: %w", address, err)
+		}
+		defer rows.Close()
+
+		events = make([]Event, 0, limit)
+		for rows.Next() {
+			e, err := scanEvent(rows)
+			if err != nil {
+				return err
+			}
+			events = append(events, e)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("reading address events: %w", err)
+		}
+
+		if len(events) > limit {
+			events = events[:limit]
+			next = events[limit-1].ID
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return events, next, nil
+}
+
+// CountAddressEvents returns the total number of events involving the given
+// address (ignoring pagination).
+func (p *Postgres) CountAddressEvents(ctx context.Context, address string) (int64, error) {
+	var total int64
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT count(*) FROM events e
+			INNER JOIN event_addresses ea ON ea.event_id = e.id
+			WHERE ea.address = $1`, address,
+		).Scan(&total)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("counting address events for %s: %w", address, err)
+	}
+	return total, nil
+}
+
+// GetAddressSummary returns aggregate information about an address\'s event
+// history: first/last seen ledger, total event count, and distinct contracts
+// interacted with.
+func (p *Postgres) GetAddressSummary(ctx context.Context, address string) (AddressSummary, error) {
+	var s AddressSummary
+	s.Address = address
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT
+				min(e.ledger),
+				max(e.ledger),
+				count(*),
+				array_agg(DISTINCT e.contract_id ORDER BY e.contract_id) FILTER (WHERE e.contract_id IS NOT NULL)
+			FROM events e
+			INNER JOIN event_addresses ea ON ea.event_id = e.id
+			WHERE ea.address = $1`, address,
+		).Scan(&s.FirstSeenLedger, &s.LastSeenLedger, &s.EventCount, &s.DistinctContracts)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return s, ErrNotFound
+	}
+	if err != nil {
+		return AddressSummary{}, fmt.Errorf("loading address summary for %s: %w", address, err)
+	}
+	return s, nil
+}

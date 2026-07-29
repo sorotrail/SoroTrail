@@ -1278,6 +1278,93 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 		ModeTransition:   modeTransition,
 	})
 }
+
+// handleAddressEvents returns events involving the given address,
+// chronologically ordered, cursor-paginated.
+func (s *Server) handleAddressEvents(w http.ResponseWriter, r *http.Request) {
+	address := chi.URLParam(r, "address")
+	if !isValidAddress(address) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid address %q (want G... or C... strkey)", address))
+		return
+	}
+
+	filter, _, err := parseFilterAndFields(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// Address events are always ordered by event_id.
+	if filter.OrderBy != "" && filter.OrderBy != store.OrderByID {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("address events only support order_by=id (the default)"))
+		return
+	}
+
+	events, cursor, qerr := s.store.QueryAddressEvents(r.Context(), address, filter)
+	if qerr != nil {
+		loggerFromContext(r.Context()).Error("querying address events", "address", address, "error", qerr)
+		writeError(w, http.StatusInternalServerError, errors.New("querying address events failed"))
+		return
+	}
+
+	// Total matching count header.
+	if total, cerr := s.store.CountAddressEvents(r.Context(), address); cerr != nil {
+		loggerFromContext(r.Context()).Warn("counting address events", "error", cerr)
+	} else {
+		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, addressEventsResponse{Events: events, Cursor: cursor})
+}
+
+// handleAddressSummary returns aggregate information about an address's
+// event history.
+func (s *Server) handleAddressSummary(w http.ResponseWriter, r *http.Request) {
+	address := chi.URLParam(r, "address")
+	if !isValidAddress(address) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid address %q (want G... or C... strkey)", address))
+		return
+	}
+
+	summary, err := s.store.GetAddressSummary(r.Context(), address)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("address %q not found", address))
+		return
+	}
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading address summary", "address", address, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading address summary failed"))
+		return
+	}
+
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, summary)
+}
+
+// isValidAddress checks if the string looks like a Stellar strkey (G... or C..., 56 chars).
+func isValidAddress(s string) bool {
+	if len(s) != 56 {
+		return false
+	}
+	prefix := s[0]
+	if prefix != 'G' && prefix != 'C' {
+		return false
+	}
+	for _, r := range s[1:] {
+		if (r < 'A' || r > 'Z') && (r < '2' || r > '7') {
+			return false
+		}
+	}
+	return true
+}
+
+// addressEventsResponse is the response shape for GET /addresses/{address}/events.
+type addressEventsResponse struct {
+	Events []store.Event `json:"events"`
+	Cursor string        `json:"cursor,omitempty"`
+}
+
 func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
 	if s.rpc == nil {
 		return
