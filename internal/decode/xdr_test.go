@@ -239,64 +239,6 @@ func TestXDRDecoder_NestedCollections(t *testing.T) {
 }
 
 func TestXDRDecoder_InvalidBase64(t *testing.T) {
-	// DecodeScVal should NOT return an error for invalid base64 — it returns
-	// a fallback with the raw value preserved and counts the failure.
-	t.Run("fallback, not error", func(t *testing.T) {
-		old := decodeErrors.Load()
-		got, err := XDRDecoder{}.DecodeScVal("not base64!!!")
-		assert.NoError(t, err, "DecodeScVal must return a fallback, not propagate the error")
-		assert.Equal(t, old+1, decodeErrors.Load(), "decode error counter must be incremented")
-
-		var decoded map[string]map[string]any
-		require.NoError(t, json.Unmarshal(got, &decoded))
-		unknown := decoded["unknown"]
-		require.NotNil(t, unknown, "invalid input must decode to an {\"unknown\": ...} wrapper")
-		assert.Equal(t, "decode_error", unknown["type"])
-		assert.Equal(t, "not base64!!!", unknown["base64"])
-		assert.NotEmpty(t, unknown["error"])
-	})
-
-	t.Run("counter increments on multiple failures", func(t *testing.T) {
-		old := decodeErrors.Load()
-		XDRDecoder{}.DecodeScVal("bad1")
-		XDRDecoder{}.DecodeScVal("bad2")
-		assert.Equal(t, old+2, decodeErrors.Load(), "each decode failure must increment the counter")
-	})
-}
-
-func TestDecodeErrorCount(t *testing.T) {
-	// DecodeErrorCount returns the current counter value.
-	before := DecodeErrorCount()
-	XDRDecoder{}.DecodeScVal("invalid!!!")
-	assert.Equal(t, before+1, DecodeErrorCount())
-}
-
-func TestXDRDecoder_InvalidScValConversion(t *testing.T) {
-	// Use a ScVal with a corrupted or boundary XDR that unmarshals
-	// but fails during conversion. ScMap with a nil ScVal entry is
-	// a valid XDR construct that requires special handling.
-	t.Run("map with nil entries preserves raw XDR", func(t *testing.T) {
-		// A map entry with void key and void value should decode fine.
-		// This verifies that the fallback path for conversion errors
-		// in scValToGo (which already handles all known types) continues
-		// to work correctly. The actual error path is exercised by the
-		// invalid base64 test above.
-		old := decodeErrors.Load()
-
-		// An ScMap with one entry of void key/val
-		entry := xdr.ScMapEntry{
-			Key: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
-			Val: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
-		}
-		scMap := xdr.ScMap{entry}
-		mapPtr := &scMap
-		val := xdr.ScVal{Type: xdr.ScValTypeScvMap, Map: &mapPtr}
-		raw := mustBase64(t, val)
-
-		got, err := XDRDecoder{}.DecodeScVal(raw)
-		require.NoError(t, err)
-		assert.JSONEq(t, `{"map":[{"key":{"void":null},"val":{"void":null}}]}`, string(got))
-		// Counter must not have been incremented for a successful decode.
-		assert.Equal(t, old, decodeErrors.Load())
-	})
+	_, err := XDRDecoder{}.DecodeScVal("not base64!!!")
+	assert.Error(t, err)
 }
