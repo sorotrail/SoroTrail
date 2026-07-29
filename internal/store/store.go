@@ -117,9 +117,6 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	// TopicCount filters events whose topics array has exactly this length.
-	// Nil means no constraint; zero matches events with no topics.
-	TopicCount *int
 	// HasValue filters events by whether they carry a value payload.
 	// nil means no constraint; true means value IS NOT NULL;
 	// false means value IS NULL.

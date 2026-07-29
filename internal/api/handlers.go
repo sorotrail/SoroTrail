@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1479,7 +1478,6 @@ func listETag(f store.EventFilter) string {
 		TopicContains    json.RawMessage `json:"pc,omitempty"`
 		TxHash           string          `json:"th,omitempty"`
 		HasValue         *bool           `json:"hv,omitempty"`
-		TopicCount       *int            `json:"tc,omitempty"`
 		TxIndex          *int32          `json:"txi,omitempty"`
 		OpIndex          *int32          `json:"opi,omitempty"`
 		FromLedger       int64           `json:"fl"`
@@ -1511,7 +1509,6 @@ func listETag(f store.EventFilter) string {
 		TopicContains: f.TopicContains,
 		TxHash:        f.TxHash,
 		HasValue:      f.HasValue,
-		TopicCount:    f.TopicCount,
 		TxIndex:       f.TxIndex,
 		OpIndex:       f.OpIndex,
 		FromLedger:    f.FromLedger,
@@ -1665,44 +1662,8 @@ func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 // (nil = unset) where a bare &true is not valid Go.
 func ptr[T any](v T) *T { return &v }
 
-// namedParam carries a query value together with the spelling the caller
-// actually used, so an error message names the parameter they typed.
-type namedParam struct {
-	name  string
-	value string
-}
-
-// timeParamAlias resolves a parameter that accepts two spellings. Passing
-// both is an error: they bound the same column, so honouring one silently
-// would make the ignored value look effective.
-func timeParamAlias(q url.Values, primary, alias string) (namedParam, error) {
-	pv, av := q.Get(primary), q.Get(alias)
-	if pv != "" && av != "" {
-		return namedParam{}, fmt.Errorf("%s and %s are aliases; set only one", primary, alias)
-	}
-	if av != "" {
-		return namedParam{name: alias, value: av}, nil
-	}
-	return namedParam{name: primary, value: pv}, nil
-}
-
-// parseTopicCountParam parses ?topic_count=. An empty value means "no
-// constraint"; zero is a real filter (events with no topics at all), so
-// the result is a pointer rather than relying on a zero value.
-func parseTopicCountParam(raw string) (*int, error) {
-	if raw == "" {
-		return nil, nil
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n < 0 {
-		return nil, fmt.Errorf("topic_count must be a non-negative integer")
-	}
-	return &n, nil
-}
-
 // filterFromQuery parses the shared event-filter query params:
-// contract_id, type, topic, from_ledger, to_ledger, from_time (alias
-// created_after), to_time (alias created_before), cursor, limit.
+// contract_id, type, topic, from_ledger, to_ledger, from_time, to_time, cursor, limit.
 //
 // It is also the one place a list-shaped read acquires its authorization.
 // Every endpoint that returns events builds its filter here, so the tenant
@@ -1730,24 +1691,11 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return store.EventFilter{}, fmt.Errorf("to_ledger %s", err.Error())
 	}
 
-	// created_after / created_before are aliases for from_time / to_time:
-	// both bound events.created_at. The alias reads more naturally next to
-	// the created_at field it filters, and callers already using the
-	// original names are unaffected. Supplying both spellings of the same
-	// bound is rejected rather than silently picking one.
-	fromTimeRaw, err := timeParamAlias(q, "from_time", "created_after")
-	if err != nil {
-		return store.EventFilter{}, err
+	if fromTime, err = queries.ParseTimeParam(q.Get("from_time")); err != nil {
+		return store.EventFilter{}, fmt.Errorf("from_time %s", err.Error())
 	}
-	toTimeRaw, err := timeParamAlias(q, "to_time", "created_before")
-	if err != nil {
-		return store.EventFilter{}, err
-	}
-	if fromTime, err = queries.ParseTimeParam(fromTimeRaw.value); err != nil {
-		return store.EventFilter{}, fmt.Errorf("%s %s", fromTimeRaw.name, err.Error())
-	}
-	if toTime, err = queries.ParseTimeParam(toTimeRaw.value); err != nil {
-		return store.EventFilter{}, fmt.Errorf("%s %s", toTimeRaw.name, err.Error())
+	if toTime, err = queries.ParseTimeParam(q.Get("to_time")); err != nil {
+		return store.EventFilter{}, fmt.Errorf("to_time %s", err.Error())
 	}
 
 	types, err := queries.ParseTypes(q.Get("type"))
@@ -1893,10 +1841,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		}
 		f.Order = "desc"
 		f.Limit = n
-	}
-
-	if f.TopicCount, err = parseTopicCountParam(q.Get("topic_count")); err != nil {
-		return f, err
 	}
 
 	if raw := q.Get("has_value"); raw != "" {
