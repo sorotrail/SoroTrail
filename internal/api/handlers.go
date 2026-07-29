@@ -1380,8 +1380,9 @@ func listETag(f store.EventFilter) string {
 	// full one-year max-age. TestListETag_CoversEveryFilterField enumerates
 	// the fields independently and fails when a new one is not added.
 	key := struct {
-		ContractID    string          `json:"c"`
-		Types         []string        `json:"t"`
+		ContractID       string          `json:"c"`
+		ContractIDPrefix string          `json:"cp,omitempty"`
+		Types            []string        `json:"t"`
 		Topic         json.RawMessage `json:"p,omitempty"`
 		Topic0        json.RawMessage `json:"p0,omitempty"`
 		Topic1        json.RawMessage `json:"p1,omitempty"`
@@ -1405,8 +1406,9 @@ func listETag(f store.EventFilter) string {
 		// server, with no CDN involved.
 		Scope string `json:"s"`
 	}{
-		ContractID: f.ContractID,
-		Types:      f.Types,
+		ContractID:       f.ContractID,
+		ContractIDPrefix: f.ContractIDPrefix,
+		Types:            f.Types,
 		Topic:      f.Topic,
 		// Each positional filter gets its own distinctly named key, so
 		// topic0={x} and topic1={x} — which select different events — cannot
@@ -1636,8 +1638,9 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 
 	args := queries.EventFilterArgs{
-		ContractID:    q.Get("contract_id"),
-		Types:         types,
+		ContractID:       q.Get("contract_id"),
+		ContractIDPrefix: q.Get("contract_id_prefix"),
+		Types:            types,
 		Topic:         topic,
 		T0:            t0,
 		T1:            t1,

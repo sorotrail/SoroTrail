@@ -28,8 +28,9 @@ import (
 // from "explicitly set to the zero value" (REST treats absent as absent;
 // GraphQL has nil semantics naturally).
 type EventFilterArgs struct {
-	ContractID    string
-	Types         []string
+	ContractID       string
+	ContractIDPrefix string
+	Types            []string
 	Topic         json.RawMessage
 	T0            json.RawMessage
 	T1            json.RawMessage
@@ -94,8 +95,9 @@ type CursorProbe struct {
 // [1, MaxPageSize] produce a validation error.
 func BuildEventFilter(args EventFilterArgs) (store.EventFilter, error) {
 	f := store.EventFilter{
-		ContractID:    args.ContractID,
-		Types:         args.Types,
+		ContractID:       args.ContractID,
+		ContractIDPrefix: args.ContractIDPrefix,
+		Types:            args.Types,
 		Topic:         args.Topic,
 		Topic0:        args.T0,
 		Topic1:        args.T1,
@@ -115,6 +117,9 @@ func BuildEventFilter(args EventFilterArgs) (store.EventFilter, error) {
 
 	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
 		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
+	}
+	if f.ContractIDPrefix != "" && f.ContractID != "" {
+		return f, errors.New("contract_id and contract_id_prefix cannot be combined")
 	}
 	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
 		return f, fmt.Errorf("invalid cursor %q", f.Cursor)

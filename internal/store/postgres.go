@@ -591,6 +591,9 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
+	if f.ContractIDPrefix != "" {
+		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
+	}
 	if len(f.Types) > 0 {
 		where = append(where, "type = ANY("+arg(f.Types)+")")
 	}
