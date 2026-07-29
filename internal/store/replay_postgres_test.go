@@ -24,12 +24,12 @@ func TestPostgres_RawXDRRoundTrip(t *testing.T) {
 	_, err := p.UpsertEvents(ctx, []Event{withXDR, legacy})
 	require.NoError(t, err)
 
-	got, err := p.GetEvent(ctx, withXDR.ID)
+	got, err := p.GetEvent(ctx, withXDR.ID, SystemScope())
 	require.NoError(t, err)
 	assert.Equal(t, withXDR.RawTopicXDR, got.RawTopicXDR)
 	assert.Equal(t, withXDR.RawValueXDR, got.RawValueXDR)
 
-	gotLegacy, err := p.GetEvent(ctx, legacy.ID)
+	gotLegacy, err := p.GetEvent(ctx, legacy.ID, SystemScope())
 	require.NoError(t, err)
 	assert.Empty(t, gotLegacy.RawTopicXDR)
 	assert.Empty(t, gotLegacy.RawValueXDR)
@@ -59,7 +59,7 @@ func TestPostgres_ReplaceEventsInRangeKeepsRawXDR(t *testing.T) {
 	repaired.RawValueXDR = "AAAACgAAAAAAAAAC"
 	require.NoError(t, p.ReplaceEventsInRange(ctx, []Event{repaired}, 100, 100))
 
-	got, err := p.GetEvent(ctx, original.ID)
+	got, err := p.GetEvent(ctx, original.ID, SystemScope())
 	require.NoError(t, err)
 	assert.Equal(t, "AAAACgAAAAAAAAAC", got.RawValueXDR)
 
@@ -69,7 +69,7 @@ func TestPostgres_ReplaceEventsInRangeKeepsRawXDR(t *testing.T) {
 	noXDR.RawTopicXDR, noXDR.RawValueXDR = nil, ""
 	require.NoError(t, p.ReplaceEventsInRange(ctx, []Event{noXDR}, 100, 100))
 
-	got, err = p.GetEvent(ctx, original.ID)
+	got, err = p.GetEvent(ctx, original.ID, SystemScope())
 	require.NoError(t, err)
 	assert.Equal(t, []string{"AAAADwAAAAh0cmFuc2Zlcg=="}, got.RawTopicXDR,
 		"a JSON-only repair must not strip stored raw XDR")
@@ -125,7 +125,7 @@ func TestPostgres_CommitReplayBatch(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	got, err := p.GetEvent(ctx, e.ID)
+	got, err := p.GetEvent(ctx, e.ID, SystemScope())
 	require.NoError(t, err)
 	assert.JSONEq(t, `[{"symbol":"mint"}]`, string(got.Topics))
 	assert.JSONEq(t, `{"i128":"42"}`, string(got.Value))
