@@ -63,13 +63,12 @@ type stubStore struct {
 	ingestion    store.IngestionState
 	ingestionErr error
 
-
-	migrationVersion int
-	migrationDirty   bool
-	migrationErr     error
-	listContractsResult []store.ContractSummary
-	listContractsCursor string
-	listContractsErr    error
+	migrationVersion     int
+	migrationDirty       bool
+	migrationErr         error
+	listContractsResult  []store.ContractSummary
+	listContractsCursor  string
+	listContractsErr     error
 	countContractsResult int64
 	countContractsErr    error
 }
@@ -496,16 +495,16 @@ func TestListEvents_TotalCountHeader(t *testing.T) {
 func TestListContracts(t *testing.T) {
 	t.Run("returns contracts with event counts", func(t *testing.T) {
 		st := &stubStore{
-			listContractsResult: []store.ContractEventCount{
-				{ContractID: testContract, EventCount: 10},
-				{ContractID: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", EventCount: 5},
+			listContractsResult: []store.ContractSummary{
+				{ContractID: testContract, EventCount: 10, FirstLedger: 1, LastLedger: 100},
+				{ContractID: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", EventCount: 5, FirstLedger: 10, LastLedger: 50},
 			},
 		}
 		s := newTestServer(st, nil)
 		resp, body := doGet(t, s, "/contracts")
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 
-		var out contractsResponse
+		var out contractListResponse
 		require.NoError(t, json.Unmarshal(body, &out))
 		require.Len(t, out.Contracts, 2)
 		assert.Equal(t, testContract, out.Contracts[0].ContractID)
@@ -521,10 +520,11 @@ func TestListContracts(t *testing.T) {
 		resp, body := doGet(t, s, "/contracts")
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 
-		var out contractsResponse
+		var out contractListResponse
 		require.NoError(t, json.Unmarshal(body, &out))
 		assert.Empty(t, out.Contracts)
 		assert.Equal(t, 0, out.Count)
+		assert.Empty(t, out.Cursor)
 		assert.Contains(t, string(body), `"contracts":[]`)
 	})
 
@@ -542,7 +542,7 @@ func TestListContracts(t *testing.T) {
 
 	t.Run("no-cache cache header", func(t *testing.T) {
 		st := &stubStore{
-			listContractsResult: []store.ContractEventCount{},
+			listContractsResult: []store.ContractSummary{},
 		}
 		s := newTestServer(st, nil)
 		resp, _ := doGet(t, s, "/contracts")
@@ -1963,12 +1963,6 @@ func TestGetEventTransaction_NoInterferenceWithGetEvent(t *testing.T) {
 	assert.Equal(t, "0001-0001", ev.ID)
 }
 
-func (m *stubStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
-	return nil, "", nil
-}
-func (m *stubStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
-	return 0, nil
-}
 func (m *stubStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
 	return store.DeadLetter{}, nil
 }
