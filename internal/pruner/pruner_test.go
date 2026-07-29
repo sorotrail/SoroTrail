@@ -10,11 +10,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // mockStore implements store.Store for testing the pruner.
 type mockStore struct {
+	// Embedded so the mock keeps satisfying store.Store as the
+	// interface grows; unstubbed methods panic if a test calls them.
+	store.Store
+
 	mu          sync.Mutex
 	events      map[string]store.Event
 	ingState    store.IngestionState
@@ -44,7 +48,7 @@ func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event
 	return nil
 }
 
-func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) {
+func (m *mockStore) GetEvent(_ context.Context, id string, _ store.Scope) (store.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.events[id]
@@ -103,7 +107,7 @@ func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState
 	return nil
 }
 
-func (m *mockStore) ListWatchedContracts(context.Context) ([]string, error) {
+func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return nil, nil
 }
 
@@ -134,8 +138,10 @@ func (m *mockStore) DeleteEventsBefore(_ context.Context, maxLedger int64, befor
 	return deleted, nil
 }
 
-func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
-func (m *mockStore) Ping(context.Context) error                 { return nil }
+func (m *mockStore) Stats(context.Context, store.Scope) (store.Stats, error) {
+	return store.Stats{}, nil
+}
+func (m *mockStore) Ping(context.Context) error { return nil }
 
 func (m *mockStore) setIngestionState(ledger int64) {
 	m.mu.Lock()
@@ -217,7 +223,7 @@ func TestPrunerGuardNeverDeletesAboveLastIngested(t *testing.T) {
 	// e3 (150) is above the guard and kept.
 	assert.Equal(t, int64(2), total)
 	assert.Equal(t, 1, st.eventCount())
-	_, err = st.GetEvent(context.Background(), "e3")
+	_, err = st.GetEvent(context.Background(), "e3", store.Scope{})
 	assert.NoError(t, err) // e3 should still exist
 }
 
@@ -289,9 +295,9 @@ func TestPrunerMaxAge(t *testing.T) {
 	assert.Equal(t, int64(1), total)
 	assert.Equal(t, 1, st.eventCount())
 
-	_, err = st.GetEvent(context.Background(), "old")
+	_, err = st.GetEvent(context.Background(), "old", store.Scope{})
 	assert.ErrorIs(t, err, store.ErrNotFound)
-	_, err = st.GetEvent(context.Background(), "recent")
+	_, err = st.GetEvent(context.Background(), "recent", store.Scope{})
 	assert.NoError(t, err)
 }
 
@@ -367,4 +373,9 @@ func TestPrunerEmptyStore(t *testing.T) {
 	total, err := prn.pruneOnce(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), total)
+}
+
+// CountContracts satisfies store.Store; unused by these tests.
+func (m *mockStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
+	return 0, nil
 }

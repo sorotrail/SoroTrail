@@ -28,6 +28,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/config"
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/pruner"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/spec"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -128,9 +129,9 @@ func run() error {
 		// startup races (database container still initialising, network
 		// not yet ready) don't crash the process before it can serve.
 		const (
-			maxRetries     = 5
-			baseBackoff    = 500 * time.Millisecond
-			maxBackoff     = 5 * time.Second
+			maxRetries  = 5
+			baseBackoff = 500 * time.Millisecond
+			maxBackoff  = 5 * time.Second
 		)
 		var pingErr error
 		for attempt := 1; attempt <= maxRetries; attempt++ {
@@ -178,16 +179,6 @@ func run() error {
 	specFetcher := spec.NewFetcher(rpcClient)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
-	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
-		PollInterval:     cfg.PollInterval,
-		StartLedger:      cfg.StartLedger,
-		RetentionLedgers: cfg.RetentionLedgers,
-		LagWarnLedgers:   cfg.LagWarnLedgers,
-		// LagMetrics is nil here on purpose: no /metrics endpoint is
-		// wired up yet, so the ingester's applyDefaults installs a
-		// no-op. When a Prometheus endpoint lands, main.go is the
-		// seam to pass a real LagMetrics implementation.
-	})
 	// Wrap the raw RPC client so per-method error totals are tracked and
 	// surfaced via /stats. specFetcher already holds a reference to the
 	// unwrapped client (spec lookups are not counted as ingestion errors).
@@ -226,6 +217,7 @@ func run() error {
 		PollInterval:            cfg.PollInterval,
 		StartLedger:             cfg.StartLedger,
 		RetentionLedgers:        cfg.RetentionLedgers,
+		LagWarnLedgers:          cfg.LagWarnLedgers,
 		SweepConcurrency:        cfg.SweepConcurrency,
 		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,

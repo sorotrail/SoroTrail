@@ -85,7 +85,6 @@ func (s *guardedStore) GetEvent(ctx context.Context, id string, sc Scope) (Event
 	return e, err
 }
 
-func (s *guardedStore) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
 func (s *guardedStore) GetEventsByTxHash(ctx context.Context, txHash, excludeID string) ([]Event, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.GetEventsByTxHash")
 	defer cancel()
@@ -95,7 +94,7 @@ func (s *guardedStore) GetEventsByTxHash(ctx context.Context, txHash, excludeID 
 	return events, err
 }
 
-func (s *guardedStore) EventExists(ctx context.Context, id string) (bool, error) {
+func (s *guardedStore) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.EventExists")
 	defer cancel()
 	start := time.Now()
@@ -352,7 +351,6 @@ func (s *guardedStore) MigrationVersion(ctx context.Context) (int, bool, error) 
 	return s.Store.MigrationVersion(ctx)
 }
 
-func (s *guardedStore) Stats(ctx context.Context) (Stats, error) {
 func (s *guardedStore) Stats(ctx context.Context, sc Scope) (Stats, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.Stats")
 	defer cancel()
