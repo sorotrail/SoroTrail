@@ -307,6 +307,66 @@ func TestListEvents_TopicAndPositionalFiltersConflict(t *testing.T) {
 	assert.Contains(t, e["error"], "cannot be combined")
 }
 
+func TestListEvents_MultiContractID(t *testing.T) {
+	const contractB = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	tests := []struct {
+		name            string
+		query           string
+		wantContractID  string
+		wantContractIDs []string
+		wantStatus      int
+	}{
+		{
+			name:           "single contract_id (backward compat)",
+			query:          "/events?contract_id=" + testContract,
+			wantContractID: testContract,
+			wantStatus:     http.StatusOK,
+		},
+		{
+			name:            "two contract_ids separated by comma",
+			query:           "/events?contract_id=" + testContract + "," + contractB,
+			wantContractIDs: []string{testContract, contractB},
+			wantStatus:      http.StatusOK,
+		},
+		{
+			name:            "three contract_ids",
+			query:           "/events?contract_id=" + testContract + "," + contractB + ",CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSD",
+			wantContractIDs: []string{testContract, contractB, "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSD"},
+			wantStatus:      http.StatusOK,
+		},
+		{
+			name:       "invalid contract_id in list returns 400",
+			query:      "/events?contract_id=" + testContract + ",nope",
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			require.Equal(t, tt.wantStatus, resp.StatusCode, string(body))
+
+			if tt.wantStatus != http.StatusOK {
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], "invalid contract_id")
+				return
+			}
+
+			if tt.wantContractID != "" {
+				assert.Equal(t, tt.wantContractID, st.lastFilter.ContractID)
+				assert.Empty(t, st.lastFilter.ContractIDs)
+			} else {
+				assert.Equal(t, "", st.lastFilter.ContractID,
+					"ContractID should be empty when ContractIDs is used")
+				assert.ElementsMatch(t, tt.wantContractIDs, st.lastFilter.ContractIDs)
+			}
+		})
+	}
+}
+
 func TestListEvents_BadParams(t *testing.T) {
 	for _, path := range []string{
 		"/events?type=bogus",
