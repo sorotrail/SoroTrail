@@ -421,3 +421,8 @@ func TestSaveAuditStateIfGreater_RaceConditionFree(t *testing.T) {
 	assert.Equal(t, int64(200), final.VerifiedThroughLedger,
 		"concurrent SaveAuditStateIfGreater must converge on max(candidates)")
 }
+
+// DeleteEventsBefore satisfies store.Store; this mock never prunes.
+func (m *mockStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -43,6 +44,10 @@ func seedEvents(contractID string) []store.Event {
 // like the real Postgres store: a single page covers all seeded events
 // when below MaxQueryLimit, otherwise it pages them.
 type fakeExportStore struct {
+	// Embedded so the mock keeps satisfying store.Store as the
+	// interface grows; unstubbed methods panic if a test calls them.
+	store.Store
+
 	events   []store.Event
 	position int
 	cursor   string
@@ -114,11 +119,10 @@ func (f *fakeExportStore) ReplaceEventsInRange(context.Context, []store.Event, i
 func (f *fakeExportStore) GetEvent(context.Context, string, store.Scope) (store.Event, error) {
 	return store.Event{}, store.ErrNotFound
 }
-func (f *fakeExportStore) EventExists(context.Context, string, store.Scope) (bool, error) {
 func (f *fakeExportStore) GetEventsByTxHash(context.Context, string, string) ([]store.Event, error) {
 	return nil, nil
 }
-func (f *fakeExportStore) EventExists(context.Context, string) (bool, error) {
+func (f *fakeExportStore) EventExists(context.Context, string, store.Scope) (bool, error) {
 	return false, nil
 }
 func (f *fakeExportStore) CountEvents(context.Context, store.EventFilter) (int64, error) {
@@ -328,3 +332,8 @@ func (m *fakeExportStore) GetDeadLetter(context.Context, int64) (store.DeadLette
 	return store.DeadLetter{}, store.ErrNotFound
 }
 func (m *fakeExportStore) DeleteDeadLetter(context.Context, int64) error { return nil }
+
+// DeleteEventsBefore satisfies store.Store; this mock never prunes.
+func (f *fakeExportStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}
