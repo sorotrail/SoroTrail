@@ -185,6 +185,34 @@ func run() error {
 	countingClient := rpc.NewCountingClient(rpcClient)
 	api.SetRPCCounter(countingClient)
 
+	// Advisory lock: when enabled (opt-in), acquire a Postgres advisory
+	// lock keyed by the RPC URL so a second instance targeting the same
+	// network yields ingestion to the lock holder. The API server still
+	// runs so the passive instance can serve reads.
+	ingesterEnabled := true
+	if cfg.IngestionLockEnabled {
+		lockKey := store.AdvisoryLockKey(cfg.RPCURL)
+		// Only Postgres-backed stores support advisory locks; ClickHouse
+		// and other backends skip silently.
+		if pg, ok := st.(*store.Postgres); ok {
+			lockConn, acquired, err := pg.TryAdvisoryLock(ctx, lockKey)
+			if err != nil {
+				return fmt.Errorf("advisory lock: %w", err)
+			}
+			if acquired {
+				defer lockConn.Release() // releases lock + connection on shutdown
+				log.Info("acquired ingestion advisory lock",
+					"key", lockKey, "rpc_url", cfg.RPCURL)
+			} else {
+				log.Warn("ingestion advisory lock held by another instance; skipping ingestion",
+					"key", lockKey, "rpc_url", cfg.RPCURL)
+				ingesterEnabled = false
+			}
+		} else {
+			log.Warn("INGESTION_LOCK_ENABLED is set but the store is not Postgres; skipping advisory lock")
+		}
+	}
+
 	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:            cfg.PollInterval,
 		StartLedger:             cfg.StartLedger,
@@ -323,14 +351,22 @@ func run() error {
 	go func() {
 		go wh.Run(ctx)
 	}()
-	go func() {
-		log.Info("ingester starting", "rpc_url", cfg.RPCURL, "poll_interval", cfg.PollInterval)
-		if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			errCh <- fmt.Errorf("ingester: %w", err)
-		} else {
-			errCh <- nil
-		}
-	}()
+
+	// Start the ingester only when the advisory lock was acquired (or
+	// when lock enforcement is disabled). The goroutine is skipped
+	// when another instance holds the lock.
+	remaining := 2 // http server + webhook
+	if ingesterEnabled {
+		remaining++ // + ingester
+		go func() {
+			log.Info("ingester starting", "rpc_url", cfg.RPCURL, "poll_interval", cfg.PollInterval)
+			if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("ingester: %w", err)
+			} else {
+				errCh <- nil
+			}
+		}()
+	}
 	go func() {
 		log.Info("http api listening", "addr", cfg.HTTPAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -370,9 +406,8 @@ func run() error {
 	}()
 
 	var firstErr error
-	remaining := 3 // ingester + http server + webhook
 	if aud != nil {
-		remaining = 4
+		remaining++
 	}
 	select {
 	case <-ctx.Done():
