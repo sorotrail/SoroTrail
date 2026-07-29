@@ -1029,8 +1029,8 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 	var s IngestionState
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx,
-			`SELECT last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE id = 1`,
-		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.UpdatedAt)
+			`SELECT last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state WHERE id = 1`,
+		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.LastSuccessfulPoll, &s.UpdatedAt)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return IngestionState{}, ErrNotFound
@@ -1043,13 +1043,14 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 
 func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) error {
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO ingestion_state (id, last_ingested_ledger, last_cursor, updated_at)
-		VALUES (1, $1, $2, now())
+		INSERT INTO ingestion_state (id, last_ingested_ledger, last_cursor, last_successful_poll, updated_at)
+		VALUES (1, $1, $2, $3, now())
 		ON CONFLICT (id) DO UPDATE SET
 			last_ingested_ledger = EXCLUDED.last_ingested_ledger,
 			last_cursor          = EXCLUDED.last_cursor,
+			last_successful_poll = EXCLUDED.last_successful_poll,
 			updated_at           = now()`,
-		s.LastIngestedLedger, s.LastCursor,
+		s.LastIngestedLedger, s.LastCursor, s.LastSuccessfulPoll,
 	)
 	if err != nil {
 		return fmt.Errorf("saving ingestion state: %w", err)

@@ -194,6 +194,7 @@ type AggregateBucket struct {
 type IngestionState struct {
 	LastIngestedLedger int64
 	LastCursor         string
+	LastSuccessfulPoll *time.Time
 	UpdatedAt          time.Time
 }
 
