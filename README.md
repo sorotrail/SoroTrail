@@ -1175,6 +1175,31 @@ Deliberately out of scope for the MVP, with seams left for contributors:
 - Metrics (Prometheus) and tracing.
 - Alternative storage backends behind `store.Store`.
 
+## API documentation UI
+
+The OpenAPI 3.1 specification lives at [`api/openapi.yaml`](api/openapi.yaml) and
+is browsable through a self-hosted Swagger UI at `/docs` when the server is
+running:
+
+```
+http://localhost:8080/docs/
+```
+
+No external CDN is required — all assets (HTML, CSS, JS) are compiled into the
+binary via Go's `//go:embed` mechanism.
+
+### Route-drift validation
+
+A dedicated test ensures the router and the OpenAPI spec stay in sync:
+
+```sh
+go test ./pkg/docs/ -run TestNoRouteDrift -v
+```
+
+The test reads `api/openapi.yaml`, walks the live chi router tree, and fails
+with `t.Fatalf` if the two diverge in either direction. Run it as part of CI
+to catch endpoint/spec drift before it reaches production.
+
 ## License
 
 [Apache-2.0](LICENSE)

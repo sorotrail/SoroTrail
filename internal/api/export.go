@@ -246,3 +246,75 @@ func (s *Server) exportFilter(ctx context.Context, contractID string, fromLedger
 		Scope:      scopeFrom(ctx),
 	}
 }
+
+// handleEventsCSV streams all matching events as CSV, using the same
+// filter params as GET /events. It sets Content-Type to text/csv and
+// Content-Disposition so browsers offer a file download.
+func (s *Server) handleEventsCSV(w http.ResponseWriter, r *http.Request) {
+	filter, err := filterFromQuery(r)
+	if err != nil {
+		writeFilterError(w, err)
+		return
+	}
+	filter.Cursor = ""
+	filter.Limit = exportQueryBatchSize
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="events.csv"`)
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+
+	s.streamEventsCSV(r.Context(), w, filter)
+}
+
+// streamEventsCSV writes one CSV record per event with columns
+// id, ledger, type, tx_hash, topics (JSON string), value (JSON string).
+// topics and value are written as JSON strings so spreadsheets and
+// pandas can parse them as a single cell without splitting on commas
+// inside the event payload.
+func (s *Server) streamEventsCSV(ctx context.Context, w http.ResponseWriter, filter store.EventFilter) {
+	cw := csv.NewWriter(w)
+	if err := cw.Write([]string{"id", "ledger", "type", "tx_hash", "topics", "value"}); err != nil {
+		loggerFromContext(ctx).Error("writing csv header", "error", err)
+		return
+	}
+	flusher, flushable := w.(http.Flusher)
+	if flushable {
+		flusher.Flush()
+	}
+
+	for {
+		events, cursor, err := s.store.QueryEvents(ctx, filter)
+		if errors.Is(err, store.ErrInvalidCursor) {
+			loggerFromContext(ctx).Error("export cursor", "error", err)
+			return
+		}
+		if err != nil {
+			loggerFromContext(ctx).Error("export query", "error", err)
+			return
+		}
+		for _, ev := range events {
+			if err := cw.Write([]string{
+				ev.ID,
+				fmt.Sprintf("%d", ev.Ledger),
+				ev.Type,
+				ev.TxHash,
+				string(ev.Topics),
+				string(ev.Value),
+			}); err != nil {
+				loggerFromContext(ctx).Error("csv write", "error", err)
+				return
+			}
+		}
+		cw.Flush()
+		if flushable {
+			flusher.Flush()
+		}
+		if cursor == "" {
+			return
+		}
+		filter.Cursor = cursor
+		if ctx.Err() != nil {
+			return
+		}
+	}
+}
