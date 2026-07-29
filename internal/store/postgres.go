@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"time"
 
@@ -973,24 +974,14 @@ func (p *Postgres) statsWhere(ctx context.Context, pred string, args []any) (Sta
 			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
 			(SELECT coalesce(min(ledger), 0) FROM events %[1]s),
 			(SELECT count(DISTINCT contract_id) FROM events %[1]s),
-			(SELECT count(*) FROM (%[2]s) w %[1]s)`,
-		pred, watchedContractsUnion)
+			(SELECT count(*) FROM (%[2]s) w %[1]s),
+			%[3]s`,
+		pred, watchedContractsUnion, tableSizeExpr(pred == ""))
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, query, args...).Scan(
 			&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger,
-			&s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
-		return tx.QueryRow(ctx, `
-			SELECT
-				(SELECT count(*) FROM events),
-				(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
-				(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
-				(SELECT coalesce(min(ledger), 0) FROM events),
-				(SELECT count(DISTINCT contract_id) FROM events),
-				(SELECT count(*) FROM watched_contracts),
-				(SELECT coalesce(sum(pg_total_relation_size(inhrelid)), 0)
-				 FROM pg_inherits
-				 WHERE inhparent = 'events'::regclass)`,
-		).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts, &s.TableSizeBytes)
+			&s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts,
+			&s.TableSizeBytes)
 	})
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
@@ -1022,6 +1013,21 @@ func (p *Postgres) MigrationVersion(ctx context.Context) (version int, dirty boo
 		return 0, false, fmt.Errorf("reading migration version: %w", err)
 	}
 	return version, dirty, nil
+}
+
+// tableSizeExpr returns the SELECT expression for events table size on
+// disk. unscoped is true only for the wildcard caller (Stats passes an
+// empty predicate for it). The figure covers every partition, so handing
+// it to a tenant would disclose the instance's total data volume — the
+// same leak the scoped counts above exist to prevent.
+func tableSizeExpr(unscoped bool) string {
+	if !unscoped {
+		return "0::bigint"
+	}
+	return `(SELECT coalesce(sum(pg_total_relation_size(inhrelid)), 0)
+			 FROM pg_inherits WHERE inhparent = 'events'::regclass)`
+}
+
 // frontierStats reports only the instance-progress counters, for a caller
 // whose scope matches no rows at all.
 func (p *Postgres) frontierStats(ctx context.Context) (Stats, error) {
@@ -1035,6 +1041,8 @@ func (p *Postgres) frontierStats(ctx context.Context) (Stats, error) {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
 	}
 	return s, nil
+}
+
 // DeleteEventsBefore deletes up to limit events that are strictly below
 // maxLedger and (if beforeTime is non-zero) older than beforeTime. It is
 // designed for the background pruner and intentionally never touches rows
@@ -1081,6 +1089,42 @@ func (p *Postgres) DeleteEventsBefore(ctx context.Context, maxLedger int64, befo
 
 func (p *Postgres) Ping(ctx context.Context) error {
 	return p.pool.Ping(ctx)
+}
+
+// AdvisoryLockKey hashes an RPC URL into an int64 suitable for use with
+// Postgres advisory locks. Different RPC URLs produce different keys with
+// high probability, ensuring two deployments targeting different networks
+// (or different RPC providers) never contend on the same lock.
+func AdvisoryLockKey(rpcURL string) int64 {
+	h := fnv.New64a()
+	h.Write([]byte(rpcURL))
+	// Fold the uint64 into int64, keeping the full entropy of the hash.
+	return int64(h.Sum64())
+}
+
+// TryAdvisoryLock attempts to acquire a session-level Postgres advisory
+// lock keyed by the given int64. It acquires a dedicated connection from
+// the pool so the lock persists for the lifetime of the returned
+// connection. When acquired=true the caller must call conn.Release() to
+// release both the lock and the connection back to the pool.
+//
+// Returns acquired=false when another session already holds the lock on
+// this key — the caller should skip ingestion but may continue serving.
+func (p *Postgres) TryAdvisoryLock(ctx context.Context, key int64) (conn *pgxpool.Conn, acquired bool, err error) {
+	conn, err = p.pool.Acquire(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("acquiring connection for advisory lock: %w", err)
+	}
+	var locked bool
+	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", key).Scan(&locked); err != nil {
+		conn.Release()
+		return nil, false, fmt.Errorf("pg_try_advisory_lock(%d): %w", key, err)
+	}
+	if !locked {
+		conn.Release()
+		return nil, false, nil
+	}
+	return conn, true, nil
 }
 
 func (p *Postgres) GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error) {

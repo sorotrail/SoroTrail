@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -118,6 +117,10 @@ func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest)
 // for the auditor. It mirrors and extends the ingester test mock so we
 // don't import the ingester test package.
 type mockStore struct {
+	// Embedded so the mock keeps satisfying store.Store as the
+	// interface grows; unstubbed methods panic if a test calls them.
+	store.Store
+
 	mu sync.Mutex
 
 	events map[string]store.Event

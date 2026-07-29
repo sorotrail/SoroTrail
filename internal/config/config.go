@@ -27,6 +27,23 @@ type Config struct {
 	APIQueryTimeout       time.Duration `env:"API_QUERY_TIMEOUT" envDefault:"25s"`
 	APISlowQueryThreshold time.Duration `env:"API_SLOW_QUERY_THRESHOLD" envDefault:"2s"`
 
+	// Retention pruning. RETENTION_MAX_AGE and RETENTION_MIN_LEDGER are the
+	// two policy dimensions; when both are unset the pruner never runs (see
+	// RetentionEnabled). The remaining knobs bound how aggressively it
+	// deletes so a single sweep never holds a long lock.
+	RetentionMaxAge    time.Duration `env:"RETENTION_MAX_AGE"`
+	RetentionMinLedger uint64        `env:"RETENTION_MIN_LEDGER"`
+	RetentionBatchSize int           `env:"RETENTION_BATCH_SIZE" envDefault:"5000"`
+	RetentionPause     time.Duration `env:"RETENTION_PAUSE" envDefault:"100ms"`
+	RetentionInterval  time.Duration `env:"RETENTION_INTERVAL" envDefault:"1h"`
+
+	// LagWarnLedgers triggers a warn-level log when the ingester falls this
+	// many ledgers behind the chain head. Zero disables the alarm.
+	LagWarnLedgers uint32 `env:"LAG_WARN_LEDGERS" envDefault:"100"`
+
+	// GraphQLPlayground gates the dev-mode GraphiQL UI at /graphiql.
+	GraphQLPlayground bool `env:"GRAPHQL_PLAYGROUND"`
+
 	// Horizon backfill configuration. HORIZON_URL is the REST endpoint
 	// the backfill command reads; BACKFILL_RATE_RPS controls how many
 	// requests per second the backfill command issues (env/v11 parses
@@ -163,6 +180,12 @@ type Config struct {
 	// private deployments can opt for a larger analytical dump.
 	ExportMaxRange int64 `env:"EXPORT_MAX_RANGE" envDefault:"17280"`
 
+	// IngestionLockEnabled, when true, acquires a Postgres advisory lock
+	// keyed by the RPC URL before starting the ingestion loop. A second
+	// instance attempting to acquire the same lock will skip ingestion
+	// (but continue serving the HTTP API), preventing double-processing.
+	// Default false — single-instance deployments keep today's behavior.
+	IngestionLockEnabled bool `env:"INGESTION_LOCK_ENABLED" envDefault:"false"`
 	// CORS configuration. Default policy is deny-all: an empty
 	// CORSAllowedOrigins list means no browser cross-origin request gets
 	// CORS headers, so the browser blocks the response. Allowing a single
@@ -271,6 +294,7 @@ func (c Config) Validate() error {
 	}
 	if c.RetentionMaxAge < 0 {
 		return fmt.Errorf("RETENTION_MAX_AGE must be non-negative")
+	}
 	if c.BackfillRateRPS <= 0 {
 		return fmt.Errorf("BACKFILL_RATE_RPS must be positive, got %v", c.BackfillRateRPS)
 	}
@@ -437,6 +461,7 @@ func (c Config) LoggableFields() []any {
 		"reorg_confirmation_window", c.ReorgConfirmationWindow,
 		"reorg_rescan_interval", c.ReorgRescanInterval,
 		"export_max_range", c.ExportMaxRange,
+		"ingestion_lock_enabled", c.IngestionLockEnabled,
 		"cors_allowed_origins", len(c.CORSAllowedOrigins),
 		"audit_enabled", c.AuditEnabled,
 	}

@@ -26,6 +26,7 @@ var envKeys = []string{
 	"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT",
 	"HTTP_READ_HEADER_TIMEOUT",
 	"SHUTDOWN_TIMEOUT",
+	"INGESTION_LOCK_ENABLED",
 	"MULTI_TENANT", "MULTI_TENANT_MAX_WATCHED", "MULTI_TENANT_USAGE_FLUSH",
 	"MULTI_TENANT_STREAM_SCOPE_SYNC", "MULTI_TENANT_BOOTSTRAP_KEY",
 }
@@ -56,8 +57,8 @@ func TestLoad(t *testing.T) {
 		{
 			name: "lag alarm threshold configurable",
 			env: map[string]string{
-				"DATABASE_URL":      "postgres://localhost/db",
-				"LAG_WARN_LEDGERS":  "50",
+				"DATABASE_URL":     "postgres://localhost/db",
+				"LAG_WARN_LEDGERS": "50",
 			},
 			check: func(t *testing.T, c Config) {
 				assert.Equal(t, uint32(50), c.LagWarnLedgers)
@@ -258,6 +259,13 @@ func TestLoad(t *testing.T) {
 				"RETENTION_PAUSE": "-1s",
 			},
 			wantErr: "RETENTION_PAUSE must be non-negative",
+		},
+		{
+			name: "shutdown timeout defaults to 15s",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
 				assert.Equal(t, 15*time.Second, c.ShutdownTimeout)
 			},
 		},
@@ -333,11 +341,6 @@ func TestLoad(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Clear the variables Load reads, then apply the case's env.
 			// t.Setenv registers restoration; Unsetenv makes defaults apply.
-			for _, key := range []string{"RPC_URL", "DATABASE_URL", "POLL_INTERVAL",
-				"HTTP_ADDR", "WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL",
-				"RETENTION_MAX_AGE", "RETENTION_MIN_LEDGER", "RETENTION_BATCH_SIZE",
-				"RETENTION_PAUSE", "RETENTION_INTERVAL"} {
-				"LAG_WARN_LEDGERS"} {
 			for _, key := range envKeys {
 				t.Setenv(key, "")
 				os.Unsetenv(key)

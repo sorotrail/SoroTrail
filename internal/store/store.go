@@ -114,8 +114,6 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	// TxHash filters events emitted by a specific transaction hash.
-	TxHash string // hex-encoded transaction hash
 	// HasValue filters events by whether they carry a value payload.
 	// nil means no constraint; true means value IS NOT NULL;
 	// false means value IS NULL.
@@ -575,7 +573,6 @@ type Store interface {
 	// the caller already supplied the contract ID and learns nothing from
 	// being told they lack access to it.
 	GetEvent(ctx context.Context, id string, sc Scope) (Event, error)
-	GetEvent(ctx context.Context, id string) (Event, error)
 	// GetEventsByTxHash returns all events emitted by the transaction
 	// identified by txHash, excluding the event with id excludeID (when
 	// non-empty). Returns an empty slice when no other events exist.
@@ -710,13 +707,16 @@ type Store interface {
 	// the given ledger number. It returns the number of rows deleted.
 	// This is an admin operation and should be auth-gated at the API layer.
 	DeleteEventsBeforeLedger(ctx context.Context, beforeLedger int64) (int64, error)
+	// DeleteEventsBefore deletes up to limit events strictly below maxLedger
+	// and (when beforeTime is non-zero) older than beforeTime. The limit
+	// keeps a single DELETE from holding a long lock; the pruner loops.
+	DeleteEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error)
 
 	// MigrationVersion returns the currently applied migration version and
 	// whether the schema_migrations table reports a dirty state. When the
 	// migration table does not exist or returns no rows, it returns (0, false, nil).
 	MigrationVersion(ctx context.Context) (version int, dirty bool, err error)
 
-	Stats(ctx context.Context) (Stats, error)
 	// Stats summarizes the store within sc. Aggregates are scoped because
 	// counts are an information leak in their own right: an unscoped
 	// total_events or contract_count tells a tenant how much data exists

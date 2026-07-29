@@ -28,6 +28,12 @@ import (
 
 	"time"
 
+	"github.com/sorotrail/sorotrail/internal/api/queries"
+	"github.com/sorotrail/sorotrail/internal/broadcast"
+	"github.com/sorotrail/sorotrail/internal/buildinfo"
+	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/store"
+)
 
 
 	"github.com/coder/websocket"
@@ -467,6 +473,29 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 }
 
+// handleDeleteEvents is the admin-only bulk delete endpoint. It deletes all
+// events whose ledger is strictly less than the ?before_ledger= query parameter.
+// The endpoint is protected by apiKeyAuth middleware (same as watched-contracts).
+//
+// Query params:
+//
+//	before_ledger (required) — delete all events with ledger < this value
+//
+// Response:
+//
+//	200 { "deleted": <count> } on success
+//	400 when before_ledger is missing or not a positive integer
+func (s *Server) handleDeleteEvents(w http.ResponseWriter, r *http.Request) {
+	raw := r.URL.Query().Get("before_ledger")
+	if raw == "" {
+		writeError(w, http.StatusBadRequest, errors.New("before_ledger query parameter is required"))
+		return
+	}
+	beforeLedger, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || beforeLedger <= 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("before_ledger must be a positive integer, got %q", raw))
+		return
+	}
 
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
@@ -475,7 +504,12 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, versionResponse{
 
-		Version:   buildinfo.Version,
+	resp := healthResponse{Status: "ok", Checks: map[string]string{
+		"database":       "ok",
+		"rpc":            "ok",
+		"schema_version": "ok",
+	}}
+	status := http.StatusOK
 
 		Commit:    buildinfo.Commit,
 
@@ -1031,7 +1065,7 @@ func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	event, err := s.store.GetEvent(r.Context(), id)
+	event, err := s.store.GetEvent(r.Context(), id, scopeFrom(r.Context()))
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
 		return
@@ -1482,6 +1516,8 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		stats.Pruner = store.PrunerStats{
 			RunsCompleted:   m.RunsCompleted,
 			TotalRowsPurged: m.TotalRowsPurged,
+		}
+	}
 	if c := getRPCCounter(); c != nil {
 
 		snap := c.Errors().Snapshot()
@@ -2343,7 +2379,9 @@ func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 
 }
 
-
+// ptr returns a pointer to v. Used for the tri-state query params
+// (nil = unset) where a bare &true is not valid Go.
+func ptr[T any](v T) *T { return &v }
 
 // filterFromQuery parses the shared event-filter query params:
 
@@ -2355,64 +2393,6 @@ func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 // remembering to attach it. A handler that hand-rolled an EventFilter
 // instead would get the zero Scope and return nothing — see store.Scope for
 // why that is the failure mode we chose.
-func filterFromQuery(r *http.Request) (store.EventFilter, error) {
-
-	q := r.URL.Query()
-
-	f := store.EventFilter{
-
-		ContractID: q.Get("contract_id"),
-
-		Cursor:     q.Get("cursor"),
-
-		TxHash:     q.Get("tx_hash"),
-		Scope:      scopeFrom(r.Context()),
-	}
-
-
-
-	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
-
-		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
-
-	}
-	// An explicitly named contract the tenant lacks is refused rather than
-	// quietly filtered to nothing, so a missing grant is distinguishable
-	// from a contract with no events. The store still ANDs the scope into
-	// the query regardless, so this check being wrong or removed downgrades
-	// the error message without opening a leak.
-	if f.ContractID != "" && !f.Scope.Allows(f.ContractID) {
-		return f, errForbiddenContract{contractID: f.ContractID}
-	}
-
-	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
-
-		return f, store.ErrInvalidCursor
-
-	}
-
-
-	if raw := q.Get("type"); raw != "" {
-
-		for _, t := range strings.Split(raw, ",") {
-
-			t = strings.TrimSpace(t)
-
-			switch t {
-
-			case "contract", "system", "diagnostic":
-
-			default:
-
-				return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
-
-			}
-
-			f.Types = append(f.Types, t)
-
-		}
-
-	}
 // The parsing rules and validation live in the shared queries package so
 // the GraphQL resolvers in internal/api/graphql can reuse them — there is
 // exactly one source of truth for which topic positions are valid, what
@@ -2508,6 +2488,23 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	}
 
+	// Scope is attached here, the single place REST list filters are built:
+	// queries.BuildEventFilter is shared with the GraphQL resolvers and
+	// deliberately knows nothing about HTTP authentication.
+	f.Scope = scopeFrom(r.Context())
+
+	// An explicitly named contract the tenant lacks is refused rather than
+	// quietly filtered to nothing, so a missing grant is distinguishable
+	// from a contract with no events. The store still ANDs the scope into
+	// the query regardless, so this check being wrong or removed downgrades
+	// the error message without opening a leak.
+	if f.ContractID != "" && !f.Scope.Allows(f.ContractID) {
+		return f, errForbiddenContract{contractID: f.ContractID}
+	}
+
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
+	}
 	if !f.FromTime.IsZero() && !f.ToTime.IsZero() && f.FromTime.After(f.ToTime) {
 
 		return f, fmt.Errorf("from_time %s is after to_time %s",

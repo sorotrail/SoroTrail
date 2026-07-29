@@ -151,13 +151,9 @@ type Ingester struct {
 	// threaded relative to Run().
 	lagging bool
 	bcast   *broadcast.Broadcaster
-	client   rpc.Client
-	store    store.Store
-	decoder  decode.Decoder
-	log      *slog.Logger
-	opts     Options
-	bcast    *broadcast.Broadcaster
-	notifier EventNotifier // optional; nil means no notification
+	// notifier fans ingested events out to subscribers; optional, nil
+	// means no notification.
+	notifier EventNotifier
 	// deadLetterStore receives events that fail to decode or persist so
 	// a poison event no longer stalls the loop. nil means no
 	// dead-lettering — the cycle aborts on the first error as before.

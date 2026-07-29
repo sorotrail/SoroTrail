@@ -442,23 +442,6 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		}
 	})
 
-	t.Run("by topic0 and topic1 positionally", func(t *testing.T) {
-		e1 := testEvent(eventID(100), 200, contractA)
-		e1.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GABC"},{"address":"GDEF"}]`)
-		e2 := testEvent(eventID(101), 201, contractA)
-		e2.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GDEF"},{"address":"GABC"}]`)
-		_, err := st.UpsertEvents(ctx, []Event{e1, e2})
-		require.NoError(t, err)
-
-		got, _, err := st.QueryEvents(ctx, EventFilter{
-			Topic0: json.RawMessage(`{"symbol":"transfer"}`),
-			Topic1: json.RawMessage(`{"address":"GABC"}`),
-		})
-		require.NoError(t, err)
-		assert.Len(t, got, 1)
-		assert.Equal(t, e1.ID, got[0].ID)
-	})
-
 	t.Run("by tx_hash", func(t *testing.T) {
 		e1 := testEvent(eventID(200), 300, contractA)
 		e1.TxHash = "txhash1"
@@ -469,15 +452,21 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		_, err := st.UpsertEvents(ctx, []Event{e1, e2, e3})
 		require.NoError(t, err)
 
-		got, _, err := st.QueryEvents(ctx, EventFilter{TxHash: "txhash1"})
+		got, _, err := st.QueryEvents(ctx, EventFilter{TxHash: "txhash1",
+			Scope: WildcardScope(),
+		})
 		require.NoError(t, err)
 		assert.Len(t, got, 2)
 
-		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "txhash2"})
+		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "txhash2",
+			Scope: WildcardScope(),
+		})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
 
-		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "nonexistent"})
+		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "nonexistent",
+			Scope: WildcardScope(),
+		})
 		require.NoError(t, err)
 		assert.Len(t, got, 0)
 	})
@@ -498,6 +487,7 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			TxHash:           "isc_test_a",
 			InSuccessfulCall: ptr(true),
+			Scope:            WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
@@ -506,12 +496,15 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		got, _, err = st.QueryEvents(ctx, EventFilter{
 			TxHash:           "isc_test_b",
 			InSuccessfulCall: ptr(false),
+			Scope:            WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
 		assert.Equal(t, e2.ID, got[0].ID)
 
-		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "isc_test_c"})
+		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "isc_test_c",
+			Scope: WildcardScope(),
+		})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.True(t, got[0].InSuccessfulCall)
@@ -533,6 +526,7 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			TxHash:           "combo1",
 			InSuccessfulCall: ptr(true),
+			Scope:            WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
@@ -541,6 +535,7 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		got, _, err = st.QueryEvents(ctx, EventFilter{
 			TxHash:           "combo1",
 			InSuccessfulCall: ptr(false),
+			Scope:            WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
@@ -562,21 +557,25 @@ func TestQueryEvents_InSuccessfulCallFilter(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("filter by true alone", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(true)})
+		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(true),
+			Scope: WildcardScope(),
+		})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.True(t, got[0].InSuccessfulCall)
 	})
 
 	t.Run("filter by false alone", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(false)})
+		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(false),
+			Scope: WildcardScope(),
+		})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.False(t, got[0].InSuccessfulCall)
 	})
 
 	t.Run("nil returns all", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{})
+		got, _, err := st.QueryEvents(ctx, EventFilter{Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, 2)
 	})

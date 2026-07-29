@@ -51,7 +51,7 @@ func (s *stubStore) CountEvents(_ context.Context, f store.EventFilter) (int64, 
 	return s.totalCount, s.countEventsErr
 }
 
-func (s *stubStore) GetEvent(_ context.Context, id string) (store.Event, error) {
+func (s *stubStore) GetEvent(_ context.Context, id string, _ store.Scope) (store.Event, error) {
 	if s.eventErr != nil {
 		return store.Event{}, s.eventErr
 	}

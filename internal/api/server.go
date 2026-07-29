@@ -15,6 +15,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/metrics"
+	"github.com/sorotrail/sorotrail/internal/pruner"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -121,7 +122,12 @@ type Server struct {
 	bcast     *broadcast.Broadcaster
 	metrics   *metrics.HTTPMetrics
 
-	metricsEnabled bool
+	// GraphQL transport, injected by main after the server is built.
+	// internal/api/graphql imports this package for its ServerDeps, so
+	// the dependency has to run in this direction to avoid an import
+	// cycle. Both nil means the /graphql routes are simply not mounted.
+	graphqlHandler    http.Handler
+	graphqlPlayground http.Handler
 	// compressMinSize is the body size at which responses start being
 	// compressed. The zero value means CompressMinSize, so compression is on
 	// by default; negative disables the middleware entirely.
@@ -268,6 +274,17 @@ func (s *Server) Router() http.Handler {
 		// a panic inside the limiter can't take down the server.
 		r.Use(s.limiter.Middleware)
 	}
+	// authenticate must run before any handler that reads events: it is what
+	// puts a Principal (and therefore a Scope) on the request context. In
+	// single-tenant mode it injects a wildcard principal, so behavior is
+	// unchanged; without it mounted, scopeFrom returns the zero Scope and
+	// every scoped query silently matches nothing.
+	r.Use(s.authenticate)
+
+	// usageMiddleware must run after authenticate: it reads the Principal
+	// that authenticate installs, and counts one request per tenant.
+	r.Use(s.usageMiddleware)
+
 	// prettyMiddleware must be the innermost wrapper (closest to the handler)
 	// so the type assertion in writeJSON sees the prettyWriter interface.
 	// It reads ?pretty=true from the query and wraps the ResponseWriter.
@@ -415,4 +432,13 @@ func loggerFromContext(ctx context.Context) *slog.Logger {
 		return slog.Default()
 	}
 	return log
+}
+
+// SetGraphQLHandler mounts the GraphQL transport. handler serves /graphql;
+// playground, when non-nil, serves GraphiQL at /graphiql. Call before
+// Router(); passing nil for either leaves that route unmounted.
+func (s *Server) SetGraphQLHandler(handler, playground http.Handler) *Server {
+	s.graphqlHandler = handler
+	s.graphqlPlayground = playground
+	return s
 }
