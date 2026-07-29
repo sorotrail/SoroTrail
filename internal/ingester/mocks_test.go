@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -161,7 +162,7 @@ func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event
 	return nil
 }
 
-func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) {
+func (m *mockStore) GetEvent(_ context.Context, id string, _ store.Scope) (store.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.events[id]
@@ -186,7 +187,7 @@ func (m *mockStore) GetEventsByTxHash(_ context.Context, txHash, excludeID strin
 // EventExists is the cheap existence probe added to the Store interface
 // for the API's 304 path. Unused by ingester tests but needed to
 // satisfy the interface.
-func (m *mockStore) EventExists(_ context.Context, id string) (bool, error) {
+func (m *mockStore) EventExists(_ context.Context, id string, _ store.Scope) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	_, ok := m.events[id]
@@ -233,6 +234,9 @@ func (m *mockStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 func (m *mockStore) GetIngestionState(context.Context) (store.IngestionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.ingestErr != nil {
+		return store.IngestionState{}, m.ingestErr
+	}
 	if m.state == nil {
 		return store.IngestionState{}, store.ErrNotFound
 	}
@@ -265,8 +269,10 @@ func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
 	return store.ErrNotFound
 }
 
-func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
-func (m *mockStore) Ping(context.Context) error                 { return nil }
+func (m *mockStore) Stats(context.Context, store.Scope) (store.Stats, error) {
+	return store.Stats{}, nil
+}
+func (m *mockStore) Ping(context.Context) error { return nil }
 
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
@@ -278,14 +284,18 @@ func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription
 	sub.ID = 1
 	return sub, nil
 }
-func (m *mockStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
+func (m *mockStore) GetSubscription(_ context.Context, id int64, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return store.Subscription{}, store.ErrNotFound
 }
-func (m *mockStore) ListSubscriptions(context.Context) ([]store.Subscription, error) { return nil, nil }
-func (m *mockStore) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+func (m *mockStore) ListSubscriptions(context.Context, store.SubscriptionOwner) ([]store.Subscription, error) {
+	return nil, nil
+}
+func (m *mockStore) UpdateSubscription(_ context.Context, sub store.Subscription, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return sub, nil
 }
-func (m *mockStore) DeleteSubscription(context.Context, int64) error { return nil }
+func (m *mockStore) DeleteSubscription(context.Context, int64, store.SubscriptionOwner) error {
+	return nil
+}
 func (m *mockStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
 	return nil, nil
 }
@@ -297,7 +307,7 @@ func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 	a.ID = 1
 	return a, nil
 }
-func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
+func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int, store.SubscriptionOwner) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
 

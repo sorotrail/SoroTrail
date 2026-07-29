@@ -18,6 +18,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
+	"github.com/sorotrail/sorotrail/internal/api/queries"
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
 	"github.com/sorotrail/sorotrail/internal/config"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -54,6 +55,31 @@ var cachePrivate atomic.Bool
 // SetCachePrivate flips the public→private override for all cacheable
 // endpoints. Call once at startup before serving requests.
 func SetCachePrivate(v bool) { cachePrivate.Store(v) }
+
+// tenantScoped mirrors Server.multiTenant for the package-level cache
+// helpers, which are plain functions and have no server to ask.
+// WithMultiTenancy sets it at startup, before any request is served.
+//
+// Caching is where multi-tenancy leaks if nobody is looking. Two tenants
+// issuing byte-identical requests produce different bodies, so the response
+// is not a function of the URL any more. Three things follow, and all three
+// are needed — any one alone is insufficient:
+//
+//   - Cache-Control must be `private`, so a CDN or proxy never pools a
+//     tenant-scoped body for the next caller.
+//   - Vary must name the credential headers, so a cache that does store the
+//     response keys it per credential.
+//   - The ETag must incorporate the scope, so a conditional request
+//     carrying another tenant's validator cannot be answered 304.
+//
+// The first two constrain intermediaries; the third constrains this server,
+// which is the one that would otherwise hand out a 304 for a page the
+// caller has never been entitled to see.
+var tenantScoped atomic.Bool
+
+// SetTenantScopedCaching marks responses as tenant-specific for caching
+// purposes. Called by WithMultiTenancy; exported for tests.
+func SetTenantScopedCaching(v bool) { tenantScoped.Store(v) }
 
 // immutableMaxAge is the max-age used for cacheable responses on
 // immutable resources (single events and list pages whose entire
@@ -313,7 +339,7 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeFilterError(w, err)
 		return
 	}
 	s.serveEvents(w, r, filter, fields)
@@ -331,7 +357,9 @@ type countResponse struct {
 func (s *Server) handleCountEvents(w http.ResponseWriter, r *http.Request) {
 	filter, _, err := parseFilterAndFields(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		// writeFilterError, not a flat 400: a request naming a contract the
+		// tenant lacks is a 403 here for the same reason it is on /events.
+		writeFilterError(w, err)
 		return
 	}
 	// Strip pagination — count is over the full matching set.
@@ -365,7 +393,9 @@ const recentDefaultLimit = 20
 func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) {
 	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		// Same mapping as the non-streaming path: naming an ungranted
+		// contract is a 403, not a malformed request.
+		writeFilterError(w, err)
 		return
 	}
 
@@ -457,7 +487,7 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeFilterError(w, err)
 		return
 	}
 	contractID := chi.URLParam(r, "id")
@@ -465,8 +495,48 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid contract ID %q", contractID))
 		return
 	}
+	if !filter.Scope.Allows(contractID) {
+		writeForbiddenContract(w, contractID)
+		return
+	}
 	filter.ContractID = contractID
 	s.serveEvents(w, r, filter, fields)
+}
+
+// errForbiddenContract is returned by filterFromQuery when the request names
+// a contract outside the caller's grants. It is a distinct type rather than
+// a sentinel string so writeFilterError can separate "you asked wrongly"
+// (400) from "you asked for someone else's data" (403).
+type errForbiddenContract struct{ contractID string }
+
+func (e errForbiddenContract) Error() string {
+	return fmt.Sprintf("contract %s is not granted to this tenant", e.contractID)
+}
+
+// writeFilterError maps a filter-construction failure to its status. Every
+// caller of filterFromQuery routes errors through here, so the 403 case
+// cannot be reported as a 400 by one endpoint and correctly by another.
+func writeFilterError(w http.ResponseWriter, err error) {
+	var forbidden errForbiddenContract
+	if errors.As(err, &forbidden) {
+		writeForbiddenContract(w, forbidden.contractID)
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
+}
+
+// writeForbiddenContract reports a contract the caller named explicitly but
+// may not read.
+//
+// 403 rather than 404 is deliberate here, and is the opposite of the choice
+// made for event IDs. The caller already possesses the contract ID — they
+// typed it into the path — and contract IDs are public on-chain identifiers,
+// so confirming "this exists but is not yours" discloses nothing they could
+// not learn from a block explorer. Answering 404 instead would leave
+// operators debugging a missing grant as though it were missing data.
+func writeForbiddenContract(w http.ResponseWriter, contractID string) {
+	writeError(w, http.StatusForbidden,
+		errForbiddenContract{contractID: contractID})
 }
 
 // serveEvents is the shared body for /events and /contracts/{id}/events.
@@ -500,6 +570,7 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
+	s.recordEventsServed(r.Context(), len(events))
 
 	// Total matching count (ignoring pagination) as a response header.
 	// Failure to count is non-fatal: we log a warning and proceed without
@@ -514,11 +585,16 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	} else {
 		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
 	}
+
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	decoded := r.URL.Query().Get("decoded") == "true"
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), events)
+		// The enriched branch writes no cache headers, so the Vary the
+		// scoped path relies on is set explicitly here too. Without it a
+		// shared cache could key ?decoded=true responses on URL alone.
+		writeVary(w)
 		if includeXDR {
 			writeJSON(w, http.StatusOK, enrichedEventsWithXDRResponse{
 				Events: enrichEventsWithXDR(enriched),
@@ -572,8 +648,13 @@ type rawEventResponse struct {
 // RPC returned already-decoded JSON for this row).
 func (s *Server) handleGetEventRaw(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	// Raw XDR is the same row as GET /events/{id}, just a different
+	// projection of it, so it takes the same scope on both the fetch and
+	// the 304 probe below. Without this the raw view would be a way to
+	// read an event body the scoped endpoint refuses.
+	scope := scopeFrom(r.Context())
 
-	event, err := s.store.GetEvent(r.Context(), id)
+	event, err := s.store.GetEvent(r.Context(), id, scope)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
 		return
@@ -595,7 +676,7 @@ func (s *Server) handleGetEventRaw(w http.ResponseWriter, r *http.Request) {
 	etag := `"` + id + `"`
 
 	if ifNoneMatch(r, etag) {
-		exists, err := s.store.EventExists(r.Context(), id)
+		exists, err := s.store.EventExists(r.Context(), id, scope)
 		if err != nil {
 			loggerFromContext(r.Context()).Error("checking event existence for raw XDR", "id", id, "error", err)
 			writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
@@ -686,6 +767,11 @@ func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	// Both the existence probe and the row fetch below run under this
+	// scope, so an event belonging to an ungranted contract is reported as
+	// absent on every path through this handler — including the 304 fast
+	// path, which would otherwise be a free existence oracle.
+	scope := scopeFrom(r.Context())
 
 	fields, err := parseFields(r.URL.Query().Get("fields"))
 	if err != nil {
@@ -706,7 +792,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	// present. A miss in EventExists is reported as 404, matching the
 	// unconditional code path.
 	if ifNoneMatch(r, etag) {
-		exists, err := s.store.EventExists(r.Context(), id)
+		exists, err := s.store.EventExists(r.Context(), id, scope)
 		if err != nil {
 			loggerFromContext(r.Context()).Error("checking event existence", "id", id, "error", err)
 			writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
@@ -724,7 +810,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	event, err := s.store.GetEvent(r.Context(), id)
+	event, err := s.store.GetEvent(r.Context(), id, scope)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
 		return
@@ -734,6 +820,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
+	s.recordEventsServed(r.Context(), 1)
 	decoded := r.URL.Query().Get("decoded") == "true"
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
@@ -933,7 +1020,7 @@ func (s *Server) handleDeleteDeadLetter(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.store.Stats(r.Context())
+	stats, err := s.store.Stats(r.Context(), scopeFrom(r.Context()))
 	if err != nil {
 		loggerFromContext(r.Context()).Error("loading stats", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
@@ -953,6 +1040,11 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			RPCRequests:           m.RPCRequests,
 		}
 	}
+	if p := getPruner(); p != nil {
+		m := p.Metrics()
+		stats.Pruner = store.PrunerStats{
+			RunsCompleted:   m.RunsCompleted,
+			TotalRowsPurged: m.TotalRowsPurged,
 	if c := getRPCCounter(); c != nil {
 		snap := c.Errors().Snapshot()
 		stats.RPCErrors = store.RPCErrorStats{
@@ -1236,6 +1328,7 @@ func listETag(f store.EventFilter) string {
 		Topic3        json.RawMessage `json:"p3,omitempty"`
 		TopicContains json.RawMessage `json:"pc,omitempty"`
 		TxHash        string          `json:"th,omitempty"`
+		HasValue      *bool           `json:"hv,omitempty"`
 		FromLedger    int64           `json:"fl"`
 		ToLedger      int64           `json:"tl"`
 		FromTime      string          `json:"ft,omitempty"`
@@ -1243,6 +1336,13 @@ func listETag(f store.EventFilter) string {
 		Cursor        string          `json:"cu,omitempty"`
 		Limit         int             `json:"l"`
 		Order         string          `json:"o,omitempty"`
+		// Scope makes the validator tenant-specific. Two tenants issuing
+		// the same request are asking for different representations of
+		// this URL, and without this component the second one's
+		// If-None-Match would match the first one's page and be answered
+		// 304 — a cross-tenant disclosure produced entirely inside this
+		// server, with no CDN involved.
+		Scope string `json:"s"`
 	}{
 		ContractID: f.ContractID,
 		Types:      f.Types,
@@ -1256,6 +1356,7 @@ func listETag(f store.EventFilter) string {
 		Topic3:        f.Topic3,
 		TopicContains: f.TopicContains,
 		TxHash:        f.TxHash,
+		HasValue:      f.HasValue,
 		FromLedger:    f.FromLedger,
 		ToLedger:      f.ToLedger,
 		FromTime:      timeOrEmpty(f.FromTime),
@@ -1263,6 +1364,7 @@ func listETag(f store.EventFilter) string {
 		Cursor:        f.Cursor,
 		Limit:         resolvedLimit(f.Limit),
 		Order:         resolvedOrder(f.Order),
+		Scope:         f.Scope.Fingerprint(),
 	}
 	b, _ := json.Marshal(key)
 	sum := sha256.Sum256(b)
@@ -1331,15 +1433,7 @@ func ifNoneMatch(r *http.Request, etag string) bool {
 // we MERGE rather than overwrite so distinct dimensions coexist in
 // the comma-separated value the cache uses.
 func writeCacheHeaders(w http.ResponseWriter, kind cacheability, maxAge time.Duration, etag string) {
-	vary := w.Header().Get("Vary")
-	if !strings.Contains(vary, "Accept-Encoding") {
-		if vary == "" {
-			vary = "Accept-Encoding"
-		} else {
-			vary = vary + ", Accept-Encoding"
-		}
-		w.Header().Set("Vary", vary)
-	}
+	writeVary(w)
 	if etag != "" {
 		w.Header().Set("ETag", etag)
 	}
@@ -1350,14 +1444,50 @@ func writeCacheHeaders(w http.ResponseWriter, kind cacheability, maxAge time.Dur
 		w.Header().Set("Cache-Control", "no-cache")
 	case cacheImmutable:
 		scope := "public"
-		if cachePrivate.Load() {
+		if cachePrivate.Load() || tenantScoped.Load() {
 			// Auth'd deployments get `private`: caching stays scoped to
 			// the authenticated user (browser cache works), but shared
 			// caches (CDN/proxy) cannot pool responses across users.
+			//
+			// Multi-tenant mode forces this regardless of CACHE_PRIVATE.
+			// The setting is an operator preference; the tenant boundary
+			// is not, and `public` on a tenant-scoped body is a
+			// cross-tenant disclosure waiting for a CDN to happen.
 			scope = "private"
 		}
 		w.Header().Set("Cache-Control",
 			fmt.Sprintf("%s, max-age=%d, immutable", scope, int(maxAge.Seconds())))
+	}
+}
+
+// varyDimensions are the request headers a response can depend on.
+// Accept-Encoding is set proactively for the compression middleware (#25);
+// the credential headers are added in multi-tenant mode because the body
+// genuinely differs per credential.
+func varyDimensions() []string {
+	if tenantScoped.Load() {
+		return []string{"Accept-Encoding", "Authorization", "X-API-Key"}
+	}
+	return []string{"Accept-Encoding"}
+}
+
+// writeVary merges the response's Vary dimensions into whatever a previous
+// middleware may already have set, rather than overwriting — distinct
+// dimensions have to coexist in the one comma-separated value a cache reads.
+func writeVary(w http.ResponseWriter) {
+	vary := w.Header().Get("Vary")
+	for _, dim := range varyDimensions() {
+		if strings.Contains(vary, dim) {
+			continue
+		}
+		if vary == "" {
+			vary = dim
+		} else {
+			vary += ", " + dim
+		}
+	}
+	if vary != "" {
+		w.Header().Set("Vary", vary)
 	}
 }
 
@@ -1376,16 +1506,32 @@ func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 
 // filterFromQuery parses the shared event-filter query params:
 // contract_id, type, topic, from_ledger, to_ledger, from_time, to_time, cursor, limit.
+//
+// It is also the one place a list-shaped read acquires its authorization.
+// Every endpoint that returns events builds its filter here, so the tenant
+// boundary is attached by construction rather than by each handler
+// remembering to attach it. A handler that hand-rolled an EventFilter
+// instead would get the zero Scope and return nothing — see store.Scope for
+// why that is the failure mode we chose.
 func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	q := r.URL.Query()
 	f := store.EventFilter{
 		ContractID: q.Get("contract_id"),
 		Cursor:     q.Get("cursor"),
 		TxHash:     q.Get("tx_hash"),
+		Scope:      scopeFrom(r.Context()),
 	}
 
 	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
 		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
+	}
+	// An explicitly named contract the tenant lacks is refused rather than
+	// quietly filtered to nothing, so a missing grant is distinguishable
+	// from a contract with no events. The store still ANDs the scope into
+	// the query regardless, so this check being wrong or removed downgrades
+	// the error message without opening a leak.
+	if f.ContractID != "" && !f.Scope.Allows(f.ContractID) {
+		return f, errForbiddenContract{contractID: f.ContractID}
 	}
 
 	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
@@ -1403,89 +1549,97 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 			f.Types = append(f.Types, t)
 		}
 	}
+// The parsing rules and validation live in the shared queries package so
+// the GraphQL resolvers in internal/api/graphql can reuse them — there is
+// exactly one source of truth for which topic positions are valid, what
+// counts as an "invalid order", etc.
+func filterFromQuery(r *http.Request) (store.EventFilter, error) {
+	q := r.URL.Query()
 
-	parseTopic := func(name, raw string) (json.RawMessage, error) {
-		if raw == "" {
-			return nil, nil
-		}
-		if json.Valid([]byte(raw)) {
-			return json.RawMessage(raw), nil
-		}
-		quoted, err := json.Marshal(raw)
-		if err != nil {
-			return nil, fmt.Errorf("invalid %s: %w", name, err)
-		}
-		return quoted, nil
-	}
-
-	// topic_contains accepts any valid JSON value and uses @> containment
-	// directly (no automatic array-wrapping). Unlike topic, bare words are
-	// not allowed — the input must be parseable JSON.
-	if raw := q.Get("topic_contains"); raw != "" {
-		if !json.Valid([]byte(raw)) {
-			return f, fmt.Errorf("topic_contains must be valid JSON")
-		}
-		f.TopicContains = json.RawMessage(raw)
-	}
-
-	// order controls sort direction for paginated results.
-	order := q.Get("order")
-	switch order {
-	case "", "asc", "desc":
-		f.Order = order
-	default:
-		return f, fmt.Errorf("invalid order %q (want asc or desc)", order)
-	}
-
-	// order_by selects the sort column; order still controls the direction,
-	// so the two combine (e.g. order_by=created_at&order=desc).
-	orderBy := q.Get("order_by")
-	if !store.ValidOrderBy(orderBy) {
-		return f, fmt.Errorf("invalid order_by %q (want %s, %s or %s)",
-			orderBy, store.OrderByID, store.OrderByLedger, store.OrderByCreatedAt)
-	}
-	f.OrderBy = orderBy
-
+	var fromLedger, toLedger int64
+	var fromTime, toTime time.Time
 	var err error
-	if topic := q.Get("topic"); topic != "" {
-		parsed, err := parseTopic("topic", topic)
-		if err != nil {
-			return f, err
+
+	if fromLedger, err = queries.ParseLedgerParam(q.Get("from_ledger")); err != nil {
+		// Match the historical REST error message: prefix the param name
+		// so users see exactly which value was bad.
+		return store.EventFilter{}, fmt.Errorf("from_ledger %s", err.Error())
+	}
+	if toLedger, err = queries.ParseLedgerParam(q.Get("to_ledger")); err != nil {
+		return store.EventFilter{}, fmt.Errorf("to_ledger %s", err.Error())
+	}
+
+	if fromTime, err = queries.ParseTimeParam(q.Get("from_time")); err != nil {
+		return store.EventFilter{}, fmt.Errorf("from_time %s", err.Error())
+	}
+	if toTime, err = queries.ParseTimeParam(q.Get("to_time")); err != nil {
+		return store.EventFilter{}, fmt.Errorf("to_time %s", err.Error())
+	}
+
+	types, err := queries.ParseTypes(q.Get("type"))
+	if err != nil {
+		return store.EventFilter{}, err
+	}
+
+	topic, err := queries.ParseTopic(q.Get("topic"))
+	if err != nil {
+		return store.EventFilter{}, fmt.Errorf("topic: %w", err)
+	}
+	t0, err := queries.ParseTopic(q.Get("topic0"))
+	if err != nil {
+		return store.EventFilter{}, fmt.Errorf("topic0: %w", err)
+	}
+	t1, err := queries.ParseTopic(q.Get("topic1"))
+	if err != nil {
+		return store.EventFilter{}, fmt.Errorf("topic1: %w", err)
+	}
+	t2, err := queries.ParseTopic(q.Get("topic2"))
+	if err != nil {
+		return store.EventFilter{}, fmt.Errorf("topic2: %w", err)
+	}
+	t3, err := queries.ParseTopic(q.Get("topic3"))
+	if err != nil {
+		return store.EventFilter{}, fmt.Errorf("topic3: %w", err)
+	}
+	tc, err := queries.ParseTopicContains(q.Get("topic_contains"))
+	if err != nil {
+		return store.EventFilter{}, err
+	}
+
+	args := queries.EventFilterArgs{
+		ContractID:    q.Get("contract_id"),
+		Types:         types,
+		Topic:         topic,
+		T0:            t0,
+		T1:            t1,
+		T2:            t2,
+		T3:            t3,
+		TopicContains: tc,
+		TxHash:        q.Get("tx_hash"),
+		FromLedger:    fromLedger,
+		ToLedger:      toLedger,
+		FromTime:      fromTime,
+		ToTime:        toTime,
+		Order:         q.Get("order"),
+		OrderBy:       q.Get("order_by"),
+		Cursor:        q.Get("cursor"),
+	}
+
+	// ?limit=N: explicit validation here so an explicit `?limit=0` (or
+	// any value outside [1,MaxQueryLimit]) is a 400. BuildingEventFilter
+	// treats args.Limit==0 as "use default" — we only invoke the
+	// default when the param is absent, not when the caller explicitly
+	// asked for an invalid value.
+	if raw := q.Get("limit"); raw != "" {
+		limit, lerr := strconv.Atoi(raw)
+		if lerr != nil || limit < 1 || limit > store.MaxQueryLimit {
+			return store.EventFilter{}, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
 		}
-		f.Topic = parsed
+		args.Limit = limit
 	}
 
-	if f.Topic0, err = parseTopic("topic0", q.Get("topic0")); err != nil {
-		return f, err
-	}
-	if f.Topic1, err = parseTopic("topic1", q.Get("topic1")); err != nil {
-		return f, err
-	}
-	if f.Topic2, err = parseTopic("topic2", q.Get("topic2")); err != nil {
-		return f, err
-	}
-	if f.Topic3, err = parseTopic("topic3", q.Get("topic3")); err != nil {
-		return f, err
-	}
-
-	if len(f.Topic) > 0 && (len(f.Topic0) > 0 || len(f.Topic1) > 0 || len(f.Topic2) > 0 || len(f.Topic3) > 0) {
-		return f, fmt.Errorf("topic and topic0..topic3 filters cannot be combined")
-	}
-
-	if f.FromLedger, err = parseLedgerParam(q.Get("from_ledger"), "from_ledger"); err != nil {
-		return f, err
-	}
-	if f.ToLedger, err = parseLedgerParam(q.Get("to_ledger"), "to_ledger"); err != nil {
-		return f, err
-	}
-	if f.FromLedger > 0 && f.ToLedger > 0 && f.FromLedger > f.ToLedger {
-		return f, fmt.Errorf("from_ledger %d is after to_ledger %d", f.FromLedger, f.ToLedger)
-	}
-
-	if f.FromTime, err = parseTimeParam(q.Get("from_time"), "from_time"); err != nil {
-		return f, err
-	}
-	if f.ToTime, err = parseTimeParam(q.Get("to_time"), "to_time"); err != nil {
+	f, err := queries.BuildEventFilter(args)
+	if err != nil {
 		return f, err
 	}
 	if !f.FromTime.IsZero() && !f.ToTime.IsZero() && f.FromTime.After(f.ToTime) {
@@ -1508,8 +1662,8 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if raw := q.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
-		if err != nil || limit < 1 || limit > store.MaxQueryLimit {
-			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
+		if err != nil || limit < 1 || limit > maxLimit {
+			return f, fmt.Errorf("limit must be an integer in [1,%d]", maxLimit)
 		}
 		f.Limit = limit
 	} else {
@@ -1517,7 +1671,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 
 	// ?recent=N: shorthand for "newest N events" — sets order=desc and
-	// limit=N (default 20). Conflicts with explicit order or limit params.
+	// limit=N (default 20). This isn't a general-purpose filter (it
+	// conflicts with explicit order/limit/order_by), so we keep the
+	// branch in the REST layer and apply it AFTER BuildEventFilter so
+	// the shared builder doesn't need a "shorthand mode" affordance.
 	if raw := q.Get("recent"); raw != "" {
 		if q.Get("order") != "" || q.Get("order_by") != "" {
 			return f, fmt.Errorf("recent cannot be combined with order or order_by")
@@ -1528,44 +1685,99 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		n := recentDefaultLimit
 		if raw != "true" {
 			n, err = strconv.Atoi(raw)
-			if err != nil || n < 1 || n > store.MaxQueryLimit {
-				return f, fmt.Errorf("recent must be a positive integer in [1,%d]", store.MaxQueryLimit)
+			if err != nil || n < 1 || n > maxLimit {
+				return f, fmt.Errorf("recent must be a positive integer in [1,%d]", maxLimit)
 			}
 		}
 		f.Order = "desc"
 		f.Limit = n
 	}
 
+	if raw := q.Get("has_value"); raw != "" {
+		switch raw {
+		case "true":
+			t := true
+			f.HasValue = &t
+		case "false":
+			v := false
+			f.HasValue = &v
+		default:
+			return f, fmt.Errorf("has_value must be true or false, got %q", raw)
+		}
+	}
+
 	return f, nil
 }
 
-func ptr[T any](v T) *T { return &v }
+// DefaultStreamScopeSync bounds how long a live stream can keep serving a
+// contract after the tenant's grant was revoked (and how long it waits for a
+// newly granted one to start flowing).
+const DefaultStreamScopeSync = 30 * time.Second
 
-func parseLedgerParam(raw, name string) (int64, error) {
-	if raw == "" {
-		return 0, nil
+// syncStreamScope re-resolves the tenant's grants periodically and pushes
+// them into the live subscription.
+//
+// Without this, the answer to the issue's "a tenant granted a contract
+// mid-stream" question would be "nothing happens until they reconnect" —
+// and, worse, the mirror-image case would be that revoking a grant does not
+// stop delivery to anyone already connected. A stream is exactly the place
+// where a snapshot-at-open authorization decision decays, because the
+// snapshot can outlive the entitlement by hours.
+//
+// Single-tenant deployments start no goroutine: their scope is a constant.
+func (s *Server) syncStreamScope(ctx context.Context, sub *broadcast.Subscription) {
+	if !s.multiTenant {
+		return
 	}
-	n, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("%s must be a positive integer", name)
+	p, ok := PrincipalFrom(ctx)
+	if !ok || p.Untenanted {
+		return
 	}
-	return n, nil
-}
-
-// parseTimeParam parses an RFC 3339 timestamp query parameter.
-// Sub-second precision and missing timezone offset are rejected.
-func parseTimeParam(raw, name string) (time.Time, error) {
-	if raw == "" {
-		return time.Time{}, nil
+	every := s.streamScopeSync
+	if every <= 0 {
+		every = DefaultStreamScopeSync
 	}
-	t, err := time.Parse(time.RFC3339, raw)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("%s must be an RFC 3339 timestamp (e.g. 2026-07-21T00:00:00Z)", name)
-	}
-	if t.Nanosecond() != 0 {
-		return time.Time{}, fmt.Errorf("%s sub-second precision is not supported", name)
-	}
-	return t, nil
+	go func() {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Re-read the tenant too, so a suspension (enabled=false)
+				// or a switch away from wildcard takes effect on open
+				// streams and not just on new requests.
+				tenant, err := s.tenants.GetTenant(ctx, p.Tenant.ID)
+				if errors.Is(err, store.ErrNotFound) {
+					// Deleted mid-stream: revoke everything. The read loop
+					// sees an empty scope and the connection goes quiet
+					// rather than continuing to serve a tenant that no
+					// longer exists.
+					sub.SetScope(store.Scope{})
+					return
+				}
+				if err != nil {
+					// Leave the existing scope in place on a transient
+					// database error: it was correct as of the last
+					// successful resolve, and widening or narrowing on a
+					// failed read would be guessing.
+					s.log.Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
+					continue
+				}
+				if !tenant.Enabled {
+					sub.SetScope(store.Scope{})
+					return
+				}
+				scope, err := s.tenants.ScopeForTenant(ctx, tenant)
+				if err != nil {
+					s.log.Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
+					continue
+				}
+				sub.SetScope(scope)
+			}
+		}
+	}()
 }
 
 func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
@@ -1576,7 +1788,7 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 
 	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeFilterError(w, err)
 		return
 	}
 
@@ -1602,6 +1814,14 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	// Use CloseRead to get a context cancelled when the client disconnects
 	// and to ensure the library processes control frames (ping/pong/close).
 	ctx = c.CloseRead(ctx)
+
+	// Attribute the connection's wall-clock duration to the tenant when it
+	// ends, however it ends.
+	streamStart := time.Now()
+	defer func() { s.recordStreamTime(r.Context(), time.Since(streamStart)) }()
+
+	// Keep the subscription's authorization current for its whole life.
+	s.syncStreamScope(ctx, sub)
 
 	// Periodic ping to detect stale connections.
 	pingCtx, pingCancel := context.WithCancel(ctx)

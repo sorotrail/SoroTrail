@@ -114,10 +114,16 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	FromLedger    int64     // inclusive
-	ToLedger      int64     // inclusive
-	FromTime      time.Time // inclusive, zero = no constraint
-	ToTime        time.Time // inclusive, zero = no constraint
+	// TxHash filters events emitted by a specific transaction hash.
+	TxHash string // hex-encoded transaction hash
+	// HasValue filters events by whether they carry a value payload.
+	// nil means no constraint; true means value IS NOT NULL;
+	// false means value IS NULL.
+	HasValue   *bool
+	FromLedger int64     // inclusive
+	ToLedger   int64     // inclusive
+	FromTime   time.Time // inclusive, zero = no constraint
+	ToTime     time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int
@@ -128,6 +134,17 @@ type EventFilter struct {
 	// a tiebreaker, so keyset pagination stays stable when the sort column
 	// has duplicates.
 	OrderBy string
+
+	// Scope is the tenant authorization boundary, ANDed into the generated
+	// SQL alongside the user-supplied filters above. Unlike every other
+	// field on this struct, its zero value is a constraint and not the
+	// absence of one: an unset Scope matches nothing. See the Scope type
+	// for why it fails closed rather than open.
+	//
+	// The API layer populates this from the authenticated request in
+	// exactly one place (filterFromQuery), so no handler decides for
+	// itself whether a caller is entitled to a row.
+	Scope Scope
 }
 
 // Sort columns accepted in EventFilter.OrderBy. The zero value means
@@ -382,7 +399,43 @@ type Subscription struct {
 	Enabled      bool               `json:"enabled"`
 	FailureCount int                `json:"failure_count"`
 	CreatedAt    time.Time          `json:"created_at"`
+	// TenantID is the owning tenant, or nil for an operator-owned
+	// subscription — which is what every subscription created before
+	// multi-tenancy, or in single-tenant mode, is.
+	TenantID *int64 `json:"tenant_id,omitempty"`
 }
+
+// SubscriptionOwner scopes subscription CRUD to one tenant's rows.
+//
+// A subscription delivers event data to an arbitrary external URL, which
+// makes it the most valuable thing in the API to an attacker: subscribing to
+// a contract you cannot read would exfiltrate it to a server you control.
+// Ownership is therefore enforced in the query, exactly like Scope, and for
+// the same reason.
+//
+// Like Scope, its zero value denies: it matches tenant_id = 0, and the
+// column is a bigserial reference that never takes that value.
+type SubscriptionOwner struct {
+	tenantID int64
+	all      bool
+}
+
+// AllSubscriptions matches every subscription regardless of owner. Used in
+// single-tenant mode, by admin tenants, and by the delivery worker, which
+// serves all tenants at once.
+func AllSubscriptions() SubscriptionOwner { return SubscriptionOwner{all: true} }
+
+// OwnedBy matches only the given tenant's subscriptions.
+func OwnedBy(tenantID int64) SubscriptionOwner {
+	return SubscriptionOwner{tenantID: tenantID}
+}
+
+// IsAll reports whether the owner filter is unrestricted.
+func (o SubscriptionOwner) IsAll() bool { return o.all }
+
+// TenantID returns the tenant this owner is restricted to; 0 when
+// unrestricted or unset.
+func (o SubscriptionOwner) TenantID() int64 { return o.tenantID }
 
 // DeliveryAttempt records one attempt to POST an event to a subscriber's
 // callback URL.
@@ -432,6 +485,15 @@ type Stats struct {
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
+	// Pruner counters are populated only when retention is configured;
+	// omitted from JSON when the pruner is a no-op.
+	Pruner PrunerStats `json:"pruner,omitempty"`
+}
+
+// PrunerStats is a JSON-friendly view of pruner.Metrics.
+type PrunerStats struct {
+	RunsCompleted   uint64 `json:"runs_completed"`
+	TotalRowsPurged int64  `json:"total_rows_purged"`
 }
 
 // RPCErrorStats is a JSON-friendly snapshot of per-method RPC error counts.
@@ -504,6 +566,15 @@ type Store interface {
 	// so a repair never costs a row its replayability.
 	ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error
 	// GetEvent returns the event with the given ID, or ErrNotFound.
+	//
+	// An event outside sc is reported as ErrNotFound, not as a permission
+	// error. Event IDs are dense and guessable (they are TOIDs), so
+	// distinguishing "exists but forbidden" from "does not exist" would let
+	// a caller enumerate the existence of other tenants' events one probe
+	// at a time. Named-contract endpoints answer 403 instead, because there
+	// the caller already supplied the contract ID and learns nothing from
+	// being told they lack access to it.
+	GetEvent(ctx context.Context, id string, sc Scope) (Event, error)
 	GetEvent(ctx context.Context, id string) (Event, error)
 	// GetEventsByTxHash returns all events emitted by the transaction
 	// identified by txHash, excluding the event with id excludeID (when
@@ -515,7 +586,11 @@ type Store interface {
 	// URL: we want to confirm "still here" without re-serializing the
 	// full row, so retention/pruning (when it lands, see #8) can't leave
 	// cached clients believing a deleted event is still available.
-	EventExists(ctx context.Context, id string) (bool, error)
+	//
+	// Scoped for the same reason as GetEvent, and more urgently: this is a
+	// pure existence oracle, so an unscoped version would be the cheapest
+	// possible cross-tenant enumeration primitive.
+	EventExists(ctx context.Context, id string, sc Scope) (bool, error)
 	// QueryEvents returns a page of events in ascending ID order, plus a
 	// cursor for the next page ("" when there are no more results).
 	// Default order is ascending (oldest-first) for backward compatibility.
@@ -570,10 +645,12 @@ type Store interface {
 	// HWM even if they race.
 	SaveAuditStateIfGreater(ctx context.Context, ledger int64) (AuditState, error)
 
-	// ListWatchedContracts returns every watched contract in stable
-	// (contract_id) order, with its add timestamp. An empty result means
-	// the watch list is empty, and the ingester interprets that as
-	// "ingest all contract events" — distinct from "ingest nothing".
+	// ListWatchedContracts returns the union of the operator-configured
+	// watch list and every tenant's watch list, which is what ingestion
+	// must fetch. It is intentionally not scoped: ingestion serves all
+	// tenants at once, and a contract two tenants both want is fetched
+	// once. Removal is implicit — a contract disappears from the union
+	// when the last row naming it is gone.
 	ListWatchedContracts(ctx context.Context) ([]WatchedContract, error)
 	AddWatchedContract(ctx context.Context, contractID string) error
 	// RemoveWatchedContract stops future ingestion for the given contract
@@ -595,12 +672,15 @@ type Store interface {
 	// uses this to keep working while a finding is being repaired.
 	ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error)
 
-	// Subscription CRUD.
+	// Subscription CRUD. Every read and mutation is filtered by owner, so a
+	// tenant cannot enumerate, read, modify or delete another's callbacks —
+	// and, critically, cannot register one that would deliver events it is
+	// not entitled to read.
 	CreateSubscription(ctx context.Context, s Subscription) (Subscription, error)
-	GetSubscription(ctx context.Context, id int64) (Subscription, error)
-	ListSubscriptions(ctx context.Context) ([]Subscription, error)
-	UpdateSubscription(ctx context.Context, s Subscription) (Subscription, error)
-	DeleteSubscription(ctx context.Context, id int64) error
+	GetSubscription(ctx context.Context, id int64, owner SubscriptionOwner) (Subscription, error)
+	ListSubscriptions(ctx context.Context, owner SubscriptionOwner) ([]Subscription, error)
+	UpdateSubscription(ctx context.Context, s Subscription, owner SubscriptionOwner) (Subscription, error)
+	DeleteSubscription(ctx context.Context, id int64, owner SubscriptionOwner) error
 
 	// ListEnabledSubscriptions returns all subscriptions with enabled=true.
 	ListEnabledSubscriptions(ctx context.Context) ([]Subscription, error)
@@ -615,8 +695,9 @@ type Store interface {
 	// RecordDeliveryAttempt persists one delivery attempt.
 	RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (DeliveryAttempt, error)
 	// ListDeliveryAttempts returns delivery attempts for a subscription,
-	// newest first.
-	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
+	// newest first. Owner-filtered: delivery history reveals which events
+	// matched, so it is as sensitive as the subscription itself.
+	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int, owner SubscriptionOwner) ([]DeliveryAttempt, error)
 
 	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
 	// or ErrNotFound when no spec is cached for that hash.
@@ -625,7 +706,12 @@ type Store interface {
 	// and contract_id so subsequent lookups avoid an RPC round trip.
 	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
 
-	Stats(ctx context.Context) (Stats, error)
+	// Stats summarizes the store within sc. Aggregates are scoped because
+	// counts are an information leak in their own right: an unscoped
+	// total_events or contract_count tells a tenant how much data exists
+	// outside its grants, and watching those numbers move reveals other
+	// tenants' ingestion activity.
+	Stats(ctx context.Context, sc Scope) (Stats, error)
 	Ping(ctx context.Context) error
 }
 

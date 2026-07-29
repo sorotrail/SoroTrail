@@ -1,11 +1,15 @@
 package ingester
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +22,112 @@ import (
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// recordingLogger returns a logger that writes JSON records to a buffer
+// for easy test-time assertions.
+func recordingLogger() (*slog.Logger, *bytes.Buffer) {
+	buf := &bytes.Buffer{}
+	return slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo})), buf
+}
+
+// recordingLagMetrics records every SetLagging call in order so tests can
+// assert the alarm published correctly.
+type recordingLagMetrics struct {
+	mu    sync.Mutex
+	calls []bool
+}
+
+func (r *recordingLagMetrics) SetLagging(b bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, b)
+}
+
+// history returns a snapshot of the published state values in order.
+// The field is named `calls` to avoid the field/method name collision
+// Go rejects; the method name `history` is the public read API.
+func (r *recordingLagMetrics) history() []bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]bool, len(r.calls))
+	copy(out, r.calls)
+	return out
+}
+
+// logRecords parses JSON records from the recordingLogger buffer.
+func logRecords(t *testing.T, buf *bytes.Buffer, levelFn func(string) bool) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("parsing log line %q: %v", line, err)
+		}
+		if levelFn == nil || levelFn(rec["level"].(string)) {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+// makeIngester is the lag-alarm test constructor. It wires a recording
+// logger and recording LagMetrics so each test focuses on driving cycles
+// and asserting behavior rather than plumbing.
+func makeIngester(t *testing.T, opts Options) (*Ingester, *bytes.Buffer, *recordingLagMetrics) {
+	t.Helper()
+	log, buf := recordingLogger()
+	metrics := &recordingLagMetrics{}
+	opts.LagMetrics = metrics
+	ing := New(&mockRPC{health: rpc.Health{LatestLedger: 1_000}}, newMockStore(),
+		passthroughDecoder{}, log, opts)
+	return ing, buf, metrics
+}
+
+// setLagAlarmClientHealth updates the chain head seen by whatever RPC is
+// wired into ing. Both supported test RPCs let the test author set the
+// latest directly (mockRPC via its health field; flakyRPC via its
+// wrapped base mockRPC's health field). Centralizing this in one
+// helper avoids repeating a type switch at every call site.
+func setLagAlarmClientHealth(t *testing.T, client rpc.Client, latest uint32) {
+	t.Helper()
+	switch r := client.(type) {
+	case *mockRPC:
+		r.health = rpc.Health{LatestLedger: latest}
+	case *flakyRPC:
+		r.base.health = rpc.Health{LatestLedger: latest}
+	default:
+		t.Fatalf("setLagAlarmClientHealth: unhandled RPC type %T", client)
+	}
+}
+
+// driveLagCycles scripts a sequence of (latestLedger, ingestedLedger)
+// pairs and invokes checkLag on each. ingestedLedger == -1 removes the
+// state row to simulate cold start.
+func driveLagCycles(t *testing.T, ing *Ingester, cycles []mockCycle) {
+	t.Helper()
+	for _, c := range cycles {
+		setLagAlarmClientHealth(t, ing.client, c.latest)
+		st := ing.store.(*mockStore)
+		if c.ingested == -1 {
+			st.state = nil
+		} else {
+			require.NoError(t, st.SaveIngestionState(context.Background(),
+				store.IngestionState{LastIngestedLedger: c.ingested}))
+		}
+		ing.checkLag(context.Background())
+	}
+}
+
+type mockCycle struct {
+	// latest is the chain head the mockRPC.GetLatestLedger reports.
+	latest uint32
+	// ingested is the stored LastIngestedLedger. Use -1 to remove the
+	// state row entirely (cold start).
+	ingested int64
 }
 
 func newTestIngester(client rpc.Client, st store.Store, opts Options) *Ingester {
@@ -106,8 +216,6 @@ func TestWarmStart_ResumesFromCursor(t *testing.T) {
 }
 
 func TestPagination_FullPageKeepsCursorAndContinues(t *testing.T) {
-	// Page 1 is full (2 events, limit 2) with a top-level cursor; page 2 is
-	// short → caught up.
 	client := &mockRPC{
 		eventsResps: []rpc.GetEventsResponse{
 			{
@@ -276,8 +384,6 @@ func paginationCursor(req rpc.GetEventsRequest) string {
 }
 
 func TestPagination_LegacyPagingTokenFallback(t *testing.T) {
-	// Old servers return no top-level cursor; the per-event pagingToken of
-	// the last event is used instead.
 	client := &mockRPC{
 		eventsResps: []rpc.GetEventsResponse{{
 			Events: []rpc.Event{
@@ -308,7 +414,6 @@ func TestIdempotentReIngest(t *testing.T) {
 
 	_, err := ing.runOnce(context.Background())
 	require.NoError(t, err)
-	// Reset position so the same page is fetched again.
 	require.NoError(t, st.SaveIngestionState(context.Background(),
 		store.IngestionState{LastIngestedLedger: 99}))
 	_, err = ing.runOnce(context.Background())
@@ -317,9 +422,6 @@ func TestIdempotentReIngest(t *testing.T) {
 	assert.Len(t, st.events, 1, "re-ingesting the same events must not duplicate")
 }
 
-// Raw XDR must be retained at ingest time, otherwise `sorotrail replay` has
-// nothing to re-decode. Events the RPC delivered as JSON have no XDR to keep,
-// and replay skips them.
 func TestPersistEvents_RetainsRawXDR(t *testing.T) {
 	fromXDR := rpc.Event{
 		ID:         "e1",
@@ -329,7 +431,7 @@ func TestPersistEvents_RetainsRawXDR(t *testing.T) {
 		Topic:      []string{"topic-xdr"},
 		Value:      "value-xdr",
 	}
-	fromJSON := rpcEvent("e2", 100) // TopicJSON/ValueJSON, no XDR
+	fromJSON := rpcEvent("e2", 100)
 
 	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{
 		Events:       []rpc.Event{fromXDR, fromJSON},
