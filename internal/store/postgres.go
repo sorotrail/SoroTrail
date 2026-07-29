@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"time"
 
@@ -1088,6 +1089,42 @@ func (p *Postgres) DeleteEventsBefore(ctx context.Context, maxLedger int64, befo
 
 func (p *Postgres) Ping(ctx context.Context) error {
 	return p.pool.Ping(ctx)
+}
+
+// AdvisoryLockKey hashes an RPC URL into an int64 suitable for use with
+// Postgres advisory locks. Different RPC URLs produce different keys with
+// high probability, ensuring two deployments targeting different networks
+// (or different RPC providers) never contend on the same lock.
+func AdvisoryLockKey(rpcURL string) int64 {
+	h := fnv.New64a()
+	h.Write([]byte(rpcURL))
+	// Fold the uint64 into int64, keeping the full entropy of the hash.
+	return int64(h.Sum64())
+}
+
+// TryAdvisoryLock attempts to acquire a session-level Postgres advisory
+// lock keyed by the given int64. It acquires a dedicated connection from
+// the pool so the lock persists for the lifetime of the returned
+// connection. When acquired=true the caller must call conn.Release() to
+// release both the lock and the connection back to the pool.
+//
+// Returns acquired=false when another session already holds the lock on
+// this key — the caller should skip ingestion but may continue serving.
+func (p *Postgres) TryAdvisoryLock(ctx context.Context, key int64) (conn *pgxpool.Conn, acquired bool, err error) {
+	conn, err = p.pool.Acquire(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("acquiring connection for advisory lock: %w", err)
+	}
+	var locked bool
+	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", key).Scan(&locked); err != nil {
+		conn.Release()
+		return nil, false, fmt.Errorf("pg_try_advisory_lock(%d): %w", key, err)
+	}
+	if !locked {
+		conn.Release()
+		return nil, false, nil
+	}
+	return conn, true, nil
 }
 
 func (p *Postgres) GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error) {
