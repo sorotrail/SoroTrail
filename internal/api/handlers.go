@@ -617,6 +617,74 @@ func (s *Server) handleGetEventRaw(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleGetEventTransaction returns all sibling events from the same
+// transaction as the event with the given {id}. The referenced event
+// itself is excluded from the response. Returns 404 when the event is
+// not found; returns an empty list when the transaction has no other
+// events.
+func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	// Validate ?fields= before touching the store.
+	fields, err := parseFields(r.URL.Query().Get("fields"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	event, err := s.store.GetEvent(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
+		return
+	}
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading event for transaction siblings", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
+		return
+	}
+
+	// If the event has no transaction hash (should not normally happen),
+	// return an empty list rather than erroring — the event is valid but
+	// has no siblings.
+	if event.TxHash == "" {
+		writeCacheHeaders(w, cacheImmutable, immutableMaxAge, `"`+id+`:tx"`)
+		writeJSON(w, http.StatusOK, eventsResponse{Events: []store.Event{}})
+		return
+	}
+
+	siblings, err := s.store.GetEventsByTxHash(r.Context(), event.TxHash, id)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading transaction siblings", "tx_hash", event.TxHash, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading transaction events failed"))
+		return
+	}
+
+	decoded := r.URL.Query().Get("decoded") == "true"
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
+
+	etag := `"` + id + `:tx"`
+	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+
+	if decoded && s.enricher != nil {
+		enriched := s.enricher.EnrichEvents(r.Context(), siblings)
+		if includeXDR {
+			writeJSON(w, http.StatusOK, enrichedEventsWithXDRResponse{Events: enrichEventsWithXDR(enriched)})
+			return
+		}
+		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched})
+		return
+	}
+	if includeXDR {
+		writeJSON(w, http.StatusOK, eventsWithXDRResponse{Events: eventsWithXDR(siblings)})
+		return
+	}
+	if fields == nil {
+		writeJSON(w, http.StatusOK, eventsResponse{Events: siblings})
+	} else {
+		writeJSON(w, http.StatusOK, map[string]any{"events": projectEvents(siblings, fields)})
+	}
+}
+
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
@@ -727,6 +795,144 @@ func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
 
 // Stats summarizes what the indexer has stored plus, when the auditor is
 // running, the post-processing counters it has accumulated.
+
+// contractListResponse is the JSON body for GET /contracts.
+type contractListResponse struct {
+	Contracts []store.ContractSummary `json:"contracts"`
+	Count     int                     `json:"count"`
+	Cursor    string                  `json:"cursor,omitempty"`
+}
+
+// handleListContracts returns one ContractSummary per indexed contract,
+// paginated, default-sorted by event_count desc (the most active
+// contracts first). The endpoint is intentionally READ-ONLY and
+// unauthenticated: a contract listing has no surface area for
+// cross-tenant data leakage (a contract_id is opaque), and gating it
+// behind API_KEY would force every browser dashboard to log in.
+//
+// Cache-Control is no-cache: a brand-new contract can be ingested at
+// any time, and a stale cache would hide it from a freshly-launched
+// explorer.
+func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
+	f := store.ContractsFilter{
+		ContractIDPrefix: r.URL.Query().Get("contract_id"),
+		SortKey:          r.URL.Query().Get("sort"),
+		Order:            r.URL.Query().Get("order"),
+		Cursor:           r.URL.Query().Get("cursor"),
+	}
+	if !store.ValidContractsSortKey(f.SortKey) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf(
+			"invalid sort %q (want %s, %s, %s, or %s)",
+			f.SortKey,
+			store.SortByActivity, store.SortByFirstLedger,
+			store.SortByLastLedger, store.SortByLastSeen))
+		return
+	}
+	if f.Order != "" && f.Order != "asc" && f.Order != "desc" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid order %q (want asc or desc)", f.Order))
+		return
+	}
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid cursor %q", f.Cursor))
+		return
+	}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		f.Limit = n
+	} else {
+		f.Limit = store.DefaultQueryLimit
+	}
+	items, cursor, err := s.store.ListContracts(r.Context(), f)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("listing contracts", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
+		return
+	}
+	total, cerr := s.store.CountContracts(r.Context(), f)
+	if cerr != nil {
+		loggerFromContext(r.Context()).Warn("counting contracts for X-Total-Count", "error", cerr)
+	} else if total > 0 {
+		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, contractListResponse{
+		Contracts: items,
+		Count:     len(items),
+		Cursor:    cursor,
+	})
+}
+
+// deadLetterListResponse is the JSON body for GET /dead-letters.
+type deadLetterListResponse struct {
+	DeadLetters []store.DeadLetter `json:"dead_letters"`
+	Count       int                `json:"count"`
+	Cursor      string             `json:"cursor,omitempty"`
+}
+
+// handleListDeadLetters returns the poison-event queue newest-first.
+// Like the watched-contracts surface, this is gated behind API_KEY —
+// dead-letter rows contain raw RPC payloads, and disclosing them on a
+// public endpoint would leak every event the indexer failed to decode.
+func (s *Server) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
+	f := struct {
+		ContractID string
+		Limit      int
+		Cursor     string
+	}{
+		ContractID: r.URL.Query().Get("contract_id"),
+		Cursor:     r.URL.Query().Get("cursor"),
+	}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		f.Limit = n
+	}
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid cursor %q", f.Cursor))
+		return
+	}
+	items, cursor, err := s.store.ListDeadLetters(r.Context(), f.ContractID, f.Limit, f.Cursor)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("listing dead letters", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("listing dead letters failed"))
+		return
+	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, deadLetterListResponse{
+		DeadLetters: items,
+		Count:       len(items),
+		Cursor:      cursor,
+	})
+}
+
+// handleDeleteDeadLetter removes a single dead-letter row by id.
+// Idempotent: calling again returns 404.
+func (s *Server) handleDeleteDeadLetter(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("dead-letter id must be a positive integer, got %q", idStr))
+		return
+	}
+	if err := s.store.DeleteDeadLetter(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("dead letter %d not found", id))
+			return
+		}
+		loggerFromContext(r.Context()).Error("deleting dead letter", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("deleting dead letter failed"))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.Stats(r.Context())
 	if err != nil {
@@ -1031,6 +1237,7 @@ func listETag(f store.EventFilter) string {
 		Topic3        json.RawMessage `json:"p3,omitempty"`
 		TopicContains json.RawMessage `json:"pc,omitempty"`
 		TxHash        string          `json:"th,omitempty"`
+		HasValue      *bool           `json:"hv,omitempty"`
 		FromLedger    int64           `json:"fl"`
 		ToLedger      int64           `json:"tl"`
 		FromTime      string          `json:"ft,omitempty"`
@@ -1051,6 +1258,7 @@ func listETag(f store.EventFilter) string {
 		Topic3:        f.Topic3,
 		TopicContains: f.TopicContains,
 		TxHash:        f.TxHash,
+		HasValue:      f.HasValue,
 		FromLedger:    f.FromLedger,
 		ToLedger:      f.ToLedger,
 		FromTime:      timeOrEmpty(f.FromTime),
@@ -1265,6 +1473,20 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	if err != nil {
 		return f, err
 	}
+	if !f.FromTime.IsZero() && !f.ToTime.IsZero() && f.FromTime.After(f.ToTime) {
+		return f, fmt.Errorf("from_time %s is after to_time %s",
+			f.FromTime.Format(time.RFC3339), f.ToTime.Format(time.RFC3339))
+	}
+
+	if raw := q.Get("limit"); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit < 1 || limit > maxLimit {
+			return f, fmt.Errorf("limit must be an integer in [1,%d]", maxLimit)
+		}
+		f.Limit = limit
+	} else {
+		f.Limit = store.DefaultQueryLimit
+	}
 
 	// ?recent=N: shorthand for "newest N events" — sets order=desc and
 	// limit=N (default 20). This isn't a general-purpose filter (it
@@ -1281,12 +1503,25 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		n := recentDefaultLimit
 		if raw != "true" {
 			n, err = strconv.Atoi(raw)
-			if err != nil || n < 1 || n > store.MaxQueryLimit {
-				return f, fmt.Errorf("recent must be a positive integer in [1,%d]", store.MaxQueryLimit)
+			if err != nil || n < 1 || n > maxLimit {
+				return f, fmt.Errorf("recent must be a positive integer in [1,%d]", maxLimit)
 			}
 		}
 		f.Order = "desc"
 		f.Limit = n
+	}
+
+	if raw := q.Get("has_value"); raw != "" {
+		switch raw {
+		case "true":
+			t := true
+			f.HasValue = &t
+		case "false":
+			v := false
+			f.HasValue = &v
+		default:
+			return f, fmt.Errorf("has_value must be true or false, got %q", raw)
+		}
 	}
 
 	return f, nil

@@ -100,7 +100,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `AUDIT_MAX_RPS` | `10` | Total request budget (split between ingest and audit). |
 | `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
 | `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
-| `API_KEY` | empty | Required to use the runtime `/watched-contracts` surface; empty means every request there is rejected with 503. This is a placeholder until #17 (real auth) lands — at that point `API_KEY` will be replaced. |
+| `API_MAX_LIMIT` | `500` | Maximum page size accepted for list endpoints (`/events`, `/subscriptions/{id}/deliveries`). Values above this are rejected with 400. |
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
@@ -129,6 +129,14 @@ All configuration comes from environment variables (see `.env.example`):
   project exists to prevent).
 - Requests are rate-limited (~10/s, matching public endpoint limits) and
   errors are retried with jittered exponential backoff.
+- **Ingest-lag alarm**: every poll cycle compares the chain head (fetched via
+  `getLatestLedger`) to the last ingested ledger. When the gap exceeds
+  `LAG_WARN_LEDGERS` (default `100`), a single WARN-level structured log is
+  emitted; a single INFO log fires when the gap closes. Hysteresis keeps the
+  alarm quiet between crossings, so a stuck indexer logs once on crossing
+  and once on recovery rather than spamming. No log is emitted on cold
+  start (no baseline yet) or when the alarm is disabled
+  (`LAG_WARN_LEDGERS=0`).
 - Topics/values are stored as JSON. When the RPC supports `xdrFormat: "json"`
   its decoding is used verbatim; otherwise the base64 XDR is decoded locally
   into shapes like `{"symbol":"transfer"}`, `{"u64":42}`, `{"i128":"-1000"}`,
@@ -245,8 +253,9 @@ Every list endpoint uses cursor-based pagination with a consistent contract:
   clients must never inspect or modify it. Sending an invalid cursor
   returns `400 Bad Request` with the standard error envelope
   `{"error": "invalid cursor ..."}`.
-- **Defaults**: `limit` defaults to 50 when unset; the maximum is 200.
-  Values outside `[1,200]` return `400 Bad Request`.
+- **Defaults**: `limit` defaults to 50 when unset; the maximum is 500
+  (configurable via `API_MAX_LIMIT`).
+  Values outside `[1, API_MAX_LIMIT]` return `400 Bad Request`.
 - **Empty result sets** return an empty array with no `"cursor"` field
   (or an empty string cursor, depending on the endpoint).
 
@@ -292,7 +301,7 @@ Query parameters (all optional, combinable):
 | `to_ledger` | `260000` | Inclusive upper ledger bound. |
 | `from_time` | `2026-07-21T00:00:00Z` | Inclusive lower `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
 | `to_time` | `2026-07-22T00:00:00Z` | Inclusive upper `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
-| `limit` | `50` | Page size, 1–200 (default 50). |
+| `limit` | `50` | Page size, 1–500 (default 50). Configurable max via `API_MAX_LIMIT`. |
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
 | `order` | `desc` | `asc` \| `desc`, defaults to asc. Sort direction. |
 | `order_by` | `created_at` | `id` \| `ledger` \| `created_at`, defaults to `id`. Sort column. Anything else is a `400`. |
@@ -732,7 +741,7 @@ curl -s -X DELETE localhost:8080/subscriptions/1
 #### `GET /subscriptions/{id}/deliveries`
 
 List delivery attempts for a subscription, newest first. Optional `?limit=`
-(default 50, max 200).
+(default 50, max configurable via `API_MAX_LIMIT`, default 500).
 
 ```sh
 curl -s localhost:8080/subscriptions/1/deliveries?limit=10

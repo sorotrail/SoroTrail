@@ -144,6 +144,16 @@ func run() error {
 	specFetcher := spec.NewFetcher(rpcClient)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
+	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
+		PollInterval:     cfg.PollInterval,
+		StartLedger:      cfg.StartLedger,
+		RetentionLedgers: cfg.RetentionLedgers,
+		LagWarnLedgers:   cfg.LagWarnLedgers,
+		// LagMetrics is nil here on purpose: no /metrics endpoint is
+		// wired up yet, so the ingester's applyDefaults installs a
+		// no-op. When a Prometheus endpoint lands, main.go is the
+		// seam to pass a real LagMetrics implementation.
+	})
 	// Wrap the raw RPC client so per-method error totals are tracked and
 	// surfaced via /stats. specFetcher already holds a reference to the
 	// unwrapped client (spec lookups are not counted as ingestion errors).
@@ -159,6 +169,10 @@ func run() error {
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
+	// Wire the same store as the dead-letter sink: events that fail to
+	// decode/persist land in the dead_letters table instead of
+	// stalling the cycle (issue #131).
+	ing.SetDeadLetterSink(st)
 
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a
@@ -194,10 +208,17 @@ func run() error {
 		SlowQueryThreshold: cfg.APISlowQueryThreshold,
 		Logger:             log,
 	})
+	api.SetMaxLimit(cfg.APIMaxLimit)
+
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
+	apiServer.SetCORSConfig(api.CORSConfig{
+		AllowedOrigins: cfg.CORSAllowedOrigins,
+		AllowedMethods: cfg.CORSAllowedMethods,
+		AllowedHeaders: cfg.CORSAllowedHeaders,
+	})
 
 	// GraphQL transport: reads against the same store + spec enricher
 	// the REST handlers use. Dev-mode playground is gated on

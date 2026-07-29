@@ -47,6 +47,29 @@ func TestLoad(t *testing.T) {
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
 				assert.Equal(t, uint32(120960), c.PartitionLedgerSpan)
 				assert.Empty(t, c.WatchedContracts)
+				assert.Equal(t, uint32(100), c.LagWarnLedgers,
+					"LagWarnLedgers default lets the lag alarm work out of the box")
+			},
+		},
+		{
+			name: "lag alarm threshold configurable",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"LAG_WARN_LEDGERS":  "50",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint32(50), c.LagWarnLedgers)
+			},
+		},
+		{
+			name: "lag alarm threshold zero disables the alarm",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"LAG_WARN_LEDGERS": "0",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint32(0), c.LagWarnLedgers,
+					"0 is the documented way to silence the alarm entirely")
 				assert.Zero(t, c.RateLimitRPS, "rate limiter disabled by default")
 				assert.Zero(t, c.RateLimitBurst)
 				assert.False(t, c.RateLimitTrustedProxy)
@@ -285,6 +308,9 @@ func TestLoad(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Clear the variables Load reads, then apply the case's env.
 			// t.Setenv registers restoration; Unsetenv makes defaults apply.
+			for _, key := range []string{"RPC_URL", "DATABASE_URL", "POLL_INTERVAL",
+				"HTTP_ADDR", "WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL",
+				"LAG_WARN_LEDGERS"} {
 			for _, key := range envKeys {
 				t.Setenv(key, "")
 				os.Unsetenv(key)
