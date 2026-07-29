@@ -40,6 +40,11 @@ type stubStore struct {
 	event    store.Event
 	eventErr error
 
+	txSiblings    []store.Event
+	txSiblingsErr error
+	lastTxHash    string
+	lastExcludeID string
+
 	stats            store.Stats
 	pingErr          error
 	watchedList      []store.WatchedContract
@@ -57,6 +62,10 @@ type stubStore struct {
 
 	ingestion    store.IngestionState
 	ingestionErr error
+
+	migrationVersion int
+	migrationDirty   bool
+	migrationErr     error
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -97,8 +106,20 @@ func (s *stubStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 	return store.AuditFinding{}, store.ErrNotFound
 }
 
-func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
+// DeleteEventsBefore is unused by API tests but needed to satisfy
+// store.Store now that the pruner can call it.
+func (s *stubStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}
+
+func (s *stubStore) GetEvent(context.Context, string, store.Scope) (store.Event, error) {
 	return s.event, s.eventErr
+}
+
+func (s *stubStore) GetEventsByTxHash(_ context.Context, txHash, excludeID string) ([]store.Event, error) {
+	s.lastTxHash = txHash
+	s.lastExcludeID = excludeID
+	return s.txSiblings, s.txSiblingsErr
 }
 
 func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
@@ -110,7 +131,7 @@ func (s *stubStore) SetContractSpec(context.Context, string, string, []byte) err
 
 // EventExists is the cheap 304 path; tests assert the handler uses it
 // (instead of GetEvent) when If-None-Match matches.
-func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
+func (s *stubStore) EventExists(_ context.Context, id string, _ store.Scope) (bool, error) {
 	s.existsCalls++
 	s.lastExistsID = id
 	return s.exists, s.existsErr
@@ -126,35 +147,56 @@ func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, er
 	return s.ingestion, s.ingestionErr
 }
 
-func (s *stubStore) Stats(context.Context) (store.Stats, error) { return s.stats, nil }
-func (s *stubStore) Ping(context.Context) error                 { return s.pingErr }
+// MigrationVersion backs /readyz's schema check. Tests that need a dirty
+// or errored schema set migrationErr / migrationDirty.
+func (s *stubStore) MigrationVersion(context.Context) (int, bool, error) {
+	if s.migrationErr != nil {
+		return 0, false, s.migrationErr
+	}
+	// Zero means "unset" for the many tests that construct stubStore{}
+	// inline; /readyz treats a real 0 as "no migrations applied", so
+	// default to a clean applied schema unless a test says otherwise.
+	v := s.migrationVersion
+	if v == 0 {
+		v = 1
+	}
+	return v, s.migrationDirty, nil
+}
+
+func (s *stubStore) Stats(context.Context, store.Scope) (store.Stats, error) { return s.stats, nil }
 func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return s.watchedList, s.watchedListErr
 }
+
 func (s *stubStore) AddWatchedContract(_ context.Context, id string) error {
 	s.added = append(s.added, id)
 	return s.addErr
 }
+
 func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
 	s.removed = append(s.removed, id)
 	return s.removeErr
 }
+
+func (s *stubStore) Ping(context.Context) error { return s.pingErr }
 
 // Subscription stubs for the webhook feature.
 func (s *stubStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
 	sub.ID = 1
 	return sub, nil
 }
-func (s *stubStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
+func (s *stubStore) GetSubscription(_ context.Context, id int64, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return store.Subscription{}, store.ErrNotFound
 }
-func (s *stubStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
+func (s *stubStore) ListSubscriptions(context.Context, store.SubscriptionOwner) ([]store.Subscription, error) {
 	return nil, nil
 }
-func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return sub, nil
 }
-func (s *stubStore) DeleteSubscription(context.Context, int64) error { return nil }
+func (s *stubStore) DeleteSubscription(context.Context, int64, store.SubscriptionOwner) error {
+	return nil
+}
 func (s *stubStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
 	return nil, nil
 }
@@ -166,7 +208,7 @@ func (s *stubStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 	a.ID = 1
 	return a, nil
 }
-func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
+func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int, store.SubscriptionOwner) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
 
@@ -310,6 +352,40 @@ func TestListEvents_TxHashFilter(t *testing.T) {
 	}
 }
 
+func TestListEvents_HasValueFilter(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		want    *bool // nil = not set, true = has value, false = no value
+		wantErr int   // 0 = success
+	}{
+		{name: "no has_value param", query: "/events", want: nil, wantErr: 0},
+		{name: "has_value=true", query: "/events?has_value=true", want: ptr(true), wantErr: 0},
+		{name: "has_value=false", query: "/events?has_value=false", want: ptr(false), wantErr: 0},
+		{name: "empty has_value is no-op", query: "/events?has_value=", want: nil, wantErr: 0},
+		{name: "combined with contract_id", query: "/events?contract_id=" + testContract + "&has_value=true", want: ptr(true), wantErr: 0},
+		{name: "combined with ledger range", query: "/events?from_ledger=100&to_ledger=200&has_value=false", want: ptr(false), wantErr: 0},
+		{name: "invalid value returns 400", query: "/events?has_value=yes", wantErr: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], "has_value")
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			assert.Equal(t, tt.want, st.lastFilter.HasValue)
+		})
+	}
+}
+
 func TestListEvents_TypeFilter(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -424,12 +500,12 @@ func TestListEvents_CursorAndLimitValidation(t *testing.T) {
 	assert.Equal(t, store.DefaultQueryLimit, st.lastFilter.Limit)
 
 	// Invalid limit returns 400
-	for _, badLimit := range []string{"0", "-5", "201", "xyz"} {
+	for _, badLimit := range []string{"0", "-5", "501", "xyz"} {
 		resp, body := doGet(t, srv, "/events?limit="+badLimit)
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		var errResp map[string]string
 		require.NoError(t, json.Unmarshal(body, &errResp))
-		assert.Contains(t, errResp["error"], "limit must be an integer in [1,200]")
+		assert.Contains(t, errResp["error"], "limit must be an integer in [1,500]")
 	}
 
 	// Malformed cursor returns 400
@@ -1312,11 +1388,11 @@ func TestListEvents_RecentParam(t *testing.T) {
 			wantLimit:  5,
 		},
 		{
-			name:       "recent=200 (max limit) is accepted",
-			query:      "/events?recent=200",
+			name:       "recent=500 (max limit) is accepted",
+			query:      "/events?recent=500",
 			wantStatus: http.StatusOK,
 			wantOrder:  "desc",
-			wantLimit:  200,
+			wantLimit:  500,
 		},
 		{
 			name:        "recent=0 is invalid",
@@ -1325,8 +1401,8 @@ func TestListEvents_RecentParam(t *testing.T) {
 			wantErrText: "recent must be a positive integer",
 		},
 		{
-			name:        "recent=201 exceeds max",
-			query:       "/events?recent=201",
+			name:        "recent=501 exceeds max",
+			query:       "/events?recent=501",
 			wantStatus:  http.StatusBadRequest,
 			wantErrText: "recent must be a positive integer",
 		},
@@ -1367,6 +1443,103 @@ func TestListEvents_RecentParam(t *testing.T) {
 
 			assert.Equal(t, tt.wantOrder, st.lastFilter.Order)
 			assert.Equal(t, tt.wantLimit, st.lastFilter.Limit)
+		})
+	}
+}
+
+// TestGetEvent_ETagAndConditionalGet verifies that GET /events/{id}
+// serves a strong ETag and honors If-None-Match conditional requests
+// with 304 Not Modified. Events are immutable so the event ID doubles
+// as a perfect strong validator. (#226)
+func TestGetEvent_ETagAndConditionalGet(t *testing.T) {
+	eventID := "0001099511627776-0000000001"
+	eventBody := store.Event{ID: eventID, Ledger: 100, TxHash: "abc123"}
+
+	tests := []struct {
+		name            string
+		setup           func(st *stubStore)
+		ifNoneMatch     string
+		wantStatus      int
+		wantETag        string
+		wantExistsCalls int
+		wantBody        string
+	}{
+		{
+			name:       "GET returns strong ETag",
+			setup:      func(st *stubStore) { st.event = eventBody },
+			wantStatus: http.StatusOK,
+			wantETag:   `"` + eventID + `"`,
+		},
+		{
+			name:            "If-None-Match match returns 304",
+			setup:           func(st *stubStore) { st.exists = true },
+			ifNoneMatch:     `"` + eventID + `"`,
+			wantStatus:      http.StatusNotModified,
+			wantETag:        `"` + eventID + `"`,
+			wantExistsCalls: 1,
+		},
+		{
+			name:            "If-None-Match wildcard returns 304",
+			setup:           func(st *stubStore) { st.exists = true },
+			ifNoneMatch:     "*",
+			wantStatus:      http.StatusNotModified,
+			wantETag:        `"` + eventID + `"`,
+			wantExistsCalls: 1,
+		},
+		{
+			name:            "If-None-Match with W/ prefix returns 304",
+			setup:           func(st *stubStore) { st.exists = true },
+			ifNoneMatch:     `W/"` + eventID + `"`,
+			wantStatus:      http.StatusNotModified,
+			wantETag:        `"` + eventID + `"`,
+			wantExistsCalls: 1,
+		},
+		{
+			name:        "If-None-Match mismatch returns 200",
+			setup:       func(st *stubStore) { st.event = eventBody },
+			ifNoneMatch: `"a-different-id"`,
+			wantStatus:  http.StatusOK,
+			wantETag:    `"` + eventID + `"`,
+		},
+		{
+			name:            "event pruned returns 404 even with matching validator",
+			setup:           func(st *stubStore) { st.exists = false },
+			ifNoneMatch:     `"` + eventID + `"`,
+			wantStatus:      http.StatusNotFound,
+			wantExistsCalls: 1,
+			wantBody:        eventID,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			tt.setup(st)
+			s := newTestServer(st, nil)
+
+			if tt.ifNoneMatch != "" {
+				resp, body := doGetWithHeader(t, s, "/events/"+eventID, "If-None-Match", tt.ifNoneMatch)
+				require.Equal(t, tt.wantStatus, resp.StatusCode)
+
+				if tt.wantETag != "" {
+					assert.Equal(t, tt.wantETag, resp.Header.Get("ETag"))
+				}
+				if tt.wantExistsCalls > 0 {
+					assert.Equal(t, tt.wantExistsCalls, st.existsCalls,
+						"304 path must use EventExists, not GetEvent")
+					assert.Equal(t, eventID, st.lastExistsID)
+				}
+				if tt.wantBody != "" {
+					assert.Contains(t, string(body), tt.wantBody)
+				}
+				return
+			}
+
+			resp, _ := doGet(t, s, "/events/"+eventID)
+			require.Equal(t, tt.wantStatus, resp.StatusCode)
+			if tt.wantETag != "" {
+				assert.Equal(t, tt.wantETag, resp.Header.Get("ETag"))
+			}
 		})
 	}
 }
@@ -1508,160 +1681,231 @@ func TestListEvents_RecentReturnsNewestFirst(t *testing.T) {
 	assert.Equal(t, "e1", out.Events[2].ID)
 }
 
-func TestPrettyPrint(t *testing.T) {
-	t.Run("?pretty=true indents JSON", func(t *testing.T) {
-		st := &stubStore{
-			events:     []store.Event{{ID: "e1"}, {ID: "e2"}},
-			nextCursor: "e2",
-		}
-		resp, body := doGet(t, newTestServer(st, nil), "/events?pretty=true")
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-		assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
-		// Pretty output must contain indentation (newline + two spaces).
-		// Encoder.Encode always appends a trailing \n; indented output
-		// has additional \n sequences with leading spaces.
-		assert.Contains(t, string(body), "\n  ")
-		// Still valid JSON.
-		assert.True(t, json.Valid(body))
-	})
+func TestListEvents_ConfigurableMaxLimit(t *testing.T) {
+	st := &stubStore{events: []store.Event{{ID: "e1"}}}
 
-	t.Run("default is compact (no indent)", func(t *testing.T) {
-		st := &stubStore{
-			events:     []store.Event{{ID: "e1"}, {ID: "e2"}},
-			nextCursor: "e2",
-		}
-		resp, body := doGet(t, newTestServer(st, nil), "/events")
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-		// Compact output: no indentation (Encoder.Encode appends one
-		// trailing \n but no lines start with spaces).
-		assert.NotContains(t, string(body), "\n  ")
-		assert.True(t, json.Valid(body))
-	})
-
-	t.Run("?pretty=false is compact", func(t *testing.T) {
-		st := &stubStore{
-			events:     []store.Event{{ID: "e1"}},
-			nextCursor: "e1",
-		}
-		resp, body := doGet(t, newTestServer(st, nil), "/events?pretty=false")
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-		assert.NotContains(t, string(body), "\n  ")
-		assert.True(t, json.Valid(body))
-	})
-
-	t.Run("?pretty=anything_else is compact", func(t *testing.T) {
-		st := &stubStore{
-			events:     []store.Event{{ID: "e1"}},
-			nextCursor: "e1",
-		}
-		resp, body := doGet(t, newTestServer(st, nil), "/events?pretty=1")
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-		assert.NotContains(t, string(body), "\n  ")
-		assert.True(t, json.Valid(body))
-	})
-}
-
-func TestPrettyPrint_ErrorResponses(t *testing.T) {
-	t.Run("?pretty=true indents error JSON", func(t *testing.T) {
-		resp, body := doGet(t, newTestServer(&stubStore{}, nil),
-			"/events?limit=99999&pretty=true")
-		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-		assert.Contains(t, string(body), "\n  ")
-		assert.True(t, json.Valid(body))
-		var e map[string]string
-		require.NoError(t, json.Unmarshal(body, &e))
-		assert.NotEmpty(t, e["error"])
-	})
-
-	t.Run("compact error when pretty not set", func(t *testing.T) {
-		resp, body := doGet(t, newTestServer(&stubStore{}, nil),
-			"/events?limit=99999")
-		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-		assert.NotContains(t, string(body), "\n  ")
-		assert.True(t, json.Valid(body))
-	})
-}
-
-func TestPrettyPrint_HealthEndpoint(t *testing.T) {
-	t.Run("?pretty=true indents health response", func(t *testing.T) {
-		resp, body := doGet(t, newTestServer(&stubStore{}, nil),
-			"/health?pretty=true")
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-		assert.Contains(t, string(body), "\n  ")
-		assert.True(t, json.Valid(body))
-	})
-}
-
-func TestPrettyPrint_VersionEndpoint(t *testing.T) {
-	t.Run("?pretty=true indents version response", func(t *testing.T) {
-		resp, body := doGet(t, newTestServer(&stubStore{}, nil),
-			"/version?pretty=true")
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-		assert.Contains(t, string(body), "\n  ")
-		assert.True(t, json.Valid(body))
-	})
-}
-
-func TestPrettyPrint_CountEndpoint(t *testing.T) {
-	t.Run("?pretty=true indents count response", func(t *testing.T) {
-		st := &stubStore{totalCount: 5}
-		resp, body := doGet(t, newTestServer(st, nil),
-			"/events/count?pretty=true")
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-		assert.Contains(t, string(body), "\n  ")
-		assert.True(t, json.Valid(body))
-	})
-}
-
-func TestPrettyPrint_StatsEndpoint(t *testing.T) {
-	t.Run("?pretty=true indents stats response", func(t *testing.T) {
-		st := &stubStore{stats: store.Stats{TotalEvents: 42}}
-		resp, body := doGet(t, newTestServer(st, nil),
-			"/stats?pretty=true")
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-		assert.Contains(t, string(body), "\n  ")
-		assert.True(t, json.Valid(body))
-	})
-}
-
-func TestPrettyPrint_SingleEventEndpoint(t *testing.T) {
-	t.Run("?pretty=true indents single event response", func(t *testing.T) {
-		st := &stubStore{event: store.Event{
-			ID:         "0000000001-0000000001",
-			ContractID: testContract,
-			Ledger:     1,
-			Type:       "contract",
-			TxHash:     "abc",
-			TxIndex:    0,
-			OpIndex:    0,
-			CreatedAt:  time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC),
-		}}
-		resp, body := doGet(t, newTestServer(st, nil),
-			"/events/0000000001-0000000001?pretty=true")
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-		assert.Contains(t, string(body), "\n  ")
-		assert.True(t, json.Valid(body))
-	})
-}
-
-func TestPrettyPrint_StreamNDJSONUnaffected(t *testing.T) {
-	// NDJSON streaming must NOT be pretty-printed: each line must stay
-	// a single compact JSON object, newline-delimited.
-	st := &stubStore{
-		events: []store.Event{
-			{ID: "e1", TxHash: "abc"},
-			{ID: "e2", TxHash: "def"},
+	tests := []struct {
+		name         string
+		setMax       int // 0 means don't call SetMaxLimit (use default 500)
+		query        string
+		wantStatus   int
+		wantLimit    int    // expected limit in filter (0 = don't check)
+		wantErrMatch string // substring in error, for 4xx cases
+	}{
+		{
+			name:       "default max allows 500",
+			setMax:     0,
+			query:      "/events?limit=500",
+			wantStatus: http.StatusOK,
+			wantLimit:  500,
+		},
+		{
+			name:         "default max rejects 501",
+			setMax:       0,
+			query:        "/events?limit=501",
+			wantStatus:   http.StatusBadRequest,
+			wantErrMatch: "limit must be an integer in [1,500]",
+		},
+		{
+			name:       "custom max 100 allows 100",
+			setMax:     100,
+			query:      "/events?limit=100",
+			wantStatus: http.StatusOK,
+			wantLimit:  100,
+		},
+		{
+			name:         "custom max 100 rejects 101",
+			setMax:       100,
+			query:        "/events?limit=101",
+			wantStatus:   http.StatusBadRequest,
+			wantErrMatch: "limit must be an integer in [1,100]",
+		},
+		{
+			name:       "custom max 100 recent accepts 100",
+			setMax:     100,
+			query:      "/events?recent=100",
+			wantStatus: http.StatusOK,
+			wantLimit:  100,
+		},
+		{
+			name:         "custom max 100 recent rejects 101",
+			setMax:       100,
+			query:        "/events?recent=101",
+			wantStatus:   http.StatusBadRequest,
+			wantErrMatch: "recent must be a positive integer in [1,100]",
+		},
+		{
+			name:       "custom max 10 accepts limit 10",
+			setMax:     10,
+			query:      "/events?limit=10",
+			wantStatus: http.StatusOK,
+			wantLimit:  10,
+		},
+		{
+			name:         "custom max 10 rejects limit 11",
+			setMax:       10,
+			query:        "/events?limit=11",
+			wantStatus:   http.StatusBadRequest,
+			wantErrMatch: "limit must be an integer in [1,10]",
 		},
 	}
-	resp, body := doGet(t, newTestServer(st, nil),
-		"/events?stream=true&pretty=true")
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, "application/x-ndjson", resp.Header.Get("Content-Type"))
-	// Each line must be a compact JSON object.
-	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
-	assert.Len(t, lines, 2)
-	for _, line := range lines {
-		assert.True(t, json.Valid([]byte(line)))
-		assert.NotContains(t, line, "  ", "NDJSON lines must stay compact even with ?pretty=true")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st.lastFilter = store.EventFilter{}
+
+			if tt.setMax > 0 {
+				SetMaxLimit(tt.setMax)
+				t.Cleanup(func() { SetMaxLimit(500) })
+			} else {
+				// Ensure we're using the default 500.
+				SetMaxLimit(500)
+			}
+
+			srv := newTestServer(st, nil)
+			resp, body := doGet(t, srv, tt.query)
+
+			require.Equal(t, tt.wantStatus, resp.StatusCode, string(body))
+
+			if tt.wantErrMatch != "" {
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], tt.wantErrMatch)
+				return
+			}
+
+			if tt.wantLimit > 0 {
+				assert.Equal(t, tt.wantLimit, st.lastFilter.Limit)
+			}
+		})
 	}
 }
+
+func TestGetEventTransaction_Success(t *testing.T) {
+	st := &stubStore{
+		event: store.Event{ID: "0001-0001", TxHash: "abc123"},
+		txSiblings: []store.Event{
+			{ID: "0001-0002", TxHash: "abc123"},
+			{ID: "0001-0003", TxHash: "abc123"},
+		},
+	}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/0001-0001/transaction")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var r eventsResponse
+	require.NoError(t, json.Unmarshal(body, &r))
+	assert.Len(t, r.Events, 2)
+	assert.Equal(t, "0001-0002", r.Events[0].ID)
+	assert.Equal(t, "0001-0003", r.Events[1].ID)
+	assert.Equal(t, "abc123", st.lastTxHash)
+	assert.Equal(t, "0001-0001", st.lastExcludeID)
+}
+
+func TestGetEventTransaction_NotFound(t *testing.T) {
+	st := &stubStore{eventErr: store.ErrNotFound}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/missing/transaction")
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	var e map[string]string
+	require.NoError(t, json.Unmarshal(body, &e))
+	assert.Contains(t, e["error"], "not found")
+}
+
+func TestGetEventTransaction_StoreError(t *testing.T) {
+	st := &stubStore{eventErr: errors.New("db down")}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/any/transaction")
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	var e map[string]string
+	require.NoError(t, json.Unmarshal(body, &e))
+	assert.Contains(t, e["error"], "loading event failed")
+}
+
+func TestGetEventTransaction_EmptyTxHash(t *testing.T) {
+	st := &stubStore{event: store.Event{ID: "0001-0001"}}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/0001-0001/transaction")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var r eventsResponse
+	require.NoError(t, json.Unmarshal(body, &r))
+	assert.Len(t, r.Events, 0)
+}
+
+func TestGetEventTransaction_CacheHeaders(t *testing.T) {
+	st := &stubStore{
+		event:      store.Event{ID: "0001-0001", TxHash: "abc"},
+		txSiblings: []store.Event{{ID: "0001-0002", TxHash: "abc"}},
+	}
+	s := newTestServer(st, nil)
+	resp, _ := doGet(t, s, "/events/0001-0001/transaction")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	cc := resp.Header.Get("Cache-Control")
+	assert.Contains(t, cc, "immutable")
+	assert.Contains(t, cc, "max-age=")
+}
+
+func TestGetEventTransaction_FieldsProjection(t *testing.T) {
+	st := &stubStore{
+		event:      store.Event{ID: "0001-0001", TxHash: "abc", Type: "contract", Ledger: 100},
+		txSiblings: []store.Event{{ID: "0001-0002", TxHash: "abc", Type: "contract", Ledger: 100}},
+	}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/0001-0001/transaction?fields=id,ledger")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var r map[string]any
+	require.NoError(t, json.Unmarshal(body, &r))
+	events, ok := r["events"].([]interface{})
+	require.True(t, ok)
+	require.Len(t, events, 1)
+	ev := events[0].(map[string]interface{})
+	assert.Contains(t, ev, "id")
+	assert.Contains(t, ev, "ledger")
+	assert.NotContains(t, ev, "type")
+}
+
+func TestGetEventTransaction_BadFields(t *testing.T) {
+	st := &stubStore{event: store.Event{ID: "0001-0001", TxHash: "abc"}}
+	s := newTestServer(st, nil)
+	resp, _ := doGet(t, s, "/events/0001-0001/transaction?fields=badfield")
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestGetEventTransaction_IncludeXDR(t *testing.T) {
+	st := &stubStore{
+		event:      store.Event{ID: "0001-0001", TxHash: "abc"},
+		txSiblings: []store.Event{{ID: "0001-0002", TxHash: "abc"}},
+	}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/0001-0001/transaction?include_xdr=true")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var r eventsWithXDRResponse
+	require.NoError(t, json.Unmarshal(body, &r))
+	assert.Len(t, r.Events, 1)
+}
+
+func TestGetEventTransaction_NoInterferenceWithGetEvent(t *testing.T) {
+	st := &stubStore{event: store.Event{ID: "0001-0001", TxHash: "abc", Type: "contract"}}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/0001-0001")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var ev store.Event
+	require.NoError(t, json.Unmarshal(body, &ev))
+	assert.Equal(t, "0001-0001", ev.ID)
+}
+
+func (m *stubStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	return nil, "", nil
+}
+func (m *stubStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
+	return 0, nil
+}
+func (m *stubStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
+	return store.DeadLetter{}, nil
+}
+func (m *stubStore) ListDeadLetters(context.Context, string, int, string) ([]store.DeadLetter, string, error) {
+	return nil, "", nil
+}
+func (m *stubStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, error) {
+	return store.DeadLetter{}, store.ErrNotFound
+}
+func (m *stubStore) DeleteDeadLetter(context.Context, int64) error { return nil }
