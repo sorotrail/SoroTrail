@@ -44,6 +44,37 @@ func SetAuditor(a *audit.Auditor) {
 	auditorMu.Unlock()
 }
 
+// SetPruner registers the binary's Pruner so /stats can surface its
+// Metrics counters. There is exactly one Pruner per process; like the
+// auditor, it is a no-op when retention is not configured.
+//
+// Like SetAuditor this MUST be called BEFORE the API starts serving
+// requests (i.e. before http.Server.ListenAndServe), so the first
+// /stats request observes a stable value rather than a nil pruner.
+// cmd/sorotrail/main does this in the wiring phase before constructing
+// the http.Server.
+//
+// The local variable name is `prn` (not `pruner`) because the pruner
+// package shares the name and a same-named variable would shadow it
+// inside this file. `prn` matches the shorthand already used in
+// cmd/sorotrail/main.go.
+var (
+	prunerMu sync.RWMutex
+	prn      *pruner.Pruner
+)
+
+func SetPruner(p *pruner.Pruner) {
+	prunerMu.Lock()
+	prn = p
+	prunerMu.Unlock()
+}
+
+func getPruner() *pruner.Pruner {
+	prunerMu.RLock()
+	defer prunerMu.RUnlock()
+	return prn
+}
+
 func getAuditor() *audit.Auditor {
 	auditorMu.RLock()
 	defer auditorMu.RUnlock()
@@ -92,6 +123,17 @@ type Server struct {
 	// compressed. The zero value means CompressMinSize, so compression is on
 	// by default; negative disables the middleware entirely.
 	compressMinSize int
+
+	// Multi-tenancy (#48). multiTenant is false by default, which makes
+	// every request run as an untenanted wildcard principal — the exact
+	// pre-#48 behavior. tenants is nil in that mode and must not be
+	// dereferenced outside the multiTenant branches.
+	multiTenant     bool
+	tenants         store.TenantStore
+	usage           *UsageRecorder
+	maxWatched      int
+	streamScopeSync time.Duration
+
 	// exportMaxRange caps the ledger span of /contracts/{id}/export.
 	// Zero means unbounded (legacy behavior); config-driven wiring sets
 	// EXPORT_MAX_RANGE so requests default to a sane ceiling.
@@ -133,6 +175,40 @@ func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, 
 	}
 	return s
 }
+
+// MultiTenantOptions configures the tenant boundary.
+type MultiTenantOptions struct {
+	// MaxWatchedContracts caps the union of every tenant's watch list, so
+	// tenants collectively cannot drive the ingester's RPC cost past what
+	// the operator budgeted. 0 means no instance cap.
+	MaxWatchedContracts int
+	// UsageFlushInterval controls how often accumulated usage counters are
+	// persisted. Zero uses DefaultUsageFlushInterval.
+	UsageFlushInterval time.Duration
+	// StreamScopeSync is how often a live stream re-resolves its tenant's
+	// grants. Zero uses DefaultStreamScopeSync.
+	StreamScopeSync time.Duration
+}
+
+// WithMultiTenancy turns on tenant isolation. Without this call the server
+// is single-tenant and behaves exactly as it did before #48.
+//
+// The usage recorder's Start/Stop lifecycle is owned by main, mirroring how
+// the rate limiter is wired.
+func (s *Server) WithMultiTenancy(ts store.TenantStore, opts MultiTenantOptions) *Server {
+	s.multiTenant = true
+	s.tenants = ts
+	// Responses become tenant-specific from here on; the cache helpers are
+	// package-level functions and read this flag rather than the server.
+	SetTenantScopedCaching(true)
+	s.maxWatched = opts.MaxWatchedContracts
+	s.streamScopeSync = opts.StreamScopeSync
+	s.usage = NewUsageRecorder(ts, s.log, opts.UsageFlushInterval)
+	return s
+}
+
+// Usage exposes the recorder so main can run its flush loop.
+func (s *Server) Usage() *UsageRecorder { return s.usage }
 
 // SetRateLimiter wires a per-client rate limiter into the router. Pass
 // nil to leave the limiter disabled (the default — no behavior change).
@@ -210,6 +286,23 @@ func (s *Server) Router() http.Handler {
 	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.
 	adminMW := apiKeyAuth(s.apiKey)
 	r.With(adminMW).Delete("/events", s.handleDeleteEvents)
+	// contributors: new read endpoints go here. Every one of them must
+	// obtain its scope from filterFromQuery (list-shaped reads) or
+	// scopeFrom (single-object reads) and pass it to the store — see
+	// docs/multi-tenancy.md. Endpoints that skip this return nothing
+	// rather than everything, but "returns nothing" is still a bug.
+	// GraphQL transport — read-only, mounts at /graphql and dev-mode
+	// /graphiql. Built by the graphql package; the API server only
+	// owns the route registration so a misconfigured GraphQL handler
+	// shows up as a 404 instead of a confusing 500.
+	if s.graphqlHandler != nil {
+		r.Handle("/graphql", s.graphqlHandler)
+	}
+	if s.graphqlPlayground != nil {
+		r.Get("/graphiql", func(w http.ResponseWriter, req *http.Request) {
+			s.graphqlPlayground.ServeHTTP(w, req)
+		})
+	}
 
 	// Watched-contracts management: writes and updates to the runtime
 	// filter list. Always auth-gated, even when AUTH_ENABLED would be
@@ -217,6 +310,11 @@ func (s *Server) Router() http.Handler {
 	// "writes are never open" contract.
 	// Routes are absolute (no sub-router) so callers don't need a
 	// trailing slash or chi's RedirectSlashes middleware.
+	//
+	// This is the operator's own list, not a tenant's: it is keyed on
+	// API_KEY rather than a tenant credential, and it edits the global
+	// watched_contracts table that forms one side of the ingestion union.
+	// Tenants manage their own claims through /tenant/watch below.
 	watchedMW := apiKeyAuth(s.apiKey)
 	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
 	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
@@ -248,6 +346,35 @@ func (s *Server) Router() http.Handler {
 		r.Get("/subscriptions/{id}", s.handleGetSubscription)
 		r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
 		r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
+	})
+
+	// Tenant self-service: who am I, what am I using, what am I watching.
+	r.Group(func(r chi.Router) {
+		r.Use(s.requireTenant)
+		r.Get("/tenant", s.handleWhoAmI)
+		r.Get("/tenant/usage", s.handleOwnUsage)
+		r.Get("/tenant/watch", s.handleListOwnWatched)
+		r.Post("/tenant/watch", s.handleAddOwnWatched)
+		r.Delete("/tenant/watch/{contract_id}", s.handleRemoveOwnWatched)
+	})
+
+	// Tenant administration.
+	r.Group(func(r chi.Router) {
+		r.Use(s.requireAdmin)
+		r.Post("/admin/tenants", s.handleCreateTenant)
+		r.Get("/admin/tenants", s.handleListTenants)
+		r.Get("/admin/tenants/{id}", s.handleGetTenant)
+		r.Patch("/admin/tenants/{id}", s.handleUpdateTenant)
+		r.Delete("/admin/tenants/{id}", s.handleDeleteTenant)
+		r.Get("/admin/tenants/{id}/usage", s.handleTenantUsage)
+
+		r.Get("/admin/tenants/{id}/grants", s.handleListTenantGrants)
+		r.Post("/admin/tenants/{id}/grants", s.handleGrantContract)
+		r.Delete("/admin/tenants/{id}/grants/{contract_id}", s.handleRevokeContract)
+
+		r.Get("/admin/tenants/{id}/keys", s.handleListTenantKeys)
+		r.Post("/admin/tenants/{id}/keys", s.handleCreateTenantKey)
+		r.Delete("/admin/keys/{key_id}", s.handleRevokeTenantKey)
 	})
 
 	return r

@@ -76,15 +76,16 @@ func (s *guardedStore) ReplaceEventsInRange(ctx context.Context, events []Event,
 	return err
 }
 
-func (s *guardedStore) GetEvent(ctx context.Context, id string) (Event, error) {
+func (s *guardedStore) GetEvent(ctx context.Context, id string, sc Scope) (Event, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.GetEvent")
 	defer cancel()
 	start := time.Now()
-	e, err := s.Store.GetEvent(ctx, id)
+	e, err := s.Store.GetEvent(ctx, id, sc)
 	s.logSlowQuery("store.GetEvent", start, err)
 	return e, err
 }
 
+func (s *guardedStore) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
 func (s *guardedStore) GetEventsByTxHash(ctx context.Context, txHash, excludeID string) ([]Event, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.GetEventsByTxHash")
 	defer cancel()
@@ -98,7 +99,7 @@ func (s *guardedStore) EventExists(ctx context.Context, id string) (bool, error)
 	ctx, cancel := s.wrapContext(ctx, "store.EventExists")
 	defer cancel()
 	start := time.Now()
-	exists, err := s.Store.EventExists(ctx, id)
+	exists, err := s.Store.EventExists(ctx, id, sc)
 	s.logSlowQuery("store.EventExists", start, err)
 	return exists, err
 }
@@ -238,38 +239,38 @@ func (s *guardedStore) CreateSubscription(ctx context.Context, sub Subscription)
 	return created, err
 }
 
-func (s *guardedStore) GetSubscription(ctx context.Context, id int64) (Subscription, error) {
+func (s *guardedStore) GetSubscription(ctx context.Context, id int64, owner SubscriptionOwner) (Subscription, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.GetSubscription")
 	defer cancel()
 	start := time.Now()
-	sub, err := s.Store.GetSubscription(ctx, id)
+	sub, err := s.Store.GetSubscription(ctx, id, owner)
 	s.logSlowQuery("store.GetSubscription", start, err)
 	return sub, err
 }
 
-func (s *guardedStore) ListSubscriptions(ctx context.Context) ([]Subscription, error) {
+func (s *guardedStore) ListSubscriptions(ctx context.Context, owner SubscriptionOwner) ([]Subscription, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.ListSubscriptions")
 	defer cancel()
 	start := time.Now()
-	subs, err := s.Store.ListSubscriptions(ctx)
+	subs, err := s.Store.ListSubscriptions(ctx, owner)
 	s.logSlowQuery("store.ListSubscriptions", start, err)
 	return subs, err
 }
 
-func (s *guardedStore) UpdateSubscription(ctx context.Context, sub Subscription) (Subscription, error) {
+func (s *guardedStore) UpdateSubscription(ctx context.Context, sub Subscription, owner SubscriptionOwner) (Subscription, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.UpdateSubscription")
 	defer cancel()
 	start := time.Now()
-	updated, err := s.Store.UpdateSubscription(ctx, sub)
+	updated, err := s.Store.UpdateSubscription(ctx, sub, owner)
 	s.logSlowQuery("store.UpdateSubscription", start, err)
 	return updated, err
 }
 
-func (s *guardedStore) DeleteSubscription(ctx context.Context, id int64) error {
+func (s *guardedStore) DeleteSubscription(ctx context.Context, id int64, owner SubscriptionOwner) error {
 	ctx, cancel := s.wrapContext(ctx, "store.DeleteSubscription")
 	defer cancel()
 	start := time.Now()
-	err := s.Store.DeleteSubscription(ctx, id)
+	err := s.Store.DeleteSubscription(ctx, id, owner)
 	s.logSlowQuery("store.DeleteSubscription", start, err)
 	return err
 }
@@ -310,11 +311,11 @@ func (s *guardedStore) RecordDeliveryAttempt(ctx context.Context, a DeliveryAtte
 	return attempt, err
 }
 
-func (s *guardedStore) ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error) {
+func (s *guardedStore) ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int, owner SubscriptionOwner) ([]DeliveryAttempt, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.ListDeliveryAttempts")
 	defer cancel()
 	start := time.Now()
-	attempts, err := s.Store.ListDeliveryAttempts(ctx, subscriptionID, limit)
+	attempts, err := s.Store.ListDeliveryAttempts(ctx, subscriptionID, limit, owner)
 	s.logSlowQuery("store.ListDeliveryAttempts", start, err)
 	return attempts, err
 }
@@ -352,10 +353,11 @@ func (s *guardedStore) MigrationVersion(ctx context.Context) (int, bool, error) 
 }
 
 func (s *guardedStore) Stats(ctx context.Context) (Stats, error) {
+func (s *guardedStore) Stats(ctx context.Context, sc Scope) (Stats, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.Stats")
 	defer cancel()
 	start := time.Now()
-	stats, err := s.Store.Stats(ctx)
+	stats, err := s.Store.Stats(ctx, sc)
 	s.logSlowQuery("store.Stats", start, err)
 	stats.QueryErrors = s.queryErrors.Load()
 	return stats, err

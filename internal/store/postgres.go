@@ -65,10 +65,6 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // value_xdr are never silently dropped on the way in; a repair that
 // arrives without XDR preserves what was already stored via the coalesce()
 // clauses in the UPDATE branch (`sorotrail replay` relies on that).
-//
-// onUpdate=false → ON CONFLICT DO NOTHING (idempotent ingest);
-// onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
-// topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
 	if onUpdate {
@@ -475,10 +471,22 @@ func nullableStringSlice(s []string) any {
 	return s
 }
 
-func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
+func (p *Postgres) GetEvent(ctx context.Context, id string, sc Scope) (Event, error) {
+	// A scope that grants nothing cannot match a row; skip the round trip
+	// and report the same ErrNotFound the query would have produced, so
+	// the two paths are indistinguishable to a caller probing for events.
+	if sc.DeniesAll() {
+		return Event{}, ErrNotFound
+	}
+	query := `SELECT ` + eventColumns + ` FROM events WHERE id = $1`
+	args := []any{id}
+	if !sc.IsWildcard() {
+		query += ` AND contract_id = ANY($2)`
+		args = append(args, sc.Contracts())
+	}
 	var e Event
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
-		row := tx.QueryRow(ctx, `SELECT `+eventColumns+` FROM events WHERE id = $1`, id)
+		row := tx.QueryRow(ctx, query, args...)
 		var err error
 		e, err = scanEvent(row)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -535,10 +543,19 @@ func (p *Postgres) GetEventsByTxHash(ctx context.Context, txHash, excludeID stri
 // cache hit so that retention/pruning (#8) cannot leave a cache
 // pretending a deleted event is still around; the full row is only
 // loaded on a real cache miss via GetEvent.
-func (p *Postgres) EventExists(ctx context.Context, id string) (bool, error) {
+func (p *Postgres) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
+	if sc.DeniesAll() {
+		return false, nil
+	}
+	query := `SELECT 1 FROM events WHERE id = $1`
+	args := []any{id}
+	if !sc.IsWildcard() {
+		query += ` AND contract_id = ANY($2)`
+		args = append(args, sc.Contracts())
+	}
 	var one int
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `SELECT 1 FROM events WHERE id = $1`, id).Scan(&one)
+		return tx.QueryRow(ctx, query, args...).Scan(&one)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
@@ -552,6 +569,9 @@ func (p *Postgres) EventExists(ctx context.Context, id string) (bool, error) {
 // buildEventWhereClause builds the WHERE clause and arguments shared by
 // QueryEvents and CountEvents. It does not include cursor, ordering, or
 // limit — those are page-specific concerns.
+//
+// Callers must reject a denying scope before calling this: an empty scope
+// produces `contract_id = ANY('{}')`, which is correct but still issues SQL.
 func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	var (
 		where []string
@@ -561,11 +581,24 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
+	// Scope is appended first so it is present in every generated
+	// statement, including ones where a later filter returns early. It is
+	// ANDed with the caller's filters, never ORed, so widening the request
+	// cannot widen the authorization.
+	if !f.Scope.IsWildcard() {
+		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
+	}
 	if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
 	if len(f.Types) > 0 {
 		where = append(where, "type = ANY("+arg(f.Types)+")")
+	}
+	if f.TxHash != "" {
+		where = append(where, "tx_hash = "+arg(f.TxHash))
+	}
+	if f.InSuccessfulCall != nil {
+		where = append(where, "in_successful_call = "+arg(*f.InSuccessfulCall))
 	}
 	if len(f.Topic) > 0 {
 		// Containment on the array matches the topic at any position.
@@ -609,6 +642,14 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 }
 
 func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
+	// The tenant boundary is evaluated before anything else, and an empty
+	// scope returns an empty page without issuing SQL. No user-supplied
+	// filter is consulted first, so no filter can influence whether the
+	// boundary is applied.
+	if f.Scope.DeniesAll() {
+		return nil, "", nil
+	}
+
 	limit := f.Limit
 	if limit <= 0 {
 		limit = DefaultQueryLimit
@@ -710,6 +751,13 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 // ignoring pagination (cursor, order, and limit). It reuses the same
 // WHERE clause builder as QueryEvents so the two stay in lockstep.
 func (p *Postgres) CountEvents(ctx context.Context, f EventFilter) (int64, error) {
+	// Same boundary as QueryEvents, evaluated before any filter: a count is
+	// an aggregate, and an unscoped one tells a tenant how much data exists
+	// outside its grants even though it can read none of it.
+	if f.Scope.DeniesAll() {
+		return 0, nil
+	}
+
 	// Strip page-specific fields so the count represents the full match set.
 	f.Cursor = ""
 	f.Order = ""
@@ -819,9 +867,32 @@ func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (A
 	return s, nil
 }
 
+// watchedContractsUnion is the set of contracts ingestion must follow: the
+// operator's own list plus every tenant's requests. UNION (not UNION ALL)
+// deduplicates, so two tenants watching the same contract produce one entry
+// and therefore one set of ingested rows that both of them read.
+//
+// This is also the whole of the removal-refcounting story. There is no
+// counter to keep consistent: the union is recomputed on read, so a
+// contract is watched for exactly as long as at least one row somewhere
+// still names it, and one tenant dropping its claim cannot stop ingestion
+// for another that still holds one.
+// added_at is aggregated rather than carried through the set operation:
+// once the timestamp is in the projection, two tenants who claimed the same
+// contract at different moments are distinct rows and a plain UNION stops
+// deduplicating. Grouping restores one row per contract, and min() reads as
+// "watched since" — the earliest claim is what ingestion has actually been
+// following.
+const watchedContractsUnion = `
+	SELECT contract_id, min(added_at) AS added_at FROM (
+		SELECT contract_id, added_at FROM watched_contracts
+		UNION ALL
+		SELECT contract_id, added_at FROM tenant_watched_contracts
+	) w GROUP BY contract_id`
+
 func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT contract_id, added_at FROM watched_contracts ORDER BY contract_id`)
+		watchedContractsUnion+` ORDER BY contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
@@ -864,12 +935,50 @@ func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) er
 	return nil
 }
 
-func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
+// Stats aggregates within sc. The event-derived counters (total, oldest
+// ledger, distinct contracts, watched contracts) are restricted to the
+// caller's contracts; the ingestion and audit frontiers are not, because
+// they describe the instance's progress rather than anyone's data and are
+// already visible through /health.
+func (p *Postgres) Stats(ctx context.Context, sc Scope) (Stats, error) {
+	if sc.DeniesAll() {
+		// Frontier values are still reported: they leak nothing about
+		// other tenants' rows, and zeroing them would make a scoped /stats
+		// look like a broken instance rather than an empty one.
+		return p.frontierStats(ctx)
+	}
+	if sc.IsWildcard() {
+		return p.statsWhere(ctx, "", nil)
+	}
+	return p.statsWhere(ctx, "WHERE contract_id = ANY($1)", []any{sc.Contracts()})
+}
+
+// statsWhere runs the stats aggregate with an optional predicate applied to
+// every events-derived subquery. The predicate is a constant string chosen
+// by Stats — never caller input — with values passed as bind parameters.
+func (p *Postgres) statsWhere(ctx context.Context, pred string, args []any) (Stats, error) {
 	var s Stats
 	// COUNT(DISTINCT contract_id) scans the contract_id index; fine at MVP
 	// scale. contributors: replace with a maintained summary table if it
 	// becomes a bottleneck on large datasets.
+	//
+	// The watch-list count runs through the same predicate — the union
+	// subquery exposes a contract_id column, so the identical WHERE clause
+	// applies — keeping a tenant's view of "how many contracts is this
+	// instance following" limited to the ones it can read.
+	query := fmt.Sprintf(`
+		SELECT
+			(SELECT count(*) FROM events %[1]s),
+			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
+			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
+			(SELECT coalesce(min(ledger), 0) FROM events %[1]s),
+			(SELECT count(DISTINCT contract_id) FROM events %[1]s),
+			(SELECT count(*) FROM (%[2]s) w %[1]s)`,
+		pred, watchedContractsUnion)
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, query, args...).Scan(
+			&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger,
+			&s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
 		return tx.QueryRow(ctx, `
 			SELECT
 				(SELECT count(*) FROM events),
@@ -913,6 +1022,61 @@ func (p *Postgres) MigrationVersion(ctx context.Context) (version int, dirty boo
 		return 0, false, fmt.Errorf("reading migration version: %w", err)
 	}
 	return version, dirty, nil
+// frontierStats reports only the instance-progress counters, for a caller
+// whose scope matches no rows at all.
+func (p *Postgres) frontierStats(ctx context.Context) (Stats, error) {
+	var s Stats
+	err := p.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
+			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state)`,
+	).Scan(&s.LastIngestedLedger, &s.VerifiedThroughLedger)
+	if err != nil {
+		return Stats{}, fmt.Errorf("loading stats: %w", err)
+	}
+	return s, nil
+// DeleteEventsBefore deletes up to limit events that are strictly below
+// maxLedger and (if beforeTime is non-zero) older than beforeTime. It is
+// designed for the background pruner and intentionally never touches rows
+// at or above maxLedger, which must be ≤ last_ingested_ledger.
+//
+// When beforeTime is zero the time clause is omitted — deletion is based
+// solely on ledger, which is useful when RETENTION_MIN_LEDGER is set.
+//
+// The limit prevents a single DELETE from holding a long lock. The caller
+// should loop with a pause between calls until the return is < limit.
+//
+// Implementation note: PostgreSQL's DELETE grammar has no LIMIT clause
+// (it is a MySQL extension). The capped set of rows is picked by an inner
+// SELECT id … LIMIT and then deleted by id. The id-based outer DELETE
+// also keeps the FK ON DELETE CASCADE story simple for the future
+// `token_events` table — Postgres cascades from the outer DELETE using
+// real row identities, not a DELETE result set, so dependent rows come
+// along for free once that table lands.
+func (p *Postgres) DeleteEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	var where string
+	var args []any
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	// Always scope by ledger: never delete at or above maxLedger.
+	where = "ledger < " + arg(maxLedger)
+
+	if !beforeTime.IsZero() {
+		where += " AND created_at < " + arg(beforeTime)
+	}
+
+	q := fmt.Sprintf(`DELETE FROM events WHERE id IN (SELECT id FROM events WHERE %s LIMIT %d)`, where, limit)
+	tag, err := p.pool.Exec(ctx, q, args...)
+	if err != nil {
+		return 0, fmt.Errorf("deleting events before ledger %d: %w", maxLedger, err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (p *Postgres) Ping(ctx context.Context) error {

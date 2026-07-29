@@ -102,6 +102,29 @@ type Config struct {
 	// no timeout (wait indefinitely).
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"15s"`
 
+	// Multi-tenancy (#48). MULTI_TENANT=false (the default) means no
+	// authentication, no tenant boundary, and no usage accounting — every
+	// request runs with full access exactly as it did before. Turning it on
+	// makes an API key mandatory on every endpoint except /health.
+	MultiTenant bool `env:"MULTI_TENANT" envDefault:"false"`
+	// MultiTenantMaxWatched caps the union of all tenants' watch lists, so
+	// tenants collectively cannot push the ingester past the RPC budget the
+	// operator planned for. 0 disables the cap.
+	MultiTenantMaxWatched int `env:"MULTI_TENANT_MAX_WATCHED" envDefault:"250"`
+	// MultiTenantUsageFlush is how often accumulated per-tenant usage
+	// counters are written.
+	MultiTenantUsageFlush time.Duration `env:"MULTI_TENANT_USAGE_FLUSH" envDefault:"10s"`
+	// MultiTenantStreamScopeSync bounds how long an open stream can keep
+	// serving a contract whose grant has been revoked.
+	MultiTenantStreamScopeSync time.Duration `env:"MULTI_TENANT_STREAM_SCOPE_SYNC" envDefault:"30s"`
+	// MultiTenantBootstrapKey solves the chicken-and-egg of a fresh
+	// multi-tenant install: minting the first key requires an admin key,
+	// which requires minting a key. When set, this value is installed as an
+	// API key for the seeded "default" admin tenant at startup, so the
+	// operator has a way in. Treat it as a secret; rotate it by revoking
+	// through /admin once real keys exist.
+	MultiTenantBootstrapKey string `env:"MULTI_TENANT_BOOTSTRAP_KEY"`
+
 	// SweepConcurrency is the maximum number of filter batches that may be
 	// fetched concurrently during a windowSweep pass. The Stellar RPC's
 	// getEvents caps each request chain at 5 filters × 5 contracts = 25
@@ -232,6 +255,17 @@ func (c Config) Validate() error {
 	if c.AuditFindingMaxLgrs == 0 {
 		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
 	}
+	if c.RetentionBatchSize <= 0 {
+		return fmt.Errorf("RETENTION_BATCH_SIZE must be positive")
+	}
+	if c.RetentionPause < 0 {
+		return fmt.Errorf("RETENTION_PAUSE must be non-negative")
+	}
+	if c.RetentionInterval <= 0 {
+		return fmt.Errorf("RETENTION_INTERVAL must be positive")
+	}
+	if c.RetentionMaxAge < 0 {
+		return fmt.Errorf("RETENTION_MAX_AGE must be non-negative")
 	if c.BackfillRateRPS <= 0 {
 		return fmt.Errorf("BACKFILL_RATE_RPS must be positive, got %v", c.BackfillRateRPS)
 	}
@@ -278,7 +312,29 @@ func (c Config) Validate() error {
 	if (c.RateLimitRPS > 0) != (c.RateLimitBurst > 0) {
 		return fmt.Errorf("RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
 	}
+	if c.MultiTenantMaxWatched < 0 {
+		return fmt.Errorf("MULTI_TENANT_MAX_WATCHED must be non-negative")
+	}
+	if c.MultiTenantUsageFlush <= 0 {
+		return fmt.Errorf("MULTI_TENANT_USAGE_FLUSH must be positive")
+	}
+	if c.MultiTenantStreamScopeSync <= 0 {
+		return fmt.Errorf("MULTI_TENANT_STREAM_SCOPE_SYNC must be positive")
+	}
+	// Rejected rather than ignored: an operator who sets a bootstrap key
+	// without enabling multi-tenancy has configured a credential that
+	// authenticates nothing, and would reasonably assume the instance is
+	// protected when it is wide open.
+	if c.MultiTenantBootstrapKey != "" && !c.MultiTenant {
+		return fmt.Errorf("MULTI_TENANT_BOOTSTRAP_KEY is set but MULTI_TENANT is false")
+	}
 	return nil
+}
+
+// RetentionEnabled reports whether at least one retention policy is
+// configured — the pruner only runs when this is true.
+func (c Config) RetentionEnabled() bool {
+	return c.RetentionMaxAge > 0 || c.RetentionMinLedger > 0
 }
 
 // ValidContractID reports whether s looks like a Soroban contract strkey.
