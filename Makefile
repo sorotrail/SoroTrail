@@ -8,7 +8,7 @@ BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown
 
 LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$(COMMIT) -X github.com/sorotrail/sorotrail/internal/buildinfo.BuildDate=$(BUILD_DATE)"
 
-.PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down clean
+.PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down clean bench bench-ci seed
 
 build:
 	go build $(LDFLAGS) -o $(BINARY) ./cmd/sorotrail
@@ -25,6 +25,25 @@ test:
 # internal/replay share one database and truncate the same tables.
 test-db:
 	TEST_DATABASE_URL=$(DATABASE_URL) go test -p 1 ./...
+
+bench:
+	@echo "=================================================================="
+	@echo " SoroTrail Benchmark Environment Capture"
+	@echo "=================================================================="
+	@echo "Date: $$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown")"
+	@echo "Go Version: $$(go version 2>/dev/null || echo "go version unknown")"
+	@echo "OS/Arch: $$(go env GOOS 2>/dev/null || echo "unknown")/$$(go env GOARCH 2>/dev/null || echo "unknown")"
+	@echo "Postgres URL: $(DATABASE_URL)"
+	@echo "=================================================================="
+	@echo " Running Benchmarks..."
+	@echo "=================================================================="
+	TEST_DATABASE_URL=$(DATABASE_URL) go test -bench=. -benchmem ./...
+
+bench-ci:
+	go test -bench=. -benchtime=10ms ./...
+
+seed:
+	go run ./cmd/seed -db="$(DATABASE_URL)" -count=1000000
 
 lint:
 	golangci-lint run
@@ -51,3 +70,4 @@ docker-down:
 
 clean:
 	rm -rf bin coverage.out
+
