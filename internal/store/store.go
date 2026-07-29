@@ -96,6 +96,12 @@ type EventFilter struct {
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
 	Topic json.RawMessage
+	// TxHash limits results to events from a specific transaction.
+	TxHash string
+	// InSuccessfulCall limits results to events from successful or failed
+	// calls. nil means no constraint — use a non-nil pointer to opt in;
+	// the zero-value convention doesn't apply to booleans.
+	InSuccessfulCall *bool
 	// Topic0-Topic3 match the exact JSON value at that specific topic array
 	// position. Unspecified positions are wildcards.
 	Topic0 json.RawMessage

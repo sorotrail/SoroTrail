@@ -22,6 +22,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func ptr[T any](v T) *T { return &v }
+
 func testStore(t *testing.T) *Postgres {
 	t.Helper()
 	return testStoreWithPartitionSpan(t, int64(DefaultEventPartitionSpan))
@@ -439,6 +441,145 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
 		}
 	})
+
+	t.Run("by topic0 and topic1 positionally", func(t *testing.T) {
+		e1 := testEvent(eventID(100), 200, contractA)
+		e1.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GABC"},{"address":"GDEF"}]`)
+		e2 := testEvent(eventID(101), 201, contractA)
+		e2.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GDEF"},{"address":"GABC"}]`)
+		_, err := st.UpsertEvents(ctx, []Event{e1, e2})
+		require.NoError(t, err)
+
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			Topic0: json.RawMessage(`{"symbol":"transfer"}`),
+			Topic1: json.RawMessage(`{"address":"GABC"}`),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+		assert.Equal(t, e1.ID, got[0].ID)
+	})
+
+	t.Run("by tx_hash", func(t *testing.T) {
+		e1 := testEvent(eventID(200), 300, contractA)
+		e1.TxHash = "txhash1"
+		e2 := testEvent(eventID(201), 301, contractA)
+		e2.TxHash = "txhash2"
+		e3 := testEvent(eventID(202), 302, contractA)
+		e3.TxHash = "txhash1"
+		_, err := st.UpsertEvents(ctx, []Event{e1, e2, e3})
+		require.NoError(t, err)
+
+		got, _, err := st.QueryEvents(ctx, EventFilter{TxHash: "txhash1"})
+		require.NoError(t, err)
+		assert.Len(t, got, 2)
+
+		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "txhash2"})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+
+		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "nonexistent"})
+		require.NoError(t, err)
+		assert.Len(t, got, 0)
+	})
+
+	t.Run("by in_successful_call", func(t *testing.T) {
+		e1 := testEvent(eventID(300), 400, contractA)
+		e1.InSuccessfulCall = true
+		e1.TxHash = "isc_test_a"
+		e2 := testEvent(eventID(301), 401, contractA)
+		e2.InSuccessfulCall = false
+		e2.TxHash = "isc_test_b"
+		e3 := testEvent(eventID(302), 402, contractA)
+		e3.InSuccessfulCall = true
+		e3.TxHash = "isc_test_c"
+		_, err := st.UpsertEvents(ctx, []Event{e1, e2, e3})
+		require.NoError(t, err)
+
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TxHash:           "isc_test_a",
+			InSuccessfulCall: ptr(true),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+		assert.Equal(t, e1.ID, got[0].ID)
+
+		got, _, err = st.QueryEvents(ctx, EventFilter{
+			TxHash:           "isc_test_b",
+			InSuccessfulCall: ptr(false),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+		assert.Equal(t, e2.ID, got[0].ID)
+
+		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "isc_test_c"})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.True(t, got[0].InSuccessfulCall)
+	})
+
+	t.Run("by tx_hash and in_successful_call combined", func(t *testing.T) {
+		e1 := testEvent(eventID(400), 500, contractA)
+		e1.TxHash = "combo1"
+		e1.InSuccessfulCall = true
+		e2 := testEvent(eventID(401), 501, contractA)
+		e2.TxHash = "combo1"
+		e2.InSuccessfulCall = false
+		e3 := testEvent(eventID(402), 502, contractA)
+		e3.TxHash = "combo2"
+		e3.InSuccessfulCall = true
+		_, err := st.UpsertEvents(ctx, []Event{e1, e2, e3})
+		require.NoError(t, err)
+
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			TxHash:           "combo1",
+			InSuccessfulCall: ptr(true),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+		assert.Equal(t, e1.ID, got[0].ID)
+
+		got, _, err = st.QueryEvents(ctx, EventFilter{
+			TxHash:           "combo1",
+			InSuccessfulCall: ptr(false),
+		})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+		assert.Equal(t, e2.ID, got[0].ID)
+	})
+}
+
+func TestQueryEvents_InSuccessfulCallFilter(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	trueEvent := testEvent(eventID(500), 600, contractA)
+	trueEvent.InSuccessfulCall = true
+
+	falseEvent := testEvent(eventID(501), 601, contractA)
+	falseEvent.InSuccessfulCall = false
+
+	_, err := st.UpsertEvents(ctx, []Event{trueEvent, falseEvent})
+	require.NoError(t, err)
+
+	t.Run("filter by true alone", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(true)})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.True(t, got[0].InSuccessfulCall)
+	})
+
+	t.Run("filter by false alone", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(false)})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.False(t, got[0].InSuccessfulCall)
+	})
+
+	t.Run("nil returns all", func(t *testing.T) {
+		got, _, err := st.QueryEvents(ctx, EventFilter{})
+		require.NoError(t, err)
+		require.Len(t, got, 2)
+	})
 }
 
 // countEventsInRange reports how many events the store holds in a ledger
@@ -557,6 +698,18 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 
 	st := NewPostgres(pool, 10)
 	ctx := context.Background()
+
+	// Drop the default partition that Migrate() created with the production
+	// span so the test's custom span-10 partition setup doesn't collide.
+	_, err = pool.Exec(ctx, `
+		DO $$DECLARE
+			part text;
+		BEGIN
+			FOR part IN SELECT inhrelid::regclass::text FROM pg_inherits WHERE inhparent = 'events'::regclass LOOP
+				EXECUTE 'DROP TABLE IF EXISTS ' || part || ' CASCADE';
+			END LOOP;
+		END$$`)
+	require.NoError(t, err)
 
 	original := testEvent(eventID(1), 100, contractA)
 	original.RawTopicXDR = []string{"AAAADwAAAAh0cmFuc2Zlcg=="}

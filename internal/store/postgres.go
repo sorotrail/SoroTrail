@@ -65,10 +65,6 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // value_xdr are never silently dropped on the way in; a repair that
 // arrives without XDR preserves what was already stored via the coalesce()
 // clauses in the UPDATE branch (`sorotrail replay` relies on that).
-//
-// onUpdate=false → ON CONFLICT DO NOTHING (idempotent ingest);
-// onUpdate=true  → ON CONFLICT DO UPDATE SET … (auditor repair, correcting
-// topic/value drift on the RPC side).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
 	if onUpdate {
@@ -597,6 +593,12 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	}
 	if len(f.Types) > 0 {
 		where = append(where, "type = ANY("+arg(f.Types)+")")
+	}
+	if f.TxHash != "" {
+		where = append(where, "tx_hash = "+arg(f.TxHash))
+	}
+	if f.InSuccessfulCall != nil {
+		where = append(where, "in_successful_call = "+arg(*f.InSuccessfulCall))
 	}
 	if len(f.Topic) > 0 {
 		// Containment on the array matches the topic at any position.
