@@ -116,6 +116,7 @@ func run() error {
 	var (
 		st   store.Store
 		pool *pgxpool.Pool
+		pg   *store.Postgres
 	)
 	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
 		st, err = store.NewStoreFromURL(cfg.DatabaseURL)
@@ -164,7 +165,9 @@ func run() error {
 			return fmt.Errorf("pinging postgres after %d retries: %w", maxRetries, pingErr)
 		}
 		log.Info("postgres connection established")
-		st = store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+		pg = store.NewPostgresWithHealthCheck(ctx, pool, cfg.DatabaseURL, int64(cfg.PartitionLedgerSpan))
+		defer pg.StopHealthCheck()
+		st = pg
 	}
 	for _, id := range cfg.WatchedContracts {
 		if err := st.AddWatchedContract(ctx, id); err != nil {
