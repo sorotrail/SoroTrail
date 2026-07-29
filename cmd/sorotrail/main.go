@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sorotrail/sorotrail/internal/api"
+	"github.com/sorotrail/sorotrail/internal/api/graphql"
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/config"
@@ -219,6 +220,16 @@ func run() error {
 		AllowedHeaders: cfg.CORSAllowedHeaders,
 	})
 
+	// GraphQL transport: reads against the same store + spec enricher
+	// the REST handlers use. Dev-mode playground is gated on
+	// GRAPHQL_PLAYGROUND. The schema is the same shape as
+	// internal/api/graphql/schema.graphqls.
+	gqlHandler, gqlErr := graphql.New(graphqlServerDeps(apiStore, specEnricher), log, cfg.GraphQLPlayground)
+	if gqlErr != nil {
+		return fmt.Errorf("constructing graphql handler: %w", gqlErr)
+	}
+	apiServer.SetGraphQLHandler(gqlHandler, gqlHandler.PlaygroundHandler())
+
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiServer.Router(),
@@ -316,4 +327,11 @@ func newLogger(level, format string) *slog.Logger {
 		h = slog.NewTextHandler(os.Stdout, opts)
 	}
 	return slog.New(h)
+}
+
+// graphqlServerDeps wraps the live store + enricher into the typed
+// bundle the GraphQL Handler consumes. Centralising the cast here
+// keeps the route wiring in main.go one line wide.
+func graphqlServerDeps(st store.Store, enricher api.Enricher) api.ServerDeps {
+	return api.ServerDeps{Store: st, Enricher: enricher}
 }

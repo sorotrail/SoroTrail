@@ -207,6 +207,19 @@ func (s *Server) Router() http.Handler {
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
+	// GraphQL transport — read-only, mounts at /graphql and dev-mode
+	// /graphiql. Built by the graphql package; the API server only
+	// owns the route registration so a misconfigured GraphQL handler
+	// shows up as a 404 instead of a confusing 500.
+	if s.graphqlHandler != nil {
+		r.Handle("/graphql", s.graphqlHandler)
+	}
+	if s.graphqlPlayground != nil {
+		r.Get("/graphiql", func(w http.ResponseWriter, req *http.Request) {
+			s.graphqlPlayground.ServeHTTP(w, req)
+		})
+	}
+
 	// Watched-contracts management: writes and updates to the runtime
 	// filter list. Always auth-gated, even when AUTH_ENABLED would be
 	// false elsewhere — that asymmetry is intentional and part of the

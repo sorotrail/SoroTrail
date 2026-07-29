@@ -18,6 +18,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
+	"github.com/sorotrail/sorotrail/internal/api/queries"
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
 	"github.com/sorotrail/sorotrail/internal/config"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -1378,116 +1379,98 @@ func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 
 // filterFromQuery parses the shared event-filter query params:
 // contract_id, type, topic, from_ledger, to_ledger, from_time, to_time, cursor, limit.
+//
+// The parsing rules and validation live in the shared queries package so
+// the GraphQL resolvers in internal/api/graphql can reuse them — there is
+// exactly one source of truth for which topic positions are valid, what
+// counts as an "invalid order", etc.
 func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	q := r.URL.Query()
-	f := store.EventFilter{
-		ContractID: q.Get("contract_id"),
-		Cursor:     q.Get("cursor"),
-		TxHash:     q.Get("tx_hash"),
-	}
 
-	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
-		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
-	}
-
-	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
-		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
-	}
-
-	if raw := q.Get("type"); raw != "" {
-		for _, t := range strings.Split(raw, ",") {
-			t = strings.TrimSpace(t)
-			switch t {
-			case "contract", "system", "diagnostic":
-			default:
-				return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
-			}
-			f.Types = append(f.Types, t)
-		}
-	}
-
-	parseTopic := func(name, raw string) (json.RawMessage, error) {
-		if raw == "" {
-			return nil, nil
-		}
-		if json.Valid([]byte(raw)) {
-			return json.RawMessage(raw), nil
-		}
-		quoted, err := json.Marshal(raw)
-		if err != nil {
-			return nil, fmt.Errorf("invalid %s: %w", name, err)
-		}
-		return quoted, nil
-	}
-
-	// topic_contains accepts any valid JSON value and uses @> containment
-	// directly (no automatic array-wrapping). Unlike topic, bare words are
-	// not allowed — the input must be parseable JSON.
-	if raw := q.Get("topic_contains"); raw != "" {
-		if !json.Valid([]byte(raw)) {
-			return f, fmt.Errorf("topic_contains must be valid JSON")
-		}
-		f.TopicContains = json.RawMessage(raw)
-	}
-
-	// order controls sort direction for paginated results.
-	order := q.Get("order")
-	switch order {
-	case "", "asc", "desc":
-		f.Order = order
-	default:
-		return f, fmt.Errorf("invalid order %q (want asc or desc)", order)
-	}
-
-	// order_by selects the sort column; order still controls the direction,
-	// so the two combine (e.g. order_by=created_at&order=desc).
-	orderBy := q.Get("order_by")
-	if !store.ValidOrderBy(orderBy) {
-		return f, fmt.Errorf("invalid order_by %q (want %s, %s or %s)",
-			orderBy, store.OrderByID, store.OrderByLedger, store.OrderByCreatedAt)
-	}
-	f.OrderBy = orderBy
-
+	var fromLedger, toLedger int64
+	var fromTime, toTime time.Time
 	var err error
-	if topic := q.Get("topic"); topic != "" {
-		parsed, err := parseTopic("topic", topic)
-		if err != nil {
-			return f, err
+
+	if fromLedger, err = queries.ParseLedgerParam(q.Get("from_ledger")); err != nil {
+		// Match the historical REST error message: prefix the param name
+		// so users see exactly which value was bad.
+		return store.EventFilter{}, fmt.Errorf("from_ledger %s", err.Error())
+	}
+	if toLedger, err = queries.ParseLedgerParam(q.Get("to_ledger")); err != nil {
+		return store.EventFilter{}, fmt.Errorf("to_ledger %s", err.Error())
+	}
+
+	if fromTime, err = queries.ParseTimeParam(q.Get("from_time")); err != nil {
+		return store.EventFilter{}, fmt.Errorf("from_time %s", err.Error())
+	}
+	if toTime, err = queries.ParseTimeParam(q.Get("to_time")); err != nil {
+		return store.EventFilter{}, fmt.Errorf("to_time %s", err.Error())
+	}
+
+	types, err := queries.ParseTypes(q.Get("type"))
+	if err != nil {
+		return store.EventFilter{}, err
+	}
+
+	topic, err := queries.ParseTopic(q.Get("topic"))
+	if err != nil {
+		return store.EventFilter{}, fmt.Errorf("topic: %w", err)
+	}
+	t0, err := queries.ParseTopic(q.Get("topic0"))
+	if err != nil {
+		return store.EventFilter{}, fmt.Errorf("topic0: %w", err)
+	}
+	t1, err := queries.ParseTopic(q.Get("topic1"))
+	if err != nil {
+		return store.EventFilter{}, fmt.Errorf("topic1: %w", err)
+	}
+	t2, err := queries.ParseTopic(q.Get("topic2"))
+	if err != nil {
+		return store.EventFilter{}, fmt.Errorf("topic2: %w", err)
+	}
+	t3, err := queries.ParseTopic(q.Get("topic3"))
+	if err != nil {
+		return store.EventFilter{}, fmt.Errorf("topic3: %w", err)
+	}
+	tc, err := queries.ParseTopicContains(q.Get("topic_contains"))
+	if err != nil {
+		return store.EventFilter{}, err
+	}
+
+	args := queries.EventFilterArgs{
+		ContractID:    q.Get("contract_id"),
+		Types:         types,
+		Topic:         topic,
+		T0:            t0,
+		T1:            t1,
+		T2:            t2,
+		T3:            t3,
+		TopicContains: tc,
+		TxHash:        q.Get("tx_hash"),
+		FromLedger:    fromLedger,
+		ToLedger:      toLedger,
+		FromTime:      fromTime,
+		ToTime:        toTime,
+		Order:         q.Get("order"),
+		OrderBy:       q.Get("order_by"),
+		Cursor:        q.Get("cursor"),
+	}
+
+	// ?limit=N: explicit validation here so an explicit `?limit=0` (or
+	// any value outside [1,MaxQueryLimit]) is a 400. BuildingEventFilter
+	// treats args.Limit==0 as "use default" — we only invoke the
+	// default when the param is absent, not when the caller explicitly
+	// asked for an invalid value.
+	if raw := q.Get("limit"); raw != "" {
+		limit, lerr := strconv.Atoi(raw)
+		if lerr != nil || limit < 1 || limit > store.MaxQueryLimit {
+			return store.EventFilter{}, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
 		}
-		f.Topic = parsed
+		args.Limit = limit
 	}
 
-	if f.Topic0, err = parseTopic("topic0", q.Get("topic0")); err != nil {
-		return f, err
-	}
-	if f.Topic1, err = parseTopic("topic1", q.Get("topic1")); err != nil {
-		return f, err
-	}
-	if f.Topic2, err = parseTopic("topic2", q.Get("topic2")); err != nil {
-		return f, err
-	}
-	if f.Topic3, err = parseTopic("topic3", q.Get("topic3")); err != nil {
-		return f, err
-	}
-
-	if len(f.Topic) > 0 && (len(f.Topic0) > 0 || len(f.Topic1) > 0 || len(f.Topic2) > 0 || len(f.Topic3) > 0) {
-		return f, fmt.Errorf("topic and topic0..topic3 filters cannot be combined")
-	}
-
-	if f.FromLedger, err = parseLedgerParam(q.Get("from_ledger"), "from_ledger"); err != nil {
-		return f, err
-	}
-	if f.ToLedger, err = parseLedgerParam(q.Get("to_ledger"), "to_ledger"); err != nil {
-		return f, err
-	}
-	if f.FromLedger > 0 && f.ToLedger > 0 && f.FromLedger > f.ToLedger {
-		return f, fmt.Errorf("from_ledger %d is after to_ledger %d", f.FromLedger, f.ToLedger)
-	}
-
-	if f.FromTime, err = parseTimeParam(q.Get("from_time"), "from_time"); err != nil {
-		return f, err
-	}
-	if f.ToTime, err = parseTimeParam(q.Get("to_time"), "to_time"); err != nil {
+	f, err := queries.BuildEventFilter(args)
+	if err != nil {
 		return f, err
 	}
 	if !f.FromTime.IsZero() && !f.ToTime.IsZero() && f.FromTime.After(f.ToTime) {
@@ -1506,7 +1489,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 
 	// ?recent=N: shorthand for "newest N events" — sets order=desc and
-	// limit=N (default 20). Conflicts with explicit order or limit params.
+	// limit=N (default 20). This isn't a general-purpose filter (it
+	// conflicts with explicit order/limit/order_by), so we keep the
+	// branch in the REST layer and apply it AFTER BuildEventFilter so
+	// the shared builder doesn't need a "shorthand mode" affordance.
 	if raw := q.Get("recent"); raw != "" {
 		if q.Get("order") != "" || q.Get("order_by") != "" {
 			return f, fmt.Errorf("recent cannot be combined with order or order_by")
@@ -1539,33 +1525,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 
 	return f, nil
-}
-
-func parseLedgerParam(raw, name string) (int64, error) {
-	if raw == "" {
-		return 0, nil
-	}
-	n, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("%s must be a positive integer", name)
-	}
-	return n, nil
-}
-
-// parseTimeParam parses an RFC 3339 timestamp query parameter.
-// Sub-second precision and missing timezone offset are rejected.
-func parseTimeParam(raw, name string) (time.Time, error) {
-	if raw == "" {
-		return time.Time{}, nil
-	}
-	t, err := time.Parse(time.RFC3339, raw)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("%s must be an RFC 3339 timestamp (e.g. 2026-07-21T00:00:00Z)", name)
-	}
-	if t.Nanosecond() != 0 {
-		return time.Time{}, fmt.Errorf("%s sub-second precision is not supported", name)
-	}
-	return t, nil
 }
 
 func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
