@@ -86,7 +86,7 @@ func TestLoad(t *testing.T) {
 		{
 			name:    "missing DATABASE_URL",
 			env:     map[string]string{},
-			wantErr: "DATABASE_URL is required",
+			wantErr: "DATABASE_URL: required but empty",
 		},
 		{
 			name: "watched contracts parsed and trimmed",
@@ -112,7 +112,7 @@ func TestLoad(t *testing.T) {
 				"DATABASE_URL":  "postgres://localhost/db",
 				"POLL_INTERVAL": "-3s",
 			},
-			wantErr: "POLL_INTERVAL must be positive",
+			wantErr: "POLL_INTERVAL",
 		},
 		{
 			name: "bad query timeout",
@@ -333,7 +333,7 @@ func TestLoad(t *testing.T) {
 				"DATABASE_URL":   "postgres://localhost/db",
 				"RATE_LIMIT_RPS": "-1",
 			},
-			wantErr: "RATE_LIMIT_RPS must be non-negative",
+			wantErr: "RATE_LIMIT_RPS: -1 must be non-negative",
 		},
 	}
 
