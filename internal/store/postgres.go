@@ -741,7 +741,26 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	if !f.Scope.IsWildcard() {
 		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
 	}
-	if f.ContractID != "" {
+	// When ContractIDs is non-empty, use = ANY(...) (SQL IN). When both
+	// ContractID and ContractIDs are set, combine them via a single
+	// = ANY(...) that includes both — the union matches an event for either.
+	if len(f.ContractIDs) > 0 {
+		ids := f.ContractIDs
+		if f.ContractID != "" {
+			// Deduplicate: ContractID might already be in ContractIDs.
+			has := false
+			for _, id := range ids {
+				if id == f.ContractID {
+					has = true
+					break
+				}
+			}
+			if !has {
+				ids = append(ids, f.ContractID)
+			}
+		}
+		where = append(where, "contract_id = ANY("+arg(ids)+")")
+	} else if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
 	if f.ContractIDPrefix != "" {
@@ -909,6 +928,70 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	return events, next, nil
 }
 
+// AggregateEvents returns event counts grouped by ledger or by a
+// time interval. Buckets with zero events are omitted. Filters
+// (contract_id, type, etc.) are applied to the aggregation query.
+func (p *Postgres) AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error) {
+	f.Cursor = ""
+	f.Order = ""
+	f.OrderBy = ""
+	f.Limit = 0
+
+	where, args := buildEventWhereClause(f)
+
+	var (
+		groupCol  string
+		bucketCol string
+	)
+
+	switch bucket {
+	case "ledger":
+		groupCol = "ledger"
+		bucketCol = "ledger::text"
+	default:
+		dur, err := time.ParseDuration(bucket)
+		if err != nil {
+			return nil, fmt.Errorf("invalid bucket %q: %w", bucket, err)
+		}
+		if dur <= 0 {
+			return nil, fmt.Errorf("bucket duration must be positive")
+		}
+		bucketSeconds := int64(dur.Seconds())
+		groupCol = fmt.Sprintf("to_timestamp(floor(extract(epoch from created_at) / %d) * %d)", bucketSeconds, bucketSeconds)
+		bucketCol = fmt.Sprintf("to_char(%s, 'YYYY-MM-DD\"T\"HH24:MI:SS')", groupCol)
+	}
+
+	query := "SELECT " + bucketCol + " AS bucket, count(*)::bigint FROM events"
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY " + groupCol + " ORDER BY " + groupCol
+
+	var buckets []AggregateBucket
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("aggregating events: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var b AggregateBucket
+			if err := rows.Scan(&b.Bucket, &b.Count); err != nil {
+				return err
+			}
+			buckets = append(buckets, b)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("reading aggregation: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return buckets, nil
+}
+
 // CountEvents returns the total number of rows matching the filter,
 // ignoring pagination (cursor, order, and limit). It reuses the same
 // WHERE clause builder as QueryEvents so the two stay in lockstep.
@@ -946,8 +1029,8 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 	var s IngestionState
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx,
-			`SELECT last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE id = 1`,
-		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.UpdatedAt)
+			`SELECT last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state WHERE id = 1`,
+		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.LastSuccessfulPoll, &s.UpdatedAt)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return IngestionState{}, ErrNotFound
@@ -960,13 +1043,14 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 
 func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) error {
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO ingestion_state (id, last_ingested_ledger, last_cursor, updated_at)
-		VALUES (1, $1, $2, now())
+		INSERT INTO ingestion_state (id, last_ingested_ledger, last_cursor, last_successful_poll, updated_at)
+		VALUES (1, $1, $2, $3, now())
 		ON CONFLICT (id) DO UPDATE SET
 			last_ingested_ledger = EXCLUDED.last_ingested_ledger,
 			last_cursor          = EXCLUDED.last_cursor,
+			last_successful_poll = EXCLUDED.last_successful_poll,
 			updated_at           = now()`,
-		s.LastIngestedLedger, s.LastCursor,
+		s.LastIngestedLedger, s.LastCursor, s.LastSuccessfulPoll,
 	)
 	if err != nil {
 		return fmt.Errorf("saving ingestion state: %w", err)

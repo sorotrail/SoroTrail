@@ -437,6 +437,55 @@ func (s *Server) handleCountEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, countResponse{Count: total})
 }
 
+// bucketResponse is the JSON body for GET /events/aggregate.
+type bucketResponse struct {
+	Buckets []AggregateBucket `json:"buckets"`
+}
+
+// AggregateBucket is one bucket in an aggregation result.
+type AggregateBucket = store.AggregateBucket
+
+// handleAggregateEvents returns event counts grouped by ledger or
+// by a time interval. The ?bucket parameter controls the grouping
+// and accepts "ledger" or a Go duration string (e.g. "1h", "1d").
+// All other event filter params (contract_id, type, from_ledger,
+// to_ledger, from_time, to_time, topic, topic0..topic3,
+// topic_contains, tx_hash) are accepted and applied to the
+// aggregation. Pagination params (cursor, limit, order, order_by)
+// are accepted in the URL but ignored.
+func (s *Server) handleAggregateEvents(w http.ResponseWriter, r *http.Request) {
+	filter, _, err := parseFilterAndFields(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	filter.Cursor = ""
+	filter.Order = ""
+	filter.OrderBy = ""
+	filter.Limit = 0
+
+	bucket := r.URL.Query().Get("bucket")
+	if bucket == "" {
+		writeError(w, http.StatusBadRequest, errors.New("bucket parameter is required"))
+		return
+	}
+	if bucket != "ledger" {
+		if _, err := time.ParseDuration(bucket); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid bucket %q: must be \"ledger\" or a duration", bucket))
+			return
+		}
+	}
+
+	buckets, err := s.store.AggregateEvents(r.Context(), filter, bucket)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("aggregating events", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("aggregating events failed"))
+		return
+	}
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, bucketResponse{Buckets: buckets})
+}
+
 // streamBatchSize is the number of events fetched per internal query when
 // streaming NDJSON. It balances query cost against flush frequency: too
 // small wastes round trips; too large buffers too long before a client
@@ -630,6 +679,13 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		return
 	}
 	s.recordEventsServed(r.Context(), len(events))
+
+	// Tag every event with its SEP-41 normalized envelope (if any) before
+	// rendering — the layer is additive and never destructive, so events
+	// that do not match keep exactly the same shape they had before.
+	for i := range events {
+		events[i].WithSEP41()
+	}
 
 	// Total matching count (ignoring pagination) as a response header.
 	// Failure to count is non-fatal: we log a warning and proceed without
@@ -880,6 +936,11 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.recordEventsServed(r.Context(), 1)
+
+	// Additive SEP-41 normalization on the single-event path; non-matches
+	// simply omit the field.
+	event.WithSEP41()
+
 	decoded := r.URL.Query().Get("decoded") == "true"
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
@@ -937,9 +998,6 @@ func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
 	}
 	return out
 }
-
-// Stats summarizes what the indexer has stored plus, when the auditor is
-// running, the post-processing counters it has accumulated.
 
 // contractListResponse is the JSON body for GET /contracts.
 type contractListResponse struct {
@@ -1002,6 +1060,9 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 		loggerFromContext(r.Context()).Warn("counting contracts for X-Total-Count", "error", cerr)
 	} else if total > 0 {
 		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+	if items == nil {
+		items = []store.ContractSummary{}
 	}
 	writeCacheHeaders(w, cacheNoCache, 0, "")
 	writeJSON(w, http.StatusOK, contractListResponse{
@@ -1199,7 +1260,6 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
 		return
 	}
-
 	modeTransition := ""
 	if len(current) == 0 {
 		if r.URL.Query().Get("confirm") != "true" {
@@ -1293,7 +1353,6 @@ func (s *Server) handleAddressEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-
 	// Address events are always ordered by event_id.
 	if filter.OrderBy != "" && filter.OrderBy != store.OrderByID {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("address events only support order_by=id (the default)"))
@@ -1728,8 +1787,41 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return store.EventFilter{}, err
 	}
 
+	// contract_ids is a comma-separated list of contract IDs. When present,
+	// each element must be a valid contract strkey. The empty string (no
+	// parameter) or a single value without commas behave identically to the
+	// original ?contract_id= — no breaking change to existing callers.
+	var contractIDs []string
+	if raw := q.Get("contract_id"); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			// The doc comment above promises each element is a valid
+			// contract strkey; enforce it rather than passing a typo
+			// through to a query that silently matches nothing.
+			if !config.ValidContractID(part) {
+				return store.EventFilter{}, fmt.Errorf("invalid contract_id %q", part)
+			}
+			contractIDs = append(contractIDs, part)
+		}
+	}
+	// Backward compatibility: a single contract_id without commas still
+	// sets ContractID so existing callers (handleContractEvents, GraphQL)
+	// are unaffected. When multiple IDs are given, ContractID is left empty
+	// and ContractIDs carries the full list.
+	var singleID string
+	if len(contractIDs) == 1 {
+		singleID = contractIDs[0]
+		contractIDs = nil
+	}
+
 	args := queries.EventFilterArgs{
-		ContractID:       q.Get("contract_id"),
+		// singleID, not the raw param: a lone contract_id keeps the
+		// historical single-ID behaviour, while a comma-separated list is
+		// carried by ContractIDs below.
+		ContractID:       singleID,
 		ContractIDPrefix: q.Get("contract_id_prefix"),
 		Types:            types,
 		Topic:            topic,
@@ -1765,6 +1857,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	if err != nil {
 		return f, err
 	}
+	// ContractIDs is set outside EventFilterArgs because the shared queries
+	// package (used by GraphQL) has no multi-ID concept yet; the store
+	// turns a non-empty list into `contract_id = ANY($N)`.
+	f.ContractIDs = contractIDs
 
 	// Scope is attached here, the single place REST list filters are built:
 	// queries.BuildEventFilter is shared with the GraphQL resolvers and

@@ -395,6 +395,33 @@ When `include_xdr=true`, events also include the original base64 XDR payload:
 }
 ```
 
+Events whose topics and value match a SEP-41 token standard shape
+(`transfer`, `mint`, `burn`, `clawback`, `approve` per SEP-41 / CAP-46-6)
+are also tagged with a `sep41_event` object carrying the normalized
+fields — addresses stay as the original `G…`/`C…` strings, amounts stay
+as decimal strings (no float precision loss), muxed transfers expose
+`to_muxed_id` from the data map, and CAP-0067 trailing SEP-0011 asset
+strings surface as `asset`. Non-matching events get no extra field; the
+augmentation is additive, never destructive.
+
+```json
+{
+  "sep41_event": {
+    "standard": "sep41",
+    "event": "transfer",
+    "from": "GA…",
+    "to": "GB…",
+    "amount": "10000000",
+    "asset": "native"
+  }
+}
+```
+
+A `mint` / `burn` / `clawback` event omits the irrelevant side
+(`transfer` has `from` and `to`; `mint` has only `to`; `burn` and
+`clawback` have only `from`; `approve` has `from`, `spender`,
+`expiration_ledger`).
+
 Time filtering narrows results and does not change ordering (events remain in
 ascending event-ID order, which agrees with `created_at` order because both
 follow ledger sequence).
@@ -806,6 +833,15 @@ hex-encoded HMAC-SHA256 digest of the request body, keyed with the
 subscription's secret. Subscribers **must verify** this signature to
 confirm the payload came from SoroTrail and has not been tampered with.
 
+When the event matches the SEP-41 token standard, the payload also
+includes the `sep41_event` envelope described under `GET /events` —
+subscribers can rely on `payload.event.sep41_event` (inside the existing
+`event` field of the posted JSON) to identify the transfer / mint /
+burn / clawback / approve semantics without re-implementing SEP-41
+themselves. The signature is computed over the full body including the
+`sep41_event` field, so subscribers who add or remove the field would
+change the signature and fail verification.
+
 **Verifying signatures — code samples:**
 
 <details>
@@ -1174,6 +1210,31 @@ Deliberately out of scope for the MVP, with seams left for contributors:
 - GraphQL / websocket subscriptions.
 - Metrics (Prometheus) and tracing.
 - Alternative storage backends behind `store.Store`.
+
+## API documentation UI
+
+The OpenAPI 3.1 specification lives at [`api/openapi.yaml`](api/openapi.yaml) and
+is browsable through a self-hosted Swagger UI at `/docs` when the server is
+running:
+
+```
+http://localhost:8080/docs/
+```
+
+No external CDN is required — all assets (HTML, CSS, JS) are compiled into the
+binary via Go's `//go:embed` mechanism.
+
+### Route-drift validation
+
+A dedicated test ensures the router and the OpenAPI spec stay in sync:
+
+```sh
+go test ./pkg/docs/ -run TestNoRouteDrift -v
+```
+
+The test reads `api/openapi.yaml`, walks the live chi router tree, and fails
+with `t.Fatalf` if the two diverge in either direction. Run it as part of CI
+to catch endpoint/spec drift before it reaches production.
 
 ## License
 

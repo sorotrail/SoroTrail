@@ -508,10 +508,11 @@ func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState
 		lastLedger = int64(resp.Events[len(resp.Events)-1].Ledger)
 	}
 
+	now := time.Now().UTC()
 	if cursor != "" {
-		return store.IngestionState{LastIngestedLedger: lastLedger, LastCursor: cursor}, caughtUp
+		return store.IngestionState{LastIngestedLedger: lastLedger, LastCursor: cursor, LastSuccessfulPoll: &now}, caughtUp
 	}
-	return store.IngestionState{LastIngestedLedger: int64(resp.LatestLedger) - 1}, caughtUp
+	return store.IngestionState{LastIngestedLedger: int64(resp.LatestLedger) - 1, LastSuccessfulPoll: &now}, caughtUp
 }
 
 // windowSweep ingests the ledger window [start, end] by paging each filter
@@ -580,7 +581,8 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	if end >= health.LatestLedger {
 		lastIngested = int64(end) - 1
 	}
-	err = ing.store.SaveIngestionState(ctx, store.IngestionState{LastIngestedLedger: lastIngested})
+	now := time.Now().UTC()
+	err = ing.store.SaveIngestionState(ctx, store.IngestionState{LastIngestedLedger: lastIngested, LastSuccessfulPoll: &now})
 	if err != nil {
 		return false, err
 	}

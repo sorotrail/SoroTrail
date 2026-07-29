@@ -130,6 +130,15 @@ func (s *guardedStore) LedgerRangeCensus(ctx context.Context, fromLedger, toLedg
 	return census, err
 }
 
+func (s *guardedStore) AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.AggregateEvents")
+	defer cancel()
+	start := time.Now()
+	buckets, err := s.Store.AggregateEvents(ctx, f, bucket)
+	s.logSlowQuery("store.AggregateEvents", start, err)
+	return buckets, err
+}
+
 func (s *guardedStore) GetIngestionState(ctx context.Context) (IngestionState, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.GetIngestionState")
 	defer cancel()
@@ -173,6 +182,24 @@ func (s *guardedStore) SaveAuditStateIfGreater(ctx context.Context, ledger int64
 	state, err := s.Store.SaveAuditStateIfGreater(ctx, ledger)
 	s.logSlowQuery("store.SaveAuditStateIfGreater", start, err)
 	return state, err
+}
+
+func (s *guardedStore) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.ListContracts")
+	defer cancel()
+	start := time.Now()
+	summaries, cursor, err := s.Store.ListContracts(ctx, f)
+	s.logSlowQuery("store.ListContracts", start, err)
+	return summaries, cursor, err
+}
+
+func (s *guardedStore) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.CountContracts")
+	defer cancel()
+	start := time.Now()
+	total, err := s.Store.CountContracts(ctx, f)
+	s.logSlowQuery("store.CountContracts", start, err)
+	return total, err
 }
 
 func (s *guardedStore) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {

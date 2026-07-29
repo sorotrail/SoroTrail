@@ -37,6 +37,11 @@ type stubStore struct {
 	countEventsErr  error
 	lastCountFilter store.EventFilter
 
+	aggregateBuckets    []store.AggregateBucket
+	aggregateErr        error
+	lastAggregateBucket string
+	lastAggregateFilter store.EventFilter
+
 	event    store.Event
 	eventErr error
 
@@ -63,9 +68,14 @@ type stubStore struct {
 	ingestion    store.IngestionState
 	ingestionErr error
 
-	migrationVersion int
-	migrationDirty   bool
-	migrationErr     error
+	migrationVersion     int
+	migrationDirty       bool
+	migrationErr         error
+	listContractsResult  []store.ContractSummary
+	listContractsCursor  string
+	listContractsErr     error
+	countContractsResult int64
+	countContractsErr    error
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -76,6 +86,12 @@ func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store
 func (s *stubStore) CountEvents(_ context.Context, f store.EventFilter) (int64, error) {
 	s.lastCountFilter = f
 	return s.totalCount, s.countEventsErr
+}
+
+func (s *stubStore) AggregateEvents(_ context.Context, f store.EventFilter, bucket string) ([]store.AggregateBucket, error) {
+	s.lastAggregateBucket = bucket
+	s.lastAggregateFilter = f
+	return s.aggregateBuckets, s.aggregateErr
 }
 
 // LedgerRangeCensus, ReplaceEventsInRange, and the audit_state/findings
@@ -164,6 +180,7 @@ func (s *stubStore) MigrationVersion(context.Context) (int, bool, error) {
 }
 
 func (s *stubStore) Stats(context.Context, store.Scope) (store.Stats, error) { return s.stats, nil }
+func (s *stubStore) Ping(context.Context) error                              { return s.pingErr }
 func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return s.watchedList, s.watchedListErr
 }
@@ -178,7 +195,13 @@ func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
 	return s.removeErr
 }
 
-func (s *stubStore) Ping(context.Context) error { return s.pingErr }
+func (s *stubStore) ListContracts(ctx context.Context, f store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	return s.listContractsResult, s.listContractsCursor, s.listContractsErr
+}
+
+func (s *stubStore) CountContracts(ctx context.Context, f store.ContractsFilter) (int64, error) {
+	return s.countContractsResult, s.countContractsErr
+}
 
 // Subscription stubs for the webhook feature.
 func (s *stubStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
@@ -293,6 +316,66 @@ func TestListEvents_TopicAndPositionalFiltersConflict(t *testing.T) {
 	var e map[string]string
 	require.NoError(t, json.Unmarshal(body, &e))
 	assert.Contains(t, e["error"], "cannot be combined")
+}
+
+func TestListEvents_MultiContractID(t *testing.T) {
+	const contractB = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	tests := []struct {
+		name            string
+		query           string
+		wantContractID  string
+		wantContractIDs []string
+		wantStatus      int
+	}{
+		{
+			name:           "single contract_id (backward compat)",
+			query:          "/events?contract_id=" + testContract,
+			wantContractID: testContract,
+			wantStatus:     http.StatusOK,
+		},
+		{
+			name:            "two contract_ids separated by comma",
+			query:           "/events?contract_id=" + testContract + "," + contractB,
+			wantContractIDs: []string{testContract, contractB},
+			wantStatus:      http.StatusOK,
+		},
+		{
+			name:            "three contract_ids",
+			query:           "/events?contract_id=" + testContract + "," + contractB + ",CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSD",
+			wantContractIDs: []string{testContract, contractB, "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSD"},
+			wantStatus:      http.StatusOK,
+		},
+		{
+			name:       "invalid contract_id in list returns 400",
+			query:      "/events?contract_id=" + testContract + ",nope",
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			require.Equal(t, tt.wantStatus, resp.StatusCode, string(body))
+
+			if tt.wantStatus != http.StatusOK {
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], "invalid contract_id")
+				return
+			}
+
+			if tt.wantContractID != "" {
+				assert.Equal(t, tt.wantContractID, st.lastFilter.ContractID)
+				assert.Empty(t, st.lastFilter.ContractIDs)
+			} else {
+				assert.Equal(t, "", st.lastFilter.ContractID,
+					"ContractID should be empty when ContractIDs is used")
+				assert.ElementsMatch(t, tt.wantContractIDs, st.lastFilter.ContractIDs)
+			}
+		})
+	}
 }
 
 func TestListEvents_BadParams(t *testing.T) {
@@ -478,6 +561,65 @@ func TestListEvents_TotalCountHeader(t *testing.T) {
 		resp, _ := doGet(t, newTestServer(st, nil), "/events")
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		assert.Equal(t, "0", resp.Header.Get("X-Total-Count"))
+	})
+}
+
+func TestListContracts(t *testing.T) {
+	t.Run("returns contracts with event counts", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{
+				{ContractID: testContract, EventCount: 10, FirstLedger: 1, LastLedger: 100},
+				{ContractID: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", EventCount: 5, FirstLedger: 10, LastLedger: 50},
+			},
+		}
+		s := newTestServer(st, nil)
+		resp, body := doGet(t, s, "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out contractListResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		require.Len(t, out.Contracts, 2)
+		assert.Equal(t, testContract, out.Contracts[0].ContractID)
+		assert.Equal(t, int64(10), out.Contracts[0].EventCount)
+		assert.Equal(t, "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", out.Contracts[1].ContractID)
+		assert.Equal(t, int64(5), out.Contracts[1].EventCount)
+		assert.Equal(t, 2, out.Count)
+	})
+
+	t.Run("empty result returns empty array, not null", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		resp, body := doGet(t, s, "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out contractListResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.Empty(t, out.Contracts)
+		assert.Equal(t, 0, out.Count)
+		assert.Empty(t, out.Cursor)
+		assert.Contains(t, string(body), `"contracts":[]`)
+	})
+
+	t.Run("store error returns 500", func(t *testing.T) {
+		st := &stubStore{
+			listContractsErr: errors.New("db unavailable"),
+		}
+		s := newTestServer(st, nil)
+		resp, body := doGet(t, s, "/contracts")
+		require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+		var e map[string]string
+		require.NoError(t, json.Unmarshal(body, &e))
+		assert.Contains(t, e["error"], "listing contracts failed")
+	})
+
+	t.Run("no-cache cache header", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{},
+		}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
 	})
 }
 
@@ -1399,6 +1541,79 @@ func TestCountEvents_ResponseShape(t *testing.T) {
 	assert.Equal(t, float64(99), raw["count"])
 }
 
+func TestAggregateEvents_BucketLedger(t *testing.T) {
+	st := &stubStore{
+		aggregateBuckets: []store.AggregateBucket{
+			{Bucket: "100", Count: 5},
+			{Bucket: "101", Count: 3},
+		},
+	}
+	resp, body := doGet(t, newTestServer(st, nil), "/events/aggregate?bucket=ledger")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	var got bucketResponse
+	require.NoError(t, json.Unmarshal(body, &got))
+	require.Len(t, got.Buckets, 2)
+	assert.Equal(t, "100", got.Buckets[0].Bucket)
+	assert.Equal(t, int64(5), got.Buckets[0].Count)
+	assert.Equal(t, "101", got.Buckets[1].Bucket)
+	assert.Equal(t, int64(3), got.Buckets[1].Count)
+	assert.Equal(t, "ledger", st.lastAggregateBucket)
+	assert.Equal(t, "", st.lastAggregateFilter.Cursor)
+	assert.Equal(t, "", st.lastAggregateFilter.Order)
+	assert.Equal(t, 0, st.lastAggregateFilter.Limit)
+}
+
+func TestAggregateEvents_BucketTimeDuration(t *testing.T) {
+	st := &stubStore{
+		aggregateBuckets: []store.AggregateBucket{
+			{Bucket: "2024-01-01T00:00:00", Count: 10},
+			{Bucket: "2024-01-02T00:00:00", Count: 7},
+		},
+	}
+	resp, body := doGet(t, newTestServer(st, nil), "/events/aggregate?bucket=24h")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	var got bucketResponse
+	require.NoError(t, json.Unmarshal(body, &got))
+	assert.Len(t, got.Buckets, 2)
+	assert.Equal(t, int64(10), got.Buckets[0].Count)
+	assert.Equal(t, int64(7), got.Buckets[1].Count)
+	assert.Equal(t, "24h", st.lastAggregateBucket)
+}
+
+func TestAggregateEvents_MissingBucket(t *testing.T) {
+	st := &stubStore{}
+	resp, body := doGet(t, newTestServer(st, nil), "/events/aggregate")
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, string(body))
+}
+
+func TestAggregateEvents_InvalidBucket(t *testing.T) {
+	st := &stubStore{}
+	resp, body := doGet(t, newTestServer(st, nil), "/events/aggregate?bucket=notaduration")
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, string(body))
+}
+
+func TestAggregateEvents_StoreError(t *testing.T) {
+	st := &stubStore{aggregateErr: errors.New("db timeout")}
+	resp, body := doGet(t, newTestServer(st, nil), "/events/aggregate?bucket=1h")
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode, string(body))
+}
+
+func TestAggregateEvents_PassesContractFilter(t *testing.T) {
+	st := &stubStore{
+		aggregateBuckets: []store.AggregateBucket{{Bucket: "100", Count: 2}},
+	}
+	doGet(t, newTestServer(st, nil), "/events/aggregate?bucket=ledger&contract_id="+testContract)
+	assert.Equal(t, testContract, st.lastAggregateFilter.ContractID)
+}
+
+func TestAggregateEvents_PassesTypeFilter(t *testing.T) {
+	st := &stubStore{
+		aggregateBuckets: []store.AggregateBucket{{Bucket: "100", Count: 2}},
+	}
+	doGet(t, newTestServer(st, nil), "/events/aggregate?bucket=ledger&type=contract")
+	assert.Equal(t, []string{"contract"}, st.lastAggregateFilter.Types)
+}
+
 func TestListEvents_RecentParam(t *testing.T) {
 	events := []store.Event{
 		{ID: "e3", Ledger: 3},
@@ -1934,12 +2149,6 @@ func TestGetEventTransaction_NoInterferenceWithGetEvent(t *testing.T) {
 	assert.Equal(t, "0001-0001", ev.ID)
 }
 
-func (m *stubStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
-	return nil, "", nil
-}
-func (m *stubStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
-	return 0, nil
-}
 func (m *stubStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
 	return store.DeadLetter{}, nil
 }

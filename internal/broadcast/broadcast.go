@@ -183,8 +183,24 @@ func (s *Subscription) Close() {
 // eventMatches reports whether an event satisfies the given filter.
 // Zero-valued filter fields are treated as "no constraint".
 func eventMatches(ev store.Event, f store.EventFilter) bool {
-	if f.ContractID != "" && ev.ContractID != f.ContractID {
-		return false
+	// If both ContractID and ContractIDs are set, match if the event's
+	// contract matches either one.
+	if f.ContractID != "" || len(f.ContractIDs) > 0 {
+		matched := false
+		if f.ContractID != "" && ev.ContractID == f.ContractID {
+			matched = true
+		}
+		if !matched {
+			for _, id := range f.ContractIDs {
+				if ev.ContractID == id {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			return false
+		}
 	}
 	if len(f.Types) > 0 {
 		ok := false
