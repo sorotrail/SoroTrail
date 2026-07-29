@@ -98,6 +98,9 @@ type EventFilter struct {
 	// of `contract_id = $N`. Together with ContractID the union is
 	// matched — an event for any of these contracts qualifies.
 	ContractIDs []string
+	// ContractIDPrefix matches events whose contract_id starts with this
+	// prefix via a LIKE query. Mutually exclusive with ContractID.
+	ContractIDPrefix string
 	// Types filters by event type. Multiple values are accepted (ANDed
 	// together at the SQL level via type = ANY(...)). An empty or nil
 	// slice means "no constraint".

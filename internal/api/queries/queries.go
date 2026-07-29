@@ -28,30 +28,24 @@ import (
 // from "explicitly set to the zero value" (REST treats absent as absent;
 // GraphQL has nil semantics naturally).
 type EventFilterArgs struct {
-	// ContractID is a single contract ID, kept for backward compatibility.
-	// When ContractIDs is also set, both are used (union).
-	ContractID string
-	// ContractIDs is a parsed list of contract IDs. The REST handler
-	// populates it by splitting the comma-separated ?contract_id= value;
-	// GraphQL callers set it directly. Each element must be a valid
-	// contract strkey.
-	ContractIDs   []string
-	Types         []string
-	Topic         json.RawMessage
-	T0            json.RawMessage
-	T1            json.RawMessage
-	T2            json.RawMessage
-	T3            json.RawMessage
-	TopicContains json.RawMessage
-	TxHash        string
-	FromLedger    int64
-	ToLedger      int64
-	FromTime      time.Time
-	ToTime        time.Time
-	Order         string
-	OrderBy       string
-	Cursor        string
-	Limit         int
+	ContractID       string
+	ContractIDPrefix string
+	Types            []string
+	Topic            json.RawMessage
+	T0               json.RawMessage
+	T1               json.RawMessage
+	T2               json.RawMessage
+	T3               json.RawMessage
+	TopicContains    json.RawMessage
+	TxHash           string
+	FromLedger       int64
+	ToLedger         int64
+	FromTime         time.Time
+	ToTime           time.Time
+	Order            string
+	OrderBy          string
+	Cursor           string
+	Limit            int
 }
 
 // PageArgs is the wire-agnostic pagination descriptor both REST and
@@ -101,33 +95,31 @@ type CursorProbe struct {
 // [1, MaxPageSize] produce a validation error.
 func BuildEventFilter(args EventFilterArgs) (store.EventFilter, error) {
 	f := store.EventFilter{
-		ContractID:    args.ContractID,
-		ContractIDs:   args.ContractIDs,
-		Types:         args.Types,
-		Topic:         args.Topic,
-		Topic0:        args.T0,
-		Topic1:        args.T1,
-		Topic2:        args.T2,
-		Topic3:        args.T3,
-		TopicContains: args.TopicContains,
-		TxHash:        args.TxHash,
-		FromLedger:    args.FromLedger,
-		ToLedger:      args.ToLedger,
-		FromTime:      args.FromTime,
-		ToTime:        args.ToTime,
-		Order:         args.Order,
-		OrderBy:       args.OrderBy,
-		Cursor:        args.Cursor,
-		Limit:         args.Limit,
+		ContractID:       args.ContractID,
+		ContractIDPrefix: args.ContractIDPrefix,
+		Types:            args.Types,
+		Topic:            args.Topic,
+		Topic0:           args.T0,
+		Topic1:           args.T1,
+		Topic2:           args.T2,
+		Topic3:           args.T3,
+		TopicContains:    args.TopicContains,
+		TxHash:           args.TxHash,
+		FromLedger:       args.FromLedger,
+		ToLedger:         args.ToLedger,
+		FromTime:         args.FromTime,
+		ToTime:           args.ToTime,
+		Order:            args.Order,
+		OrderBy:          args.OrderBy,
+		Cursor:           args.Cursor,
+		Limit:            args.Limit,
 	}
 
 	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
 		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
 	}
-	for _, id := range f.ContractIDs {
-		if !config.ValidContractID(id) {
-			return f, fmt.Errorf("invalid contract_id %q in contract_id list", id)
-		}
+	if f.ContractIDPrefix != "" && f.ContractID != "" {
+		return f, errors.New("contract_id and contract_id_prefix cannot be combined")
 	}
 	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
 		return f, fmt.Errorf("invalid cursor %q", f.Cursor)

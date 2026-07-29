@@ -1467,26 +1467,26 @@ func listETag(f store.EventFilter) string {
 	// full one-year max-age. TestListETag_CoversEveryFilterField enumerates
 	// the fields independently and fails when a new one is not added.
 	key := struct {
-		ContractID    string          `json:"c"`
-		ContractIDs   []string        `json:"cs,omitempty"`
-		Types         []string        `json:"t"`
-		Topic         json.RawMessage `json:"p,omitempty"`
-		Topic0        json.RawMessage `json:"p0,omitempty"`
-		Topic1        json.RawMessage `json:"p1,omitempty"`
-		Topic2        json.RawMessage `json:"p2,omitempty"`
-		Topic3        json.RawMessage `json:"p3,omitempty"`
-		TopicContains json.RawMessage `json:"pc,omitempty"`
-		TxHash        string          `json:"th,omitempty"`
-		HasValue      *bool           `json:"hv,omitempty"`
-		TxIndex       *int32          `json:"txi,omitempty"`
-		OpIndex       *int32          `json:"opi,omitempty"`
-		FromLedger    int64           `json:"fl"`
-		ToLedger      int64           `json:"tl"`
-		FromTime      string          `json:"ft,omitempty"`
-		ToTime        string          `json:"tt,omitempty"`
-		Cursor        string          `json:"cu,omitempty"`
-		Limit         int             `json:"l"`
-		Order         string          `json:"o,omitempty"`
+		ContractID       string          `json:"c"`
+		ContractIDPrefix string          `json:"cp,omitempty"`
+		Types            []string        `json:"t"`
+		Topic            json.RawMessage `json:"p,omitempty"`
+		Topic0           json.RawMessage `json:"p0,omitempty"`
+		Topic1           json.RawMessage `json:"p1,omitempty"`
+		Topic2           json.RawMessage `json:"p2,omitempty"`
+		Topic3           json.RawMessage `json:"p3,omitempty"`
+		TopicContains    json.RawMessage `json:"pc,omitempty"`
+		TxHash           string          `json:"th,omitempty"`
+		HasValue         *bool           `json:"hv,omitempty"`
+		TxIndex          *int32          `json:"txi,omitempty"`
+		OpIndex          *int32          `json:"opi,omitempty"`
+		FromLedger       int64           `json:"fl"`
+		ToLedger         int64           `json:"tl"`
+		FromTime         string          `json:"ft,omitempty"`
+		ToTime           string          `json:"tt,omitempty"`
+		Cursor           string          `json:"cu,omitempty"`
+		Limit            int             `json:"l"`
+		Order            string          `json:"o,omitempty"`
 		// Scope makes the validator tenant-specific. Two tenants issuing
 		// the same request are asking for different representations of
 		// this URL, and without this component the second one's
@@ -1495,10 +1495,10 @@ func listETag(f store.EventFilter) string {
 		// server, with no CDN involved.
 		Scope string `json:"s"`
 	}{
-		ContractID:  f.ContractID,
-		ContractIDs: f.ContractIDs,
-		Types:       f.Types,
-		Topic:       f.Topic,
+		ContractID:       f.ContractID,
+		ContractIDPrefix: f.ContractIDPrefix,
+		Types:            f.Types,
+		Topic:            f.Topic,
 		// Each positional filter gets its own distinctly named key, so
 		// topic0={x} and topic1={x} — which select different events — cannot
 		// serialize identically.
@@ -1753,23 +1753,23 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 
 	args := queries.EventFilterArgs{
-		ContractID:    singleID,
-		ContractIDs:   contractIDs,
-		Types:         types,
-		Topic:         topic,
-		T0:            t0,
-		T1:            t1,
-		T2:            t2,
-		T3:            t3,
-		TopicContains: tc,
-		TxHash:        q.Get("tx_hash"),
-		FromLedger:    fromLedger,
-		ToLedger:      toLedger,
-		FromTime:      fromTime,
-		ToTime:        toTime,
-		Order:         q.Get("order"),
-		OrderBy:       q.Get("order_by"),
-		Cursor:        q.Get("cursor"),
+		ContractID:       q.Get("contract_id"),
+		ContractIDPrefix: q.Get("contract_id_prefix"),
+		Types:            types,
+		Topic:            topic,
+		T0:               t0,
+		T1:               t1,
+		T2:               t2,
+		T3:               t3,
+		TopicContains:    tc,
+		TxHash:           q.Get("tx_hash"),
+		FromLedger:       fromLedger,
+		ToLedger:         toLedger,
+		FromTime:         fromTime,
+		ToTime:           toTime,
+		Order:            q.Get("order"),
+		OrderBy:          q.Get("order_by"),
+		Cursor:           q.Get("cursor"),
 	}
 
 	// ?limit=N: explicit validation here so an explicit `?limit=0` (or

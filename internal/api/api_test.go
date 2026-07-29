@@ -747,6 +747,47 @@ func TestContractEvents_ForcesContractFilter(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
+// TestListEvents_ContractIDPrefix validates that ?contract_id_prefix= flows
+// through to the store's EventFilter and is mutually exclusive with
+// ?contract_id=. (#224)
+func TestListEvents_ContractIDPrefix(t *testing.T) {
+	t.Run("passes prefix to store filter", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/events?contract_id_prefix=CABC")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "CABC", st.lastFilter.ContractIDPrefix)
+		assert.Empty(t, st.lastFilter.ContractID)
+	})
+
+	t.Run("empty prefix is a no-op", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/events?contract_id_prefix=")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Empty(t, st.lastFilter.ContractIDPrefix)
+	})
+
+	t.Run("conflict with contract_id returns 400", func(t *testing.T) {
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil),
+			"/events?contract_id="+testContract+"&contract_id_prefix=C")
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var e map[string]string
+		require.NoError(t, json.Unmarshal(body, &e))
+		assert.Contains(t, e["error"], "cannot be combined")
+	})
+
+	t.Run("combines with ledger range", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/events?contract_id_prefix=CD&from_ledger=100&to_ledger=200")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "CD", st.lastFilter.ContractIDPrefix)
+		assert.Equal(t, int64(100), st.lastFilter.FromLedger)
+		assert.Equal(t, int64(200), st.lastFilter.ToLedger)
+	})
+}
+
 func TestListEvents_TopicContainsValidation(t *testing.T) {
 	t.Run("valid JSON array", func(t *testing.T) {
 		st := &stubStore{}

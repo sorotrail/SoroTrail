@@ -490,7 +490,7 @@ func TestListETag_CoversEveryFilterField(t *testing.T) {
 		mutate func(f *store.EventFilter)
 	}{
 		{"ContractID", func(f *store.EventFilter) { f.ContractID = testContract }},
-		{"ContractIDs", func(f *store.EventFilter) { f.ContractIDs = []string{testContract, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"} }},
+		{"ContractIDPrefix", func(f *store.EventFilter) { f.ContractIDPrefix = "CABC" }},
 		{"Type", func(f *store.EventFilter) { f.Types = []string{"diagnostic"} }},
 		{"Topic", func(f *store.EventFilter) { f.Topic = json.RawMessage(`{"symbol":"transfer"}`) }},
 		{"Topic0", func(f *store.EventFilter) { f.Topic0 = json.RawMessage(`{"symbol":"transfer"}`) }},
