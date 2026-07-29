@@ -17,20 +17,20 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/khaylebfortune/sorotrail/internal/api"
-	"github.com/khaylebfortune/sorotrail/internal/audit"
-	"github.com/khaylebfortune/sorotrail/internal/broadcast"
-	"github.com/khaylebfortune/sorotrail/internal/config"
-	"github.com/khaylebfortune/sorotrail/internal/decode"
-	"github.com/khaylebfortune/sorotrail/internal/ingester"
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/spec"
-	"github.com/khaylebfortune/sorotrail/internal/store"
-	"github.com/khaylebfortune/sorotrail/internal/webhook"
+	"github.com/sorotrail/sorotrail/internal/api"
+	"github.com/sorotrail/sorotrail/internal/api/graphql"
+	"github.com/sorotrail/sorotrail/internal/audit"
+	"github.com/sorotrail/sorotrail/internal/broadcast"
+	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/spec"
+	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/webhook"
 )
 
 func main() {
@@ -56,6 +56,17 @@ func dispatch(args []string) error {
 		return runReplay(args[1:])
 	case "backfill":
 		return runBackfill(args[1:])
+	case "healthcheck":
+		// The healthcheck subcommand manages its own exit codes
+		// (0 healthy, 1 unhealthy, 2 usage error) — the docker
+		// HEALTHCHECK directive inspects them directly, so we
+		// hand control to os.Exit here rather than letting the
+		// main switch collapse everything into 1-with-a-prefix.
+		code := runHealthcheck(args[1:])
+		if code != 0 {
+			os.Exit(code)
+		}
+		return nil
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -71,10 +82,12 @@ func usage() {
 With no subcommand, runs the indexer (ingester + HTTP API).
 
 subcommands:
-  replay    re-decode stored events with the current decoder
-            (sorotrail replay --help)
-  backfill  ingest historical contract events from Horizon
-            (sorotrail backfill --help)
+  replay       re-decode stored events with the current decoder
+               (sorotrail replay --help)
+  backfill     ingest historical contract events from Horizon
+               (sorotrail backfill --help)
+  healthcheck  probe /health and exit (used by docker HEALTHCHECK)
+               (sorotrail healthcheck --help)
 `)
 }
 
@@ -83,7 +96,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log := newLogger(cfg.LogLevel)
+	log := newLogger(cfg.LogLevel, cfg.LogFormat)
 
 	log.Info("startup configuration", cfg.LoggableFields()...)
 
@@ -135,8 +148,31 @@ func run() error {
 		PollInterval:     cfg.PollInterval,
 		StartLedger:      cfg.StartLedger,
 		RetentionLedgers: cfg.RetentionLedgers,
+		LagWarnLedgers:   cfg.LagWarnLedgers,
+		// LagMetrics is nil here on purpose: no /metrics endpoint is
+		// wired up yet, so the ingester's applyDefaults installs a
+		// no-op. When a Prometheus endpoint lands, main.go is the
+		// seam to pass a real LagMetrics implementation.
+	})
+	// Wrap the raw RPC client so per-method error totals are tracked and
+	// surfaced via /stats. specFetcher already holds a reference to the
+	// unwrapped client (spec lookups are not counted as ingestion errors).
+	countingClient := rpc.NewCountingClient(rpcClient)
+	api.SetRPCCounter(countingClient)
+
+	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
+		PollInterval:            cfg.PollInterval,
+		StartLedger:             cfg.StartLedger,
+		RetentionLedgers:        cfg.RetentionLedgers,
+		SweepConcurrency:        cfg.SweepConcurrency,
+		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
+		ReorgRescanInterval:     cfg.ReorgRescanInterval,
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
+	// Wire the same store as the dead-letter sink: events that fail to
+	// decode/persist land in the dead_letters table instead of
+	// stalling the cycle (issue #131).
+	ing.SetDeadLetterSink(st)
 
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a
@@ -147,7 +183,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		auditClient := audit.NewBudgetedClient(rpcClient, budget)
+		auditClient := audit.NewBudgetedClient(countingClient, budget)
 		aud = audit.New(auditClient, st, ing, log, audit.Options{
 			PollInterval:      cfg.AuditPollInterval,
 			BatchLedgers:      cfg.AuditBatchLedgers,
@@ -160,10 +196,32 @@ func run() error {
 		api.SetAuditor(aud)
 	}
 
+	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
+	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
+	// returns immediately. Only when at least one retention policy is
+	// configured does it allocate a goroutine and a metrics struct.
+	prn := pruner.New(st, log, pruner.Options{
+		MaxAge:    cfg.RetentionMaxAge,
+		MinLedger: cfg.RetentionMinLedger,
+		BatchSize: cfg.RetentionBatchSize,
+		Pause:     cfg.RetentionPause,
+		Interval:  cfg.RetentionInterval,
+	})
+	if cfg.RetentionEnabled() {
+		api.SetPruner(prn)
+	}
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
 	// its cleanup goroutine is never started.
-	limiter := api.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.RateLimitTrustedProxy)
+	limiterOpts := []api.LimiterOption{}
+	if cfg.MultiTenant {
+		// Key buckets on the authenticated tenant rather than the source
+		// IP, so a tenant's quota follows its identity across however many
+		// addresses it calls from.
+		limiterOpts = append(limiterOpts,
+			api.WithLimitResolver(api.TenantLimitResolver(cfg.RateLimitRPS, cfg.RateLimitBurst)))
+	}
+	limiter := api.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.RateLimitTrustedProxy, limiterOpts...)
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
@@ -172,13 +230,62 @@ func run() error {
 		SlowQueryThreshold: cfg.APISlowQueryThreshold,
 		Logger:             log,
 	})
-	apiServer := api.New(apiStore, rpcClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
+	api.SetMaxLimit(cfg.APIMaxLimit)
+
+	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
+	apiServer.SetCompressMinSize(cfg.CompressMinSize)
+	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
+	apiServer.SetCORSConfig(api.CORSConfig{
+		AllowedOrigins: cfg.CORSAllowedOrigins,
+		AllowedMethods: cfg.CORSAllowedMethods,
+		AllowedHeaders: cfg.CORSAllowedHeaders,
+	})
+
+	// GraphQL transport: reads against the same store + spec enricher
+	// the REST handlers use. Dev-mode playground is gated on
+	// GRAPHQL_PLAYGROUND. The schema is the same shape as
+	// internal/api/graphql/schema.graphqls.
+	gqlHandler, gqlErr := graphql.New(graphqlServerDeps(apiStore, specEnricher), log, cfg.GraphQLPlayground)
+	if gqlErr != nil {
+		return fmt.Errorf("constructing graphql handler: %w", gqlErr)
+	}
+	apiServer.SetGraphQLHandler(gqlHandler, gqlHandler.PlaygroundHandler())
+
+	if cfg.MultiTenant {
+		// Tenancy lives in tables (tenants, grants, api_keys, usage) that
+		// only the Postgres backend has. Refusing at startup is the whole
+		// point: silently running a ClickHouse deployment with MULTI_TENANT
+		// set would mean an operator believing a boundary is enforced when
+		// there is none, which is the one failure this feature must not have.
+		tenants, ok := st.(store.TenantStore)
+		if !ok {
+			return fmt.Errorf(
+				"MULTI_TENANT=true requires a backend with tenant storage, but %T has none; use a postgres:// DATABASE_URL", st)
+		}
+		apiServer = apiServer.WithMultiTenancy(tenants, api.MultiTenantOptions{
+			MaxWatchedContracts: cfg.MultiTenantMaxWatched,
+			UsageFlushInterval:  cfg.MultiTenantUsageFlush,
+			StreamScopeSync:     cfg.MultiTenantStreamScopeSync,
+		})
+		if err := bootstrapAdminKey(ctx, tenants, cfg.MultiTenantBootstrapKey, log); err != nil {
+			return err
+		}
+		usage := apiServer.Usage()
+		usage.Start(ctx)
+		defer usage.Stop()
+		log.Info("multi-tenant mode enabled",
+			"max_watched_contracts", cfg.MultiTenantMaxWatched,
+			"stream_scope_sync", cfg.MultiTenantStreamScopeSync)
+	}
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiServer.Router(),
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       cfg.HTTPReadTimeout,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
+		IdleTimeout:       cfg.HTTPIdleTimeout,
+		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
 	}
 	if cfg.APIKey == "" {
 		log.Warn("API_KEY env is unset; watched-contracts endpoints will reject every request with 503")
@@ -220,6 +327,21 @@ func run() error {
 			}
 		}()
 	}
+	go func() {
+		if cfg.RetentionEnabled() {
+			log.Info("pruner starting",
+				"max_age", cfg.RetentionMaxAge,
+				"min_ledger", cfg.RetentionMinLedger,
+				"batch_size", cfg.RetentionBatchSize,
+				"pause", cfg.RetentionPause,
+				"interval", cfg.RetentionInterval)
+		}
+		if err := prn.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errCh <- fmt.Errorf("pruner: %w", err)
+		} else {
+			errCh <- nil
+		}
+	}()
 
 	var firstErr error
 	remaining := 3 // ingester + http server + webhook
@@ -234,7 +356,7 @@ func run() error {
 		stop() // one component failed; wind down the others
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Error("http shutdown", "error", err)
@@ -248,7 +370,41 @@ func run() error {
 	return firstErr
 }
 
-func newLogger(level string) *slog.Logger {
+// bootstrapAdminKey installs MULTI_TENANT_BOOTSTRAP_KEY as a credential for
+// the seeded "default" admin tenant, so a fresh multi-tenant install has a
+// way to mint its first real keys.
+//
+// Without this an operator enabling MULTI_TENANT=true locks themselves out
+// completely: every endpoint demands a key, and the only endpoint that
+// issues keys demands an admin key. The bootstrap value is a plaintext
+// credential in the environment, which is why it is opt-in and why the log
+// line nudges toward replacing it — it exists to be used once and revoked.
+//
+// Re-running with the same value is a no-op, so restarts are safe.
+func bootstrapAdminKey(ctx context.Context, ts store.TenantStore, key string, log *slog.Logger) error {
+	if key == "" {
+		return nil
+	}
+	prefix, digest, ok := api.ParseAPIKeyForBootstrap(key)
+	if !ok {
+		return fmt.Errorf("MULTI_TENANT_BOOTSTRAP_KEY is not a valid key; " +
+			"generate one with `sorotrail help` format st_<12 chars>_<secret>")
+	}
+	tenant, err := ts.GetTenantByName(ctx, "default")
+	if err != nil {
+		return fmt.Errorf("loading default tenant: %w", err)
+	}
+	err = ts.CreateAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", prefix, digest)
+	if err != nil {
+		return fmt.Errorf("installing bootstrap key: %w", err)
+	}
+	log.Warn("bootstrap admin key installed from MULTI_TENANT_BOOTSTRAP_KEY; "+
+		"mint per-tenant keys via POST /admin/tenants/{id}/keys and revoke this one",
+		"tenant", tenant.Name, "prefix", prefix)
+	return nil
+}
+
+func newLogger(level, format string) *slog.Logger {
 	var lvl slog.Level
 	switch strings.ToLower(level) {
 	case "debug":
@@ -260,5 +416,20 @@ func newLogger(level string) *slog.Logger {
 	default:
 		lvl = slog.LevelInfo
 	}
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
+	opts := &slog.HandlerOptions{Level: lvl}
+	var h slog.Handler
+	switch strings.ToLower(format) {
+	case "json":
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	default:
+		h = slog.NewTextHandler(os.Stdout, opts)
+	}
+	return slog.New(h)
+}
+
+// graphqlServerDeps wraps the live store + enricher into the typed
+// bundle the GraphQL Handler consumes. Centralising the cast here
+// keeps the route wiring in main.go one line wide.
+func graphqlServerDeps(st store.Store, enricher api.Enricher) api.ServerDeps {
+	return api.ServerDeps{Store: st, Enricher: enricher}
 }
