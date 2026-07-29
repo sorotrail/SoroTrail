@@ -8,7 +8,7 @@ BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown
 
 LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$(COMMIT) -X github.com/sorotrail/sorotrail/internal/buildinfo.BuildDate=$(BUILD_DATE)"
 
-.PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down clean bench bench-ci seed
+.PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down simtest simtest-long clean bench bench-ci seed
 
 build:
 	go build $(LDFLAGS) -o $(BINARY) ./cmd/sorotrail
@@ -25,6 +25,15 @@ test:
 # internal/replay share one database and truncate the same tables.
 test-db:
 	TEST_DATABASE_URL=$(DATABASE_URL) go test -p 1 ./...
+
+# Run the deterministic simulation test suite (mock store, fast).
+simtest:
+	go test ./internal/simtest/... -count=1 -timeout 120s
+
+# Run the simulation test suite with randomized mode extended budget.
+# Uses a higher iteration count and prints seeds for reproducibility.
+simtest-long:
+	go test ./internal/simtest/... -count=1 -timeout 600s -v -run "TestAllCuratedScenarios|TestRandomizedMode"
 
 bench:
 	@echo "=================================================================="
