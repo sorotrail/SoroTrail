@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/sorotrail/sorotrail/internal/sep41"
 )
 
 // Event is a Soroban contract event as persisted by SoroTrail.
@@ -32,6 +34,34 @@ type Event struct {
 	// They are not part of the API representation.
 	RawTopicXDR []string `json:"-"`
 	RawValueXDR string   `json:"-"`
+
+	// SEP41Event carries the SEP-41 normalized envelope when the event's
+	// topics and value match the SEP-41 / CAP-46-6 shapes (transfer, mint,
+	// burn, clawback, approve). It is computed at render time by
+	// internal/sep41 and is nil for non-matching events, so the field is
+	// omitted entirely from the JSON.
+	SEP41Event *json.RawMessage `json:"sep41_event,omitempty"`
+}
+
+// WithSEP41 populates SEP41Event from the SEP-41 normalizer when the
+// event matches any of the SEP-41 / CAP-46-6 token event shapes
+// (transfer, mint, burn, clawback, approve). Non-matches leave the
+// field nil and the JSON output without the slot, which keeps the
+// augmentation additive and never destructive.
+//
+// Both delivery points (API render, webhook signing) call this before
+// JSON serialization so the same envelope surfaces in both
+// representations.
+func (e *Event) WithSEP41() {
+	if e == nil {
+		return
+	}
+	// sep41.Normalize returns a json.RawMessage ([]byte) value; nil on no
+	// match. We need to take its address so the field's pointer stays
+	// nil when nothing matched (omitempty drops the slot in JSON).
+	if n := sep41.Normalize(e.Topics, e.Value); n != nil {
+		e.SEP41Event = &n
+	}
 }
 
 // EnrichedEvent wraps an Event with decoded field information derived from

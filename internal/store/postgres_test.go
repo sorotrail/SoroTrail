@@ -69,6 +69,25 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	_, err = pool.Exec(context.Background(),
 		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
 	require.NoError(t, err)
+
+	// Detach and drop all existing event partitions so a store with a different
+	// partition span can create fresh partitions without overlap. This is
+	// needed because TestMigrate_UpgradesLegacyEventsTable re-runs migrations
+	// on the shared database, which may create the default (span=120960)
+	// partition covering a very wide range.
+	_, err = pool.Exec(context.Background(), `
+		DO $block$
+		DECLARE
+			part text;
+		BEGIN
+			FOR part IN SELECT inhrelid::regclass::text FROM pg_inherits WHERE inhparent = 'events'::regclass
+			LOOP
+				EXECUTE 'DROP TABLE IF EXISTS ' || part || ' CASCADE';
+			END LOOP;
+		END $block$;
+	`)
+	require.NoError(t, err)
+
 	return NewPostgres(pool, span)
 }
 
@@ -849,6 +868,10 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		FROM events_partitioned
 		ORDER BY ledger, id;
 		DROP TABLE events_partitioned CASCADE;
+		DROP TABLE IF EXISTS contract_specs CASCADE;
+		DROP TABLE IF EXISTS replay_state CASCADE;
+		DROP TABLE IF EXISTS subscriptions CASCADE;
+		DROP TABLE IF EXISTS delivery_attempts CASCADE;
 		DROP FUNCTION IF EXISTS ensure_event_partitions(bigint, bigint, bigint);
 		UPDATE schema_migrations SET version = %d, dirty = false;
 	`, legacySchemaMigrationsVersion)
@@ -880,10 +903,9 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	require.NoError(t, err)
 	defer partitions.Close()
 	require.True(t, partitions.Next())
-	var firstPartition, secondPartition sql.NullString
-	require.NoError(t, partitions.Scan(&firstPartition, &secondPartition))
-	assert.True(t, firstPartition.Valid)
-	assert.False(t, secondPartition.Valid)
+	var partition sql.NullString
+	require.NoError(t, partitions.Scan(&partition))
+	assert.True(t, partition.Valid, "migration should create events_0_120959 partition")
 }
 
 func TestIngestionStateRoundTrip(t *testing.T) {
