@@ -29,6 +29,7 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/spec"
 	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/khaylebfortune/sorotrail/internal/telemetry"
 	"github.com/khaylebfortune/sorotrail/internal/webhook"
 )
 
@@ -81,6 +82,14 @@ func run() error {
 	log := newLogger(cfg.LogLevel)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	provider, shutdown, err := telemetry.Configure(ctx, log)
+	if err != nil {
+		return fmt.Errorf("configuring tracing: %w", err)
+	}
+	defer func() {
+		_ = shutdown(context.Background())
+	}()
+	_ = provider
 	defer stop()
 
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {

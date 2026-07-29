@@ -69,6 +69,9 @@ All configuration comes from environment variables (see `.env.example`):
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
 | `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Enable OTLP trace export to a collector such as Jaeger, Tempo, or Grafana Cloud. When unset, tracing stays a no-op with effectively no overhead. |
+| `OTEL_TRACES_SAMPLER` | `parentbased_traceidratio` | Standard OpenTelemetry sampler selection (`always_on`, `always_off`, `traceidratio`, etc.). |
+| `OTEL_TRACES_SAMPLER_ARG` | `1.0` | Sampling ratio for `traceidratio`-based samplers. |
 
 ## Ingestion behavior
 
@@ -618,6 +621,27 @@ in normal operation — so the API serves two distinct cache policies:
 All cacheable responses set `Vary: Accept-Encoding` so a future
 compression middleware (#25) can serve distinct encoded variants
 without reconciling caches that warmed on a non-encoded version.
+
+### Monitoring and tracing
+
+SoroTrail emits OpenTelemetry spans for inbound HTTP requests and ingester poll cycles. Configure an OTLP exporter with `OTEL_EXPORTER_OTLP_ENDPOINT` and optionally use the standard sampler environment variables to control tracing volume. When the endpoint is unset, tracing stays a no-op and the process behaves as before.
+
+A minimal local Jaeger setup can be started with Docker Compose:
+
+```yaml
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+```
+
+Then run SoroTrail with:
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/traces make run
+```
 
 ### Retention/pruning (#8)
 

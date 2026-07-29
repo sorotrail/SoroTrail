@@ -13,6 +13,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
@@ -371,6 +375,57 @@ func TestListEvents_TopicContainsValidation(t *testing.T) {
 		assert.Equal(t, int64(100), st.lastFilter.FromLedger)
 		assert.JSONEq(t, `[{"symbol":"transfer"}]`, string(st.lastFilter.TopicContains))
 	})
+}
+
+func TestRouter_EmitsTraceSpansForHTTPAndStore(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	tp := trace.NewTracerProvider(trace.WithSpanProcessor(sr))
+	tracer := tp.Tracer("test")
+
+	// Override global provider so otelhttp sees the test exporter and
+	// W3C traceparent propagation works.
+	prevTP := otel.GetTracerProvider()
+	prevProp := otel.GetTextMapPropagator()
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	defer func() {
+		otel.SetTracerProvider(prevTP)
+		otel.SetTextMapPropagator(prevProp)
+	}()
+
+	st := &stubStore{events: []store.Event{{ID: "e1"}}}
+	s := newTestServer(st, nil).WithTracer(tracer)
+	srv := httptest.NewServer(s.Router())
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/events", nil)
+	require.NoError(t, err)
+	req.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	_, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	spans := sr.Ended()
+	require.NotEmpty(t, spans)
+
+	var httpSpan, storeSpan trace.ReadOnlySpan
+	for _, span := range spans {
+		switch span.Name() {
+		case "GET":
+			httpSpan = span
+		case "store.QueryEvents":
+			storeSpan = span
+		}
+	}
+	require.NotNil(t, httpSpan)
+	require.NotNil(t, storeSpan)
+	assert.Equal(t, httpSpan.SpanContext().TraceID(), storeSpan.SpanContext().TraceID())
+	assert.Equal(t, httpSpan.SpanContext().SpanID(), storeSpan.Parent().SpanID())
+	assert.True(t, httpSpan.Parent().IsRemote())
 }
 
 func TestHealth(t *testing.T) {

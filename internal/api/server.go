@@ -11,6 +11,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	otelhttp "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/khaylebfortune/sorotrail/internal/audit"
 	"github.com/khaylebfortune/sorotrail/internal/broadcast"
@@ -59,14 +63,28 @@ type Server struct {
 	log      *slog.Logger
 	limiter  *RateLimiter
 	bcast    *broadcast.Broadcaster
+	tracer   trace.Tracer
 }
 
 // New builds the API server. rpcClient is only used by /health.
 // enricher is optional — pass nil to disable spec decoding.
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log}
+	s := &Server{store: st, rpc: rpcClient, log: log, tracer: otel.GetTracerProvider().Tracer("sorotrail/api")}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
+	}
+	if s.store != nil {
+		s.store = store.NewTracingStore(s.store, s.tracer)
+	}
+	return s
+}
+
+func (s *Server) WithTracer(tracer trace.Tracer) *Server {
+	if tracer != nil {
+		s.tracer = tracer
+		if s.store != nil {
+			s.store = store.NewTracingStore(s.store, s.tracer)
+		}
 	}
 	return s
 }
@@ -88,6 +106,7 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
@@ -116,7 +135,7 @@ func (s *Server) Router() http.Handler {
 	r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
 	r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
 
-	return r
+	return otelhttp.NewHandler(r, "HTTP")
 }
 
 func (s *Server) requestLogger(next http.Handler) http.Handler {
@@ -124,6 +143,12 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		start := time.Now()
 		next.ServeHTTP(ww, r)
+		span := trace.SpanFromContext(r.Context())
+		span.SetAttributes(
+			attribute.String("http.route", s.routePattern(r)),
+			attribute.String("request.id", middleware.GetReqID(r.Context())),
+			attribute.Int("http.status_code", ww.Status()),
+		)
 		s.log.Info("http request",
 			"method", r.Method,
 			"path", r.URL.Path,
@@ -132,4 +157,17 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 			"remote", r.RemoteAddr,
 		)
 	})
+}
+
+func (s *Server) routePattern(r *http.Request) string {
+	rctx := chi.RouteContext(r.Context())
+	if rctx != nil {
+		if rctx.RoutePath != "" {
+			return rctx.RoutePath
+		}
+		if len(rctx.RoutePatterns) > 0 {
+			return rctx.RoutePatterns[0]
+		}
+	}
+	return r.URL.Path
 }
