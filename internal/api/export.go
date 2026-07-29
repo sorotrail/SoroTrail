@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/sorotrail/sorotrail/internal/api/queries"
 	"github.com/sorotrail/sorotrail/internal/config"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -65,20 +66,32 @@ func (s *Server) handleContractExport(w http.ResponseWriter, r *http.Request) {
 			fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", contractID))
 		return
 	}
+	// Refused before any header is committed, matching
+	// GET /contracts/{id}/events. This governs the status code only — the
+	// store ANDs the scope into every page regardless, so removing this
+	// check downgrades a 403 to an empty file rather than opening a leak.
+	if !scopeFrom(r.Context()).Allows(contractID) {
+		writeForbiddenContract(w, contractID)
+		return
+	}
+
 	format, err := parseExportFormat(r.URL.Query().Get("format"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 
-	fromLedger, err := parseLedgerParam(r.URL.Query().Get("from_ledger"), "from_ledger")
+	// parseLedgerParam is now in internal/api/queries. We reconstruct
+	// the original error string (which used the param-name prefix) so
+	// REST clients see the same message they have always seen.
+	fromLedger, err := queries.ParseLedgerParam(r.URL.Query().Get("from_ledger"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, http.StatusBadRequest, fmt.Errorf("from_ledger %s", err.Error()))
 		return
 	}
-	toLedger, err := parseLedgerParam(r.URL.Query().Get("to_ledger"), "to_ledger")
+	toLedger, err := queries.ParseLedgerParam(r.URL.Query().Get("to_ledger"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, http.StatusBadRequest, fmt.Errorf("to_ledger %s", err.Error()))
 		return
 	}
 	if fromLedger <= 0 || toLedger <= 0 {
@@ -136,7 +149,7 @@ func (s *Server) streamExportCSV(ctx context.Context, w http.ResponseWriter, con
 		flusher.Flush() // header row lands before any other body
 	}
 
-	filter := s.exportFilter(contractID, fromLedger, toLedger)
+	filter := s.exportFilter(ctx, contractID, fromLedger, toLedger)
 	for {
 		events, cursor, err := s.store.QueryEvents(ctx, filter)
 		if errors.Is(err, store.ErrInvalidCursor) {
@@ -183,7 +196,7 @@ func (s *Server) streamExportCSV(ctx context.Context, w http.ResponseWriter, con
 func (s *Server) streamExportNDJSON(ctx context.Context, w http.ResponseWriter, contractID string, fromLedger, toLedger int64) {
 	enc := json.NewEncoder(w)
 	flusher, flushable := w.(http.Flusher)
-	filter := s.exportFilter(contractID, fromLedger, toLedger)
+	filter := s.exportFilter(ctx, contractID, fromLedger, toLedger)
 	for {
 		events, cursor, err := s.store.QueryEvents(ctx, filter)
 		if errors.Is(err, store.ErrInvalidCursor) {
@@ -216,7 +229,13 @@ func (s *Server) streamExportNDJSON(ctx context.Context, w http.ResponseWriter, 
 // exportFilter is the filter every export page request uses; the
 // handler sets FromLedger/ToLedger once and lets QueryEvents walk the
 // result range via cursor pagination.
-func (s *Server) exportFilter(contractID string, fromLedger, toLedger int64) store.EventFilter {
+//
+// The scope comes from the request context and is carried on every page,
+// not just the first: an export is a long-running cursor walk, and a
+// filter that lost its scope midway would widen the walk rather than end
+// it. In single-tenant mode the injected principal is the wildcard, so
+// this is the pre-#48 behavior exactly.
+func (s *Server) exportFilter(ctx context.Context, contractID string, fromLedger, toLedger int64) store.EventFilter {
 	return store.EventFilter{
 		ContractID: contractID,
 		FromLedger: fromLedger,
@@ -224,5 +243,6 @@ func (s *Server) exportFilter(contractID string, fromLedger, toLedger int64) sto
 		Order:      "asc",
 		OrderBy:    store.OrderByLedger,
 		Limit:      exportQueryBatchSize,
+		Scope:      scopeFrom(ctx),
 	}
 }
