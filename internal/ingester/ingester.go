@@ -637,6 +637,18 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	if err != nil {
 		return err
 	}
+
+	// Extract addresses from decoded event topics/values and persist the
+	// inverted index. Extraction operates on the decoded JSON (not XDR) and
+	// runs after UpsertEvents so a failed address extraction does not lose
+	// events — the events themselves are already committed.
+	if err := ing.indexEventAddresses(ctx, events); err != nil {
+		// Log the error but do not fail the ingest pass: address indexing
+		// is a derived index and can be rebuilt via the index-addresses
+		// backfill command if it falls behind.
+		ing.log.Error("indexing event addresses", "error", err)
+	}
+
 	ing.log.Info("ingested events",
 		"count", len(events), "new", inserted,
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
@@ -872,6 +884,32 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 
 // sleepCtx sleeps for d or until ctx is done; it reports whether the full
 // sleep completed.
+// indexEventAddresses extracts G.../C... addresses from each event's
+// decoded topics and value JSON, then persists them to the event_addresses
+// inverted index. Extraction is a best-effort derived index: errors are
+// logged but do not fail the ingest pass, because the index can be rebuilt
+// from stored events via the index-addresses backfill command.
+func (ing *Ingester) indexEventAddresses(ctx context.Context, events []store.Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+	var refs []store.AddressRef
+	for _, ev := range events {
+		decoded := decode.ExtractAddresses(ev.Topics, ev.Value)
+		for _, r := range decoded {
+			refs = append(refs, store.AddressRef{
+				Address: r.Address,
+				EventID: ev.ID,
+				Role:    r.Role,
+			})
+		}
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	return ing.store.UpsertAddressRefs(ctx, refs)
+}
+
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
