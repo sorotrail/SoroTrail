@@ -233,6 +233,9 @@ func (m *mockStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 func (m *mockStore) GetIngestionState(context.Context) (store.IngestionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.ingestErr != nil {
+		return store.IngestionState{}, m.ingestErr
+	}
 	if m.state == nil {
 		return store.IngestionState{}, store.ErrNotFound
 	}
