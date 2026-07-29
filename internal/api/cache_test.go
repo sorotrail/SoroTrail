@@ -500,6 +500,8 @@ func TestListETag_CoversEveryFilterField(t *testing.T) {
 		{"TxHash", func(f *store.EventFilter) { f.TxHash = "abc123def" }},
 		{"HasValueTrue", func(f *store.EventFilter) { t := true; f.HasValue = &t }},
 		{"HasValueFalse", func(f *store.EventFilter) { v := false; f.HasValue = &v }},
+		{"TxIndex", func(f *store.EventFilter) { v := int32(1); f.TxIndex = &v }},
+		{"OpIndex", func(f *store.EventFilter) { v := int32(0); f.OpIndex = &v }},
 		{"FromLedger", func(f *store.EventFilter) { f.FromLedger = 501 }},
 		{"ToLedger", func(f *store.EventFilter) { f.ToLedger = 998 }},
 		{"FromTime", func(f *store.EventFilter) { f.FromTime = time.Unix(1_000_000, 0).UTC() }},
