@@ -998,6 +998,30 @@ func (p *Postgres) statsWhere(ctx context.Context, pred string, args []any) (Sta
 	return s, nil
 }
 
+// DeleteEventsBeforeLedger deletes all events with a ledger strictly less than
+// the given ledger number. Returns the number of rows deleted.
+func (p *Postgres) DeleteEventsBeforeLedger(ctx context.Context, beforeLedger int64) (int64, error) {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM events WHERE ledger < $1`, beforeLedger)
+	if err != nil {
+		return 0, fmt.Errorf("deleting events before ledger %d: %w", beforeLedger, err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// MigrationVersion returns the currently applied migration version by querying
+// the schema_migrations table. When the table does not exist or returns no rows,
+// it returns (0, false, nil).
+func (p *Postgres) MigrationVersion(ctx context.Context) (version int, dirty bool, err error) {
+	err = p.pool.QueryRow(ctx,
+		`SELECT version, dirty FROM schema_migrations`,
+	).Scan(&version, &dirty)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil // no migrations applied yet
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("reading migration version: %w", err)
+	}
+	return version, dirty, nil
 // frontierStats reports only the instance-progress counters, for a caller
 // whose scope matches no rows at all.
 func (p *Postgres) frontierStats(ctx context.Context) (Stats, error) {

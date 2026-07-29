@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -122,9 +123,42 @@ func run() error {
 			return fmt.Errorf("connecting to postgres: %w", err)
 		}
 		defer pool.Close()
-		if err := pool.Ping(ctx); err != nil {
-			return fmt.Errorf("pinging postgres: %w", err)
+
+		// Retry the initial ping with exponential backoff so transient
+		// startup races (database container still initialising, network
+		// not yet ready) don't crash the process before it can serve.
+		const (
+			maxRetries     = 5
+			baseBackoff    = 500 * time.Millisecond
+			maxBackoff     = 5 * time.Second
+		)
+		var pingErr error
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			pingErr = pool.Ping(ctx)
+			if pingErr == nil {
+				break
+			}
+			log.Warn("postgres ping failed, retrying",
+				"attempt", attempt,
+				"max_retries", maxRetries,
+				"error", pingErr,
+			)
+			if attempt < maxRetries {
+				backoff := time.Duration(attempt) * baseBackoff
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(backoff):
+				}
+			}
 		}
+		if pingErr != nil {
+			return fmt.Errorf("pinging postgres after %d retries: %w", maxRetries, pingErr)
+		}
+		log.Info("postgres connection established")
 		st = store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
 	}
 	for _, id := range cfg.WatchedContracts {

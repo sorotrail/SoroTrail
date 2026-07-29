@@ -369,6 +369,14 @@ func (m *mockStore) Stats(context.Context, store.Scope) (store.Stats, error) {
 	return s, nil
 }
 
+func (m *mockStore) DeleteEventsBeforeLedger(context.Context, int64) (int64, error) {
+	return 0, nil
+}
+
+func (m *mockStore) MigrationVersion(context.Context) (int, bool, error) {
+	return 9, false, nil
+}
+
 func (m *mockStore) Ping(context.Context) error { return nil }
 
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
