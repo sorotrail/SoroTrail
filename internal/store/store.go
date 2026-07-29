@@ -187,12 +187,6 @@ type AuditState struct {
 	UpdatedAt             time.Time
 }
 
-// ContractEventCount is one row returned by ListContracts.
-type ContractEventCount struct {
-	ContractID string `json:"contract_id"`
-	EventCount int64  `json:"event_count"`
-}
-
 // WatchedContract is one entry of the watch list: a contract ID and the
 // time it was added (either by env seeding on startup, or by a runtime
 // POST). The API uses this to render the GET response; the ingester reads
@@ -687,10 +681,6 @@ type Store interface {
 	// ErrNotFound is returned when no row matches the given ID, so the
 	// API can surface 404 for typos.
 	RemoveWatchedContract(ctx context.Context, contractID string) error
-
-	// ListContracts returns every distinct contract ID seen in the events
-	// table, with a count of events for each.
-	ListContracts(ctx context.Context) ([]ContractEventCount, error)
 
 	// RecordAuditFinding persists a new finding (status "open") and
 	// returns it with its assigned ID populated.

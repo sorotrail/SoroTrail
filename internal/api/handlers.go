@@ -938,33 +938,6 @@ func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
 	return out
 }
 
-type contractsResponse struct {
-	Contracts []store.ContractEventCount `json:"contracts"`
-	Count     int                        `json:"count"`
-}
-
-// handleListContracts returns every distinct contract ID seen in the store
-// with a count of events each, ordered alphabetically by contract ID.
-func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
-	contracts, err := s.store.ListContracts(r.Context())
-	if err != nil {
-		loggerFromContext(r.Context()).Error("listing contracts", "error", err)
-		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
-		return
-	}
-	if contracts == nil {
-		contracts = []store.ContractEventCount{}
-	}
-	writeCacheHeaders(w, cacheNoCache, 0, "")
-	writeJSON(w, http.StatusOK, contractsResponse{
-		Contracts: contracts,
-		Count:     len(contracts),
-	})
-}
-
-// Stats summarizes what the indexer has stored plus, when the auditor is
-// running, the post-processing counters it has accumulated.
-
 // contractListResponse is the JSON body for GET /contracts.
 type contractListResponse struct {
 	Contracts []store.ContractSummary `json:"contracts"`
@@ -1026,6 +999,9 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 		loggerFromContext(r.Context()).Warn("counting contracts for X-Total-Count", "error", cerr)
 	} else if total > 0 {
 		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+	if items == nil {
+		items = []store.ContractSummary{}
 	}
 	writeCacheHeaders(w, cacheNoCache, 0, "")
 	writeJSON(w, http.StatusOK, contractListResponse{
