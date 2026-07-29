@@ -11,16 +11,31 @@ import (
 
 // --- Subscription CRUD ---
 
+// subscriptionColumns is shared by every subscription read so tenant_id
+// cannot be forgotten by one of them.
+const subscriptionColumns = `id, url, filters, secret, enabled, failure_count, created_at, tenant_id`
+
+// ownerPredicate renders the owner filter as a SQL fragment plus its bind
+// value. An unrestricted owner contributes no predicate; any other —
+// including the zero value — restricts to a tenant_id, and the zero value's
+// 0 matches no row because the column references a bigserial.
+func ownerPredicate(o SubscriptionOwner, argN int) (string, []any) {
+	if o.IsAll() {
+		return "", nil
+	}
+	return fmt.Sprintf(" AND tenant_id = $%d", argN), []any{o.TenantID()}
+}
+
 func (p *Postgres) CreateSubscription(ctx context.Context, s Subscription) (Subscription, error) {
 	filtersJSON, err := json.Marshal(s.Filters)
 	if err != nil {
 		return Subscription{}, fmt.Errorf("marshaling subscription filters: %w", err)
 	}
 	err = p.pool.QueryRow(ctx, `
-		INSERT INTO subscriptions (url, filters, secret, enabled)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO subscriptions (url, filters, secret, enabled, tenant_id)
+		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, failure_count, created_at`,
-		s.URL, filtersJSON, s.Secret, s.Enabled,
+		s.URL, filtersJSON, s.Secret, s.Enabled, s.TenantID,
 	).Scan(&s.ID, &s.FailureCount, &s.CreatedAt)
 	if err != nil {
 		return Subscription{}, fmt.Errorf("creating subscription: %w", err)
@@ -28,15 +43,16 @@ func (p *Postgres) CreateSubscription(ctx context.Context, s Subscription) (Subs
 	return s, nil
 }
 
-func (p *Postgres) GetSubscription(ctx context.Context, id int64) (Subscription, error) {
+func (p *Postgres) GetSubscription(ctx context.Context, id int64, owner SubscriptionOwner) (Subscription, error) {
 	var (
 		s       Subscription
 		filters []byte
 	)
-	err := p.pool.QueryRow(ctx, `
-		SELECT id, url, filters, secret, enabled, failure_count, created_at
-		FROM subscriptions WHERE id = $1`, id,
-	).Scan(&s.ID, &s.URL, &filters, &s.Secret, &s.Enabled, &s.FailureCount, &s.CreatedAt)
+	pred, args := ownerPredicate(owner, 2)
+	err := p.pool.QueryRow(ctx,
+		`SELECT `+subscriptionColumns+` FROM subscriptions WHERE id = $1`+pred,
+		append([]any{id}, args...)...,
+	).Scan(&s.ID, &s.URL, &filters, &s.Secret, &s.Enabled, &s.FailureCount, &s.CreatedAt, &s.TenantID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Subscription{}, ErrNotFound
 	}
@@ -49,10 +65,13 @@ func (p *Postgres) GetSubscription(ctx context.Context, id int64) (Subscription,
 	return s, nil
 }
 
-func (p *Postgres) ListSubscriptions(ctx context.Context) ([]Subscription, error) {
-	rows, err := p.pool.Query(ctx, `
-		SELECT id, url, filters, secret, enabled, failure_count, created_at
-		FROM subscriptions ORDER BY id`)
+func (p *Postgres) ListSubscriptions(ctx context.Context, owner SubscriptionOwner) ([]Subscription, error) {
+	// WHERE true lets the owner predicate append uniformly rather than
+	// needing to know whether it is the first clause.
+	pred, args := ownerPredicate(owner, 1)
+	rows, err := p.pool.Query(ctx,
+		`SELECT `+subscriptionColumns+` FROM subscriptions WHERE true`+pred+` ORDER BY id`,
+		args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing subscriptions: %w", err)
 	}
@@ -60,22 +79,22 @@ func (p *Postgres) ListSubscriptions(ctx context.Context) ([]Subscription, error
 	return scanSubscriptions(rows)
 }
 
-func (p *Postgres) UpdateSubscription(ctx context.Context, s Subscription) (Subscription, error) {
+func (p *Postgres) UpdateSubscription(ctx context.Context, s Subscription, owner SubscriptionOwner) (Subscription, error) {
 	filtersJSON, err := json.Marshal(s.Filters)
 	if err != nil {
 		return Subscription{}, fmt.Errorf("marshaling subscription filters: %w", err)
 	}
 	var updatedFilters []byte
+	pred, ownerArgs := ownerPredicate(owner, 6)
 	err = p.pool.QueryRow(ctx, `
 		UPDATE subscriptions SET
 			url    = $2,
 			filters = $3,
 			secret  = $4,
 			enabled = $5
-		WHERE id = $1
+		WHERE id = $1`+pred+`
 		RETURNING filters`,
-
-		s.ID, s.URL, filtersJSON, s.Secret, s.Enabled,
+		append([]any{s.ID, s.URL, filtersJSON, s.Secret, s.Enabled}, ownerArgs...)...,
 	).Scan(&updatedFilters)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Subscription{}, ErrNotFound
@@ -87,11 +106,14 @@ func (p *Postgres) UpdateSubscription(ctx context.Context, s Subscription) (Subs
 		return Subscription{}, fmt.Errorf("unmarshaling subscription filters: %w", err)
 	}
 	// Re-read to get failure_count and created_at (not updated here).
-	return p.GetSubscription(ctx, s.ID)
+	return p.GetSubscription(ctx, s.ID, owner)
 }
 
-func (p *Postgres) DeleteSubscription(ctx context.Context, id int64) error {
-	tag, err := p.pool.Exec(ctx, `DELETE FROM subscriptions WHERE id = $1`, id)
+func (p *Postgres) DeleteSubscription(ctx context.Context, id int64, owner SubscriptionOwner) error {
+	pred, args := ownerPredicate(owner, 2)
+	tag, err := p.pool.Exec(ctx,
+		`DELETE FROM subscriptions WHERE id = $1`+pred,
+		append([]any{id}, args...)...)
 	if err != nil {
 		return fmt.Errorf("deleting subscription %d: %w", id, err)
 	}
@@ -103,10 +125,14 @@ func (p *Postgres) DeleteSubscription(ctx context.Context, id int64) error {
 
 // --- Enabled subscriptions ---
 
+// ListEnabledSubscriptions is deliberately unowned: the delivery worker is
+// process machinery serving every tenant at once, not a caller. What keeps
+// delivery inside the boundary is the check at creation time — a
+// non-wildcard tenant's subscription must name a contract it holds — so a
+// subscription can only ever match events its owner may read.
 func (p *Postgres) ListEnabledSubscriptions(ctx context.Context) ([]Subscription, error) {
-	rows, err := p.pool.Query(ctx, `
-		SELECT id, url, filters, secret, enabled, failure_count, created_at
-		FROM subscriptions WHERE enabled = true ORDER BY id`)
+	rows, err := p.pool.Query(ctx,
+		`SELECT `+subscriptionColumns+` FROM subscriptions WHERE enabled = true ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing enabled subscriptions: %w", err)
 	}
@@ -162,9 +188,15 @@ func (p *Postgres) RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt)
 	return a, nil
 }
 
-func (p *Postgres) ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error) {
+func (p *Postgres) ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int, owner SubscriptionOwner) ([]DeliveryAttempt, error) {
 	if limit <= 0 {
 		limit = 50
+	}
+	// Resolve the subscription under the owner filter first: delivery
+	// history names the events that matched, so reading another tenant's is
+	// reading their data one attempt at a time.
+	if _, err := p.GetSubscription(ctx, subscriptionID, owner); err != nil {
+		return nil, err
 	}
 	rows, err := p.pool.Query(ctx, `
 		SELECT id, subscription_id, event_id, status, response_code,
@@ -209,7 +241,7 @@ func scanSubscriptions(rows pgx.Rows) ([]Subscription, error) {
 			filters []byte
 		)
 		if err := rows.Scan(&s.ID, &s.URL, &filters, &s.Secret, &s.Enabled,
-			&s.FailureCount, &s.CreatedAt); err != nil {
+			&s.FailureCount, &s.CreatedAt, &s.TenantID); err != nil {
 			return nil, fmt.Errorf("scanning subscription: %w", err)
 		}
 		if err := json.Unmarshal(filters, &s.Filters); err != nil {

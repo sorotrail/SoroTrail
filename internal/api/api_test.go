@@ -62,6 +62,10 @@ type stubStore struct {
 
 	ingestion    store.IngestionState
 	ingestionErr error
+
+	migrationVersion int
+	migrationDirty   bool
+	migrationErr     error
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -102,7 +106,13 @@ func (s *stubStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 	return store.AuditFinding{}, store.ErrNotFound
 }
 
-func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
+// DeleteEventsBefore is unused by API tests but needed to satisfy
+// store.Store now that the pruner can call it.
+func (s *stubStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}
+
+func (s *stubStore) GetEvent(context.Context, string, store.Scope) (store.Event, error) {
 	return s.event, s.eventErr
 }
 
@@ -121,7 +131,7 @@ func (s *stubStore) SetContractSpec(context.Context, string, string, []byte) err
 
 // EventExists is the cheap 304 path; tests assert the handler uses it
 // (instead of GetEvent) when If-None-Match matches.
-func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
+func (s *stubStore) EventExists(_ context.Context, id string, _ store.Scope) (bool, error) {
 	s.existsCalls++
 	s.lastExistsID = id
 	return s.exists, s.existsErr
@@ -137,35 +147,56 @@ func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, er
 	return s.ingestion, s.ingestionErr
 }
 
-func (s *stubStore) Stats(context.Context) (store.Stats, error) { return s.stats, nil }
-func (s *stubStore) Ping(context.Context) error                 { return s.pingErr }
+// MigrationVersion backs /readyz's schema check. Tests that need a dirty
+// or errored schema set migrationErr / migrationDirty.
+func (s *stubStore) MigrationVersion(context.Context) (int, bool, error) {
+	if s.migrationErr != nil {
+		return 0, false, s.migrationErr
+	}
+	// Zero means "unset" for the many tests that construct stubStore{}
+	// inline; /readyz treats a real 0 as "no migrations applied", so
+	// default to a clean applied schema unless a test says otherwise.
+	v := s.migrationVersion
+	if v == 0 {
+		v = 1
+	}
+	return v, s.migrationDirty, nil
+}
+
+func (s *stubStore) Stats(context.Context, store.Scope) (store.Stats, error) { return s.stats, nil }
 func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return s.watchedList, s.watchedListErr
 }
+
 func (s *stubStore) AddWatchedContract(_ context.Context, id string) error {
 	s.added = append(s.added, id)
 	return s.addErr
 }
+
 func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
 	s.removed = append(s.removed, id)
 	return s.removeErr
 }
+
+func (s *stubStore) Ping(context.Context) error { return s.pingErr }
 
 // Subscription stubs for the webhook feature.
 func (s *stubStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
 	sub.ID = 1
 	return sub, nil
 }
-func (s *stubStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
+func (s *stubStore) GetSubscription(_ context.Context, id int64, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return store.Subscription{}, store.ErrNotFound
 }
-func (s *stubStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
+func (s *stubStore) ListSubscriptions(context.Context, store.SubscriptionOwner) ([]store.Subscription, error) {
 	return nil, nil
 }
-func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return sub, nil
 }
-func (s *stubStore) DeleteSubscription(context.Context, int64) error { return nil }
+func (s *stubStore) DeleteSubscription(context.Context, int64, store.SubscriptionOwner) error {
+	return nil
+}
 func (s *stubStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
 	return nil, nil
 }
@@ -177,7 +208,7 @@ func (s *stubStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 	a.ID = 1
 	return a, nil
 }
-func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
+func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int, store.SubscriptionOwner) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
 
@@ -354,8 +385,6 @@ func TestListEvents_HasValueFilter(t *testing.T) {
 		})
 	}
 }
-
-func ptr[T any](v T) *T { return &v }
 
 func TestListEvents_TypeFilter(t *testing.T) {
 	tests := []struct {
@@ -586,6 +615,47 @@ func TestContractEvents_ForcesContractFilter(t *testing.T) {
 
 	resp, _ = doGet(t, newTestServer(st, nil), "/contracts/junk/events")
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+// TestListEvents_ContractIDPrefix validates that ?contract_id_prefix= flows
+// through to the store's EventFilter and is mutually exclusive with
+// ?contract_id=. (#224)
+func TestListEvents_ContractIDPrefix(t *testing.T) {
+	t.Run("passes prefix to store filter", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/events?contract_id_prefix=CABC")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "CABC", st.lastFilter.ContractIDPrefix)
+		assert.Empty(t, st.lastFilter.ContractID)
+	})
+
+	t.Run("empty prefix is a no-op", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/events?contract_id_prefix=")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Empty(t, st.lastFilter.ContractIDPrefix)
+	})
+
+	t.Run("conflict with contract_id returns 400", func(t *testing.T) {
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil),
+			"/events?contract_id="+testContract+"&contract_id_prefix=C")
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var e map[string]string
+		require.NoError(t, json.Unmarshal(body, &e))
+		assert.Contains(t, e["error"], "cannot be combined")
+	})
+
+	t.Run("combines with ledger range", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/events?contract_id_prefix=CD&from_ledger=100&to_ledger=200")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "CD", st.lastFilter.ContractIDPrefix)
+		assert.Equal(t, int64(100), st.lastFilter.FromLedger)
+		assert.Equal(t, int64(200), st.lastFilter.ToLedger)
+	})
 }
 
 func TestListEvents_TopicContainsValidation(t *testing.T) {
@@ -1418,6 +1488,103 @@ func TestListEvents_RecentParam(t *testing.T) {
 	}
 }
 
+// TestGetEvent_ETagAndConditionalGet verifies that GET /events/{id}
+// serves a strong ETag and honors If-None-Match conditional requests
+// with 304 Not Modified. Events are immutable so the event ID doubles
+// as a perfect strong validator. (#226)
+func TestGetEvent_ETagAndConditionalGet(t *testing.T) {
+	eventID := "0001099511627776-0000000001"
+	eventBody := store.Event{ID: eventID, Ledger: 100, TxHash: "abc123"}
+
+	tests := []struct {
+		name            string
+		setup           func(st *stubStore)
+		ifNoneMatch     string
+		wantStatus      int
+		wantETag        string
+		wantExistsCalls int
+		wantBody        string
+	}{
+		{
+			name:       "GET returns strong ETag",
+			setup:      func(st *stubStore) { st.event = eventBody },
+			wantStatus: http.StatusOK,
+			wantETag:   `"` + eventID + `"`,
+		},
+		{
+			name:            "If-None-Match match returns 304",
+			setup:           func(st *stubStore) { st.exists = true },
+			ifNoneMatch:     `"` + eventID + `"`,
+			wantStatus:      http.StatusNotModified,
+			wantETag:        `"` + eventID + `"`,
+			wantExistsCalls: 1,
+		},
+		{
+			name:            "If-None-Match wildcard returns 304",
+			setup:           func(st *stubStore) { st.exists = true },
+			ifNoneMatch:     "*",
+			wantStatus:      http.StatusNotModified,
+			wantETag:        `"` + eventID + `"`,
+			wantExistsCalls: 1,
+		},
+		{
+			name:            "If-None-Match with W/ prefix returns 304",
+			setup:           func(st *stubStore) { st.exists = true },
+			ifNoneMatch:     `W/"` + eventID + `"`,
+			wantStatus:      http.StatusNotModified,
+			wantETag:        `"` + eventID + `"`,
+			wantExistsCalls: 1,
+		},
+		{
+			name:        "If-None-Match mismatch returns 200",
+			setup:       func(st *stubStore) { st.event = eventBody },
+			ifNoneMatch: `"a-different-id"`,
+			wantStatus:  http.StatusOK,
+			wantETag:    `"` + eventID + `"`,
+		},
+		{
+			name:            "event pruned returns 404 even with matching validator",
+			setup:           func(st *stubStore) { st.exists = false },
+			ifNoneMatch:     `"` + eventID + `"`,
+			wantStatus:      http.StatusNotFound,
+			wantExistsCalls: 1,
+			wantBody:        eventID,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			tt.setup(st)
+			s := newTestServer(st, nil)
+
+			if tt.ifNoneMatch != "" {
+				resp, body := doGetWithHeader(t, s, "/events/"+eventID, "If-None-Match", tt.ifNoneMatch)
+				require.Equal(t, tt.wantStatus, resp.StatusCode)
+
+				if tt.wantETag != "" {
+					assert.Equal(t, tt.wantETag, resp.Header.Get("ETag"))
+				}
+				if tt.wantExistsCalls > 0 {
+					assert.Equal(t, tt.wantExistsCalls, st.existsCalls,
+						"304 path must use EventExists, not GetEvent")
+					assert.Equal(t, eventID, st.lastExistsID)
+				}
+				if tt.wantBody != "" {
+					assert.Contains(t, string(body), tt.wantBody)
+				}
+				return
+			}
+
+			resp, _ := doGet(t, s, "/events/"+eventID)
+			require.Equal(t, tt.wantStatus, resp.StatusCode)
+			if tt.wantETag != "" {
+				assert.Equal(t, tt.wantETag, resp.Header.Get("ETag"))
+			}
+		})
+	}
+}
+
 func TestGetEventRaw_ReturnsXDR(t *testing.T) {
 	eventID := "0000000000-0000000001"
 	t.Run("returns raw XDR when present", func(t *testing.T) {
@@ -1655,6 +1822,118 @@ func TestListEvents_ConfigurableMaxLimit(t *testing.T) {
 	}
 }
 
+func TestGetEventTransaction_Success(t *testing.T) {
+	st := &stubStore{
+		event: store.Event{ID: "0001-0001", TxHash: "abc123"},
+		txSiblings: []store.Event{
+			{ID: "0001-0002", TxHash: "abc123"},
+			{ID: "0001-0003", TxHash: "abc123"},
+		},
+	}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/0001-0001/transaction")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var r eventsResponse
+	require.NoError(t, json.Unmarshal(body, &r))
+	assert.Len(t, r.Events, 2)
+	assert.Equal(t, "0001-0002", r.Events[0].ID)
+	assert.Equal(t, "0001-0003", r.Events[1].ID)
+	assert.Equal(t, "abc123", st.lastTxHash)
+	assert.Equal(t, "0001-0001", st.lastExcludeID)
+}
+
+func TestGetEventTransaction_NotFound(t *testing.T) {
+	st := &stubStore{eventErr: store.ErrNotFound}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/missing/transaction")
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	var e map[string]string
+	require.NoError(t, json.Unmarshal(body, &e))
+	assert.Contains(t, e["error"], "not found")
+}
+
+func TestGetEventTransaction_StoreError(t *testing.T) {
+	st := &stubStore{eventErr: errors.New("db down")}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/any/transaction")
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	var e map[string]string
+	require.NoError(t, json.Unmarshal(body, &e))
+	assert.Contains(t, e["error"], "loading event failed")
+}
+
+func TestGetEventTransaction_EmptyTxHash(t *testing.T) {
+	st := &stubStore{event: store.Event{ID: "0001-0001"}}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/0001-0001/transaction")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var r eventsResponse
+	require.NoError(t, json.Unmarshal(body, &r))
+	assert.Len(t, r.Events, 0)
+}
+
+func TestGetEventTransaction_CacheHeaders(t *testing.T) {
+	st := &stubStore{
+		event:      store.Event{ID: "0001-0001", TxHash: "abc"},
+		txSiblings: []store.Event{{ID: "0001-0002", TxHash: "abc"}},
+	}
+	s := newTestServer(st, nil)
+	resp, _ := doGet(t, s, "/events/0001-0001/transaction")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	cc := resp.Header.Get("Cache-Control")
+	assert.Contains(t, cc, "immutable")
+	assert.Contains(t, cc, "max-age=")
+}
+
+func TestGetEventTransaction_FieldsProjection(t *testing.T) {
+	st := &stubStore{
+		event:      store.Event{ID: "0001-0001", TxHash: "abc", Type: "contract", Ledger: 100},
+		txSiblings: []store.Event{{ID: "0001-0002", TxHash: "abc", Type: "contract", Ledger: 100}},
+	}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/0001-0001/transaction?fields=id,ledger")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var r map[string]any
+	require.NoError(t, json.Unmarshal(body, &r))
+	events, ok := r["events"].([]interface{})
+	require.True(t, ok)
+	require.Len(t, events, 1)
+	ev := events[0].(map[string]interface{})
+	assert.Contains(t, ev, "id")
+	assert.Contains(t, ev, "ledger")
+	assert.NotContains(t, ev, "type")
+}
+
+func TestGetEventTransaction_BadFields(t *testing.T) {
+	st := &stubStore{event: store.Event{ID: "0001-0001", TxHash: "abc"}}
+	s := newTestServer(st, nil)
+	resp, _ := doGet(t, s, "/events/0001-0001/transaction?fields=badfield")
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestGetEventTransaction_IncludeXDR(t *testing.T) {
+	st := &stubStore{
+		event:      store.Event{ID: "0001-0001", TxHash: "abc"},
+		txSiblings: []store.Event{{ID: "0001-0002", TxHash: "abc"}},
+	}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/0001-0001/transaction?include_xdr=true")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var r eventsWithXDRResponse
+	require.NoError(t, json.Unmarshal(body, &r))
+	assert.Len(t, r.Events, 1)
+}
+
+func TestGetEventTransaction_NoInterferenceWithGetEvent(t *testing.T) {
+	st := &stubStore{event: store.Event{ID: "0001-0001", TxHash: "abc", Type: "contract"}}
+	s := newTestServer(st, nil)
+	resp, body := doGet(t, s, "/events/0001-0001")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var ev store.Event
+	require.NoError(t, json.Unmarshal(body, &ev))
+	assert.Equal(t, "0001-0001", ev.ID)
+}
+
 func (m *stubStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
 	return nil, "", nil
 }
@@ -1671,3 +1950,83 @@ func (m *stubStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, err
 	return store.DeadLetter{}, store.ErrNotFound
 }
 func (m *stubStore) DeleteDeadLetter(context.Context, int64) error { return nil }
+
+func TestListEvents_CreatedAtFilters(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		wantFrom string
+		wantTo   string
+		wantErr  int // 0 = success
+	}{
+		{name: "created_after only", query: "/events?created_after=2026-07-21T00:00:00Z", wantFrom: "2026-07-21T00:00:00Z", wantErr: 0},
+		{name: "created_before only", query: "/events?created_before=2026-07-22T00:00:00Z", wantTo: "2026-07-22T00:00:00Z", wantErr: 0},
+		{name: "both created bounds", query: "/events?created_after=2026-07-21T00:00:00Z&created_before=2026-07-22T00:00:00Z", wantFrom: "2026-07-21T00:00:00Z", wantTo: "2026-07-22T00:00:00Z", wantErr: 0},
+		{name: "mixed with from_time and created_before", query: "/events?from_time=2026-07-21T00:00:00Z&created_before=2026-07-22T00:00:00Z", wantFrom: "2026-07-21T00:00:00Z", wantTo: "2026-07-22T00:00:00Z", wantErr: 0},
+		{name: "created_after conflicts with from_time", query: "/events?from_time=2026-07-21T00:00:00Z&created_after=2026-07-21T00:00:00Z", wantErr: http.StatusBadRequest},
+		{name: "created_before conflicts with to_time", query: "/events?to_time=2026-07-22T00:00:00Z&created_before=2026-07-22T00:00:00Z", wantErr: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			if tt.wantFrom != "" {
+				assert.Equal(t, tt.wantFrom, st.lastFilter.FromTime.Format(time.RFC3339))
+			} else {
+				assert.True(t, st.lastFilter.FromTime.IsZero())
+			}
+			if tt.wantTo != "" {
+				assert.Equal(t, tt.wantTo, st.lastFilter.ToTime.Format(time.RFC3339))
+			} else {
+				assert.True(t, st.lastFilter.ToTime.IsZero())
+			}
+		})
+	}
+}
+
+func TestListEvents_TopicCountFilter(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		want    *int
+		wantErr int // 0 = success
+	}{
+		{name: "no topic_count param", query: "/events", want: nil, wantErr: 0},
+		{name: "with topic_count", query: "/events?topic_count=2", want: ptr(2), wantErr: 0},
+		{name: "zero topic_count", query: "/events?topic_count=0", want: ptr(0), wantErr: 0},
+		{name: "empty topic_count is no-op", query: "/events?topic_count=", want: nil, wantErr: 0},
+		{name: "combined with contract_id", query: "/events?contract_id=" + testContract + "&topic_count=1", want: ptr(1), wantErr: 0},
+		{name: "negative topic_count", query: "/events?topic_count=-1", wantErr: http.StatusBadRequest},
+		{name: "non-integer topic_count", query: "/events?topic_count=abc", wantErr: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			if tt.want == nil {
+				assert.Nil(t, st.lastFilter.TopicCount)
+			} else {
+				require.NotNil(t, st.lastFilter.TopicCount)
+				assert.Equal(t, *tt.want, *st.lastFilter.TopicCount)
+			}
+		})
+	}
+}

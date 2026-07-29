@@ -123,7 +123,7 @@ func TestReplay_ImprovedDecoderRewritesStoredRows(t *testing.T) {
 	ctx := context.Background()
 	seedEvents(t, p, 5, true)
 
-	before, err := p.GetEvent(ctx, eventID(1))
+	before, err := p.GetEvent(ctx, eventID(1), store.SystemScope())
 	require.NoError(t, err)
 	assert.Contains(t, string(before.Topics), "unknown", "seeded with the stale decoding")
 
@@ -137,7 +137,7 @@ func TestReplay_ImprovedDecoderRewritesStoredRows(t *testing.T) {
 	assert.Zero(t, sum.Skipped)
 	assert.Zero(t, sum.Failed)
 
-	after, err := p.GetEvent(ctx, eventID(1))
+	after, err := p.GetEvent(ctx, eventID(1), store.SystemScope())
 	require.NoError(t, err)
 	assert.JSONEq(t, `[{"symbol":"transfer"}]`, string(after.Topics))
 	assert.JSONEq(t, `{"u64":101}`, string(after.Value))
@@ -152,7 +152,7 @@ func TestReplay_ImprovedDecoderRewritesStoredRows(t *testing.T) {
 	assert.EqualValues(t, 5, second.Processed)
 	assert.EqualValues(t, 0, second.Changed, "re-running an up-to-date replay rewrites nothing")
 
-	stillAfter, err := p.GetEvent(ctx, eventID(1))
+	stillAfter, err := p.GetEvent(ctx, eventID(1), store.SystemScope())
 	require.NoError(t, err)
 	assert.JSONEq(t, string(after.Topics), string(stillAfter.Topics))
 	assert.JSONEq(t, string(after.Value), string(stillAfter.Value))
