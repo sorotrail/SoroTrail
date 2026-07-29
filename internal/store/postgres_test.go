@@ -935,3 +935,49 @@ func TestQueryEvents_PositionalTopics(t *testing.T) {
 	assert.Len(t, got, 1)
 	assert.Equal(t, e1.ID, got[0].ID)
 }
+
+func TestQueryEvents_TopicCount(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	events := []Event{
+		testEvent(eventID(1), 101, contractA),
+		testEvent(eventID(2), 102, contractA),
+	}
+	events[1].Topics = json.RawMessage(`[]`)
+
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	t.Run("exact topic count", func(t *testing.T) {
+		n := 2
+		got, _, err := st.QueryEvents(ctx, EventFilter{TopicCount: &n, Scope: WildcardScope()})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+		assert.Equal(t, events[0].ID, got[0].ID)
+	})
+
+	t.Run("zero topics", func(t *testing.T) {
+		n := 0
+		got, _, err := st.QueryEvents(ctx, EventFilter{TopicCount: &n, Scope: WildcardScope()})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+		assert.Equal(t, events[1].ID, got[0].ID)
+	})
+
+	t.Run("no match", func(t *testing.T) {
+		n := 5
+		got, _, err := st.QueryEvents(ctx, EventFilter{TopicCount: &n, Scope: WildcardScope()})
+		require.NoError(t, err)
+		assert.Len(t, got, 0)
+	})
+
+	t.Run("combined with contract_id", func(t *testing.T) {
+		n := 2
+		got, _, err := st.QueryEvents(ctx, EventFilter{
+			ContractID: contractA,
+			TopicCount: &n, Scope: WildcardScope()})
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+	})
+}

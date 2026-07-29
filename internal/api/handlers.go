@@ -1391,6 +1391,7 @@ func listETag(f store.EventFilter) string {
 		TopicContains json.RawMessage `json:"pc,omitempty"`
 		TxHash        string          `json:"th,omitempty"`
 		HasValue      *bool           `json:"hv,omitempty"`
+		TopicCount    *int            `json:"tc,omitempty"`
 		TxIndex       *int32          `json:"txi,omitempty"`
 		OpIndex       *int32          `json:"opi,omitempty"`
 		FromLedger    int64           `json:"fl"`
@@ -1421,6 +1422,7 @@ func listETag(f store.EventFilter) string {
 		TopicContains: f.TopicContains,
 		TxHash:        f.TxHash,
 		HasValue:      f.HasValue,
+		TopicCount:    f.TopicCount,
 		TxIndex:       f.TxIndex,
 		OpIndex:       f.OpIndex,
 		FromLedger:    f.FromLedger,
@@ -1593,6 +1595,20 @@ func timeParamAlias(q url.Values, primary, alias string) (namedParam, error) {
 		return namedParam{name: alias, value: av}, nil
 	}
 	return namedParam{name: primary, value: pv}, nil
+}
+
+// parseTopicCountParam parses ?topic_count=. An empty value means "no
+// constraint"; zero is a real filter (events with no topics at all), so
+// the result is a pointer rather than relying on a zero value.
+func parseTopicCountParam(raw string) (*int, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return nil, fmt.Errorf("topic_count must be a non-negative integer")
+	}
+	return &n, nil
 }
 
 // filterFromQuery parses the shared event-filter query params:
@@ -1787,6 +1803,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		}
 		f.Order = "desc"
 		f.Limit = n
+	}
+
+	if f.TopicCount, err = parseTopicCountParam(q.Get("topic_count")); err != nil {
+		return f, err
 	}
 
 	if raw := q.Get("has_value"); raw != "" {
