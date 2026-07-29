@@ -50,6 +50,18 @@ To watch specific contracts instead of everything:
 WATCHED_CONTRACTS=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC docker compose up --build
 ```
 
+**Container health.** The published image ships with a `HEALTHCHECK` that
+probes `/health` via the in-binary `sorotrail healthcheck` subcommand
+(alpine has no curl/wget — installing curl or shipping a second binary
+would just grow the image; routing the probe through the existing
+binary reuses the `net/http` client that's already linked in for the
+server, so the cost is a few hundred bytes of flag-parsing and a probe
+function). Compose mirrors the same probe so `docker ps` shows an
+honest health status, and combined with `depends_on: condition:
+service_healthy` on Postgres, a fresh `docker compose up --build`
+brings the stack up in the right order instead of hoping the indexer
+wins a race against a half-up database.
+
 ### Bare metal
 
 ```sh
@@ -88,7 +100,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `AUDIT_MAX_RPS` | `10` | Total request budget (split between ingest and audit). |
 | `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
 | `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
-| `API_KEY` | empty | Required to use the runtime `/watched-contracts` surface; empty means every request there is rejected with 503. This is a placeholder until #17 (real auth) lands — at that point `API_KEY` will be replaced. |
+| `API_MAX_LIMIT` | `500` | Maximum page size accepted for list endpoints (`/events`, `/subscriptions/{id}/deliveries`). Values above this are rejected with 400. |
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
@@ -117,6 +129,14 @@ All configuration comes from environment variables (see `.env.example`):
   project exists to prevent).
 - Requests are rate-limited (~10/s, matching public endpoint limits) and
   errors are retried with jittered exponential backoff.
+- **Ingest-lag alarm**: every poll cycle compares the chain head (fetched via
+  `getLatestLedger`) to the last ingested ledger. When the gap exceeds
+  `LAG_WARN_LEDGERS` (default `100`), a single WARN-level structured log is
+  emitted; a single INFO log fires when the gap closes. Hysteresis keeps the
+  alarm quiet between crossings, so a stuck indexer logs once on crossing
+  and once on recovery rather than spamming. No log is emitted on cold
+  start (no baseline yet) or when the alarm is disabled
+  (`LAG_WARN_LEDGERS=0`).
 - Topics/values are stored as JSON. When the RPC supports `xdrFormat: "json"`
   its decoding is used verbatim; otherwise the base64 XDR is decoded locally
   into shapes like `{"symbol":"transfer"}`, `{"u64":42}`, `{"i128":"-1000"}`,
@@ -233,8 +253,9 @@ Every list endpoint uses cursor-based pagination with a consistent contract:
   clients must never inspect or modify it. Sending an invalid cursor
   returns `400 Bad Request` with the standard error envelope
   `{"error": "invalid cursor ..."}`.
-- **Defaults**: `limit` defaults to 50 when unset; the maximum is 200.
-  Values outside `[1,200]` return `400 Bad Request`.
+- **Defaults**: `limit` defaults to 50 when unset; the maximum is 500
+  (configurable via `API_MAX_LIMIT`).
+  Values outside `[1, API_MAX_LIMIT]` return `400 Bad Request`.
 - **Empty result sets** return an empty array with no `"cursor"` field
   (or an empty string cursor, depending on the endpoint).
 
@@ -280,7 +301,7 @@ Query parameters (all optional, combinable):
 | `to_ledger` | `260000` | Inclusive upper ledger bound. |
 | `from_time` | `2026-07-21T00:00:00Z` | Inclusive lower `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
 | `to_time` | `2026-07-22T00:00:00Z` | Inclusive upper `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
-| `limit` | `50` | Page size, 1–200 (default 50). |
+| `limit` | `50` | Page size, 1–500 (default 50). Configurable max via `API_MAX_LIMIT`. |
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
 | `order` | `desc` | `asc` \| `desc`, defaults to asc. Sort direction. |
 | `order_by` | `created_at` | `id` \| `ledger` \| `created_at`, defaults to `id`. Sort column. Anything else is a `400`. |
@@ -454,6 +475,189 @@ This guarantees no panics and no truncated writes on `Ctrl-C` / `kill`,
 and the cursor is always persisted so the next process picks up exactly
 where the previous one stopped.
 
+### GraphQL API
+
+Read-only GraphQL endpoint at `POST /graphql`, schema-first with
+Shared query-builder helpers in `internal/api/queries` so REST and
+GraphQL validate filters identically. Same `EventFilter` shape,
+same `Cursor` semantics, no drift between transports.
+
+#### Endpoints
+
+- **`POST /graphql`** — accepts a JSON body
+  `{"query": "...", "variables": {...}, "operationName": "..."}`. Returns
+  the standard GraphQL envelope `{"data": ..., "errors": ...}`.
+- **`GET /graphql?query=...`** — same handler; useful for browser
+  playground GET hits.
+- **`GET /graphiql`** — dev-mode GraphiQL playground. Disabled by
+  default; set `GRAPHQL_PLAYGROUND=true` to serve it.
+
+#### Limits
+
+To prevent abuse, every operation runs through two pre-flight checks
+before any resolver runs:
+
+- **Depth**: 10 (hard cap). Anything deeper is rejected with an
+  `errors[].message` describing the violation.
+- **Complexity**: 1000 (hard cap). Connection-style fields cost 25,
+  leaf fields 1, plus a 5-unit operation overhead. Wide fanout sits
+  comfortably within the cap; a pathological 100k-field request is
+  rejected before SQL touches the events table.
+
+Both limits are configurable in `internal/api/graphql/limits.go`.
+Bumping them requires rebaselining against real client queries.
+
+#### Schema highlights
+
+Queries (read-only, no mutations):
+
+- `events(filter: EventFilterInput, page: PageInput): EventConnection!`
+- `tokenEvents(filter: EventFilterInput, page: PageInput): TokenEventConnection!`
+- `contracts(page: PageInput): ContractConnection!`
+- `event(id: ID!): Event` — single event lookup, null when missing.
+- `contract(id: ID!): Contract` — single watched-contract lookup.
+
+Filter input fields mirror the REST `GET /events` query parameters:
+
+- `contractId`, `types[]`, `topic`, `topics.t0..t3`, `topicContains`,
+  `txHash`, `fromLedger`/`toLedger`, `fromTime`/`toTime`.
+
+Pagination input is Relay-style: `first`/`after` for forward,
+`last`/`before` for backward (currently unsupported and rejected
+with an error message — see `queries.ResolvePage`). Sort: `order`
++ `orderBy` (defaults ASC/id).
+
+#### Example 1 — list events with filter + cursor pagination
+
+```graphql
+query EventsForContract($id: ID!, $first: Int!) {
+  events(
+    filter: { contractId: $id, type: CONTRACT }
+    page: { first: $first, orderBy: LEDGER, order: ASC }
+  ) {
+    edges {
+      cursor
+      node { id contractId ledger type topics value createdAt }
+    }
+    nodes { id ledger createdAt }
+    pageInfo { hasNextPage endCursor }
+    totalCount
+  }
+}
+```
+
+Variables:
+
+```json
+{
+  "id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+  "first": 10
+}
+```
+
+Response (200 OK):
+
+```json
+{
+  "data": {
+    "events": {
+      "edges": [
+        {
+          "cursor": "eyJpZCI6IjAwMDEwOTk1MTE2Mjc3NzYtMDAwMDAwMDAwMSIsIm9yZGVyX2J5IjoiaWQiLCJvcmRlciI6ImFzYyJ9",
+          "node": {
+            "id": "0001099511627776-0000000001",
+            "contractId": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+            "ledger": 256000,
+            "type": "contract",
+            "topics": [{"symbol":"transfer"}, {"address":"G..."}],
+            "value": {"i128":"10000000"},
+            "createdAt": "2026-07-16T12:00:00Z"
+          }
+        }
+      ],
+      "nodes": [
+        {
+          "id": "0001099511627776-0000000001",
+          "ledger": 256000,
+          "createdAt": "2026-07-16T12:00:00Z"
+        }
+      ],
+      "pageInfo": { "hasNextPage": true, "endCursor": "eyJpZCI6..." },
+      "totalCount": 4321
+    }
+  }
+}
+```
+
+Pass `endCursor` back as `page.after` to retrieve the next page.
+Cursors are opaque — base64-JSON `{LastID, OrderBy, Order}` — so
+clients should treat them as strings.
+
+#### Example 2 — list token events with spec decoding
+
+```graphql
+query TokenEvents($id: ID!) {
+  tokenEvents(
+    filter: { contractId: $id, topic: "transfer", topicContains: [{"symbol":"transfer"}] }
+    page: { first: 5, orderBy: LEDGER, order: DESC }
+  ) {
+    edges { cursor node { id ledger } }
+    nodes {
+      id
+      decoded
+      decodedEvent { name fields }
+      topics
+      value
+    }
+    pageInfo { hasNextPage endCursor }
+    totalCount
+  }
+}
+```
+
+Variables:
+
+```json
+{ "id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC" }
+```
+
+Response (200 OK; `decodedEvent.fields` is only populated when
+`decoded == true`):
+
+```json
+{
+  "data": {
+    "tokenEvents": {
+      "edges": [{"cursor": "...", "node": {"id": "...", "ledger": 256100}}],
+      "nodes": [
+        {
+          "id": "0001099511627776-0000000042",
+          "decoded": true,
+          "decodedEvent": {
+            "name": "transfer",
+            "fields": {"from": "G...", "to": "G...", "amount": "10000000"}
+          },
+          "topics": [{"symbol":"transfer"}, {"address":"G..."}, {"address":"G..."}],
+          "value": {"i128":"10000000"}
+        }
+      ],
+      "pageInfo": { "hasNextPage": false, "endCursor": null },
+      "totalCount": 1
+    }
+  }
+}
+```
+
+#### Filter + pagination parity with REST
+
+Both transports share `internal/api/queries`: type whitelists, topic
+positional rules, ledger/time bounds, cursor validation, page-size
+caps are identical. A REST request rejected with `400 invalid cursor`
+returns the same `errors[].message` from GraphQL. Conversely a
+GraphQL topic/topic0 conflict returns the same `errors[].message` as
+the REST `/events?topic=…&topic0=…` handler.
+
+
 ### Webhooks
 
 Consumers can register callback URLs that receive matching events as they are
@@ -537,7 +741,7 @@ curl -s -X DELETE localhost:8080/subscriptions/1
 #### `GET /subscriptions/{id}/deliveries`
 
 List delivery attempts for a subscription, newest first. Optional `?limit=`
-(default 50, max 200).
+(default 50, max configurable via `API_MAX_LIMIT`, default 500).
 
 ```sh
 curl -s localhost:8080/subscriptions/1/deliveries?limit=10

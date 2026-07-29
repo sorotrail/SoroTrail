@@ -127,12 +127,29 @@ type Server struct {
 	// Zero means unbounded (legacy behavior); config-driven wiring sets
 	// EXPORT_MAX_RANGE so requests default to a sane ceiling.
 	exportMaxRange int64
+	// cors is the CORS middleware config. Wired via SetCORS from main so
+	// the API does not import the config package.
+	cors CORSConfig
 }
 
 // SetCompressMinSize overrides the body size at which responses are
 // compressed. Pass a negative value to disable compression.
 func (s *Server) SetCompressMinSize(n int) {
 	s.compressMinSize = n
+}
+
+// maxLimit is the API's upper bound for page-size parameters (limit and
+// recent). It is set once at startup via SetMaxLimit (driven by the
+// API_MAX_LIMIT env var) before any requests are served so no mutex is
+// needed. Default 500.
+var maxLimit = 500
+
+// SetMaxLimit configures the API's maximum page size for list endpoints.
+// Call once at startup before ListenAndServe. Values ≤0 are ignored.
+func SetMaxLimit(n int) {
+	if n > 0 {
+		maxLimit = n
+	}
 }
 
 // New builds the API server. rpcClient is used by /health, /readyz, and /stats.
@@ -169,28 +186,41 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 // analytical workloads without code changes.
 func (s *Server) SetExportMaxRange(n int64) { s.exportMaxRange = n }
 
+// SetCORSConfig wires the CORS middleware. The default (zero-valued
+// config) is deny-all: no cross-origin browser request receives CORS
+// headers, so the browser blocks the response. Pass the
+// CORSAllowedOrigins / CORSAllowedMethods / CORSAllowedHeaders lists the
+// operator wants; an empty AllowedOrigins is still deny-all (the
+// middleware short-circuits).
+func (s *Server) SetCORSConfig(cfg CORSConfig) { s.cors = cfg }
+
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
 	r.Use(s.metrics.Middleware)
+	// CORS runs before Recoverer/Timeout so a preflight never blocks
+	// nor panics inside the recovery middleware, and so the same-origin
+	// contract (no Origin header) is forwarded as-is. Mounted
+	// unconditionally so an operator can flip the config on without
+	// restarts; CORS() is a no-op when the allowlist is empty.
+	r.Use(CORS(s.cors))
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
-	// Compression sits outside the limiter so a 429 is written through the
-	// same encoding path as any other small response (i.e. sent as-is), and
-	// inside Recoverer so a panic mid-body can't leave a truncated gzip
-	// stream as the last thing the client sees.
-	if s.compressMinSize >= 0 {
-		r.Use(Compress(s.compressMinSize))
-	}
 	if s.limiter != nil {
 		// Limiter sits inside Timeout and Recoverer so its instant 429
 		// response always makes it back through the deadline cleanly, and
 		// a panic inside the limiter can't take down the server.
 		r.Use(s.limiter.Middleware)
 	}
+	// prettyMiddleware must be the innermost wrapper (closest to the handler)
+	// so the type assertion in writeJSON sees the prettyWriter interface.
+	// It reads ?pretty=true from the query and wraps the ResponseWriter.
+	r.Use(prettyMiddleware)
 
+	// Non-list routes: health, metrics, writes — responses are always
+	// small, so compression is just overhead with no benefit.
 	r.Get("/health", s.handleHealth)
 	r.Get("/livez", s.handleLivez)
 	r.Get("/readyz", s.handleReadyz)
@@ -199,31 +229,66 @@ func (s *Server) Router() http.Handler {
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/count", s.handleCountEvents)
 	r.Get("/events/{id}/raw", s.handleGetEventRaw)
+	r.Get("/events/{id}/transaction", s.handleGetEventTransaction)
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/contracts/{id}/export", s.handleContractExport)
+
+	r.Get("/contracts", s.handleListContracts)
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
+
+	// GraphQL transport — read-only, mounts at /graphql and dev-mode
+	// /graphiql. Built by the graphql package; the API server only
+	// owns the route registration so a misconfigured GraphQL handler
+	// shows up as a 404 instead of a confusing 500.
+	if s.graphqlHandler != nil {
+		r.Handle("/graphql", s.graphqlHandler)
+	}
+	if s.graphqlPlayground != nil {
+		r.Get("/graphiql", func(w http.ResponseWriter, req *http.Request) {
+			s.graphqlPlayground.ServeHTTP(w, req)
+		})
+	}
 
 	// Watched-contracts management: writes and updates to the runtime
 	// filter list. Always auth-gated, even when AUTH_ENABLED would be
 	// false elsewhere — that asymmetry is intentional and part of the
-	// "writes are never open" contract. GET is gated too so an operator
-	// with the key can confirm the current list without touching /stats.
+	// "writes are never open" contract.
 	// Routes are absolute (no sub-router) so callers don't need a
 	// trailing slash or chi's RedirectSlashes middleware.
 	watchedMW := apiKeyAuth(s.apiKey)
-	r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
 	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
 	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
 
+	r.With(watchedMW).Get("/dead-letters", s.handleListDeadLetters)
+	r.With(watchedMW).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)
+
 	// Subscription CRUD and delivery history.
 	r.Post("/subscriptions", s.handleCreateSubscription)
-	r.Get("/subscriptions", s.handleListSubscriptions)
-	r.Get("/subscriptions/{id}", s.handleGetSubscription)
 	r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
 	r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
-	r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+
+	// List endpoints: responses can be large (many events, many
+	// subscriptions), so compression is negotiated per request.
+	// Inside a Group so the middleware only touches routes worth
+	// compressing and a panic mid-body can't leave a truncated gzip
+	// stream as the last thing the client sees (Recoverer is above).
+	r.Group(func(r chi.Router) {
+		if s.compressMinSize >= 0 {
+			r.Use(Compress(s.compressMinSize))
+		}
+		r.Get("/events", s.handleListEvents)
+		r.Get("/events/count", s.handleCountEvents)
+		r.Get("/events/{id}/raw", s.handleGetEventRaw)
+		r.Get("/events/{id}", s.handleGetEvent)
+		r.Get("/contracts/{id}/events", s.handleContractEvents)
+		r.Get("/contracts/{id}/export", s.handleContractExport)
+		r.Get("/subscriptions", s.handleListSubscriptions)
+		r.Get("/subscriptions/{id}", s.handleGetSubscription)
+		r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+		r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
+	})
 
 	return r
 }

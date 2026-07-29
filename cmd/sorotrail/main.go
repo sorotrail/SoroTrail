@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sorotrail/sorotrail/internal/api"
+	"github.com/sorotrail/sorotrail/internal/api/graphql"
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/config"
@@ -55,6 +56,17 @@ func dispatch(args []string) error {
 		return runReplay(args[1:])
 	case "backfill":
 		return runBackfill(args[1:])
+	case "healthcheck":
+		// The healthcheck subcommand manages its own exit codes
+		// (0 healthy, 1 unhealthy, 2 usage error) — the docker
+		// HEALTHCHECK directive inspects them directly, so we
+		// hand control to os.Exit here rather than letting the
+		// main switch collapse everything into 1-with-a-prefix.
+		code := runHealthcheck(args[1:])
+		if code != 0 {
+			os.Exit(code)
+		}
+		return nil
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -70,10 +82,12 @@ func usage() {
 With no subcommand, runs the indexer (ingester + HTTP API).
 
 subcommands:
-  replay    re-decode stored events with the current decoder
-            (sorotrail replay --help)
-  backfill  ingest historical contract events from Horizon
-            (sorotrail backfill --help)
+  replay       re-decode stored events with the current decoder
+               (sorotrail replay --help)
+  backfill     ingest historical contract events from Horizon
+               (sorotrail backfill --help)
+  healthcheck  probe /health and exit (used by docker HEALTHCHECK)
+               (sorotrail healthcheck --help)
 `)
 }
 
@@ -130,6 +144,16 @@ func run() error {
 	specFetcher := spec.NewFetcher(rpcClient)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
+	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
+		PollInterval:     cfg.PollInterval,
+		StartLedger:      cfg.StartLedger,
+		RetentionLedgers: cfg.RetentionLedgers,
+		LagWarnLedgers:   cfg.LagWarnLedgers,
+		// LagMetrics is nil here on purpose: no /metrics endpoint is
+		// wired up yet, so the ingester's applyDefaults installs a
+		// no-op. When a Prometheus endpoint lands, main.go is the
+		// seam to pass a real LagMetrics implementation.
+	})
 	// Wrap the raw RPC client so per-method error totals are tracked and
 	// surfaced via /stats. specFetcher already holds a reference to the
 	// unwrapped client (spec lookups are not counted as ingestion errors).
@@ -145,6 +169,10 @@ func run() error {
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
+	// Wire the same store as the dead-letter sink: events that fail to
+	// decode/persist land in the dead_letters table instead of
+	// stalling the cycle (issue #131).
+	ing.SetDeadLetterSink(st)
 
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a
@@ -194,10 +222,27 @@ func run() error {
 		SlowQueryThreshold: cfg.APISlowQueryThreshold,
 		Logger:             log,
 	})
+	api.SetMaxLimit(cfg.APIMaxLimit)
+
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
+	apiServer.SetCORSConfig(api.CORSConfig{
+		AllowedOrigins: cfg.CORSAllowedOrigins,
+		AllowedMethods: cfg.CORSAllowedMethods,
+		AllowedHeaders: cfg.CORSAllowedHeaders,
+	})
+
+	// GraphQL transport: reads against the same store + spec enricher
+	// the REST handlers use. Dev-mode playground is gated on
+	// GRAPHQL_PLAYGROUND. The schema is the same shape as
+	// internal/api/graphql/schema.graphqls.
+	gqlHandler, gqlErr := graphql.New(graphqlServerDeps(apiStore, specEnricher), log, cfg.GraphQLPlayground)
+	if gqlErr != nil {
+		return fmt.Errorf("constructing graphql handler: %w", gqlErr)
+	}
+	apiServer.SetGraphQLHandler(gqlHandler, gqlHandler.PlaygroundHandler())
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -311,4 +356,11 @@ func newLogger(level, format string) *slog.Logger {
 		h = slog.NewTextHandler(os.Stdout, opts)
 	}
 	return slog.New(h)
+}
+
+// graphqlServerDeps wraps the live store + enricher into the typed
+// bundle the GraphQL Handler consumes. Centralising the cast here
+// keeps the route wiring in main.go one line wide.
+func graphqlServerDeps(st store.Store, enricher api.Enricher) api.ServerDeps {
+	return api.ServerDeps{Store: st, Enricher: enricher}
 }
