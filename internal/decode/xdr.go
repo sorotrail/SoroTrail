@@ -8,7 +8,7 @@ import (
 	"math/big"
 	"sync/atomic"
 
-	"github.com/stellar/go/xdr"
+	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
 // decodeErrors counts ScVal decode failures. Incremented by DecodeScVal
