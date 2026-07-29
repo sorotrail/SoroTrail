@@ -181,6 +181,11 @@ func ValidOrderBy(s string) bool {
 type IngestionState struct {
 	LastIngestedLedger int64
 	LastCursor         string
+	// LastSuccessfulPoll is when the ingester last completed a poll without
+	// error. Nil before the first successful poll (and for rows written
+	// before the column existed). It is distinct from UpdatedAt, which moves
+	// on any write — including one recording no progress.
+	LastSuccessfulPoll *time.Time
 	UpdatedAt          time.Time
 }
 
@@ -494,6 +499,11 @@ type Stats struct {
 	IngestLagLedgers      *int64 `json:"ingest_lag_ledgers"`
 	ContractCount         int64  `json:"contract_count"`
 	WatchedContracts      int64  `json:"watched_contracts"`
+	// LastSuccessfulPoll is when ingestion last completed a poll without
+	// error. Null until the first successful poll. Operators watch this
+	// alongside ingest_lag_ledgers: a lag that stops moving *and* a poll
+	// timestamp that stops advancing means ingestion is stuck, not just slow.
+	LastSuccessfulPoll *time.Time `json:"last_successful_poll"`
 	// TableSizeBytes is the approximate on-disk size of the events table
 	// (including partitions, indexes, and TOAST). 0 when the backend does
 	// not report it.

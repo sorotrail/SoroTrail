@@ -797,8 +797,9 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 	var s IngestionState
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx,
-			`SELECT last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE id = 1`,
-		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.UpdatedAt)
+			`SELECT last_ingested_ledger, last_cursor, last_successful_poll, updated_at
+			 FROM ingestion_state WHERE id = 1`,
+		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.LastSuccessfulPoll, &s.UpdatedAt)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return IngestionState{}, ErrNotFound
@@ -811,13 +812,16 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 
 func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) error {
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO ingestion_state (id, last_ingested_ledger, last_cursor, updated_at)
-		VALUES (1, $1, $2, now())
+		INSERT INTO ingestion_state (id, last_ingested_ledger, last_cursor, last_successful_poll, updated_at)
+		VALUES (1, $1, $2, $3, now())
 		ON CONFLICT (id) DO UPDATE SET
 			last_ingested_ledger = EXCLUDED.last_ingested_ledger,
 			last_cursor          = EXCLUDED.last_cursor,
+			-- coalesce so a write that carries no poll timestamp (an
+			-- auditor or backfill save) cannot erase the ingester's.
+			last_successful_poll = coalesce(EXCLUDED.last_successful_poll, ingestion_state.last_successful_poll),
 			updated_at           = now()`,
-		s.LastIngestedLedger, s.LastCursor,
+		s.LastIngestedLedger, s.LastCursor, s.LastSuccessfulPoll,
 	)
 	if err != nil {
 		return fmt.Errorf("saving ingestion state: %w", err)
@@ -987,13 +991,14 @@ func (p *Postgres) statsWhere(ctx context.Context, pred string, args []any) (Sta
 			(SELECT coalesce(min(ledger), 0) FROM events %[1]s),
 			(SELECT count(DISTINCT contract_id) FROM events %[1]s),
 			(SELECT count(*) FROM (%[2]s) w %[1]s),
+			(SELECT last_successful_poll FROM ingestion_state WHERE id = 1),
 			%[3]s`,
 		pred, watchedContractsUnion, tableSizeExpr(pred == ""))
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, query, args...).Scan(
 			&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger,
 			&s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts,
-			&s.TableSizeBytes)
+			&s.LastSuccessfulPoll, &s.TableSizeBytes)
 	})
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
@@ -1047,8 +1052,9 @@ func (p *Postgres) frontierStats(ctx context.Context) (Stats, error) {
 	err := p.pool.QueryRow(ctx, `
 		SELECT
 			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
-			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state)`,
-	).Scan(&s.LastIngestedLedger, &s.VerifiedThroughLedger)
+			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
+			(SELECT last_successful_poll FROM ingestion_state WHERE id = 1)`,
+	).Scan(&s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.LastSuccessfulPoll)
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
 	}
