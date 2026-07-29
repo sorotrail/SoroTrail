@@ -109,7 +109,11 @@ type EventFilter struct {
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
 	// TxHash filters events emitted by a specific transaction hash.
-	TxHash     string    // hex-encoded transaction hash
+	TxHash string // hex-encoded transaction hash
+	// HasValue filters events by whether they carry a value payload.
+	// nil means no constraint; true means value IS NOT NULL;
+	// false means value IS NULL.
+	HasValue   *bool
 	FromLedger int64     // inclusive
 	ToLedger   int64     // inclusive
 	FromTime   time.Time // inclusive, zero = no constraint
