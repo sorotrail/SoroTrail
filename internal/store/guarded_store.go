@@ -85,6 +85,15 @@ func (s *guardedStore) GetEvent(ctx context.Context, id string) (Event, error) {
 	return e, err
 }
 
+func (s *guardedStore) GetEventsByTxHash(ctx context.Context, txHash, excludeID string) ([]Event, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.GetEventsByTxHash")
+	defer cancel()
+	start := time.Now()
+	events, err := s.Store.GetEventsByTxHash(ctx, txHash, excludeID)
+	s.logSlowQuery("store.GetEventsByTxHash", start, err)
+	return events, err
+}
+
 func (s *guardedStore) EventExists(ctx context.Context, id string) (bool, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.EventExists")
 	defer cancel()
