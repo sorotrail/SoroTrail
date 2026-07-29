@@ -31,21 +31,21 @@ type EventFilterArgs struct {
 	ContractID       string
 	ContractIDPrefix string
 	Types            []string
-	Topic         json.RawMessage
-	T0            json.RawMessage
-	T1            json.RawMessage
-	T2            json.RawMessage
-	T3            json.RawMessage
-	TopicContains json.RawMessage
-	TxHash        string
-	FromLedger    int64
-	ToLedger      int64
-	FromTime      time.Time
-	ToTime        time.Time
-	Order         string
-	OrderBy       string
-	Cursor        string
-	Limit         int
+	Topic            json.RawMessage
+	T0               json.RawMessage
+	T1               json.RawMessage
+	T2               json.RawMessage
+	T3               json.RawMessage
+	TopicContains    json.RawMessage
+	TxHash           string
+	FromLedger       int64
+	ToLedger         int64
+	FromTime         time.Time
+	ToTime           time.Time
+	Order            string
+	OrderBy          string
+	Cursor           string
+	Limit            int
 }
 
 // PageArgs is the wire-agnostic pagination descriptor both REST and
@@ -98,21 +98,21 @@ func BuildEventFilter(args EventFilterArgs) (store.EventFilter, error) {
 		ContractID:       args.ContractID,
 		ContractIDPrefix: args.ContractIDPrefix,
 		Types:            args.Types,
-		Topic:         args.Topic,
-		Topic0:        args.T0,
-		Topic1:        args.T1,
-		Topic2:        args.T2,
-		Topic3:        args.T3,
-		TopicContains: args.TopicContains,
-		TxHash:        args.TxHash,
-		FromLedger:    args.FromLedger,
-		ToLedger:      args.ToLedger,
-		FromTime:      args.FromTime,
-		ToTime:        args.ToTime,
-		Order:         args.Order,
-		OrderBy:       args.OrderBy,
-		Cursor:        args.Cursor,
-		Limit:         args.Limit,
+		Topic:            args.Topic,
+		Topic0:           args.T0,
+		Topic1:           args.T1,
+		Topic2:           args.T2,
+		Topic3:           args.T3,
+		TopicContains:    args.TopicContains,
+		TxHash:           args.TxHash,
+		FromLedger:       args.FromLedger,
+		ToLedger:         args.ToLedger,
+		FromTime:         args.FromTime,
+		ToTime:           args.ToTime,
+		Order:            args.Order,
+		OrderBy:          args.OrderBy,
+		Cursor:           args.Cursor,
+		Limit:            args.Limit,
 	}
 
 	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
