@@ -283,6 +283,9 @@ func (s *Server) Router() http.Handler {
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
+	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.
+	adminMW := apiKeyAuth(s.apiKey)
+	r.With(adminMW).Delete("/events", s.handleDeleteEvents)
 	// contributors: new read endpoints go here. Every one of them must
 	// obtain its scope from filterFromQuery (list-shaped reads) or
 	// scopeFrom (single-object reads) and pass it to the store — see

@@ -286,6 +286,37 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, resp)
 }
 
+// handleDeleteEvents is the admin-only bulk delete endpoint. It deletes all
+// events whose ledger is strictly less than the ?before_ledger= query parameter.
+// The endpoint is protected by apiKeyAuth middleware (same as watched-contracts).
+//
+// Query params:
+//   before_ledger (required) — delete all events with ledger < this value
+//
+// Response:
+//   200 { "deleted": <count> } on success
+//   400 when before_ledger is missing or not a positive integer
+func (s *Server) handleDeleteEvents(w http.ResponseWriter, r *http.Request) {
+	raw := r.URL.Query().Get("before_ledger")
+	if raw == "" {
+		writeError(w, http.StatusBadRequest, errors.New("before_ledger query parameter is required"))
+		return
+	}
+	beforeLedger, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || beforeLedger <= 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("before_ledger must be a positive integer, got %q", raw))
+		return
+	}
+
+	deleted, err := s.store.DeleteEventsBeforeLedger(r.Context(), beforeLedger)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("bulk delete events", "before_ledger", beforeLedger, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("deleting events failed"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"deleted": deleted})
+}
+
 // handleLivez is the liveness probe. It returns 200 as long as the process
 // is running. No dependencies are checked — a transient DB or RPC outage
 // must not cause orchestration to kill and restart the pod (readiness is
@@ -295,14 +326,19 @@ func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Checks: map[string]string{"process": "ok"}})
 }
 
-// handleReadyz is the readiness probe. It performs a bounded DB ping and
-// RPC head check. Returns 200 when all dependencies are reachable, 503
-// with a JSON body explaining which dependency is down.
+// handleReadyz is the readiness probe. It performs a bounded DB ping,
+// RPC head check, and verifies the database schema is at the expected
+// migration version. Returns 200 when all dependencies are reachable,
+// 503 with a JSON body explaining which dependency is down.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok", "rpc": "ok"}}
+	resp := healthResponse{Status: "ok", Checks: map[string]string{
+		"database":        "ok",
+		"rpc":             "ok",
+		"schema_version":  "ok",
+	}}
 	status := http.StatusOK
 
 	if err := s.store.Ping(ctx); err != nil {
@@ -310,6 +346,26 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		resp.Checks["database"] = err.Error()
 		status = http.StatusServiceUnavailable
 	}
+
+	// Check that the schema_migrations table reports a clean state with the
+	// expected version. A dirty migration or missing schema is a deployment
+	// error that should prevent the pod from receiving traffic.
+	if version, dirty, err := s.store.MigrationVersion(ctx); err != nil {
+		resp.Status = "degraded"
+		resp.Checks["schema_version"] = fmt.Sprintf("check failed: %v", err)
+		status = http.StatusServiceUnavailable
+	} else if version == 0 {
+		resp.Status = "degraded"
+		resp.Checks["schema_version"] = "no migrations applied"
+		status = http.StatusServiceUnavailable
+	} else if dirty {
+		resp.Status = "degraded"
+		resp.Checks["schema_version"] = fmt.Sprintf("dirty (version %d)", version)
+		status = http.StatusServiceUnavailable
+	} else {
+		resp.Checks["schema_version"] = fmt.Sprintf("ok (version %d)", version)
+	}
+
 	if health, err := s.rpc.GetHealth(ctx); err != nil {
 		resp.Status = "degraded"
 		resp.Checks["rpc"] = err.Error()
