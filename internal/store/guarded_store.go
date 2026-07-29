@@ -175,6 +175,24 @@ func (s *guardedStore) SaveAuditStateIfGreater(ctx context.Context, ledger int64
 	return state, err
 }
 
+func (s *guardedStore) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.ListContracts")
+	defer cancel()
+	start := time.Now()
+	summaries, cursor, err := s.Store.ListContracts(ctx, f)
+	s.logSlowQuery("store.ListContracts", start, err)
+	return summaries, cursor, err
+}
+
+func (s *guardedStore) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.CountContracts")
+	defer cancel()
+	start := time.Now()
+	total, err := s.Store.CountContracts(ctx, f)
+	s.logSlowQuery("store.CountContracts", start, err)
+	return total, err
+}
+
 func (s *guardedStore) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.ListWatchedContracts")
 	defer cancel()
