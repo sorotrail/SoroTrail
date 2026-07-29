@@ -64,7 +64,7 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	require.NoError(t, err)
 
 	_, err = pool.Exec(context.Background(),
-		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
+		`TRUNCATE events, ingestion_state, watched_contracts, replay_state, rollup_events, rollup_token_volume`)
 	require.NoError(t, err)
 
 	// Detach and drop all existing event partitions so a store with a different
