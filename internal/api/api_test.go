@@ -1909,3 +1909,45 @@ func (m *stubStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, err
 	return store.DeadLetter{}, store.ErrNotFound
 }
 func (m *stubStore) DeleteDeadLetter(context.Context, int64) error { return nil }
+
+func TestListEvents_CreatedAtFilters(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		wantFrom string
+		wantTo   string
+		wantErr  int // 0 = success
+	}{
+		{name: "created_after only", query: "/events?created_after=2026-07-21T00:00:00Z", wantFrom: "2026-07-21T00:00:00Z", wantErr: 0},
+		{name: "created_before only", query: "/events?created_before=2026-07-22T00:00:00Z", wantTo: "2026-07-22T00:00:00Z", wantErr: 0},
+		{name: "both created bounds", query: "/events?created_after=2026-07-21T00:00:00Z&created_before=2026-07-22T00:00:00Z", wantFrom: "2026-07-21T00:00:00Z", wantTo: "2026-07-22T00:00:00Z", wantErr: 0},
+		{name: "mixed with from_time and created_before", query: "/events?from_time=2026-07-21T00:00:00Z&created_before=2026-07-22T00:00:00Z", wantFrom: "2026-07-21T00:00:00Z", wantTo: "2026-07-22T00:00:00Z", wantErr: 0},
+		{name: "created_after conflicts with from_time", query: "/events?from_time=2026-07-21T00:00:00Z&created_after=2026-07-21T00:00:00Z", wantErr: http.StatusBadRequest},
+		{name: "created_before conflicts with to_time", query: "/events?to_time=2026-07-22T00:00:00Z&created_before=2026-07-22T00:00:00Z", wantErr: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			if tt.wantFrom != "" {
+				assert.Equal(t, tt.wantFrom, st.lastFilter.FromTime.Format(time.RFC3339))
+			} else {
+				assert.True(t, st.lastFilter.FromTime.IsZero())
+			}
+			if tt.wantTo != "" {
+				assert.Equal(t, tt.wantTo, st.lastFilter.ToTime.Format(time.RFC3339))
+			} else {
+				assert.True(t, st.lastFilter.ToTime.IsZero())
+			}
+		})
+	}
+}
