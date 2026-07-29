@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -89,7 +88,7 @@ func makeIngester(t *testing.T, opts Options) (*Ingester, *bytes.Buffer, *record
 
 // setLagAlarmClientHealth updates the chain head seen by whatever RPC is
 // wired into ing. Both supported test RPCs let the test author set the
-// latest directly (mockRPC via its health field; flakyRPC via its
+// latest directly (mockRPC via its health field; other clients via
 // wrapped base mockRPC's health field). Centralizing this in one
 // helper avoids repeating a type switch at every call site.
 func setLagAlarmClientHealth(t *testing.T, client rpc.Client, latest uint32) {
@@ -97,8 +96,6 @@ func setLagAlarmClientHealth(t *testing.T, client rpc.Client, latest uint32) {
 	switch r := client.(type) {
 	case *mockRPC:
 		r.health = rpc.Health{LatestLedger: latest}
-	case *flakyRPC:
-		r.base.health = rpc.Health{LatestLedger: latest}
 	default:
 		t.Fatalf("setLagAlarmClientHealth: unhandled RPC type %T", client)
 	}

@@ -6,9 +6,21 @@ import (
 	"errors"
 	"time"
 
+	"github.com/sorotrail/sorotrail/internal/api"
 	"github.com/sorotrail/sorotrail/internal/api/queries"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
+
+// scopeFrom mirrors the REST path's authorization lookup so a GraphQL read
+// is bounded by exactly the same tenant grants. An unauthenticated context
+// yields the zero Scope, which the store treats as "matches nothing" — a
+// GraphQL query can therefore never see more than the equivalent REST call.
+func scopeFrom(ctx context.Context) store.Scope {
+	if p, ok := api.PrincipalFrom(ctx); ok {
+		return p.Scope
+	}
+	return store.Scope{}
+}
 
 // Resolver holds the dependencies the GraphQL operations need. It is
 // constructed once at startup and shared between goroutines — every
@@ -68,8 +80,8 @@ func eventToResult(e store.Event) EventResult {
 // entry; DecodedEvent is nil when decoding produced no useful mapping.
 type TokenEventResult struct {
 	EventResult
-	Decoded      bool            `json:"decoded"`
-	DecodedEvent *DecodedResult  `json:"decodedEvent,omitempty"`
+	Decoded      bool           `json:"decoded"`
+	DecodedEvent *DecodedResult `json:"decodedEvent,omitempty"`
 }
 
 // DecodedResult mirrors store.DecodedEventResponse so the GraphQL
@@ -93,32 +105,32 @@ type PageInfo struct {
 
 // EventConnection is the events / tokenEvents responses.
 type EventConnection struct {
-	Edges      []EventEdge `json:"edges"`
+	Edges      []EventEdge   `json:"edges"`
 	Nodes      []EventResult `json:"nodes"`
-	PageInfo   PageInfo   `json:"pageInfo"`
-	TotalCount int32      `json:"totalCount"`
+	PageInfo   PageInfo      `json:"pageInfo"`
+	TotalCount int32         `json:"totalCount"`
 }
 
 // TokenEventConnection is the alias-typed connection for tokenEvents.
 type TokenEventConnection struct {
-	Edges      []TokenEventEdge `json:"edges"`
+	Edges      []TokenEventEdge   `json:"edges"`
 	Nodes      []TokenEventResult `json:"nodes"`
-	PageInfo   PageInfo   `json:"pageInfo"`
-	TotalCount int32      `json:"totalCount"`
+	PageInfo   PageInfo           `json:"pageInfo"`
+	TotalCount int32              `json:"totalCount"`
 }
 
 // ContractConnection is the watched-contracts response.
 type ContractConnection struct {
-	Edges      []ContractEdge `json:"edges"`
+	Edges      []ContractEdge   `json:"edges"`
 	Nodes      []ContractResult `json:"nodes"`
-	PageInfo   PageInfo   `json:"pageInfo"`
-	TotalCount int32      `json:"totalCount"`
+	PageInfo   PageInfo         `json:"pageInfo"`
+	TotalCount int32            `json:"totalCount"`
 }
 
 // EventEdge / TokenEventEdge / ContractEdge are the Relay edge wrappers.
 type EventEdge struct {
-	Cursor string       `json:"cursor"`
-	Node   EventResult  `json:"node"`
+	Cursor string      `json:"cursor"`
+	Node   EventResult `json:"node"`
 }
 type TokenEventEdge struct {
 	Cursor string           `json:"cursor"`
@@ -140,16 +152,16 @@ type EventFilterArgs struct {
 
 // FilterInput maps the GraphQL EventFilterInput input type.
 type FilterInput struct {
-	ContractID    string                  `json:"contractId"`
-	Types         []string                `json:"types"`
-	Topic         json.RawMessage         `json:"topic"`
-	Topics        *TopicPositionInput     `json:"topics"`
-	TopicContains json.RawMessage         `json:"topicContains"`
-	TxHash        string                  `json:"txHash"`
-	FromLedger    *int64                  `json:"fromLedger"`
-	ToLedger      *int64                  `json:"toLedger"`
-	FromTime      *time.Time              `json:"fromTime"`
-	ToTime        *time.Time              `json:"toTime"`
+	ContractID    string              `json:"contractId"`
+	Types         []string            `json:"types"`
+	Topic         json.RawMessage     `json:"topic"`
+	Topics        *TopicPositionInput `json:"topics"`
+	TopicContains json.RawMessage     `json:"topicContains"`
+	TxHash        string              `json:"txHash"`
+	FromLedger    *int64              `json:"fromLedger"`
+	ToLedger      *int64              `json:"toLedger"`
+	FromTime      *time.Time          `json:"fromTime"`
+	ToTime        *time.Time          `json:"toTime"`
 }
 
 // TopicPositionInput maps the GraphQL TopicPositionFilterInput input type.
@@ -162,12 +174,12 @@ type TopicPositionInput struct {
 
 // PageInput maps the GraphQL PageInput input type.
 type PageInput struct {
-	First   *int32  `json:"first"`
-	After   string  `json:"after"`
-	Last    *int32  `json:"last"`
-	Before  string  `json:"before"`
-	Order   string  `json:"order"`
-	OrderBy string  `json:"orderBy"`
+	First   *int32 `json:"first"`
+	After   string `json:"after"`
+	Last    *int32 `json:"last"`
+	Before  string `json:"before"`
+	Order   string `json:"order"`
+	OrderBy string `json:"orderBy"`
 }
 
 // buildEventFilter is the GraphQL-to-EventFilter bridge. It pulls
@@ -218,18 +230,18 @@ func buildEventFilter(args EventFilterArgs) (store.EventFilter, string, string, 
 	}
 
 	queryArgs := queries.EventFilterArgs{
-		ContractID:    args.Filter.ContractID,
-		Types:         args.Filter.Types,
-		Topic:         args.Filter.Topic,
-		TxHash:        args.Filter.TxHash,
-		FromLedger:    derefInt64(args.Filter.FromLedger),
-		ToLedger:      derefInt64(args.Filter.ToLedger),
-		FromTime:      derefTime(args.Filter.FromTime),
-		ToTime:        derefTime(args.Filter.ToTime),
-		Order:         order,
-		OrderBy:       orderBy,
-		Cursor:        pageCursor,
-		Limit:         limit,
+		ContractID: args.Filter.ContractID,
+		Types:      args.Filter.Types,
+		Topic:      args.Filter.Topic,
+		TxHash:     args.Filter.TxHash,
+		FromLedger: derefInt64(args.Filter.FromLedger),
+		ToLedger:   derefInt64(args.Filter.ToLedger),
+		FromTime:   derefTime(args.Filter.FromTime),
+		ToTime:     derefTime(args.Filter.ToTime),
+		Order:      order,
+		OrderBy:    orderBy,
+		Cursor:     pageCursor,
+		Limit:      limit,
 	}
 	if topics != nil {
 		queryArgs.T0 = topics.T0
@@ -268,9 +280,9 @@ func (r *Resolver) resolveEvents(ctx context.Context, args EventFilterArgs) (any
 	total, totalErr := r.store.CountEvents(ctx, stripPagination(filter))
 
 	out := EventConnection{
-		Edges:      make([]EventEdge, 0, len(events)),
-		Nodes:      make([]EventResult, 0, len(events)),
-		PageInfo:   PageInfo{HasNextPage: nextCursor != "", EndCursor: EncodeCursor(nextCursor, orderBy, order)},
+		Edges:    make([]EventEdge, 0, len(events)),
+		Nodes:    make([]EventResult, 0, len(events)),
+		PageInfo: PageInfo{HasNextPage: nextCursor != "", EndCursor: EncodeCursor(nextCursor, orderBy, order)},
 	}
 	for _, e := range events {
 		out.Edges = append(out.Edges, EventEdge{
@@ -294,7 +306,7 @@ func (r *Resolver) resolveEvent(ctx context.Context, id string) (any, error) {
 	if id == "" {
 		return nil, errors.New("event id is required")
 	}
-	e, err := r.store.GetEvent(ctx, id)
+	e, err := r.store.GetEvent(ctx, id, scopeFrom(ctx))
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, nil
 	}

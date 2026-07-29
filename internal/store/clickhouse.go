@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ClickHouse implements Store with clickhouse-go/v2.
@@ -82,12 +83,11 @@ func (c *ClickHouse) GetEvent(ctx context.Context, id string, sc Scope) (Event, 
 	return Event{}, ErrNotFound
 }
 
-func (c *ClickHouse) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
 func (c *ClickHouse) GetEventsByTxHash(ctx context.Context, txHash, excludeID string) ([]Event, error) {
 	return nil, nil
 }
 
-func (c *ClickHouse) EventExists(ctx context.Context, id string) (bool, error) {
+func (c *ClickHouse) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
 	return false, nil
 }
 
@@ -203,7 +203,6 @@ func (c *ClickHouse) MigrationVersion(ctx context.Context) (int, bool, error) {
 	return 0, false, nil
 }
 
-func (c *ClickHouse) Stats(ctx context.Context) (Stats, error) {
 func (c *ClickHouse) Stats(ctx context.Context, sc Scope) (Stats, error) {
 	return Stats{}, nil
 }
@@ -213,6 +212,12 @@ func (c *ClickHouse) ListContracts(context.Context, ContractsFilter) ([]Contract
 }
 
 func (c *ClickHouse) CountContracts(context.Context, ContractsFilter) (int64, error) {
+	return 0, nil
+}
+
+// DeleteEventsBefore is a stub: retention pruning is not implemented for
+// the ClickHouse backend yet.
+func (c *ClickHouse) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
 	return 0, nil
 }
 

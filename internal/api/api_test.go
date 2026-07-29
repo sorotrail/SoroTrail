@@ -62,6 +62,10 @@ type stubStore struct {
 
 	ingestion    store.IngestionState
 	ingestionErr error
+
+	migrationVersion int
+	migrationDirty   bool
+	migrationErr     error
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -102,14 +106,13 @@ func (s *stubStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 	return store.AuditFinding{}, store.ErrNotFound
 }
 
-func (s *stubStore) GetEvent(context.Context, string, store.Scope) (store.Event, error) {
 // DeleteEventsBefore is unused by API tests but needed to satisfy
 // store.Store now that the pruner can call it.
 func (s *stubStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
 	return 0, nil
 }
 
-func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
+func (s *stubStore) GetEvent(context.Context, string, store.Scope) (store.Event, error) {
 	return s.event, s.eventErr
 }
 
@@ -142,6 +145,22 @@ func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, er
 		return *s.ingestionState, s.ingestionStateEr
 	}
 	return s.ingestion, s.ingestionErr
+}
+
+// MigrationVersion backs /readyz's schema check. Tests that need a dirty
+// or errored schema set migrationErr / migrationDirty.
+func (s *stubStore) MigrationVersion(context.Context) (int, bool, error) {
+	if s.migrationErr != nil {
+		return 0, false, s.migrationErr
+	}
+	// Zero means "unset" for the many tests that construct stubStore{}
+	// inline; /readyz treats a real 0 as "no migrations applied", so
+	// default to a clean applied schema unless a test says otherwise.
+	v := s.migrationVersion
+	if v == 0 {
+		v = 1
+	}
+	return v, s.migrationDirty, nil
 }
 
 func (s *stubStore) Stats(context.Context, store.Scope) (store.Stats, error) { return s.stats, nil }
@@ -366,8 +385,6 @@ func TestListEvents_HasValueFilter(t *testing.T) {
 		})
 	}
 }
-
-func ptr[T any](v T) *T { return &v }
 
 func TestListEvents_TypeFilter(t *testing.T) {
 	tests := []struct {

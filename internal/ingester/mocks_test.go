@@ -122,12 +122,19 @@ func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest)
 
 // mockStore is an in-memory Store.
 type mockStore struct {
+	// Embedded so the mock keeps satisfying store.Store as the
+	// interface grows; unstubbed methods panic if a test calls them.
+	store.Store
+
 	mu          sync.Mutex
 	events      map[string]store.Event
 	state       *store.IngestionState
 	watched     []store.WatchedContract
 	upserted    [][]store.Event
 	deadLetters []store.DeadLetterInput
+	// ingestErr, when set, is returned by GetIngestionState so tests can
+	// exercise the ingester's error path.
+	ingestErr error
 }
 
 func newMockStore() *mockStore {
@@ -277,8 +284,6 @@ func (m *mockStore) MigrationVersion(context.Context) (int, bool, error) {
 	return 9, false, nil
 }
 
-func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
-func (m *mockStore) Ping(context.Context) error                 { return nil }
 func (m *mockStore) Stats(context.Context, store.Scope) (store.Stats, error) {
 	return store.Stats{}, nil
 }
@@ -346,4 +351,9 @@ type passthroughDecoder struct{}
 
 func (passthroughDecoder) DecodeScVal(string) (json.RawMessage, error) {
 	return json.RawMessage(`"decoded"`), nil
+}
+
+// DeleteEventsBefore satisfies store.Store; this mock never prunes.
+func (m *mockStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
 }
