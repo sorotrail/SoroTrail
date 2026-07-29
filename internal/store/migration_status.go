@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/source"
@@ -19,7 +20,7 @@ type MigrationStatus struct {
 // GetMigrationStatus reports the database's current migration version and
 // migrations that have not yet been applied. It does not modify the database.
 func GetMigrationStatus(databaseURL string) (MigrationStatus, error) {
-	migrationSource, err := iofs.New(migrationFS, "migrations")
+	migrationSource, err := iofs.New(migrationsFS, "migrations")
 	if err != nil {
 		return MigrationStatus{}, fmt.Errorf("opening migrations: %w", err)
 	}
@@ -53,7 +54,7 @@ func GetMigrationStatus(databaseURL string) (MigrationStatus, error) {
 func migrationVersions(migrationSource source.Driver, current uint) ([]uint, error) {
 	first, err := migrationSource.First()
 	if err != nil {
-		if errors.Is(err, source.ErrNotExist) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, err
@@ -66,7 +67,7 @@ func migrationVersions(migrationSource source.Driver, current uint) ([]uint, err
 		}
 
 		next, err := migrationSource.Next(version)
-		if errors.Is(err, source.ErrNotExist) {
+		if errors.Is(err, os.ErrNotExist) {
 			break
 		}
 		if err != nil {
