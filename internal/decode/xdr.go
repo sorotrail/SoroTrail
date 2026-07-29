@@ -63,9 +63,9 @@ func (XDRDecoder) DecodeScVal(base64XDR string) (json.RawMessage, error) {
 func fallbackDecode(base64XDR string, decodeErr error) json.RawMessage {
 	fallback, _ := json.Marshal(map[string]any{
 		"unknown": map[string]any{
-			"type":    "decode_error",
-			"base64":  base64XDR,
-			"error":   decodeErr.Error(),
+			"type":   "decode_error",
+			"base64": base64XDR,
+			"error":  decodeErr.Error(),
 		},
 	})
 	return fallback
