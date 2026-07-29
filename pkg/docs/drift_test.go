@@ -11,7 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"gopkg.in/yaml.v3"
 
-	"github.com/khaylebfortune/sorotrail/internal/api"
+	"github.com/sorotrail/sorotrail/internal/api"
 )
 
 type openAPIDoc struct {
@@ -79,7 +79,7 @@ func specRoutePairs(doc openAPIDoc) []routePair {
 
 func routerRoutePairs(t *testing.T) []routePair {
 	t.Helper()
-	server := api.New(nil, nil, slog.Default())
+	server := api.New(nil, nil, slog.Default(), "")
 	handler := server.Router()
 	mux, ok := handler.(*chi.Mux)
 	if !ok {
