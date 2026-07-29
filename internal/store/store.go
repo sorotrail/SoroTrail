@@ -119,7 +119,7 @@ type EventFilter struct {
 	// false means value IS NULL.
 	HasValue   *bool
 	FromLedger int64     // inclusive
-	ToLedger   int64     // inclusive
+	ToLedger   int64     // inclusive, zero = no constraint
 	FromTime   time.Time // inclusive, zero = no constraint
 	ToTime     time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
