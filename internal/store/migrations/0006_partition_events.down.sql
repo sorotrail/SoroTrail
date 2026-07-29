@@ -2,6 +2,19 @@ BEGIN;
 
 ALTER TABLE events RENAME TO events_partitioned;
 
+-- Drop partitioned-table indexes whose names would collide with new
+-- indexes on the replacement events table.
+DROP INDEX IF EXISTS idx_events_id;
+DROP INDEX IF EXISTS idx_events_contract_id;
+DROP INDEX IF EXISTS idx_events_ledger;
+DROP INDEX IF EXISTS idx_events_contract_ledger;
+DROP INDEX IF EXISTS idx_events_topics;
+DROP INDEX IF EXISTS idx_events_created_at;
+-- Drop the partitioned table's primary key constraint before creating the
+-- replacement plain table, whose PRIMARY KEY would otherwise collide with
+-- the implicit "events_pkey" inherited by events_partitioned.
+ALTER TABLE events_partitioned DROP CONSTRAINT IF EXISTS events_pkey;
+
 CREATE TABLE events (
     id                 text PRIMARY KEY,
     contract_id        text NOT NULL,
@@ -14,8 +27,8 @@ CREATE TABLE events (
     topics             jsonb NOT NULL DEFAULT '[]'::jsonb,
     value              jsonb,
     created_at         timestamptz NOT NULL DEFAULT now(),
-    topics_xdr         jsonb CHECK (topics_xdr IS NULL OR jsonb_typeof(topics_xdr) = 'array'),
-    value_xdr          text
+    raw_topic_xdr      text[],
+    raw_value_xdr      text
 );
 
 CREATE INDEX idx_events_contract_id ON events (contract_id);
@@ -26,11 +39,11 @@ CREATE INDEX idx_events_created_at ON events (created_at);
 
 INSERT INTO events (
     id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-    in_successful_call, topics, value, created_at, topics_xdr, value_xdr
+    in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr
 )
 SELECT
     id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-    in_successful_call, topics, value, created_at, topics_xdr, value_xdr
+    in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr
 FROM events_partitioned
 ORDER BY ledger, id;
 

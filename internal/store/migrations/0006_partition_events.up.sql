@@ -2,14 +2,19 @@ BEGIN;
 
 ALTER TABLE events RENAME TO events_legacy;
 
--- Drop indexes from the renamed table so the same index names can be
--- created on the new partitioned table without conflict.
-DROP INDEX IF EXISTS idx_events_id;
+-- Drop legacy indexes whose names would collide with new indexes on the
+-- replacement events table. PostgreSQL enforces unique index names per
+-- schema, so the renamed table's indexes (now on events_legacy) prevent
+-- creating fresh ones with the same names.
 DROP INDEX IF EXISTS idx_events_contract_id;
 DROP INDEX IF EXISTS idx_events_ledger;
 DROP INDEX IF EXISTS idx_events_contract_ledger;
 DROP INDEX IF EXISTS idx_events_topics;
 DROP INDEX IF EXISTS idx_events_created_at;
+-- Also drop the old primary key constraint so the new table's PRIMARY KEY
+-- (which gets the same implicit constraint name "events_pkey") does not
+-- collide with the constraint inherited by events_legacy.
+ALTER TABLE events_legacy DROP CONSTRAINT IF EXISTS events_pkey;
 
 CREATE TABLE events (
     id                 text NOT NULL,
@@ -23,8 +28,8 @@ CREATE TABLE events (
     topics             jsonb NOT NULL DEFAULT '[]'::jsonb,
     value              jsonb,
     created_at         timestamptz NOT NULL DEFAULT now(),
-    topics_xdr         jsonb CHECK (topics_xdr IS NULL OR jsonb_typeof(topics_xdr) = 'array'),
-    value_xdr          text,
+    raw_topic_xdr      text[],
+    raw_value_xdr      text,
     PRIMARY KEY (ledger, id)
 ) PARTITION BY RANGE (ledger);
 
@@ -68,20 +73,19 @@ $$;
 
 SELECT ensure_event_partitions((SELECT min(ledger) FROM events_legacy), (SELECT max(ledger) FROM events_legacy), 120960);
 
--- Ensure the legacy table has the XDR columns that the new partitioned table
--- already declares; on a fresh install events_legacy comes from 0001_init
--- which predates raw XDR, so the columns may not exist yet.
+-- Ensure raw-XDR columns exist on the legacy table; they were absent in
+-- very early schemas (before migration 7 / old 0004_raw_xdr_and_replay).
 ALTER TABLE events_legacy
-    ADD COLUMN IF NOT EXISTS topics_xdr jsonb,
-    ADD COLUMN IF NOT EXISTS value_xdr text;
+    ADD COLUMN IF NOT EXISTS raw_topic_xdr text[],
+    ADD COLUMN IF NOT EXISTS raw_value_xdr text;
 
 INSERT INTO events (
     id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-    in_successful_call, topics, value, created_at, topics_xdr, value_xdr
+    in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr
 )
 SELECT
     id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-    in_successful_call, topics, value, created_at, topics_xdr, value_xdr
+    in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr
 FROM events_legacy
 ORDER BY ledger, id;
 
