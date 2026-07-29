@@ -26,6 +26,7 @@ var envKeys = []string{
 	"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT",
 	"HTTP_READ_HEADER_TIMEOUT",
 	"SHUTDOWN_TIMEOUT",
+	"INGESTION_LOCK_ENABLED",
 }
 
 func TestLoad(t *testing.T) {

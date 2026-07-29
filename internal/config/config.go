@@ -128,6 +128,13 @@ type Config struct {
 	// uncooperative GC pauses on big results; the cap is configurable so
 	// private deployments can opt for a larger analytical dump.
 	ExportMaxRange int64 `env:"EXPORT_MAX_RANGE" envDefault:"17280"`
+
+	// IngestionLockEnabled, when true, acquires a Postgres advisory lock
+	// keyed by the RPC URL before starting the ingestion loop. A second
+	// instance attempting to acquire the same lock will skip ingestion
+	// (but continue serving the HTTP API), preventing double-processing.
+	// Default false — single-instance deployments keep today's behavior.
+	IngestionLockEnabled bool `env:"INGESTION_LOCK_ENABLED" envDefault:"false"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -319,6 +326,7 @@ func (c Config) LoggableFields() []any {
 		"reorg_confirmation_window", c.ReorgConfirmationWindow,
 		"reorg_rescan_interval", c.ReorgRescanInterval,
 		"export_max_range", c.ExportMaxRange,
+		"ingestion_lock_enabled", c.IngestionLockEnabled,
 		"audit_enabled", c.AuditEnabled,
 	}
 }
