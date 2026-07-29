@@ -37,6 +37,11 @@ type stubStore struct {
 	countEventsErr  error
 	lastCountFilter store.EventFilter
 
+	aggregateBuckets    []store.AggregateBucket
+	aggregateErr        error
+	lastAggregateBucket string
+	lastAggregateFilter store.EventFilter
+
 	event    store.Event
 	eventErr error
 
@@ -81,6 +86,12 @@ func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store
 func (s *stubStore) CountEvents(_ context.Context, f store.EventFilter) (int64, error) {
 	s.lastCountFilter = f
 	return s.totalCount, s.countEventsErr
+}
+
+func (s *stubStore) AggregateEvents(_ context.Context, f store.EventFilter, bucket string) ([]store.AggregateBucket, error) {
+	s.lastAggregateBucket = bucket
+	s.lastAggregateFilter = f
+	return s.aggregateBuckets, s.aggregateErr
 }
 
 // LedgerRangeCensus, ReplaceEventsInRange, and the audit_state/findings
@@ -1528,6 +1539,79 @@ func TestCountEvents_ResponseShape(t *testing.T) {
 	_, hasCount := raw["count"]
 	assert.True(t, hasCount)
 	assert.Equal(t, float64(99), raw["count"])
+}
+
+func TestAggregateEvents_BucketLedger(t *testing.T) {
+	st := &stubStore{
+		aggregateBuckets: []store.AggregateBucket{
+			{Bucket: "100", Count: 5},
+			{Bucket: "101", Count: 3},
+		},
+	}
+	resp, body := doGet(t, newTestServer(st, nil), "/events/aggregate?bucket=ledger")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	var got bucketResponse
+	require.NoError(t, json.Unmarshal(body, &got))
+	require.Len(t, got.Buckets, 2)
+	assert.Equal(t, "100", got.Buckets[0].Bucket)
+	assert.Equal(t, int64(5), got.Buckets[0].Count)
+	assert.Equal(t, "101", got.Buckets[1].Bucket)
+	assert.Equal(t, int64(3), got.Buckets[1].Count)
+	assert.Equal(t, "ledger", st.lastAggregateBucket)
+	assert.Equal(t, "", st.lastAggregateFilter.Cursor)
+	assert.Equal(t, "", st.lastAggregateFilter.Order)
+	assert.Equal(t, 0, st.lastAggregateFilter.Limit)
+}
+
+func TestAggregateEvents_BucketTimeDuration(t *testing.T) {
+	st := &stubStore{
+		aggregateBuckets: []store.AggregateBucket{
+			{Bucket: "2024-01-01T00:00:00", Count: 10},
+			{Bucket: "2024-01-02T00:00:00", Count: 7},
+		},
+	}
+	resp, body := doGet(t, newTestServer(st, nil), "/events/aggregate?bucket=24h")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	var got bucketResponse
+	require.NoError(t, json.Unmarshal(body, &got))
+	assert.Len(t, got.Buckets, 2)
+	assert.Equal(t, int64(10), got.Buckets[0].Count)
+	assert.Equal(t, int64(7), got.Buckets[1].Count)
+	assert.Equal(t, "24h", st.lastAggregateBucket)
+}
+
+func TestAggregateEvents_MissingBucket(t *testing.T) {
+	st := &stubStore{}
+	resp, body := doGet(t, newTestServer(st, nil), "/events/aggregate")
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, string(body))
+}
+
+func TestAggregateEvents_InvalidBucket(t *testing.T) {
+	st := &stubStore{}
+	resp, body := doGet(t, newTestServer(st, nil), "/events/aggregate?bucket=notaduration")
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, string(body))
+}
+
+func TestAggregateEvents_StoreError(t *testing.T) {
+	st := &stubStore{aggregateErr: errors.New("db timeout")}
+	resp, body := doGet(t, newTestServer(st, nil), "/events/aggregate?bucket=1h")
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode, string(body))
+}
+
+func TestAggregateEvents_PassesContractFilter(t *testing.T) {
+	st := &stubStore{
+		aggregateBuckets: []store.AggregateBucket{{Bucket: "100", Count: 2}},
+	}
+	doGet(t, newTestServer(st, nil), "/events/aggregate?bucket=ledger&contract_id="+testContract)
+	assert.Equal(t, testContract, st.lastAggregateFilter.ContractID)
+}
+
+func TestAggregateEvents_PassesTypeFilter(t *testing.T) {
+	st := &stubStore{
+		aggregateBuckets: []store.AggregateBucket{{Bucket: "100", Count: 2}},
+	}
+	doGet(t, newTestServer(st, nil), "/events/aggregate?bucket=ledger&type=contract")
+	assert.Equal(t, []string{"contract"}, st.lastAggregateFilter.Types)
 }
 
 func TestListEvents_RecentParam(t *testing.T) {

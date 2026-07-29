@@ -19,6 +19,38 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
+// Clock abstracts time operations so tests and simulations can supply a
+// deterministic virtual clock instead of wall time.
+type Clock interface {
+	// Now returns the current time.
+	Now() time.Time
+	// SleepCtx sleeps for d or until ctx is done; it reports whether the
+	// full sleep completed. This is the only sleep seam in the ingester.
+	SleepCtx(ctx context.Context, d time.Duration) bool
+}
+
+// RealClock is the wall-clock implementation of Clock.
+type RealClock struct{}
+
+func (RealClock) Now() time.Time { return time.Now() }
+func (RealClock) SleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// JitterFunc returns a random duration in [0, max). The default uses
+// math/rand/v2; simulations inject a seeded generator for determinism.
+type JitterFunc func(max time.Duration) time.Duration
+
+// RealJitter is the wall-clock jitter function.
+func RealJitter(max time.Duration) time.Duration { return rand.N(max) }
+
 // Options configure an Ingester.
 type Options struct {
 	// PollInterval is how long to sleep once caught up. Default 5s.
@@ -225,9 +257,9 @@ func (ing *Ingester) Run(ctx context.Context) error {
 			ing.checkLag(ctx)
 			// Jittered exponential backoff so restarts don't thundering-herd
 			// a shared endpoint.
-			sleep := backoff/2 + rand.N(backoff/2)
+			sleep := backoff/2 + ing.opts.Jitter(backoff/2)
 			ing.log.Error("ingestion pass failed", "error", err, "retry_in", sleep)
-			if !sleepCtx(ctx, sleep) {
+			if !ing.opts.Clock.SleepCtx(ctx, sleep) {
 				return ctx.Err()
 			}
 			if backoff *= 2; backoff > ing.opts.MaxBackoff {
@@ -240,7 +272,7 @@ func (ing *Ingester) Run(ctx context.Context) error {
 			ing.checkLag(ctx)
 			backoff = time.Second
 			if caughtUp {
-				if !sleepCtx(ctx, ing.opts.PollInterval) {
+				if !ing.opts.Clock.SleepCtx(ctx, ing.opts.PollInterval) {
 					return ctx.Err()
 				}
 			}
@@ -476,10 +508,11 @@ func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState
 		lastLedger = int64(resp.Events[len(resp.Events)-1].Ledger)
 	}
 
+	now := time.Now().UTC()
 	if cursor != "" {
-		return store.IngestionState{LastIngestedLedger: lastLedger, LastCursor: cursor}, caughtUp
+		return store.IngestionState{LastIngestedLedger: lastLedger, LastCursor: cursor, LastSuccessfulPoll: &now}, caughtUp
 	}
-	return store.IngestionState{LastIngestedLedger: int64(resp.LatestLedger) - 1}, caughtUp
+	return store.IngestionState{LastIngestedLedger: int64(resp.LatestLedger) - 1, LastSuccessfulPoll: &now}, caughtUp
 }
 
 // windowSweep ingests the ledger window [start, end] by paging each filter
@@ -548,7 +581,8 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	if end >= health.LatestLedger {
 		lastIngested = int64(end) - 1
 	}
-	err = ing.store.SaveIngestionState(ctx, store.IngestionState{LastIngestedLedger: lastIngested})
+	now := time.Now().UTC()
+	err = ing.store.SaveIngestionState(ctx, store.IngestionState{LastIngestedLedger: lastIngested, LastSuccessfulPoll: &now})
 	if err != nil {
 		return false, err
 	}
