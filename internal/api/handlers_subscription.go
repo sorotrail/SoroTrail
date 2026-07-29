@@ -9,7 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // --- Subscription CRUD handlers ---
@@ -178,8 +178,8 @@ func (s *Server) handleListDeliveries(w http.ResponseWriter, r *http.Request) {
 	limit := store.DefaultQueryLimit
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		l, err := strconv.Atoi(raw)
-		if err != nil || l < 1 || l > store.MaxQueryLimit {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+		if err != nil || l < 1 || l > maxLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", maxLimit))
 			return
 		}
 		limit = l

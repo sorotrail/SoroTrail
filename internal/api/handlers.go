@@ -1,12 +1,14 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,9 +18,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
-	"github.com/khaylebfortune/sorotrail/internal/buildinfo"
-	"github.com/khaylebfortune/sorotrail/internal/config"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/buildinfo"
+	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
@@ -95,6 +97,30 @@ type enrichedEventsResponse struct {
 	Events []store.EnrichedEvent `json:"events"`
 	// Cursor is non-empty when another page exists.
 	Cursor string `json:"cursor,omitempty"`
+}
+
+type eventsWithXDRResponse struct {
+	Events []eventWithXDR `json:"events"`
+	// Cursor is non-empty when another page exists.
+	Cursor string `json:"cursor,omitempty"`
+}
+
+type enrichedEventsWithXDRResponse struct {
+	Events []enrichedEventWithXDR `json:"events"`
+	// Cursor is non-empty when another page exists.
+	Cursor string `json:"cursor,omitempty"`
+}
+
+type eventWithXDR struct {
+	store.Event
+	TopicsXDR []string `json:"topics_xdr"`
+	ValueXDR  *string  `json:"value_xdr"`
+}
+
+type enrichedEventWithXDR struct {
+	eventWithXDR
+	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                        `json:"decoded"`
 }
 
 type healthResponse struct {
@@ -218,6 +244,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok", "rpc": "ok"}}
 	status := http.StatusOK
 
+	// DB connectivity check: Ping the store to verify the database is reachable.
 	if err := s.store.Ping(ctx); err != nil {
 		resp.Status, resp.Checks["database"] = "degraded", err.Error()
 		status = http.StatusServiceUnavailable
@@ -227,6 +254,43 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusServiceUnavailable
 	} else if health.Status != "healthy" {
 		resp.Status, resp.Checks["rpc"] = "degraded", fmt.Sprintf("rpc reports %q", health.Status)
+		status = http.StatusServiceUnavailable
+	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, status, resp)
+}
+
+// handleLivez is the liveness probe. It returns 200 as long as the process
+// is running. No dependencies are checked — a transient DB or RPC outage
+// must not cause orchestration to kill and restart the pod (readiness is
+// a separate signal).
+func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Checks: map[string]string{"process": "ok"}})
+}
+
+// handleReadyz is the readiness probe. It performs a bounded DB ping and
+// RPC head check. Returns 200 when all dependencies are reachable, 503
+// with a JSON body explaining which dependency is down.
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok", "rpc": "ok"}}
+	status := http.StatusOK
+
+	if err := s.store.Ping(ctx); err != nil {
+		resp.Status = "degraded"
+		resp.Checks["database"] = err.Error()
+		status = http.StatusServiceUnavailable
+	}
+	if health, err := s.rpc.GetHealth(ctx); err != nil {
+		resp.Status = "degraded"
+		resp.Checks["rpc"] = err.Error()
+		status = http.StatusServiceUnavailable
+	} else if health.Status != "healthy" {
+		resp.Status = "degraded"
+		resp.Checks["rpc"] = fmt.Sprintf("rpc reports %q", health.Status)
 		status = http.StatusServiceUnavailable
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
@@ -243,12 +307,151 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("stream") == "true" {
+		s.handleListEventsStream(w, r)
+		return
+	}
 	filter, fields, err := parseFilterAndFields(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	s.serveEvents(w, r, filter, fields)
+}
+
+// countResponse is the JSON body for GET /events/count.
+type countResponse struct {
+	Count int64 `json:"count"`
+}
+
+// handleCountEvents returns the number of events matching the same filters
+// as GET /events. Pagination params (cursor, limit, order, order_by) are
+// accepted in the URL but ignored for the count — only the filter fields
+// that narrow the result set are applied.
+func (s *Server) handleCountEvents(w http.ResponseWriter, r *http.Request) {
+	filter, _, err := parseFilterAndFields(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	// Strip pagination — count is over the full matching set.
+	filter.Cursor = ""
+	filter.Order = ""
+	filter.OrderBy = ""
+	filter.Limit = 0
+
+	total, err := s.store.CountEvents(r.Context(), filter)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("counting events", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("counting events failed"))
+		return
+	}
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, countResponse{Count: total})
+}
+
+// streamBatchSize is the number of events fetched per internal query when
+// streaming NDJSON. It balances query cost against flush frequency: too
+// small wastes round trips; too large buffers too long before a client
+// sees progress.
+const streamBatchSize = 500
+
+// recentDefaultLimit is the number of events returned when ?recent is
+// specified without a numeric value (i.e. ?recent=true). Chosen to be
+// useful at a glance without overwhelming a caller that just wants the
+// latest activity.
+const recentDefaultLimit = 20
+
+func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) {
+	filter, fields, err := parseFilterAndFields(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// Streaming overrides pagination: the limit is an internal batch size.
+	filter.Limit = streamBatchSize
+
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
+	decoded := r.URL.Query().Get("decoded") == "true"
+
+	ctx := r.Context()
+
+	// Fetch the first batch BEFORE writing headers so a query failure
+	// returns a proper error envelope rather than a 200 with an empty
+	// body. On success we write the NDJSON headers and stream out.
+	events, cursor, qerr := s.store.QueryEvents(ctx, filter)
+	if qerr != nil {
+		loggerFromContext(ctx).Error("streaming events (first batch)", "error", qerr)
+		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	w.WriteHeader(http.StatusOK)
+
+	// Grab the flusher before streaming so a non-streamable wrapper is
+	// detected early. The compress middleware's Flush works correctly
+	// for uninflated buffers: it decides not to compress and flushes
+	// the underlying writer.
+	flusher, flushable := w.(http.Flusher)
+
+	enc := json.NewEncoder(w)
+
+	// writeEvents marshals and writes a batch of events as NDJSON lines.
+	writeEvents := func(evs []store.Event) {
+		if decoded && s.enricher != nil {
+			// Batch-enrich like serveEvents: one call per batch, not per event.
+			for _, enrichedEv := range s.enricher.EnrichEvents(ctx, evs) {
+				if includeXDR {
+					_ = enc.Encode(enrichEventWithXDR(enrichedEv))
+				} else {
+					_ = enc.Encode(enrichedEv)
+				}
+			}
+			return
+		}
+		for _, ev := range evs {
+			if includeXDR {
+				_ = enc.Encode(eventToXDRResponse(ev))
+			} else {
+				_ = enc.Encode(projectEvent(ev, fields))
+			}
+		}
+	}
+
+	writeEvents(events)
+
+	// Flush the first batch so the client sees data immediately even
+	// when the entire result set fits in one batch.
+	if flushable {
+		flusher.Flush()
+	}
+
+	for cursor != "" {
+		filter.Cursor = cursor
+		events, cursor, qerr = s.store.QueryEvents(ctx, filter)
+		if qerr != nil {
+			loggerFromContext(ctx).Error("streaming events", "error", qerr)
+			return // connection likely gone; just stop
+		}
+
+		writeEvents(events)
+
+		// Flush after every batch so clients see progress, and so the
+		// compression middleware can push bytes through the compressor.
+		if flushable {
+			flusher.Flush()
+		}
+
+		// Check for client disconnect so we don't keep querying forever.
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
 }
 
 func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
@@ -284,20 +487,55 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	}
 
 	events, cursor, qerr := s.store.QueryEvents(r.Context(), filter)
+	if errors.Is(qerr, store.ErrInvalidCursor) {
+		// A cursor that doesn't decode is client input — most often a cursor
+		// taken from one ordering and replayed against another. Report it as
+		// a bad request rather than a server error.
+		writeError(w, http.StatusBadRequest, fmt.Errorf(
+			"invalid cursor for order_by=%s; use the cursor returned by the same ordering", filter.OrderBy))
+		return
+	}
 	if qerr != nil {
 		loggerFromContext(r.Context()).Error("querying events", "error", qerr)
 		writeError(w, http.StatusInternalServerError, errors.New("querying events failed"))
 		return
 	}
+
+	// Total matching count (ignoring pagination) as a response header.
+	// Failure to count is non-fatal: we log a warning and proceed without
+	// the header rather than dropping a successful page.
+	countFilter := filter
+	countFilter.Cursor = ""
+	countFilter.Order = ""
+	countFilter.OrderBy = ""
+	countFilter.Limit = 0
+	if total, cerr := s.store.CountEvents(r.Context(), countFilter); cerr != nil {
+		loggerFromContext(r.Context()).Warn("counting events for X-Total-Count", "error", cerr)
+	} else {
+		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	decoded := r.URL.Query().Get("decoded") == "true"
+	writeCacheHeaders(w, policy, immutableMaxAge, etag)
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), events)
+		if includeXDR {
+			writeJSON(w, http.StatusOK, enrichedEventsWithXDRResponse{
+				Events: enrichEventsWithXDR(enriched),
+				Cursor: cursor,
+			})
+			return
+		}
 		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
 		return
 	}
-	writeCacheHeaders(w, policy, immutableMaxAge, etag)
-	// eventsResponse expects []store.Event; when fields projection is active
-	// we wrap the projected maps in a compatible envelope.
+	if includeXDR {
+		writeJSON(w, http.StatusOK, eventsWithXDRResponse{
+			Events: eventsWithXDR(events),
+			Cursor: cursor,
+		})
+		return
+	}
 	if fields == nil {
 		writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
 	} else {
@@ -321,6 +559,129 @@ func parseFilterAndFields(r *http.Request) (store.EventFilter, map[string]bool, 
 		return filter, nil, err
 	}
 	return filter, fields, nil
+}
+
+// rawEventResponse is the JSON body for GET /events/{id}/raw.
+type rawEventResponse struct {
+	TopicsXDR []string `json:"topics_xdr"`
+	ValueXDR  string   `json:"value_xdr,omitempty"`
+}
+
+// handleGetEventRaw returns the stored raw topic/value XDR for an event.
+// Returns 404 if the event is not found or no raw XDR was stored (e.g. the
+// RPC returned already-decoded JSON for this row).
+func (s *Server) handleGetEventRaw(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	event, err := s.store.GetEvent(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
+		return
+	}
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading event for raw XDR", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
+		return
+	}
+
+	// Return 404 when no raw XDR was stored for this event.
+	if len(event.RawTopicXDR) == 0 && event.RawValueXDR == "" {
+		writeError(w, http.StatusNotFound, fmt.Errorf("event %q has no raw XDR stored", id))
+		return
+	}
+
+	// Strong ETag: the event ID is a perfect validator for an immutable
+	// resource. The same reuse logic as handleGetEvent.
+	etag := `"` + id + `"`
+
+	if ifNoneMatch(r, etag) {
+		exists, err := s.store.EventExists(r.Context(), id)
+		if err != nil {
+			loggerFromContext(r.Context()).Error("checking event existence for raw XDR", "id", id, "error", err)
+			writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
+			return
+		}
+		if !exists {
+			writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
+			return
+		}
+		writeNotModified(w, etag, cacheImmutable)
+		return
+	}
+
+	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+	writeJSON(w, http.StatusOK, rawEventResponse{
+		TopicsXDR: event.RawTopicXDR,
+		ValueXDR:  event.RawValueXDR,
+	})
+}
+
+// handleGetEventTransaction returns all sibling events from the same
+// transaction as the event with the given {id}. The referenced event
+// itself is excluded from the response. Returns 404 when the event is
+// not found; returns an empty list when the transaction has no other
+// events.
+func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	// Validate ?fields= before touching the store.
+	fields, err := parseFields(r.URL.Query().Get("fields"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	event, err := s.store.GetEvent(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
+		return
+	}
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading event for transaction siblings", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
+		return
+	}
+
+	// If the event has no transaction hash (should not normally happen),
+	// return an empty list rather than erroring — the event is valid but
+	// has no siblings.
+	if event.TxHash == "" {
+		writeCacheHeaders(w, cacheImmutable, immutableMaxAge, `"`+id+`:tx"`)
+		writeJSON(w, http.StatusOK, eventsResponse{Events: []store.Event{}})
+		return
+	}
+
+	siblings, err := s.store.GetEventsByTxHash(r.Context(), event.TxHash, id)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading transaction siblings", "tx_hash", event.TxHash, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading transaction events failed"))
+		return
+	}
+
+	decoded := r.URL.Query().Get("decoded") == "true"
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
+
+	etag := `"` + id + `:tx"`
+	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+
+	if decoded && s.enricher != nil {
+		enriched := s.enricher.EnrichEvents(r.Context(), siblings)
+		if includeXDR {
+			writeJSON(w, http.StatusOK, enrichedEventsWithXDRResponse{Events: enrichEventsWithXDR(enriched)})
+			return
+		}
+		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched})
+		return
+	}
+	if includeXDR {
+		writeJSON(w, http.StatusOK, eventsWithXDRResponse{Events: eventsWithXDR(siblings)})
+		return
+	}
+	if fields == nil {
+		writeJSON(w, http.StatusOK, eventsResponse{Events: siblings})
+	} else {
+		writeJSON(w, http.StatusOK, map[string]any{"events": projectEvents(siblings, fields)})
+	}
 }
 
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
@@ -374,19 +735,203 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	decoded := r.URL.Query().Get("decoded") == "true"
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {
+			writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+			if includeXDR {
+				writeJSON(w, http.StatusOK, enrichEventWithXDR(enriched[0]))
+				return
+			}
 			writeJSON(w, http.StatusOK, enriched[0])
 			return
 		}
 	}
 	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+	if includeXDR {
+		writeJSON(w, http.StatusOK, eventToXDRResponse(event))
+		return
+	}
 	writeJSON(w, http.StatusOK, projectEvent(event, fields))
+}
+
+func eventToXDRResponse(e store.Event) eventWithXDR {
+	var value *string
+	if e.RawValueXDR != "" {
+		value = &e.RawValueXDR
+	}
+	return eventWithXDR{
+		Event:     e,
+		TopicsXDR: e.RawTopicXDR,
+		ValueXDR:  value,
+	}
+}
+
+func eventsWithXDR(events []store.Event) []eventWithXDR {
+	out := make([]eventWithXDR, len(events))
+	for i, event := range events {
+		out[i] = eventToXDRResponse(event)
+	}
+	return out
+}
+
+func enrichEventWithXDR(e store.EnrichedEvent) enrichedEventWithXDR {
+	return enrichedEventWithXDR{
+		eventWithXDR: eventToXDRResponse(e.Event),
+		DecodedEvent: e.DecodedEvent,
+		Decoded:      e.Decoded,
+	}
+}
+
+func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
+	out := make([]enrichedEventWithXDR, len(events))
+	for i, event := range events {
+		out[i] = enrichEventWithXDR(event)
+	}
+	return out
 }
 
 // Stats summarizes what the indexer has stored plus, when the auditor is
 // running, the post-processing counters it has accumulated.
+
+// contractListResponse is the JSON body for GET /contracts.
+type contractListResponse struct {
+	Contracts []store.ContractSummary `json:"contracts"`
+	Count     int                     `json:"count"`
+	Cursor    string                  `json:"cursor,omitempty"`
+}
+
+// handleListContracts returns one ContractSummary per indexed contract,
+// paginated, default-sorted by event_count desc (the most active
+// contracts first). The endpoint is intentionally READ-ONLY and
+// unauthenticated: a contract listing has no surface area for
+// cross-tenant data leakage (a contract_id is opaque), and gating it
+// behind API_KEY would force every browser dashboard to log in.
+//
+// Cache-Control is no-cache: a brand-new contract can be ingested at
+// any time, and a stale cache would hide it from a freshly-launched
+// explorer.
+func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
+	f := store.ContractsFilter{
+		ContractIDPrefix: r.URL.Query().Get("contract_id"),
+		SortKey:          r.URL.Query().Get("sort"),
+		Order:            r.URL.Query().Get("order"),
+		Cursor:           r.URL.Query().Get("cursor"),
+	}
+	if !store.ValidContractsSortKey(f.SortKey) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf(
+			"invalid sort %q (want %s, %s, %s, or %s)",
+			f.SortKey,
+			store.SortByActivity, store.SortByFirstLedger,
+			store.SortByLastLedger, store.SortByLastSeen))
+		return
+	}
+	if f.Order != "" && f.Order != "asc" && f.Order != "desc" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid order %q (want asc or desc)", f.Order))
+		return
+	}
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid cursor %q", f.Cursor))
+		return
+	}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		f.Limit = n
+	} else {
+		f.Limit = store.DefaultQueryLimit
+	}
+	items, cursor, err := s.store.ListContracts(r.Context(), f)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("listing contracts", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
+		return
+	}
+	total, cerr := s.store.CountContracts(r.Context(), f)
+	if cerr != nil {
+		loggerFromContext(r.Context()).Warn("counting contracts for X-Total-Count", "error", cerr)
+	} else if total > 0 {
+		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, contractListResponse{
+		Contracts: items,
+		Count:     len(items),
+		Cursor:    cursor,
+	})
+}
+
+// deadLetterListResponse is the JSON body for GET /dead-letters.
+type deadLetterListResponse struct {
+	DeadLetters []store.DeadLetter `json:"dead_letters"`
+	Count       int                `json:"count"`
+	Cursor      string             `json:"cursor,omitempty"`
+}
+
+// handleListDeadLetters returns the poison-event queue newest-first.
+// Like the watched-contracts surface, this is gated behind API_KEY —
+// dead-letter rows contain raw RPC payloads, and disclosing them on a
+// public endpoint would leak every event the indexer failed to decode.
+func (s *Server) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
+	f := struct {
+		ContractID string
+		Limit      int
+		Cursor     string
+	}{
+		ContractID: r.URL.Query().Get("contract_id"),
+		Cursor:     r.URL.Query().Get("cursor"),
+	}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		f.Limit = n
+	}
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid cursor %q", f.Cursor))
+		return
+	}
+	items, cursor, err := s.store.ListDeadLetters(r.Context(), f.ContractID, f.Limit, f.Cursor)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("listing dead letters", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("listing dead letters failed"))
+		return
+	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, deadLetterListResponse{
+		DeadLetters: items,
+		Count:       len(items),
+		Cursor:      cursor,
+	})
+}
+
+// handleDeleteDeadLetter removes a single dead-letter row by id.
+// Idempotent: calling again returns 404.
+func (s *Server) handleDeleteDeadLetter(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("dead-letter id must be a positive integer, got %q", idStr))
+		return
+	}
+	if err := s.store.DeleteDeadLetter(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("dead letter %d not found", id))
+			return
+		}
+		loggerFromContext(r.Context()).Error("deleting dead letter", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("deleting dead letter failed"))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.Stats(r.Context())
 	if err != nil {
@@ -395,6 +940,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.addStatsFreshness(r.Context(), &stats)
+	stats.PanicsRecovered = s.recoverer.PanicsRecovered()
 	if a := getAuditor(); a != nil {
 		m := a.Metrics()
 		stats.Auditor = store.AuditStats{
@@ -405,6 +951,15 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			FindingsUnverifiable:  m.FindingsUnverifiable,
 			FindingsUnrecoverable: m.FindingsUnrecoverable,
 			RPCRequests:           m.RPCRequests,
+		}
+	}
+	if c := getRPCCounter(); c != nil {
+		snap := c.Errors().Snapshot()
+		stats.RPCErrors = store.RPCErrorStats{
+			GetEvents:        snap.GetEvents,
+			GetLatestLedger:  snap.GetLatestLedger,
+			GetHealth:        snap.GetHealth,
+			GetLedgerEntries: snap.GetLedgerEntries,
 		}
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
@@ -494,11 +1049,6 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	modeTransition := ""
 	if len(current) == 0 {
-		// Empty -> non-empty switches the ingester from "all contract
-		// events" to a specific list. The guard exists because the new
-		// filter silently narrows what's indexed going forward — exactly
-		// the kind of change an operator should make on purpose, not by
-		// typo.
 		if r.URL.Query().Get("confirm") != "true" {
 			writeError(w, http.StatusBadRequest, errors.New(
 				"adding the first watched contract would switch ingestion from "+
@@ -532,11 +1082,6 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 // handleRemoveWatchedChain stops future ingestion for the named contract
 // without deleting any events already stored. The same empty<->non-empty
 // guard fires when removing the last contract on the list (specific -> all).
-//
-// TOCTOU note: same read-then-write shape as POST — see the comment on
-// handleAddWatchedChain. Two concurrent DELETE/s of the last contract
-// could both pass the guard; only the first actually transitions the
-// list (the second returns ErrNotFound → 404), so no mode claim is wrong.
 func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if !config.ValidContractID(id) {
@@ -554,8 +1099,6 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 	modeTransition := ""
 	if len(current) == 1 && current[0].ContractID == id {
-		// Last contract on the list: removing it flips ingestion from
-		// "specific list" back to "all contract events".
 		if r.URL.Query().Get("confirm") != "true" {
 			writeError(w, http.StatusBadRequest, errors.New(
 				"removing the last watched contract would switch ingestion from "+
@@ -582,7 +1125,6 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 		ModeTransition:   modeTransition,
 	})
 }
-
 func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
 	if s.rpc == nil {
 		return
@@ -686,13 +1228,15 @@ func listETag(f store.EventFilter) string {
 	// the fields independently and fails when a new one is not added.
 	key := struct {
 		ContractID    string          `json:"c"`
-		Type          string          `json:"t"`
+		Types         []string        `json:"t"`
 		Topic         json.RawMessage `json:"p,omitempty"`
 		Topic0        json.RawMessage `json:"p0,omitempty"`
 		Topic1        json.RawMessage `json:"p1,omitempty"`
 		Topic2        json.RawMessage `json:"p2,omitempty"`
 		Topic3        json.RawMessage `json:"p3,omitempty"`
 		TopicContains json.RawMessage `json:"pc,omitempty"`
+		TxHash        string          `json:"th,omitempty"`
+		HasValue      *bool           `json:"hv,omitempty"`
 		FromLedger    int64           `json:"fl"`
 		ToLedger      int64           `json:"tl"`
 		FromTime      string          `json:"ft,omitempty"`
@@ -702,7 +1246,7 @@ func listETag(f store.EventFilter) string {
 		Order         string          `json:"o,omitempty"`
 	}{
 		ContractID: f.ContractID,
-		Type:       f.Type,
+		Types:      f.Types,
 		Topic:      f.Topic,
 		// Each positional filter gets its own distinctly named key, so
 		// topic0={x} and topic1={x} — which select different events — cannot
@@ -712,6 +1256,8 @@ func listETag(f store.EventFilter) string {
 		Topic2:        f.Topic2,
 		Topic3:        f.Topic3,
 		TopicContains: f.TopicContains,
+		TxHash:        f.TxHash,
+		HasValue:      f.HasValue,
 		FromLedger:    f.FromLedger,
 		ToLedger:      f.ToLedger,
 		FromTime:      timeOrEmpty(f.FromTime),
@@ -837,6 +1383,7 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	f := store.EventFilter{
 		ContractID: q.Get("contract_id"),
 		Cursor:     q.Get("cursor"),
+		TxHash:     q.Get("tx_hash"),
 	}
 
 	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
@@ -847,11 +1394,16 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
 	}
 
-	switch t := q.Get("type"); t {
-	case "", "contract", "system", "diagnostic":
-		f.Type = t
-	default:
-		return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
+	if raw := q.Get("type"); raw != "" {
+		for _, t := range strings.Split(raw, ",") {
+			t = strings.TrimSpace(t)
+			switch t {
+			case "contract", "system", "diagnostic":
+			default:
+				return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
+			}
+			f.Types = append(f.Types, t)
+		}
 	}
 
 	parseTopic := func(name, raw string) (json.RawMessage, error) {
@@ -886,6 +1438,15 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	default:
 		return f, fmt.Errorf("invalid order %q (want asc or desc)", order)
 	}
+
+	// order_by selects the sort column; order still controls the direction,
+	// so the two combine (e.g. order_by=created_at&order=desc).
+	orderBy := q.Get("order_by")
+	if !store.ValidOrderBy(orderBy) {
+		return f, fmt.Errorf("invalid order_by %q (want %s, %s or %s)",
+			orderBy, store.OrderByID, store.OrderByLedger, store.OrderByCreatedAt)
+	}
+	f.OrderBy = orderBy
 
 	var err error
 	if topic := q.Get("topic"); topic != "" {
@@ -936,13 +1497,47 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if raw := q.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
-		if err != nil || limit < 1 || limit > store.MaxQueryLimit {
-			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
+		if err != nil || limit < 1 || limit > maxLimit {
+			return f, fmt.Errorf("limit must be an integer in [1,%d]", maxLimit)
 		}
 		f.Limit = limit
 	} else {
 		f.Limit = store.DefaultQueryLimit
 	}
+
+	// ?recent=N: shorthand for "newest N events" — sets order=desc and
+	// limit=N (default 20). Conflicts with explicit order or limit params.
+	if raw := q.Get("recent"); raw != "" {
+		if q.Get("order") != "" || q.Get("order_by") != "" {
+			return f, fmt.Errorf("recent cannot be combined with order or order_by")
+		}
+		if q.Get("limit") != "" {
+			return f, fmt.Errorf("recent cannot be combined with limit")
+		}
+		n := recentDefaultLimit
+		if raw != "true" {
+			n, err = strconv.Atoi(raw)
+			if err != nil || n < 1 || n > maxLimit {
+				return f, fmt.Errorf("recent must be a positive integer in [1,%d]", maxLimit)
+			}
+		}
+		f.Order = "desc"
+		f.Limit = n
+	}
+
+	if raw := q.Get("has_value"); raw != "" {
+		switch raw {
+		case "true":
+			t := true
+			f.HasValue = &t
+		case "false":
+			v := false
+			f.HasValue = &v
+		default:
+			return f, fmt.Errorf("has_value must be true or false, got %q", raw)
+		}
+	}
+
 	return f, nil
 }
 
@@ -1050,10 +1645,60 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// prettyWriter is implemented by ResponseWriter wrappers that carry the
+// ?pretty flag so writeJSON can optionally indent the output.
+type prettyWriter interface {
+	Pretty() bool
+}
+
+// prettyResponseWriter wraps an http.ResponseWriter to carry the ?pretty flag
+// through the middleware chain. All ResponseWriter methods delegate to the
+// embedded writer so compression, flushing, and hijacking still work.
+type prettyResponseWriter struct {
+	http.ResponseWriter
+	pretty bool
+}
+
+func (w *prettyResponseWriter) Pretty() bool { return w.pretty }
+
+// Flush forwards to the embedded ResponseWriter if it supports flushing.
+// This is required because interface embedding does not promote optional
+// interfaces like http.Flusher — without it, the NDJSON stream handler's
+// w.(http.Flusher) type assertion would fail.
+func (w *prettyResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack forwards to the embedded ResponseWriter if it supports hijacking,
+// matching the pattern used by compressWriter.
+func (w *prettyResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
+}
+
+// prettyMiddleware reads ?pretty=true from the query string and wraps the
+// ResponseWriter with the flag so writeJSON can set indentation when
+// requested. It must be the innermost middleware (closest to the handler)
+// so the type assertion in writeJSON sees the wrapper.
+func prettyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pw := &prettyResponseWriter{ResponseWriter: w, pretty: r.URL.Query().Get("pretty") == "true"}
+		next.ServeHTTP(pw, r)
+	})
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	enc := json.NewEncoder(w)
+	if pw, ok := w.(prettyWriter); ok && pw.Pretty() {
+		enc.SetIndent("", "  ")
+	}
+	_ = enc.Encode(v)
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {

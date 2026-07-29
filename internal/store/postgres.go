@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,11 +16,16 @@ import (
 // ErrNotFound is returned when a lookup matches no rows.
 var ErrNotFound = errors.New("not found")
 
+// ErrInvalidCursor is returned when a pagination cursor is malformed for the
+// requested ordering. It is caller error: the API maps it to 400, not 500.
+var ErrInvalidCursor = errors.New("invalid cursor")
+
 // DefaultQueryLimit applies when EventFilter.Limit is unset; MaxQueryLimit
-// caps requested page sizes.
+// caps requested page sizes as a server-side safety net (the API layer
+// enforces its own configurable limit via API_MAX_LIMIT).
 const (
 	DefaultQueryLimit         = 50
-	MaxQueryLimit             = 200
+	MaxQueryLimit             = 500
 	DefaultEventPartitionSpan = 120960
 )
 
@@ -55,8 +61,8 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
 // ingest, DO NOTHING) and ReplaceEventsInRange (auditor repair, DO UPDATE).
-// Both paths write all 13 columns of the events table so raw_topic_xdr /
-// raw_value_xdr are never silently dropped on the way in; a repair that
+// Both paths write all 13 columns of the events table so topics_xdr /
+// value_xdr are never silently dropped on the way in; a repair that
 // arrives without XDR preserves what was already stored via the coalesce()
 // clauses in the UPDATE branch (`sorotrail replay` relies on that).
 //
@@ -66,9 +72,6 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
 	if onUpdate {
-		// Refresh every column, but never blank out raw XDR: a repair
-		// fetch that came back as JSON (xdrFormat "json") carries no XDR
-		// and must not destroy what an earlier ingest managed to keep.
 		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
 			contract_id        = EXCLUDED.contract_id,
 			ledger             = EXCLUDED.ledger,
@@ -79,6 +82,7 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			in_successful_call = EXCLUDED.in_successful_call,
 			topics             = EXCLUDED.topics,
 			value              = EXCLUDED.value,
+			created_at         = EXCLUDED.created_at,
 			raw_topic_xdr      = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
 			raw_value_xdr      = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
@@ -97,7 +101,7 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 		batch.Queue(stmt,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
-			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
+			nullableStringSlice(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
 	}
 	return batch
@@ -272,6 +276,157 @@ func restoreRawXDR(events []Event, kept map[string]rawXDR) []Event {
 // counts only (cheap path for the common "all good" sweep); idsOnly=true
 // → per-ledger sorted ID list (used to diff a ledger whose count
 // disagrees with the RPC).
+func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+	if !ValidContractsSortKey(f.SortKey) {
+		return nil, "", fmt.Errorf("unsupported sort_key %q", f.SortKey)
+	}
+	orderDir := "DESC"
+	cursorOp := "<"
+	if strings.EqualFold(f.Order, "asc") {
+		orderDir = "ASC"
+		cursorOp = ">"
+	}
+	sortCol, sortExpr, sortType := contractsSortParts(f.SortKey)
+	args := []any{}
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	where := []string{}
+	if f.ContractIDPrefix != "" {
+		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
+	}
+	if f.Cursor != "" {
+		sortValue, contractID, err := DecodeContractsCursor(f.Cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		typed := arg(sortValue)
+		switch sortType {
+		case "bigint":
+			typed += "::bigint"
+		case "timestamptz":
+			typed += "::timestamptz"
+		}
+		where = append(where,
+			fmt.Sprintf("(%s, contract_id) %s (%s, %s)",
+				sortCol, cursorOp, typed, arg(contractID)))
+	}
+	query := fmt.Sprintf(`
+		SELECT contract_id, count(*) AS event_count,
+		       min(ledger) AS first_ledger, max(ledger) AS last_ledger,
+		       max(created_at) AS last_seen
+		FROM events
+		%s
+		GROUP BY contract_id
+		ORDER BY %s %s, contract_id %s
+		LIMIT %d`,
+		contractsWhere(where),
+		sortExpr, orderDir, orderDir,
+		limit+1,
+	)
+	var out []ContractSummary
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("listing contracts: %w", err)
+		}
+		defer rows.Close()
+		out = make([]ContractSummary, 0, limit)
+		for rows.Next() {
+			var c ContractSummary
+			if err := rows.Scan(&c.ContractID, &c.EventCount,
+				&c.FirstLedger, &c.LastLedger, &c.LastSeen); err != nil {
+				return err
+			}
+			out = append(out, c)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("reading contracts: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(out) > limit {
+		last := out[limit-1]
+		out = out[:limit]
+		next = EncodeContractsCursor(f.SortKey, contractSortValue(last, f.SortKey), last.ContractID)
+	}
+	return out, next, nil
+}
+
+func (p *Postgres) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
+	args := []any{}
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	where := []string{}
+	if f.ContractIDPrefix != "" {
+		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
+	}
+	q := `SELECT count(*) FROM (SELECT contract_id FROM events ` + contractsWhere(where) + ` GROUP BY contract_id) AS sub`
+	var total int64
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, q, args...).Scan(&total)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("counting contracts: %w", err)
+	}
+	return total, nil
+}
+
+func ValidContractsSortKey(s string) bool {
+	switch s {
+	case "", SortByActivity, SortByFirstLedger, SortByLastLedger, SortByLastSeen:
+		return true
+	}
+	return false
+}
+
+func contractsSortParts(sortKey string) (col, expr, typ string) {
+	switch sortKey {
+	case SortByFirstLedger:
+		return "min(ledger)", "min(ledger)", "bigint"
+	case SortByLastLedger:
+		return "max(ledger)", "max(ledger)", "bigint"
+	case SortByLastSeen:
+		return "max(created_at)", "max(created_at)", "timestamptz"
+	default:
+		return "count(*)", "count(*)", ""
+	}
+}
+
+func contractSortValue(c ContractSummary, sortKey string) string {
+	switch sortKey {
+	case SortByFirstLedger:
+		return fmt.Sprint(c.FirstLedger)
+	case SortByLastLedger:
+		return fmt.Sprint(c.LastLedger)
+	case SortByLastSeen:
+		return c.LastSeen.UTC().Format(time.RFC3339Nano)
+	default:
+		return fmt.Sprint(c.EventCount)
+	}
+}
+
+func contractsWhere(parts []string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	return " WHERE " + strings.Join(parts, " AND ")
+}
+
 func (p *Postgres) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error) {
 	rows, err := p.pool.Query(ctx, `
 		SELECT ledger, count(*)::int, array_agg(id ORDER BY id)
@@ -304,7 +459,7 @@ func (p *Postgres) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger i
 const eventColumns = `id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 	in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr`
 
-// nullableText and nullableTextArray store empty raw-XDR values as SQL NULL
+// nullableText and nullableStringSlice store empty raw-XDR values as SQL NULL
 // so "no raw XDR" is one representation, not two.
 func nullableText(s string) any {
 	if s == "" {
@@ -313,7 +468,7 @@ func nullableText(s string) any {
 	return s
 }
 
-func nullableTextArray(s []string) any {
+func nullableStringSlice(s []string) any {
 	if len(s) == 0 {
 		return nil
 	}
@@ -321,12 +476,55 @@ func nullableTextArray(s []string) any {
 }
 
 func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
-	row := p.pool.QueryRow(ctx, `SELECT `+eventColumns+` FROM events WHERE id = $1`, id)
-	e, err := scanEvent(row)
-	if errors.Is(err, pgx.ErrNoRows) {
+	var e Event
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `SELECT `+eventColumns+` FROM events WHERE id = $1`, id)
+		var err error
+		e, err = scanEvent(row)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	})
+	if errors.Is(err, ErrNotFound) {
 		return Event{}, ErrNotFound
 	}
 	return e, err
+}
+
+// GetEventsByTxHash returns all events emitted by the transaction
+// identified by txHash, excluding the event with id excludeID (when
+// non-empty). Events are returned in ascending ID order.
+func (p *Postgres) GetEventsByTxHash(ctx context.Context, txHash, excludeID string) ([]Event, error) {
+	query := `SELECT ` + eventColumns + ` FROM events WHERE tx_hash = $1`
+	args := []any{txHash}
+	if excludeID != "" {
+		query += ` AND id != $2`
+		args = append(args, excludeID)
+	}
+	query += ` ORDER BY id ASC`
+
+	var events []Event
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("querying events by tx hash: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			e, err := scanEvent(rows)
+			if err != nil {
+				return err
+			}
+			events = append(events, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return events, nil
 }
 
 // EventExists is the cheap 304 path used by the API's conditional GET:
@@ -339,7 +537,9 @@ func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
 // loaded on a real cache miss via GetEvent.
 func (p *Postgres) EventExists(ctx context.Context, id string) (bool, error) {
 	var one int
-	err := p.pool.QueryRow(ctx, `SELECT 1 FROM events WHERE id = $1`, id).Scan(&one)
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT 1 FROM events WHERE id = $1`, id).Scan(&one)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -349,15 +549,10 @@ func (p *Postgres) EventExists(ctx context.Context, id string) (bool, error) {
 	return true, nil
 }
 
-func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
-	limit := f.Limit
-	if limit <= 0 {
-		limit = DefaultQueryLimit
-	}
-	if limit > MaxQueryLimit {
-		limit = MaxQueryLimit
-	}
-
+// buildEventWhereClause builds the WHERE clause and arguments shared by
+// QueryEvents and CountEvents. It does not include cursor, ordering, or
+// limit — those are page-specific concerns.
+func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	var (
 		where []string
 		args  []any
@@ -369,8 +564,8 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
-	if f.Type != "" {
-		where = append(where, "type = "+arg(f.Type))
+	if len(f.Types) > 0 {
+		where = append(where, "type = ANY("+arg(f.Types)+")")
 	}
 	if len(f.Topic) > 0 {
 		// Containment on the array matches the topic at any position.
@@ -388,6 +583,16 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		// array for element match, multi-element arrays for subset match).
 		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
 	}
+	if f.TxHash != "" {
+		where = append(where, "tx_hash = "+arg(f.TxHash))
+	}
+	if f.HasValue != nil {
+		if *f.HasValue {
+			where = append(where, "value IS NOT NULL")
+		} else {
+			where = append(where, "value IS NULL")
+		}
+	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))
 	}
@@ -400,10 +605,27 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if !f.ToTime.IsZero() {
 		where = append(where, "created_at <= "+arg(f.ToTime))
 	}
+	return where, args
+}
 
-	// if f.Cursor != "" {
-	// 	where = append(where, "id > "+arg(f.Cursor))
-	// }
+func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+
+	where, args := buildEventWhereClause(f)
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	if !ValidOrderBy(f.OrderBy) {
+		return nil, "", fmt.Errorf("unsupported order_by %q", f.OrderBy)
+	}
 	orderDir := "ASC"
 	cursorOp := ">"
 	if f.Order == "desc" {
@@ -411,8 +633,37 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		cursorOp = "<"
 	}
 
+	// Every ordering ends in id so the sort is total: ledger and created_at
+	// both have duplicates, and without a tiebreaker the database may order
+	// equal rows differently between two queries, which would let keyset
+	// pagination skip or repeat rows at a page boundary.
+	orderCols := "id " + orderDir
+	if f.OrderBy != "" && f.OrderBy != OrderByID {
+		orderCols = f.OrderBy + " " + orderDir + ", id " + orderDir
+	}
+
 	if f.Cursor != "" {
-		where = append(where, "id "+cursorOp+" "+arg(f.Cursor))
+		switch f.OrderBy {
+		case "", OrderByID:
+			where = append(where, "id "+cursorOp+" "+arg(f.Cursor))
+		default:
+			sortValue, id, err := decodeCompositeCursor(f.Cursor)
+			if err != nil {
+				return nil, "", err
+			}
+			// Row-value comparison gives the correct "everything after this
+			// (value, id) pair" semantics in one predicate, and Postgres can
+			// still drive it from an index on (sort column, id).
+			var typed string
+			switch f.OrderBy {
+			case OrderByLedger:
+				typed = arg(sortValue) + "::bigint"
+			case OrderByCreatedAt:
+				typed = arg(sortValue) + "::timestamptz"
+			}
+			where = append(where, fmt.Sprintf("(%s, id) %s (%s, %s)",
+				f.OrderBy, cursorOp, typed, arg(id)))
+		}
 	}
 
 	query := `SELECT ` + eventColumns + ` FROM events`
@@ -420,40 +671,74 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
 	// Fetch one extra row to know whether a next page exists.
-	// query += " ORDER BY id ASC LIMIT " + arg(limit+1)
-	query += " ORDER BY id " + orderDir + " LIMIT " + arg(limit+1)
+	query += " ORDER BY " + orderCols + " LIMIT " + arg(limit+1)
 
-	rows, err := p.pool.Query(ctx, query, args...)
-	if err != nil {
-		return nil, "", fmt.Errorf("querying events: %w", err)
-	}
-	defer rows.Close()
-
-	events := make([]Event, 0, limit)
-	for rows.Next() {
-		e, err := scanEvent(rows)
-		if err != nil {
-			return nil, "", err
-		}
-		events = append(events, e)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, "", fmt.Errorf("reading events: %w", err)
-	}
-
+	var events []Event
 	next := ""
-	if len(events) > limit {
-		events = events[:limit]
-		next = events[limit-1].ID
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("querying events: %w", err)
+		}
+		defer rows.Close()
+
+		events = make([]Event, 0, limit)
+		for rows.Next() {
+			e, err := scanEvent(rows)
+			if err != nil {
+				return err
+			}
+			events = append(events, e)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("reading events: %w", err)
+		}
+
+		if len(events) > limit {
+			events = events[:limit]
+			next = EncodeCursor(f.OrderBy, events[limit-1])
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
 	}
 	return events, next, nil
 }
 
+// CountEvents returns the total number of rows matching the filter,
+// ignoring pagination (cursor, order, and limit). It reuses the same
+// WHERE clause builder as QueryEvents so the two stay in lockstep.
+func (p *Postgres) CountEvents(ctx context.Context, f EventFilter) (int64, error) {
+	// Strip page-specific fields so the count represents the full match set.
+	f.Cursor = ""
+	f.Order = ""
+	f.OrderBy = ""
+	f.Limit = 0
+
+	where, args := buildEventWhereClause(f)
+	query := `SELECT count(*) FROM events`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+
+	var total int64
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, query, args...).Scan(&total)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("counting events: %w", err)
+	}
+	return total, nil
+}
+
 func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error) {
 	var s IngestionState
-	err := p.pool.QueryRow(ctx,
-		`SELECT last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE id = 1`,
-	).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.UpdatedAt)
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE id = 1`,
+		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.UpdatedAt)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return IngestionState{}, ErrNotFound
 	}
@@ -481,9 +766,11 @@ func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) err
 
 func (p *Postgres) GetAuditState(ctx context.Context) (AuditState, error) {
 	var s AuditState
-	err := p.pool.QueryRow(ctx,
-		`SELECT verified_through_ledger, updated_at FROM audit_state WHERE id = 1`,
-	).Scan(&s.VerifiedThroughLedger, &s.UpdatedAt)
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT verified_through_ledger, updated_at FROM audit_state WHERE id = 1`,
+		).Scan(&s.VerifiedThroughLedger, &s.UpdatedAt)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuditState{}, ErrNotFound
 	}
@@ -582,15 +869,20 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 	// COUNT(DISTINCT contract_id) scans the contract_id index; fine at MVP
 	// scale. contributors: replace with a maintained summary table if it
 	// becomes a bottleneck on large datasets.
-	err := p.pool.QueryRow(ctx, `
-		SELECT
-			(SELECT count(*) FROM events),
-			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
-			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
-			(SELECT coalesce(min(ledger), 0) FROM events),
-			(SELECT count(DISTINCT contract_id) FROM events),
-			(SELECT count(*) FROM watched_contracts)`,
-	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT
+				(SELECT count(*) FROM events),
+				(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
+				(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
+				(SELECT coalesce(min(ledger), 0) FROM events),
+				(SELECT count(DISTINCT contract_id) FROM events),
+				(SELECT count(*) FROM watched_contracts),
+				(SELECT coalesce(sum(pg_total_relation_size(inhrelid)), 0)
+				 FROM pg_inherits
+				 WHERE inhparent = 'events'::regclass)`,
+		).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts, &s.TableSizeBytes)
+	})
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
 	}
@@ -702,11 +994,218 @@ func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, fromLedger, toLe
 	return f, nil
 }
 
+// DeadLetterEvent records a poison event into the dead_letters table.
+// Re-submitting the same event ID is treated as a retry: the existing
+// row's attempts counter is incremented, last_attempt and error
+// columns are updated, and the row's raw payload is overwritten with
+// the most recent attempt (the latest error message is the most
+// useful context for debugging).
+func (p *Postgres) DeadLetterEvent(ctx context.Context, in DeadLetterInput) (DeadLetter, error) {
+	errStr := ""
+	if in.Err != nil {
+		errStr = in.Err.Error()
+	}
+	var d DeadLetter
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			INSERT INTO dead_letters
+			    (event_id, contract_id, ledger, type, tx_hash,
+			     topic_xdr, value_xdr, error, attempts, last_attempt)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, now())
+			ON CONFLICT (event_id) DO UPDATE SET
+			    error        = EXCLUDED.error,
+			    attempts     = dead_letters.attempts + 1,
+			    last_attempt = now(),
+			    topic_xdr    = EXCLUDED.topic_xdr,
+			    value_xdr    = EXCLUDED.value_xdr
+			RETURNING id, event_id, contract_id, ledger, type, tx_hash,
+			          topic_xdr, value_xdr, error, attempts, last_attempt, created_at`,
+			in.EventID, in.ContractID, in.Ledger, in.Type, nullableText(in.TxHash),
+			nullableStringSlice(in.TopicXDR), nullableText(in.ValueXDR), errStr,
+		)
+		var txHash *string
+		var valueXDR *string
+		scanErr := row.Scan(&d.ID, &d.EventID, &d.ContractID, &d.Ledger, &d.Type, &txHash,
+			&d.TopicXDR, &valueXDR, &d.Error, &d.Attempts, &d.LastAttempt, &d.CreatedAt)
+		if scanErr != nil {
+			return scanErr
+		}
+		if txHash != nil {
+			d.TxHash = *txHash
+		}
+		if valueXDR != nil {
+			d.ValueXDR = *valueXDR
+		}
+		return nil
+	})
+	if err != nil {
+		// The ON CONFLICT clause targets event_id, and the migration
+		// adds a UNIQUE constraint on event_id so the retry path
+		// emits a row-level conflict instead of crashing.
+		return DeadLetter{}, fmt.Errorf("recording dead letter: %w", err)
+	}
+	return d, nil
+}
+
+// ListDeadLetters returns dead-letter rows newest-first. contractID ""
+// means all contracts; limit==0 means DefaultQueryLimit.
+//
+// Pagination is keyset by id (the bigserial primary key). The cursor
+// is the encoded id of the last row from the previous page; passing ""
+// resumes from the newest.
+func (p *Postgres) ListDeadLetters(ctx context.Context, contractID string, limit int, cursor string) ([]DeadLetter, string, error) {
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+	args := []any{}
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	where := []string{}
+	if contractID != "" {
+		where = append(where, "contract_id = "+arg(contractID))
+	}
+	if cursor != "" {
+		sv, err := base64.RawURLEncoding.DecodeString(cursor)
+		if err != nil {
+			return nil, "", fmt.Errorf("%w: dead letter cursor", ErrInvalidContractsCursor)
+		}
+		idIdx := len(args) + 1
+		args = append(args, string(sv))
+		where = append(where, fmt.Sprintf("dead_letters.id < $%d", idIdx))
+	}
+	query := `SELECT id, event_id, contract_id, ledger, type, tx_hash,
+	                 topic_xdr, value_xdr, error, attempts, last_attempt, created_at
+	          FROM dead_letters`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY id DESC LIMIT " + arg(limit+1)
+	var rows []DeadLetter
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		r, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("listing dead letters: %w", err)
+		}
+		defer r.Close()
+		for r.Next() {
+			var d DeadLetter
+			var txh *string
+			var vxdr *string
+			if err := r.Scan(&d.ID, &d.EventID, &d.ContractID, &d.Ledger,
+				&d.Type, &txh, &d.TopicXDR, &vxdr, &d.Error, &d.Attempts,
+				&d.LastAttempt, &d.CreatedAt); err != nil {
+				return err
+			}
+			if txh != nil {
+				d.TxHash = *txh
+			}
+			if vxdr != nil {
+				d.ValueXDR = *vxdr
+			}
+			rows = append(rows, d)
+		}
+		return r.Err()
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(rows) > limit {
+		last := rows[limit-1]
+		rows = rows[:limit]
+		next = base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprint(last.ID)))
+	}
+	return rows, next, nil
+}
+
+func (p *Postgres) GetDeadLetter(ctx context.Context, id int64) (DeadLetter, error) {
+	var d DeadLetter
+	var txHash *string
+	var valueXDR *string
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT id, event_id, contract_id, ledger, type, tx_hash,
+			       topic_xdr, value_xdr, error, attempts, last_attempt, created_at
+			FROM dead_letters WHERE id = $1`,
+			id,
+		).Scan(&d.ID, &d.EventID, &d.ContractID, &d.Ledger, &d.Type, &txHash,
+			&d.TopicXDR, &valueXDR, &d.Error, &d.Attempts, &d.LastAttempt, &d.CreatedAt)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DeadLetter{}, ErrNotFound
+	}
+	if err != nil {
+		return DeadLetter{}, fmt.Errorf("loading dead letter %d: %w", id, err)
+	}
+	if txHash != nil {
+		d.TxHash = *txHash
+	}
+	if valueXDR != nil {
+		d.ValueXDR = *valueXDR
+	}
+	return d, nil
+}
+
+func (p *Postgres) DeleteDeadLetter(ctx context.Context, id int64) error {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM dead_letters WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("deleting dead letter %d: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func nullableString(s string) any {
 	if s == "" {
 		return nil
 	}
 	return s
+}
+
+func (p *Postgres) withStatementTimeoutTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin guarded tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if timeout, ok := statementTimeoutFromContext(ctx); ok && timeout > 0 {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = '%dms'", timeout.Milliseconds())); err != nil {
+			return fmt.Errorf("setting statement_timeout: %w", err)
+		}
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit guarded tx: %w", err)
+	}
+	return nil
+}
+
+func statementTimeoutFromContext(ctx context.Context) (time.Duration, bool) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0, false
+	}
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		return 0, false
+	}
+	if timeout < time.Millisecond {
+		return time.Millisecond, true
+	}
+	return timeout, true
 }
 
 func scanEvent(row pgx.Row) (Event, error) {

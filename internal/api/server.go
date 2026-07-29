@@ -12,10 +12,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
-	"github.com/khaylebfortune/sorotrail/internal/audit"
-	"github.com/khaylebfortune/sorotrail/internal/broadcast"
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/audit"
+	"github.com/sorotrail/sorotrail/internal/broadcast"
+	"github.com/sorotrail/sorotrail/internal/metrics"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 type ctxKey string
@@ -49,6 +50,27 @@ func getAuditor() *audit.Auditor {
 	return auditor
 }
 
+// SetRPCCounter registers the CountingClient so /stats can expose
+// per-method RPC error totals. Call this before ListenAndServe.
+// The setter is guarded by a RWMutex so concurrent /stats readers
+// never observe a torn pointer.
+var (
+	rpcCounterMu sync.RWMutex
+	rpcCounter   *rpc.CountingClient
+)
+
+func SetRPCCounter(c *rpc.CountingClient) {
+	rpcCounterMu.Lock()
+	rpcCounter = c
+	rpcCounterMu.Unlock()
+}
+
+func getRPCCounter() *rpc.CountingClient {
+	rpcCounterMu.RLock()
+	defer rpcCounterMu.RUnlock()
+	return rpcCounter
+}
+
 // Enricher is the spec-based event enrichment interface used by the API.
 // Defined here so the API package doesn't import internal/spec directly.
 type Enricher interface {
@@ -57,22 +79,55 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store    store.Store
-	rpc      rpc.Client
-	enricher Enricher
-	log      *slog.Logger
-	apiKey   string
-	limiter  *RateLimiter
-	bcast    *broadcast.Broadcaster
+	store     store.Store
+	rpc       rpc.Client
+	enricher  Enricher
+	log       *slog.Logger
+	apiKey    string
+	limiter   *RateLimiter
+	recoverer *Recoverer
+	bcast     *broadcast.Broadcaster
+	metrics   *metrics.HTTPMetrics
+	// compressMinSize is the body size at which responses start being
+	// compressed. The zero value means CompressMinSize, so compression is on
+	// by default; negative disables the middleware entirely.
+	compressMinSize int
+	// exportMaxRange caps the ledger span of /contracts/{id}/export.
+	// Zero means unbounded (legacy behavior); config-driven wiring sets
+	// EXPORT_MAX_RANGE so requests default to a sane ceiling.
+	exportMaxRange int64
+	// cors is the CORS middleware config. Wired via SetCORS from main so
+	// the API does not import the config package.
+	cors CORSConfig
 }
 
-// New builds the API server. rpcClient is only used by /health.
+// SetCompressMinSize overrides the body size at which responses are
+// compressed. Pass a negative value to disable compression.
+func (s *Server) SetCompressMinSize(n int) {
+	s.compressMinSize = n
+}
+
+// maxLimit is the API's upper bound for page-size parameters (limit and
+// recent). It is set once at startup via SetMaxLimit (driven by the
+// API_MAX_LIMIT env var) before any requests are served so no mutex is
+// needed. Default 500.
+var maxLimit = 500
+
+// SetMaxLimit configures the API's maximum page size for list endpoints.
+// Call once at startup before ListenAndServe. Values ≤0 are ignored.
+func SetMaxLimit(n int) {
+	if n > 0 {
+		maxLimit = n
+	}
+}
+
+// New builds the API server. rpcClient is used by /health, /readyz, and /stats.
 // apiKey gates the watched-contracts management endpoints; pass "" to
 // fail closed (every request gets a 503 with "API_KEY not configured").
 // See apiKeyAuth for the exact contract. The trailing enricher is optional —
 // pass nil to disable spec decoding, or one Enricher to enable it.
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey}
+	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New()}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
@@ -93,12 +148,34 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 	return s
 }
 
+// SetExportMaxRange caps the ledger span a /contracts/{id}/export call
+// may request. Zero means no cap (the handler still validates range fits
+// the requested bound, but won't reject on span alone). The config layer
+// exposes EXPORT_MAX_RANGE; pass it through so an operator can tune
+// analytical workloads without code changes.
+func (s *Server) SetExportMaxRange(n int64) { s.exportMaxRange = n }
+
+// SetCORSConfig wires the CORS middleware. The default (zero-valued
+// config) is deny-all: no cross-origin browser request receives CORS
+// headers, so the browser blocks the response. Pass the
+// CORSAllowedOrigins / CORSAllowedMethods / CORSAllowedHeaders lists the
+// operator wants; an empty AllowedOrigins is still deny-all (the
+// middleware short-circuits).
+func (s *Server) SetCORSConfig(cfg CORSConfig) { s.cors = cfg }
+
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
-	r.Use(middleware.Recoverer)
+	r.Use(s.metrics.Middleware)
+	// CORS runs before Recoverer/Timeout so a preflight never blocks
+	// nor panics inside the recovery middleware, and so the same-origin
+	// contract (no Origin header) is forwarded as-is. Mounted
+	// unconditionally so an operator can flip the config on without
+	// restarts; CORS() is a no-op when the allowlist is empty.
+	r.Use(CORS(s.cors))
+	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 	if s.limiter != nil {
 		// Limiter sits inside Timeout and Recoverer so its instant 429
@@ -106,34 +183,68 @@ func (s *Server) Router() http.Handler {
 		// a panic inside the limiter can't take down the server.
 		r.Use(s.limiter.Middleware)
 	}
+	// prettyMiddleware must be the innermost wrapper (closest to the handler)
+	// so the type assertion in writeJSON sees the prettyWriter interface.
+	// It reads ?pretty=true from the query and wraps the ResponseWriter.
+	r.Use(prettyMiddleware)
 
+	// Non-list routes: health, metrics, writes — responses are always
+	// small, so compression is just overhead with no benefit.
 	r.Get("/health", s.handleHealth)
+	r.Get("/livez", s.handleLivez)
+	r.Get("/readyz", s.handleReadyz)
 	r.Get("/version", s.handleVersion)
+	r.Handle("/metrics", s.metrics.Handler())
 	r.Get("/events", s.handleListEvents)
+	r.Get("/events/count", s.handleCountEvents)
+	r.Get("/events/{id}/raw", s.handleGetEventRaw)
+	r.Get("/events/{id}/transaction", s.handleGetEventTransaction)
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
+	r.Get("/contracts/{id}/export", s.handleContractExport)
+
+	r.Get("/contracts", s.handleListContracts)
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// Watched-contracts management: writes and updates to the runtime
 	// filter list. Always auth-gated, even when AUTH_ENABLED would be
 	// false elsewhere — that asymmetry is intentional and part of the
-	// "writes are never open" contract. GET is gated too so an operator
-	// with the key can confirm the current list without touching /stats.
+	// "writes are never open" contract.
 	// Routes are absolute (no sub-router) so callers don't need a
 	// trailing slash or chi's RedirectSlashes middleware.
 	watchedMW := apiKeyAuth(s.apiKey)
-	r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
 	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
 	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
 
+	r.With(watchedMW).Get("/dead-letters", s.handleListDeadLetters)
+	r.With(watchedMW).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)
+
 	// Subscription CRUD and delivery history.
 	r.Post("/subscriptions", s.handleCreateSubscription)
-	r.Get("/subscriptions", s.handleListSubscriptions)
-	r.Get("/subscriptions/{id}", s.handleGetSubscription)
 	r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
 	r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
-	r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+
+	// List endpoints: responses can be large (many events, many
+	// subscriptions), so compression is negotiated per request.
+	// Inside a Group so the middleware only touches routes worth
+	// compressing and a panic mid-body can't leave a truncated gzip
+	// stream as the last thing the client sees (Recoverer is above).
+	r.Group(func(r chi.Router) {
+		if s.compressMinSize >= 0 {
+			r.Use(Compress(s.compressMinSize))
+		}
+		r.Get("/events", s.handleListEvents)
+		r.Get("/events/count", s.handleCountEvents)
+		r.Get("/events/{id}/raw", s.handleGetEventRaw)
+		r.Get("/events/{id}", s.handleGetEvent)
+		r.Get("/contracts/{id}/events", s.handleContractEvents)
+		r.Get("/contracts/{id}/export", s.handleContractExport)
+		r.Get("/subscriptions", s.handleListSubscriptions)
+		r.Get("/subscriptions/{id}", s.handleGetSubscription)
+		r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+		r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
+	})
 
 	return r
 }
