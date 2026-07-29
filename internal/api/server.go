@@ -177,13 +177,6 @@ func (s *Server) Router() http.Handler {
 	r.Use(CORS(s.cors))
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
-	// Compression sits outside the limiter so a 429 is written through the
-	// same encoding path as any other small response (i.e. sent as-is), and
-	// inside Recoverer so a panic mid-body can't leave a truncated gzip
-	// stream as the last thing the client sees.
-	if s.compressMinSize >= 0 {
-		r.Use(Compress(s.compressMinSize))
-	}
 	if s.limiter != nil {
 		// Limiter sits inside Timeout and Recoverer so its instant 429
 		// response always makes it back through the deadline cleanly, and
@@ -195,6 +188,8 @@ func (s *Server) Router() http.Handler {
 	// It reads ?pretty=true from the query and wraps the ResponseWriter.
 	r.Use(prettyMiddleware)
 
+	// Non-list routes: health, metrics, writes — responses are always
+	// small, so compression is just overhead with no benefit.
 	r.Get("/health", s.handleHealth)
 	r.Get("/livez", s.handleLivez)
 	r.Get("/readyz", s.handleReadyz)
@@ -215,12 +210,10 @@ func (s *Server) Router() http.Handler {
 	// Watched-contracts management: writes and updates to the runtime
 	// filter list. Always auth-gated, even when AUTH_ENABLED would be
 	// false elsewhere — that asymmetry is intentional and part of the
-	// "writes are never open" contract. GET is gated too so an operator
-	// with the key can confirm the current list without touching /stats.
+	// "writes are never open" contract.
 	// Routes are absolute (no sub-router) so callers don't need a
 	// trailing slash or chi's RedirectSlashes middleware.
 	watchedMW := apiKeyAuth(s.apiKey)
-	r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
 	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
 	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
 
@@ -229,11 +222,29 @@ func (s *Server) Router() http.Handler {
 
 	// Subscription CRUD and delivery history.
 	r.Post("/subscriptions", s.handleCreateSubscription)
-	r.Get("/subscriptions", s.handleListSubscriptions)
-	r.Get("/subscriptions/{id}", s.handleGetSubscription)
 	r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
 	r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
-	r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+
+	// List endpoints: responses can be large (many events, many
+	// subscriptions), so compression is negotiated per request.
+	// Inside a Group so the middleware only touches routes worth
+	// compressing and a panic mid-body can't leave a truncated gzip
+	// stream as the last thing the client sees (Recoverer is above).
+	r.Group(func(r chi.Router) {
+		if s.compressMinSize >= 0 {
+			r.Use(Compress(s.compressMinSize))
+		}
+		r.Get("/events", s.handleListEvents)
+		r.Get("/events/count", s.handleCountEvents)
+		r.Get("/events/{id}/raw", s.handleGetEventRaw)
+		r.Get("/events/{id}", s.handleGetEvent)
+		r.Get("/contracts/{id}/events", s.handleContractEvents)
+		r.Get("/contracts/{id}/export", s.handleContractExport)
+		r.Get("/subscriptions", s.handleListSubscriptions)
+		r.Get("/subscriptions/{id}", s.handleGetSubscription)
+		r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+		r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
+	})
 
 	return r
 }
