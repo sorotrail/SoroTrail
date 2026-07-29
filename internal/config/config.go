@@ -55,6 +55,16 @@ type Config struct {
 	HorizonURL      string  `env:"HORIZON_URL" envDefault:"https://horizon-testnet.stellar.org"`
 	BackfillRateRPS float64 `env:"BACKFILL_RATE_RPS" envDefault:"10"`
 
+	// RPC retry/backoff configuration. These control how many times a
+	// failing RPC call is retried, the base (exponential) backoff duration,
+	// the maximum backoff cap, and whether random jitter is added between
+	// attempts. Applied uniformly to every RPC call (getEvents,
+	// getLatestLedger, getHealth, getLedgerEntries).
+	RPCMaxAttempts int           `env:"RPC_MAX_ATTEMPTS" envDefault:"3"`
+	RPCBaseBackoff time.Duration `env:"RPC_BASE_BACKOFF" envDefault:"500ms"`
+	RPCMaxBackoff  time.Duration `env:"RPC_MAX_BACKOFF" envDefault:"30s"`
+	RPCJitter      bool          `env:"RPC_JITTER" envDefault:"true"`
+
 	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
 	// entirely; the binary behaves exactly like the pre-audit build.
 	AuditEnabled        bool          `env:"AUDIT_ENABLED" envDefault:"false"`
@@ -293,6 +303,15 @@ func (c Config) Validate() error {
 	if c.BackfillRateRPS <= 0 {
 		return fmt.Errorf("BACKFILL_RATE_RPS must be positive, got %v", c.BackfillRateRPS)
 	}
+	if c.RPCMaxAttempts <= 0 {
+		return fmt.Errorf("RPC_MAX_ATTEMPTS must be positive, got %d", c.RPCMaxAttempts)
+	}
+	if c.RPCBaseBackoff <= 0 {
+		return fmt.Errorf("RPC_BASE_BACKOFF must be positive, got %s", c.RPCBaseBackoff)
+	}
+	if c.RPCMaxBackoff <= 0 {
+		return fmt.Errorf("RPC_MAX_BACKOFF must be positive, got %s", c.RPCMaxBackoff)
+	}
 	if c.RateLimitRPS < 0 {
 		return fmt.Errorf("RATE_LIMIT_RPS must be non-negative")
 	}
@@ -439,6 +458,10 @@ func (c Config) LoggableFields() []any {
 
 	return []any{
 		"rpc_url", c.RPCURL,
+		"rpc_max_attempts", c.RPCMaxAttempts,
+		"rpc_base_backoff", c.RPCBaseBackoff,
+		"rpc_max_backoff", c.RPCMaxBackoff,
+		"rpc_jitter", c.RPCJitter,
 		"database_url", dbURL,
 		"poll_interval", c.PollInterval,
 		"http_addr", c.HTTPAddr,
