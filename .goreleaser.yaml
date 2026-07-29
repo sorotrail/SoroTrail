@@ -1,0 +1,101 @@
+# GoReleaser configuration for SoroTrail multi-platform binary releases.
+#
+# Usage:
+#   goreleaser release --snapshot   # local snapshot build
+#   goreleaser release              # tag-triggered in CI
+#
+# Build info ldflags coordinate with internal/buildinfo/buildinfo.go
+# and the Makefile so every distribution method injects the same fields.
+
+project_name: sorotrail
+
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: sorotrail
+    main: ./cmd/sorotrail
+    binary: sorotrail
+    ldflags:
+      - -X github.com/sorotrail/sorotrail/internal/buildinfo.Version={{ .Version }}
+      - -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit={{ .ShortCommit }}
+      - -X github.com/sorotrail/sorotrail/internal/buildinfo.BuildDate={{ .Date }}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    # The project has no CGO dependencies (SQLite, if merged, uses a
+    # pure-Go driver), so CGO_ENABLED=0 is safe across all platforms.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    # Strip debug info to keep binaries small.
+    flags:
+      - -trimpath
+
+archives:
+  - id: default
+    formats: ["tar.gz"]
+    wrap_in_directory: true
+    format_overrides:
+      - goos: windows
+        formats: ["zip"]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - "merge conflict"
+      - Merge pull request
+      - Merge branch
+  groups:
+    - title: "Features"
+      regexp: "^.*feat[(\\w)]*:+.*$"
+      order: 0
+    - title: "Bug fixes"
+      regexp: "^.*fix[(\\w)]*:+.*$"
+      order: 1
+    - title: "Maintenance"
+      order: 2
+
+# Docker images continue to be published by the existing
+# .github/workflows/docker-publish.yml workflow. The goreleaser
+# release workflow and the docker-publish workflow are both
+# triggered on the same v* tag — they run in parallel and do not
+# conflict. See RELEASING.md for the full release process.
+
+release:
+  prerelease: auto
+  header: |
+    ## SoroTrail {{ .Version }}
+
+    See the [README](https://github.com/sorotrail/sorotrail) for installation
+    and usage instructions.
+
+    ### Download
+
+    | OS      | Arch   | Archive |
+    |---------|--------|---------|
+    | Linux   | amd64  | `sorotrail_{{ .Version }}_linux_amd64.tar.gz` |
+    | Linux   | arm64  | `sorotrail_{{ .Version }}_linux_arm64.tar.gz` |
+    | macOS   | amd64  | `sorotrail_{{ .Version }}_darwin_amd64.tar.gz` |
+    | macOS   | arm64  | `sorotrail_{{ .Version }}_darwin_arm64.tar.gz` |
+    | Windows | amd64  | `sorotrail_{{ .Version }}_windows_amd64.zip` |
+    | Windows | arm64  | `sorotrail_{{ .Version }}_windows_arm64.zip` |
