@@ -226,14 +226,28 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+// IsSQLite reports whether the database URL points to a SQLite database.
+func IsSQLite(databaseURL string) bool {
+	return strings.HasPrefix(databaseURL, "sqlite:")
+}
+
 // Validate checks the configuration for values that would fail at runtime.
 func (c Config) Validate() error {
 	if c.DatabaseURL == "" {
 		return fmt.Errorf("DATABASE_URL is required")
 	}
-	u, err := url.Parse(c.RPCURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("RPC_URL %q is not a valid URL", c.RPCURL)
+	if !IsSQLite(c.DatabaseURL) {
+		u, err := url.Parse(c.RPCURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("RPC_URL %q is not a valid URL", c.RPCURL)
+		}
+	}
+	if IsSQLite(c.DatabaseURL) {
+		path := c.DatabaseURL[7:]
+		if path == "" || path == ":memory:" {
+		} else if path[0] != '/' && path[0] != '.' && path[0] != ':' {
+			return fmt.Errorf("sqlite DATABASE_URL %q must be an absolute or relative path (or :memory:)", c.DatabaseURL)
+		}
 	}
 	if u, err := url.Parse(c.HorizonURL); err != nil || u.Scheme == "" || u.Host == "" {
 		return fmt.Errorf("HORIZON_URL %q is not a valid URL", c.HorizonURL)

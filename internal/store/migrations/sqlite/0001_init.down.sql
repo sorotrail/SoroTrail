@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS contract_specs;
+DROP TABLE IF EXISTS delivery_attempts;
+DROP TABLE IF EXISTS subscriptions;
+DROP TABLE IF EXISTS replay_state;
+DROP TABLE IF EXISTS audit_findings;
+DROP TABLE IF EXISTS audit_state;
+DROP TABLE IF EXISTS watched_contracts;
+DROP TABLE IF EXISTS ingestion_state;
+DROP TABLE IF EXISTS events;
