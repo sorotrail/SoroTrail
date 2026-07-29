@@ -631,6 +631,13 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	}
 	s.recordEventsServed(r.Context(), len(events))
 
+	// Tag every event with its SEP-41 normalized envelope (if any) before
+	// rendering — the layer is additive and never destructive, so events
+	// that do not match keep exactly the same shape they had before.
+	for i := range events {
+		events[i].WithSEP41()
+	}
+
 	// Total matching count (ignoring pagination) as a response header.
 	// Failure to count is non-fatal: we log a warning and proceed without
 	// the header rather than dropping a successful page.
@@ -880,6 +887,11 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.recordEventsServed(r.Context(), 1)
+
+	// Additive SEP-41 normalization on the single-event path; non-matches
+	// simply omit the field.
+	event.WithSEP41()
+
 	decoded := r.URL.Query().Get("decoded") == "true"
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
@@ -1199,13 +1211,6 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
 		return
 	}
-	// Tag every event with its SEP-41 normalized envelope (if any) before
-	// rendering — the layer is additive and never destructive, so events
-	// that do not match keep exactly the same shape they had before.
-	for i := range events {
-		events[i].WithSEP41()
-	}
-
 	modeTransition := ""
 	if len(current) == 0 {
 		if r.URL.Query().Get("confirm") != "true" {
@@ -1299,10 +1304,6 @@ func (s *Server) handleAddressEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	// Additive SEP-41 normalization on the single-event path; non-matches
-	// simply omit the field.
-	event.WithSEP41()
-
 	// Address events are always ordered by event_id.
 	if filter.OrderBy != "" && filter.OrderBy != store.OrderByID {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("address events only support order_by=id (the default)"))

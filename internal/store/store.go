@@ -7,7 +7,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/khaylebfortune/sorotrail/internal/sep41"
+	"github.com/sorotrail/sorotrail/internal/sep41"
 )
 
 // Event is a Soroban contract event as persisted by SoroTrail.
