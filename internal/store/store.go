@@ -89,6 +89,9 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
 	ContractID string
+	// ContractIDPrefix matches events whose contract_id starts with this
+	// prefix via a LIKE query. Mutually exclusive with ContractID.
+	ContractIDPrefix string
 	// Types filters by event type. Multiple values are accepted (ANDed
 	// together at the SQL level via type = ANY(...)). An empty or nil
 	// slice means "no constraint".
@@ -117,9 +120,16 @@ type EventFilter struct {
 	// HasValue filters events by whether they carry a value payload.
 	// nil means no constraint; true means value IS NOT NULL;
 	// false means value IS NULL.
-	HasValue   *bool
+	HasValue *bool
+	// TxIndex is an exact-match filter on the transaction index within a
+	// ledger. A nil pointer means "no constraint". Use TxIndexToPtr for
+	// inline construction of a non-nil pointer from a literal.
+	TxIndex *int32 // exact match on tx index, nil = unset
+	// OpIndex is an exact-match filter on the operation index within a
+	// transaction. A nil pointer means "no constraint".
+	OpIndex    *int32    // exact match on op index, nil = unset
 	FromLedger int64     // inclusive
-	ToLedger   int64     // inclusive
+	ToLedger   int64     // inclusive, zero = no constraint
 	FromTime   time.Time // inclusive, zero = no constraint
 	ToTime     time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
