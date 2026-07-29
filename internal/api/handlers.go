@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1278,6 +1279,93 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 		ModeTransition:   modeTransition,
 	})
 }
+
+// handleAddressEvents returns events involving the given address,
+// chronologically ordered, cursor-paginated.
+func (s *Server) handleAddressEvents(w http.ResponseWriter, r *http.Request) {
+	address := chi.URLParam(r, "address")
+	if !isValidAddress(address) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid address %q (want G... or C... strkey)", address))
+		return
+	}
+
+	filter, _, err := parseFilterAndFields(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// Address events are always ordered by event_id.
+	if filter.OrderBy != "" && filter.OrderBy != store.OrderByID {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("address events only support order_by=id (the default)"))
+		return
+	}
+
+	events, cursor, qerr := s.store.QueryAddressEvents(r.Context(), address, filter)
+	if qerr != nil {
+		loggerFromContext(r.Context()).Error("querying address events", "address", address, "error", qerr)
+		writeError(w, http.StatusInternalServerError, errors.New("querying address events failed"))
+		return
+	}
+
+	// Total matching count header.
+	if total, cerr := s.store.CountAddressEvents(r.Context(), address); cerr != nil {
+		loggerFromContext(r.Context()).Warn("counting address events", "error", cerr)
+	} else {
+		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, addressEventsResponse{Events: events, Cursor: cursor})
+}
+
+// handleAddressSummary returns aggregate information about an address's
+// event history.
+func (s *Server) handleAddressSummary(w http.ResponseWriter, r *http.Request) {
+	address := chi.URLParam(r, "address")
+	if !isValidAddress(address) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid address %q (want G... or C... strkey)", address))
+		return
+	}
+
+	summary, err := s.store.GetAddressSummary(r.Context(), address)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("address %q not found", address))
+		return
+	}
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading address summary", "address", address, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading address summary failed"))
+		return
+	}
+
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, summary)
+}
+
+// isValidAddress checks if the string looks like a Stellar strkey (G... or C..., 56 chars).
+func isValidAddress(s string) bool {
+	if len(s) != 56 {
+		return false
+	}
+	prefix := s[0]
+	if prefix != 'G' && prefix != 'C' {
+		return false
+	}
+	for _, r := range s[1:] {
+		if (r < 'A' || r > 'Z') && (r < '2' || r > '7') {
+			return false
+		}
+	}
+	return true
+}
+
+// addressEventsResponse is the response shape for GET /addresses/{address}/events.
+type addressEventsResponse struct {
+	Events []store.Event `json:"events"`
+	Cursor string        `json:"cursor,omitempty"`
+}
+
 func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
 	if s.rpc == nil {
 		return
@@ -1380,25 +1468,27 @@ func listETag(f store.EventFilter) string {
 	// full one-year max-age. TestListETag_CoversEveryFilterField enumerates
 	// the fields independently and fails when a new one is not added.
 	key := struct {
-		ContractID    string          `json:"c"`
-		Types         []string        `json:"t"`
-		Topic         json.RawMessage `json:"p,omitempty"`
-		Topic0        json.RawMessage `json:"p0,omitempty"`
-		Topic1        json.RawMessage `json:"p1,omitempty"`
-		Topic2        json.RawMessage `json:"p2,omitempty"`
-		Topic3        json.RawMessage `json:"p3,omitempty"`
-		TopicContains json.RawMessage `json:"pc,omitempty"`
-		TxHash        string          `json:"th,omitempty"`
-		HasValue      *bool           `json:"hv,omitempty"`
-		TxIndex       *int32          `json:"txi,omitempty"`
-		OpIndex       *int32          `json:"opi,omitempty"`
-		FromLedger    int64           `json:"fl"`
-		ToLedger      int64           `json:"tl"`
-		FromTime      string          `json:"ft,omitempty"`
-		ToTime        string          `json:"tt,omitempty"`
-		Cursor        string          `json:"cu,omitempty"`
-		Limit         int             `json:"l"`
-		Order         string          `json:"o,omitempty"`
+		ContractID       string          `json:"c"`
+		ContractIDPrefix string          `json:"cp,omitempty"`
+		Types            []string        `json:"t"`
+		Topic            json.RawMessage `json:"p,omitempty"`
+		Topic0           json.RawMessage `json:"p0,omitempty"`
+		Topic1           json.RawMessage `json:"p1,omitempty"`
+		Topic2           json.RawMessage `json:"p2,omitempty"`
+		Topic3           json.RawMessage `json:"p3,omitempty"`
+		TopicContains    json.RawMessage `json:"pc,omitempty"`
+		TxHash           string          `json:"th,omitempty"`
+		HasValue         *bool           `json:"hv,omitempty"`
+		TopicCount       *int            `json:"tc,omitempty"`
+		TxIndex          *int32          `json:"txi,omitempty"`
+		OpIndex          *int32          `json:"opi,omitempty"`
+		FromLedger       int64           `json:"fl"`
+		ToLedger         int64           `json:"tl"`
+		FromTime         string          `json:"ft,omitempty"`
+		ToTime           string          `json:"tt,omitempty"`
+		Cursor           string          `json:"cu,omitempty"`
+		Limit            int             `json:"l"`
+		Order            string          `json:"o,omitempty"`
 		// Scope makes the validator tenant-specific. Two tenants issuing
 		// the same request are asking for different representations of
 		// this URL, and without this component the second one's
@@ -1407,9 +1497,10 @@ func listETag(f store.EventFilter) string {
 		// server, with no CDN involved.
 		Scope string `json:"s"`
 	}{
-		ContractID: f.ContractID,
-		Types:      f.Types,
-		Topic:      f.Topic,
+		ContractID:       f.ContractID,
+		ContractIDPrefix: f.ContractIDPrefix,
+		Types:            f.Types,
+		Topic:            f.Topic,
 		// Each positional filter gets its own distinctly named key, so
 		// topic0={x} and topic1={x} — which select different events — cannot
 		// serialize identically.
@@ -1420,6 +1511,7 @@ func listETag(f store.EventFilter) string {
 		TopicContains: f.TopicContains,
 		TxHash:        f.TxHash,
 		HasValue:      f.HasValue,
+		TopicCount:    f.TopicCount,
 		TxIndex:       f.TxIndex,
 		OpIndex:       f.OpIndex,
 		FromLedger:    f.FromLedger,
@@ -1573,8 +1665,44 @@ func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 // (nil = unset) where a bare &true is not valid Go.
 func ptr[T any](v T) *T { return &v }
 
+// namedParam carries a query value together with the spelling the caller
+// actually used, so an error message names the parameter they typed.
+type namedParam struct {
+	name  string
+	value string
+}
+
+// timeParamAlias resolves a parameter that accepts two spellings. Passing
+// both is an error: they bound the same column, so honouring one silently
+// would make the ignored value look effective.
+func timeParamAlias(q url.Values, primary, alias string) (namedParam, error) {
+	pv, av := q.Get(primary), q.Get(alias)
+	if pv != "" && av != "" {
+		return namedParam{}, fmt.Errorf("%s and %s are aliases; set only one", primary, alias)
+	}
+	if av != "" {
+		return namedParam{name: alias, value: av}, nil
+	}
+	return namedParam{name: primary, value: pv}, nil
+}
+
+// parseTopicCountParam parses ?topic_count=. An empty value means "no
+// constraint"; zero is a real filter (events with no topics at all), so
+// the result is a pointer rather than relying on a zero value.
+func parseTopicCountParam(raw string) (*int, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return nil, fmt.Errorf("topic_count must be a non-negative integer")
+	}
+	return &n, nil
+}
+
 // filterFromQuery parses the shared event-filter query params:
-// contract_id, type, topic, from_ledger, to_ledger, from_time, to_time, cursor, limit.
+// contract_id, type, topic, from_ledger, to_ledger, from_time (alias
+// created_after), to_time (alias created_before), cursor, limit.
 //
 // It is also the one place a list-shaped read acquires its authorization.
 // Every endpoint that returns events builds its filter here, so the tenant
@@ -1602,11 +1730,24 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return store.EventFilter{}, fmt.Errorf("to_ledger %s", err.Error())
 	}
 
-	if fromTime, err = queries.ParseTimeParam(q.Get("from_time")); err != nil {
-		return store.EventFilter{}, fmt.Errorf("from_time %s", err.Error())
+	// created_after / created_before are aliases for from_time / to_time:
+	// both bound events.created_at. The alias reads more naturally next to
+	// the created_at field it filters, and callers already using the
+	// original names are unaffected. Supplying both spellings of the same
+	// bound is rejected rather than silently picking one.
+	fromTimeRaw, err := timeParamAlias(q, "from_time", "created_after")
+	if err != nil {
+		return store.EventFilter{}, err
 	}
-	if toTime, err = queries.ParseTimeParam(q.Get("to_time")); err != nil {
-		return store.EventFilter{}, fmt.Errorf("to_time %s", err.Error())
+	toTimeRaw, err := timeParamAlias(q, "to_time", "created_before")
+	if err != nil {
+		return store.EventFilter{}, err
+	}
+	if fromTime, err = queries.ParseTimeParam(fromTimeRaw.value); err != nil {
+		return store.EventFilter{}, fmt.Errorf("%s %s", fromTimeRaw.name, err.Error())
+	}
+	if toTime, err = queries.ParseTimeParam(toTimeRaw.value); err != nil {
+		return store.EventFilter{}, fmt.Errorf("%s %s", toTimeRaw.name, err.Error())
 	}
 
 	types, err := queries.ParseTypes(q.Get("type"))
@@ -1640,22 +1781,23 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 
 	args := queries.EventFilterArgs{
-		ContractID:    q.Get("contract_id"),
-		Types:         types,
-		Topic:         topic,
-		T0:            t0,
-		T1:            t1,
-		T2:            t2,
-		T3:            t3,
-		TopicContains: tc,
-		TxHash:        q.Get("tx_hash"),
-		FromLedger:    fromLedger,
-		ToLedger:      toLedger,
-		FromTime:      fromTime,
-		ToTime:        toTime,
-		Order:         q.Get("order"),
-		OrderBy:       q.Get("order_by"),
-		Cursor:        q.Get("cursor"),
+		ContractID:       q.Get("contract_id"),
+		ContractIDPrefix: q.Get("contract_id_prefix"),
+		Types:            types,
+		Topic:            topic,
+		T0:               t0,
+		T1:               t1,
+		T2:               t2,
+		T3:               t3,
+		TopicContains:    tc,
+		TxHash:           q.Get("tx_hash"),
+		FromLedger:       fromLedger,
+		ToLedger:         toLedger,
+		FromTime:         fromTime,
+		ToTime:           toTime,
+		Order:            q.Get("order"),
+		OrderBy:          q.Get("order_by"),
+		Cursor:           q.Get("cursor"),
 	}
 
 	// ?limit=N: explicit validation here so an explicit `?limit=0` (or
@@ -1751,6 +1893,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		}
 		f.Order = "desc"
 		f.Limit = n
+	}
+
+	if f.TopicCount, err = parseTopicCountParam(q.Get("topic_count")); err != nil {
+		return f, err
 	}
 
 	if raw := q.Get("has_value"); raw != "" {

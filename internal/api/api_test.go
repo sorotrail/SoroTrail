@@ -617,6 +617,47 @@ func TestContractEvents_ForcesContractFilter(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
+// TestListEvents_ContractIDPrefix validates that ?contract_id_prefix= flows
+// through to the store's EventFilter and is mutually exclusive with
+// ?contract_id=. (#224)
+func TestListEvents_ContractIDPrefix(t *testing.T) {
+	t.Run("passes prefix to store filter", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/events?contract_id_prefix=CABC")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "CABC", st.lastFilter.ContractIDPrefix)
+		assert.Empty(t, st.lastFilter.ContractID)
+	})
+
+	t.Run("empty prefix is a no-op", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/events?contract_id_prefix=")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Empty(t, st.lastFilter.ContractIDPrefix)
+	})
+
+	t.Run("conflict with contract_id returns 400", func(t *testing.T) {
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil),
+			"/events?contract_id="+testContract+"&contract_id_prefix=C")
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var e map[string]string
+		require.NoError(t, json.Unmarshal(body, &e))
+		assert.Contains(t, e["error"], "cannot be combined")
+	})
+
+	t.Run("combines with ledger range", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/events?contract_id_prefix=CD&from_ledger=100&to_ledger=200")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "CD", st.lastFilter.ContractIDPrefix)
+		assert.Equal(t, int64(100), st.lastFilter.FromLedger)
+		assert.Equal(t, int64(200), st.lastFilter.ToLedger)
+	})
+}
+
 func TestListEvents_TopicContainsValidation(t *testing.T) {
 	t.Run("valid JSON array", func(t *testing.T) {
 		st := &stubStore{}
@@ -1909,3 +1950,83 @@ func (m *stubStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, err
 	return store.DeadLetter{}, store.ErrNotFound
 }
 func (m *stubStore) DeleteDeadLetter(context.Context, int64) error { return nil }
+
+func TestListEvents_CreatedAtFilters(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		wantFrom string
+		wantTo   string
+		wantErr  int // 0 = success
+	}{
+		{name: "created_after only", query: "/events?created_after=2026-07-21T00:00:00Z", wantFrom: "2026-07-21T00:00:00Z", wantErr: 0},
+		{name: "created_before only", query: "/events?created_before=2026-07-22T00:00:00Z", wantTo: "2026-07-22T00:00:00Z", wantErr: 0},
+		{name: "both created bounds", query: "/events?created_after=2026-07-21T00:00:00Z&created_before=2026-07-22T00:00:00Z", wantFrom: "2026-07-21T00:00:00Z", wantTo: "2026-07-22T00:00:00Z", wantErr: 0},
+		{name: "mixed with from_time and created_before", query: "/events?from_time=2026-07-21T00:00:00Z&created_before=2026-07-22T00:00:00Z", wantFrom: "2026-07-21T00:00:00Z", wantTo: "2026-07-22T00:00:00Z", wantErr: 0},
+		{name: "created_after conflicts with from_time", query: "/events?from_time=2026-07-21T00:00:00Z&created_after=2026-07-21T00:00:00Z", wantErr: http.StatusBadRequest},
+		{name: "created_before conflicts with to_time", query: "/events?to_time=2026-07-22T00:00:00Z&created_before=2026-07-22T00:00:00Z", wantErr: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			if tt.wantFrom != "" {
+				assert.Equal(t, tt.wantFrom, st.lastFilter.FromTime.Format(time.RFC3339))
+			} else {
+				assert.True(t, st.lastFilter.FromTime.IsZero())
+			}
+			if tt.wantTo != "" {
+				assert.Equal(t, tt.wantTo, st.lastFilter.ToTime.Format(time.RFC3339))
+			} else {
+				assert.True(t, st.lastFilter.ToTime.IsZero())
+			}
+		})
+	}
+}
+
+func TestListEvents_TopicCountFilter(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		want    *int
+		wantErr int // 0 = success
+	}{
+		{name: "no topic_count param", query: "/events", want: nil, wantErr: 0},
+		{name: "with topic_count", query: "/events?topic_count=2", want: ptr(2), wantErr: 0},
+		{name: "zero topic_count", query: "/events?topic_count=0", want: ptr(0), wantErr: 0},
+		{name: "empty topic_count is no-op", query: "/events?topic_count=", want: nil, wantErr: 0},
+		{name: "combined with contract_id", query: "/events?contract_id=" + testContract + "&topic_count=1", want: ptr(1), wantErr: 0},
+		{name: "negative topic_count", query: "/events?topic_count=-1", wantErr: http.StatusBadRequest},
+		{name: "non-integer topic_count", query: "/events?topic_count=abc", wantErr: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			if tt.want == nil {
+				assert.Nil(t, st.lastFilter.TopicCount)
+			} else {
+				require.NotNil(t, st.lastFilter.TopicCount)
+				assert.Equal(t, *tt.want, *st.lastFilter.TopicCount)
+			}
+		})
+	}
+}

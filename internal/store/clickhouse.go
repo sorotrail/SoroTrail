@@ -240,3 +240,19 @@ func (c *ClickHouse) DeleteDeadLetter(context.Context, int64) error {
 func (c *ClickHouse) Ping(ctx context.Context) error {
 	return nil
 }
+
+func (c *ClickHouse) UpsertAddressRefs(ctx context.Context, refs []AddressRef) error {
+	return nil
+}
+
+func (c *ClickHouse) QueryAddressEvents(ctx context.Context, address string, f EventFilter) ([]Event, string, error) {
+	return nil, "", nil
+}
+
+func (c *ClickHouse) CountAddressEvents(ctx context.Context, address string) (int64, error) {
+	return 0, nil
+}
+
+func (c *ClickHouse) GetAddressSummary(ctx context.Context, address string) (AddressSummary, error) {
+	return AddressSummary{}, nil
+}

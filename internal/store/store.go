@@ -89,6 +89,9 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
 	ContractID string
+	// ContractIDPrefix matches events whose contract_id starts with this
+	// prefix via a LIKE query. Mutually exclusive with ContractID.
+	ContractIDPrefix string
 	// Types filters by event type. Multiple values are accepted (ANDed
 	// together at the SQL level via type = ANY(...)). An empty or nil
 	// slice means "no constraint".
@@ -114,6 +117,9 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
+	// TopicCount filters events whose topics array has exactly this length.
+	// Nil means no constraint; zero matches events with no topics.
+	TopicCount *int
 	// HasValue filters events by whether they carry a value payload.
 	// nil means no constraint; true means value IS NOT NULL;
 	// false means value IS NULL.
@@ -455,6 +461,23 @@ type DeliveryAttempt struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
+// AddressRef records one address→event mapping. Populated during ingestion
+// from decoded event topics and value JSON.
+type AddressRef struct {
+	Address string `json:"address"`
+	EventID string `json:"event_id"`
+	Role    string `json:"role"`
+}
+
+// AddressSummary is the aggregate view returned by GetAddressSummary.
+type AddressSummary struct {
+	Address           string   `json:"address"`
+	FirstSeenLedger   int64    `json:"first_seen_ledger"`
+	LastSeenLedger    int64    `json:"last_seen_ledger"`
+	EventCount        int64    `json:"event_count"`
+	DistinctContracts []string `json:"distinct_contracts"`
+}
+
 // Stats summarizes what the indexer has stored so far. VerifiedThroughLedger
 // is the inclusive highest ledger whose stored events have been confirmed
 // to match a fresh RPC fetch; 0 means no ledger has been verified yet.
@@ -718,6 +741,20 @@ type Store interface {
 	// and (when beforeTime is non-zero) older than beforeTime. The limit
 	// keeps a single DELETE from holding a long lock; the pruner loops.
 	DeleteEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error)
+
+	// UpsertAddressRefs inserts address→event index rows idempotently.
+	// Duplicate (address, event_id, role) combinations are silently ignored.
+	UpsertAddressRefs(ctx context.Context, refs []AddressRef) error
+	// QueryAddressEvents returns events involving the given address, in
+	// chronological order (by event_id), cursor-paginated.
+	QueryAddressEvents(ctx context.Context, address string, f EventFilter) ([]Event, string, error)
+	// CountAddressEvents returns the total number of events involving the
+	// given address (ignoring pagination).
+	CountAddressEvents(ctx context.Context, address string) (int64, error)
+	// GetAddressSummary returns aggregate information about an address's
+	// event history: first/last seen ledger, total event count, and
+	// distinct contracts interacted with.
+	GetAddressSummary(ctx context.Context, address string) (AddressSummary, error)
 
 	// MigrationVersion returns the currently applied migration version and
 	// whether the schema_migrations table reports a dirty state. When the

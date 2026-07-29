@@ -396,6 +396,10 @@ func (s *Server) Router() http.Handler {
 		r.Delete("/admin/keys/{key_id}", s.handleRevokeTenantKey)
 	})
 
+	// Address activity index (#46).
+	r.Get("/addresses/{address}/events", s.handleAddressEvents)
+	r.Get("/addresses/{address}/summary", s.handleAddressSummary)
+
 	return r
 }
 
