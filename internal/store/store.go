@@ -88,7 +88,16 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
+	// ContractID is a single contract ID to filter by. For backward
+	// compatibility with callers that set a single ID (e.g.
+	// handleContractEvents). When set alongside ContractIDs, the two are
+	// merged — an event matching either is returned.
 	ContractID string
+	// ContractIDs is a list of contract IDs to filter by (SQL IN / ANY).
+	// When non-empty, the store generates `contract_id = ANY($N)` instead
+	// of `contract_id = $N`. Together with ContractID the union is
+	// matched — an event for any of these contracts qualifies.
+	ContractIDs []string
 	// ContractIDPrefix matches events whose contract_id starts with this
 	// prefix via a LIKE query. Mutually exclusive with ContractID.
 	ContractIDPrefix string

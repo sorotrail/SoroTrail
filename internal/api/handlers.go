@@ -987,9 +987,6 @@ func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
 	return out
 }
 
-// Stats summarizes what the indexer has stored plus, when the auditor is
-// running, the post-processing counters it has accumulated.
-
 // contractListResponse is the JSON body for GET /contracts.
 type contractListResponse struct {
 	Contracts []store.ContractSummary `json:"contracts"`
@@ -1051,6 +1048,9 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 		loggerFromContext(r.Context()).Warn("counting contracts for X-Total-Count", "error", cerr)
 	} else if total > 0 {
 		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+	if items == nil {
+		items = []store.ContractSummary{}
 	}
 	writeCacheHeaders(w, cacheNoCache, 0, "")
 	writeJSON(w, http.StatusOK, contractListResponse{
@@ -1777,8 +1777,41 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return store.EventFilter{}, err
 	}
 
+	// contract_ids is a comma-separated list of contract IDs. When present,
+	// each element must be a valid contract strkey. The empty string (no
+	// parameter) or a single value without commas behave identically to the
+	// original ?contract_id= — no breaking change to existing callers.
+	var contractIDs []string
+	if raw := q.Get("contract_id"); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			// The doc comment above promises each element is a valid
+			// contract strkey; enforce it rather than passing a typo
+			// through to a query that silently matches nothing.
+			if !config.ValidContractID(part) {
+				return store.EventFilter{}, fmt.Errorf("invalid contract_id %q", part)
+			}
+			contractIDs = append(contractIDs, part)
+		}
+	}
+	// Backward compatibility: a single contract_id without commas still
+	// sets ContractID so existing callers (handleContractEvents, GraphQL)
+	// are unaffected. When multiple IDs are given, ContractID is left empty
+	// and ContractIDs carries the full list.
+	var singleID string
+	if len(contractIDs) == 1 {
+		singleID = contractIDs[0]
+		contractIDs = nil
+	}
+
 	args := queries.EventFilterArgs{
-		ContractID:       q.Get("contract_id"),
+		// singleID, not the raw param: a lone contract_id keeps the
+		// historical single-ID behaviour, while a comma-separated list is
+		// carried by ContractIDs below.
+		ContractID:       singleID,
 		ContractIDPrefix: q.Get("contract_id_prefix"),
 		Types:            types,
 		Topic:            topic,
@@ -1814,6 +1847,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	if err != nil {
 		return f, err
 	}
+	// ContractIDs is set outside EventFilterArgs because the shared queries
+	// package (used by GraphQL) has no multi-ID concept yet; the store
+	// turns a non-empty list into `contract_id = ANY($N)`.
+	f.ContractIDs = contractIDs
 
 	// Scope is attached here, the single place REST list filters are built:
 	// queries.BuildEventFilter is shared with the GraphQL resolvers and
