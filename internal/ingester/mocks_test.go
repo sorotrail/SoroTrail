@@ -171,6 +171,18 @@ func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) 
 	return e, nil
 }
 
+func (m *mockStore) GetEventsByTxHash(_ context.Context, txHash, excludeID string) ([]store.Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []store.Event
+	for _, e := range m.events {
+		if e.TxHash == txHash && e.ID != excludeID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
 // EventExists is the cheap existence probe added to the Store interface
 // for the API's 304 path. Unused by ingester tests but needed to
 // satisfy the interface.

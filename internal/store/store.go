@@ -109,7 +109,11 @@ type EventFilter struct {
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
 	// TxHash filters events emitted by a specific transaction hash.
-	TxHash     string    // hex-encoded transaction hash
+	TxHash string // hex-encoded transaction hash
+	// HasValue filters events by whether they carry a value payload.
+	// nil means no constraint; true means value IS NOT NULL;
+	// false means value IS NULL.
+	HasValue   *bool
 	FromLedger int64     // inclusive
 	ToLedger   int64     // inclusive
 	FromTime   time.Time // inclusive, zero = no constraint
@@ -502,6 +506,10 @@ type Store interface {
 	ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error
 	// GetEvent returns the event with the given ID, or ErrNotFound.
 	GetEvent(ctx context.Context, id string) (Event, error)
+	// GetEventsByTxHash returns all events emitted by the transaction
+	// identified by txHash, excluding the event with id excludeID (when
+	// non-empty). Returns an empty slice when no other events exist.
+	GetEventsByTxHash(ctx context.Context, txHash, excludeID string) ([]Event, error)
 	// EventExists reports whether an event with the given ID is in the
 	// store. It is the cheap 304 path used by the API when a conditional
 	// GET carries an If-None-Match whose validator matches the request

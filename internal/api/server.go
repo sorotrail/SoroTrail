@@ -107,6 +107,20 @@ func (s *Server) SetCompressMinSize(n int) {
 	s.compressMinSize = n
 }
 
+// maxLimit is the API's upper bound for page-size parameters (limit and
+// recent). It is set once at startup via SetMaxLimit (driven by the
+// API_MAX_LIMIT env var) before any requests are served so no mutex is
+// needed. Default 500.
+var maxLimit = 500
+
+// SetMaxLimit configures the API's maximum page size for list endpoints.
+// Call once at startup before ListenAndServe. Values ≤0 are ignored.
+func SetMaxLimit(n int) {
+	if n > 0 {
+		maxLimit = n
+	}
+}
+
 // New builds the API server. rpcClient is used by /health, /readyz, and /stats.
 // apiKey gates the watched-contracts management endpoints; pass "" to
 // fail closed (every request gets a 503 with "API_KEY not configured").
@@ -190,6 +204,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/count", s.handleCountEvents)
 	r.Get("/events/{id}/raw", s.handleGetEventRaw)
+	r.Get("/events/{id}/transaction", s.handleGetEventTransaction)
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/contracts/{id}/export", s.handleContractExport)

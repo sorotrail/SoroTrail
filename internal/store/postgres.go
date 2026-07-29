@@ -21,10 +21,11 @@ var ErrNotFound = errors.New("not found")
 var ErrInvalidCursor = errors.New("invalid cursor")
 
 // DefaultQueryLimit applies when EventFilter.Limit is unset; MaxQueryLimit
-// caps requested page sizes.
+// caps requested page sizes as a server-side safety net (the API layer
+// enforces its own configurable limit via API_MAX_LIMIT).
 const (
 	DefaultQueryLimit         = 50
-	MaxQueryLimit             = 200
+	MaxQueryLimit             = 500
 	DefaultEventPartitionSpan = 120960
 )
 
@@ -491,6 +492,41 @@ func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
 	return e, err
 }
 
+// GetEventsByTxHash returns all events emitted by the transaction
+// identified by txHash, excluding the event with id excludeID (when
+// non-empty). Events are returned in ascending ID order.
+func (p *Postgres) GetEventsByTxHash(ctx context.Context, txHash, excludeID string) ([]Event, error) {
+	query := `SELECT ` + eventColumns + ` FROM events WHERE tx_hash = $1`
+	args := []any{txHash}
+	if excludeID != "" {
+		query += ` AND id != $2`
+		args = append(args, excludeID)
+	}
+	query += ` ORDER BY id ASC`
+
+	var events []Event
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("querying events by tx hash: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			e, err := scanEvent(rows)
+			if err != nil {
+				return err
+			}
+			events = append(events, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
 // EventExists is the cheap 304 path used by the API's conditional GET:
 // an index-only probe against the primary key that never deserializes
 // the row, so it stays index-bound even on a wide row. Existence is a
@@ -549,6 +585,13 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	}
 	if f.TxHash != "" {
 		where = append(where, "tx_hash = "+arg(f.TxHash))
+	}
+	if f.HasValue != nil {
+		if *f.HasValue {
+			where = append(where, "value IS NOT NULL")
+		} else {
+			where = append(where, "value IS NULL")
+		}
 	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))

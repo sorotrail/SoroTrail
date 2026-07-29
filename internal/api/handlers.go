@@ -620,6 +620,74 @@ func (s *Server) handleGetEventRaw(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleGetEventTransaction returns all sibling events from the same
+// transaction as the event with the given {id}. The referenced event
+// itself is excluded from the response. Returns 404 when the event is
+// not found; returns an empty list when the transaction has no other
+// events.
+func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	// Validate ?fields= before touching the store.
+	fields, err := parseFields(r.URL.Query().Get("fields"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	event, err := s.store.GetEvent(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
+		return
+	}
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading event for transaction siblings", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
+		return
+	}
+
+	// If the event has no transaction hash (should not normally happen),
+	// return an empty list rather than erroring — the event is valid but
+	// has no siblings.
+	if event.TxHash == "" {
+		writeCacheHeaders(w, cacheImmutable, immutableMaxAge, `"`+id+`:tx"`)
+		writeJSON(w, http.StatusOK, eventsResponse{Events: []store.Event{}})
+		return
+	}
+
+	siblings, err := s.store.GetEventsByTxHash(r.Context(), event.TxHash, id)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading transaction siblings", "tx_hash", event.TxHash, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading transaction events failed"))
+		return
+	}
+
+	decoded := r.URL.Query().Get("decoded") == "true"
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
+
+	etag := `"` + id + `:tx"`
+	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+
+	if decoded && s.enricher != nil {
+		enriched := s.enricher.EnrichEvents(r.Context(), siblings)
+		if includeXDR {
+			writeJSON(w, http.StatusOK, enrichedEventsWithXDRResponse{Events: enrichEventsWithXDR(enriched)})
+			return
+		}
+		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched})
+		return
+	}
+	if includeXDR {
+		writeJSON(w, http.StatusOK, eventsWithXDRResponse{Events: eventsWithXDR(siblings)})
+		return
+	}
+	if fields == nil {
+		writeJSON(w, http.StatusOK, eventsResponse{Events: siblings})
+	} else {
+		writeJSON(w, http.StatusOK, map[string]any{"events": projectEvents(siblings, fields)})
+	}
+}
+
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
@@ -1172,6 +1240,7 @@ func listETag(f store.EventFilter) string {
 		Topic3        json.RawMessage `json:"p3,omitempty"`
 		TopicContains json.RawMessage `json:"pc,omitempty"`
 		TxHash        string          `json:"th,omitempty"`
+		HasValue      *bool           `json:"hv,omitempty"`
 		FromLedger    int64           `json:"fl"`
 		ToLedger      int64           `json:"tl"`
 		FromTime      string          `json:"ft,omitempty"`
@@ -1192,6 +1261,7 @@ func listETag(f store.EventFilter) string {
 		Topic3:        f.Topic3,
 		TopicContains: f.TopicContains,
 		TxHash:        f.TxHash,
+		HasValue:      f.HasValue,
 		FromLedger:    f.FromLedger,
 		ToLedger:      f.ToLedger,
 		FromTime:      timeOrEmpty(f.FromTime),
@@ -1431,8 +1501,8 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 	if raw := q.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
-		if err != nil || limit < 1 || limit > store.MaxQueryLimit {
-			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
+		if err != nil || limit < 1 || limit > maxLimit {
+			return f, fmt.Errorf("limit must be an integer in [1,%d]", maxLimit)
 		}
 		f.Limit = limit
 	} else {
@@ -1451,12 +1521,25 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		n := recentDefaultLimit
 		if raw != "true" {
 			n, err = strconv.Atoi(raw)
-			if err != nil || n < 1 || n > store.MaxQueryLimit {
-				return f, fmt.Errorf("recent must be a positive integer in [1,%d]", store.MaxQueryLimit)
+			if err != nil || n < 1 || n > maxLimit {
+				return f, fmt.Errorf("recent must be a positive integer in [1,%d]", maxLimit)
 			}
 		}
 		f.Order = "desc"
 		f.Limit = n
+	}
+
+	if raw := q.Get("has_value"); raw != "" {
+		switch raw {
+		case "true":
+			t := true
+			f.HasValue = &t
+		case "false":
+			v := false
+			f.HasValue = &v
+		default:
+			return f, fmt.Errorf("has_value must be true or false, got %q", raw)
+		}
 	}
 
 	return f, nil
