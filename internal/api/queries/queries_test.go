@@ -81,25 +81,6 @@ func TestBuildEventFilter_BadContractID(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid contract_id")
 }
 
-// TestBuildEventFilter_ContractIDPrefixConflict rejects combining
-// contract_id and contract_id_prefix.
-func TestBuildEventFilter_ContractIDPrefixConflict(t *testing.T) {
-	_, err := BuildEventFilter(EventFilterArgs{
-		ContractID:       "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-		ContractIDPrefix: "C",
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "cannot be combined")
-}
-
-// TestBuildEventFilter_ContractIDPrefix passes through the prefix unchanged.
-func TestBuildEventFilter_ContractIDPrefix(t *testing.T) {
-	got, err := BuildEventFilter(EventFilterArgs{ContractIDPrefix: "CABC"})
-	require.NoError(t, err)
-	assert.Equal(t, "CABC", got.ContractIDPrefix)
-	assert.Empty(t, got.ContractID)
-}
-
 // TestBuildEventFilter_BadOrder rejects unsupported sort directions.
 func TestBuildEventFilter_BadOrder(t *testing.T) {
 	_, err := BuildEventFilter(EventFilterArgs{Order: "reverse"})

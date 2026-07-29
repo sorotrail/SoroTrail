@@ -465,10 +465,6 @@ func (ing *Ingester) PageLimit() uint { return ing.opts.PageLimit }
 // latest ledger; idempotent upserts make the overlap harmless.
 func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState, bool) {
 	caughtUp := uint(len(resp.Events)) < pageLimit
-	// Stamped here rather than in the store so every state this function
-	// returns carries the same instant, and so a save that records no
-	// progress still marks that the poll itself succeeded.
-	now := time.Now().UTC()
 
 	cursor := resp.Cursor
 	if cursor == "" && len(resp.Events) > 0 {
@@ -481,9 +477,9 @@ func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState
 	}
 
 	if cursor != "" {
-		return store.IngestionState{LastIngestedLedger: lastLedger, LastCursor: cursor, LastSuccessfulPoll: &now}, caughtUp
+		return store.IngestionState{LastIngestedLedger: lastLedger, LastCursor: cursor}, caughtUp
 	}
-	return store.IngestionState{LastIngestedLedger: int64(resp.LatestLedger) - 1, LastSuccessfulPoll: &now}, caughtUp
+	return store.IngestionState{LastIngestedLedger: int64(resp.LatestLedger) - 1}, caughtUp
 }
 
 // windowSweep ingests the ledger window [start, end] by paging each filter
@@ -552,8 +548,7 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	if end >= health.LatestLedger {
 		lastIngested = int64(end) - 1
 	}
-	now := time.Now().UTC()
-	err = ing.store.SaveIngestionState(ctx, store.IngestionState{LastIngestedLedger: lastIngested, LastSuccessfulPoll: &now})
+	err = ing.store.SaveIngestionState(ctx, store.IngestionState{LastIngestedLedger: lastIngested})
 	if err != nil {
 		return false, err
 	}
