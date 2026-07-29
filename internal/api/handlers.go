@@ -1739,6 +1739,12 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 			if part == "" {
 				continue
 			}
+			// The doc comment above promises each element is a valid
+			// contract strkey; enforce it rather than passing a typo
+			// through to a query that silently matches nothing.
+			if !config.ValidContractID(part) {
+				return store.EventFilter{}, fmt.Errorf("invalid contract_id %q", part)
+			}
 			contractIDs = append(contractIDs, part)
 		}
 	}
@@ -1753,7 +1759,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 
 	args := queries.EventFilterArgs{
-		ContractID:       q.Get("contract_id"),
+		// singleID, not the raw param: a lone contract_id keeps the
+		// historical single-ID behaviour, while a comma-separated list is
+		// carried by ContractIDs below.
+		ContractID:       singleID,
 		ContractIDPrefix: q.Get("contract_id_prefix"),
 		Types:            types,
 		Topic:            topic,
@@ -1789,6 +1798,10 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	if err != nil {
 		return f, err
 	}
+	// ContractIDs is set outside EventFilterArgs because the shared queries
+	// package (used by GraphQL) has no multi-ID concept yet; the store
+	// turns a non-empty list into `contract_id = ANY($N)`.
+	f.ContractIDs = contractIDs
 
 	// Scope is attached here, the single place REST list filters are built:
 	// queries.BuildEventFilter is shared with the GraphQL resolvers and

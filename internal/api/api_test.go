@@ -169,6 +169,7 @@ func (s *stubStore) MigrationVersion(context.Context) (int, bool, error) {
 }
 
 func (s *stubStore) Stats(context.Context, store.Scope) (store.Stats, error) { return s.stats, nil }
+func (s *stubStore) Ping(context.Context) error                              { return s.pingErr }
 func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return s.watchedList, s.watchedListErr
 }
