@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -194,6 +195,18 @@ func (m *mockStore) GetEvent(_ context.Context, id string, _ store.Scope) (store
 		return store.Event{}, store.ErrNotFound
 	}
 	return e, nil
+}
+
+func (m *mockStore) GetEventsByTxHash(_ context.Context, txHash, excludeID string) ([]store.Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []store.Event
+	for _, e := range m.events {
+		if e.TxHash == txHash && e.ID != excludeID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Event, string, error) {
@@ -430,3 +443,20 @@ func mkEvents(ledger uint32, count int, contractID string) []rpc.Event {
 	}
 	return out
 }
+
+func (m *mockStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
+	return 0, nil
+}
+func (m *mockStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
+	return store.DeadLetter{}, nil
+}
+func (m *mockStore) ListDeadLetters(context.Context, string, int, string) ([]store.DeadLetter, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, error) {
+	return store.DeadLetter{}, store.ErrNotFound
+}
+func (m *mockStore) DeleteDeadLetter(context.Context, int64) error { return nil }

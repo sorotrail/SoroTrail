@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sorotrail/sorotrail/internal/api"
+	"github.com/sorotrail/sorotrail/internal/api/graphql"
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/config"
@@ -143,6 +144,16 @@ func run() error {
 	specFetcher := spec.NewFetcher(rpcClient)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
+	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
+		PollInterval:     cfg.PollInterval,
+		StartLedger:      cfg.StartLedger,
+		RetentionLedgers: cfg.RetentionLedgers,
+		LagWarnLedgers:   cfg.LagWarnLedgers,
+		// LagMetrics is nil here on purpose: no /metrics endpoint is
+		// wired up yet, so the ingester's applyDefaults installs a
+		// no-op. When a Prometheus endpoint lands, main.go is the
+		// seam to pass a real LagMetrics implementation.
+	})
 	// Wrap the raw RPC client so per-method error totals are tracked and
 	// surfaced via /stats. specFetcher already holds a reference to the
 	// unwrapped client (spec lookups are not counted as ingestion errors).
@@ -158,6 +169,10 @@ func run() error {
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
+	// Wire the same store as the dead-letter sink: events that fail to
+	// decode/persist land in the dead_letters table instead of
+	// stalling the cycle (issue #131).
+	ing.SetDeadLetterSink(st)
 
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a
@@ -181,6 +196,20 @@ func run() error {
 		api.SetAuditor(aud)
 	}
 
+	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
+	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
+	// returns immediately. Only when at least one retention policy is
+	// configured does it allocate a goroutine and a metrics struct.
+	prn := pruner.New(st, log, pruner.Options{
+		MaxAge:    cfg.RetentionMaxAge,
+		MinLedger: cfg.RetentionMinLedger,
+		BatchSize: cfg.RetentionBatchSize,
+		Pause:     cfg.RetentionPause,
+		Interval:  cfg.RetentionInterval,
+	})
+	if cfg.RetentionEnabled() {
+		api.SetPruner(prn)
+	}
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
 	// its cleanup goroutine is never started.
@@ -201,10 +230,27 @@ func run() error {
 		SlowQueryThreshold: cfg.APISlowQueryThreshold,
 		Logger:             log,
 	})
+	api.SetMaxLimit(cfg.APIMaxLimit)
+
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
+	apiServer.SetCORSConfig(api.CORSConfig{
+		AllowedOrigins: cfg.CORSAllowedOrigins,
+		AllowedMethods: cfg.CORSAllowedMethods,
+		AllowedHeaders: cfg.CORSAllowedHeaders,
+	})
+
+	// GraphQL transport: reads against the same store + spec enricher
+	// the REST handlers use. Dev-mode playground is gated on
+	// GRAPHQL_PLAYGROUND. The schema is the same shape as
+	// internal/api/graphql/schema.graphqls.
+	gqlHandler, gqlErr := graphql.New(graphqlServerDeps(apiStore, specEnricher), log, cfg.GraphQLPlayground)
+	if gqlErr != nil {
+		return fmt.Errorf("constructing graphql handler: %w", gqlErr)
+	}
+	apiServer.SetGraphQLHandler(gqlHandler, gqlHandler.PlaygroundHandler())
 
 	if cfg.MultiTenant {
 		// Tenancy lives in tables (tenants, grants, api_keys, usage) that
@@ -281,6 +327,21 @@ func run() error {
 			}
 		}()
 	}
+	go func() {
+		if cfg.RetentionEnabled() {
+			log.Info("pruner starting",
+				"max_age", cfg.RetentionMaxAge,
+				"min_ledger", cfg.RetentionMinLedger,
+				"batch_size", cfg.RetentionBatchSize,
+				"pause", cfg.RetentionPause,
+				"interval", cfg.RetentionInterval)
+		}
+		if err := prn.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errCh <- fmt.Errorf("pruner: %w", err)
+		} else {
+			errCh <- nil
+		}
+	}()
 
 	var firstErr error
 	remaining := 3 // ingester + http server + webhook
@@ -364,4 +425,11 @@ func newLogger(level, format string) *slog.Logger {
 		h = slog.NewTextHandler(os.Stdout, opts)
 	}
 	return slog.New(h)
+}
+
+// graphqlServerDeps wraps the live store + enricher into the typed
+// bundle the GraphQL Handler consumes. Centralising the cast here
+// keeps the route wiring in main.go one line wide.
+func graphqlServerDeps(st store.Store, enricher api.Enricher) api.ServerDeps {
+	return api.ServerDeps{Store: st, Enricher: enricher}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -121,11 +122,12 @@ func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest)
 
 // mockStore is an in-memory Store.
 type mockStore struct {
-	mu       sync.Mutex
-	events   map[string]store.Event
-	state    *store.IngestionState
-	watched  []store.WatchedContract
-	upserted [][]store.Event
+	mu          sync.Mutex
+	events      map[string]store.Event
+	state       *store.IngestionState
+	watched     []store.WatchedContract
+	upserted    [][]store.Event
+	deadLetters []store.DeadLetterInput
 }
 
 func newMockStore() *mockStore {
@@ -168,6 +170,18 @@ func (m *mockStore) GetEvent(_ context.Context, id string, _ store.Scope) (store
 		return store.Event{}, store.ErrNotFound
 	}
 	return e, nil
+}
+
+func (m *mockStore) GetEventsByTxHash(_ context.Context, txHash, excludeID string) ([]store.Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []store.Event
+	for _, e := range m.events {
+		if e.TxHash == txHash && e.ID != excludeID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 // EventExists is the cheap existence probe added to the Store interface
@@ -220,6 +234,9 @@ func (m *mockStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 func (m *mockStore) GetIngestionState(context.Context) (store.IngestionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.ingestErr != nil {
+		return store.IngestionState{}, m.ingestErr
+	}
 	if m.state == nil {
 		return store.IngestionState{}, store.ErrNotFound
 	}
@@ -293,6 +310,26 @@ func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int, store.SubscriptionOwner) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
+
+func (m *mockStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
+	return 0, nil
+}
+func (m *mockStore) DeadLetterEvent(_ context.Context, in store.DeadLetterInput) (store.DeadLetter, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deadLetters = append(m.deadLetters, in)
+	return store.DeadLetter{ID: int64(len(m.deadLetters)), EventID: in.EventID, ContractID: in.ContractID, Ledger: in.Ledger, Type: in.Type, TxHash: in.TxHash, TopicXDR: in.TopicXDR, ValueXDR: in.ValueXDR, Error: in.Err.Error()}, nil
+}
+func (m *mockStore) ListDeadLetters(context.Context, string, int, string) ([]store.DeadLetter, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, error) {
+	return store.DeadLetter{}, store.ErrNotFound
+}
+func (m *mockStore) DeleteDeadLetter(context.Context, int64) error { return nil }
 
 // passthroughDecoder avoids XDR fixtures in ingester tests.
 type passthroughDecoder struct{}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/sorotrail/sorotrail/internal/api/queries"
 	"github.com/sorotrail/sorotrail/internal/config"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -80,14 +81,17 @@ func (s *Server) handleContractExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fromLedger, err := parseLedgerParam(r.URL.Query().Get("from_ledger"), "from_ledger")
+	// parseLedgerParam is now in internal/api/queries. We reconstruct
+	// the original error string (which used the param-name prefix) so
+	// REST clients see the same message they have always seen.
+	fromLedger, err := queries.ParseLedgerParam(r.URL.Query().Get("from_ledger"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, http.StatusBadRequest, fmt.Errorf("from_ledger %s", err.Error()))
 		return
 	}
-	toLedger, err := parseLedgerParam(r.URL.Query().Get("to_ledger"), "to_ledger")
+	toLedger, err := queries.ParseLedgerParam(r.URL.Query().Get("to_ledger"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, http.StatusBadRequest, fmt.Errorf("to_ledger %s", err.Error()))
 		return
 	}
 	if fromLedger <= 0 || toLedger <= 0 {

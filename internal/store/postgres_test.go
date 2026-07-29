@@ -742,6 +742,7 @@ func TestStats(t *testing.T) {
 	assert.Equal(t, int64(100), stats.OldestStoredLedger)
 	assert.Equal(t, int64(2), stats.ContractCount)
 	assert.Equal(t, int64(1), stats.WatchedContracts)
+	assert.Greater(t, stats.TableSizeBytes, int64(0), "table_size_bytes should report the on-disk size of the events table")
 
 	var plan string
 	rows, err := st.pool.Query(ctx, `EXPLAIN (COSTS OFF) SELECT coalesce(min(ledger), 0) FROM events`)

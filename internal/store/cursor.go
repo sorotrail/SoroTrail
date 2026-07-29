@@ -61,3 +61,22 @@ func decodeCompositeCursor(cursor string) (sortValue, id string, err error) {
 	}
 	return sortValue, id, nil
 }
+
+// EncodeContractsCursor keys keyset pagination for ListContracts over
+// the (sortValue, contractID) pair. sortAs is the literal column being
+// sorted — the API keeps the same cursor format for any sort so a
+// client can mix sortings between pages, but typically a caller picks
+// one and sticks with it.
+func EncodeContractsCursor(sortAs, sortValue, contractID string) string {
+	return encodeCompositeCursor(sortValue, contractID)
+}
+
+// DecodeContractsCursor is the inverse of EncodeContractsCursor. It
+// surfaces a typed error the handler maps to 400.
+func DecodeContractsCursor(cursor string) (sortValue, contractID string, err error) {
+	sortValue, contractID, err = decodeCompositeCursor(cursor)
+	if err != nil {
+		err = fmt.Errorf("%w: contracts cursor", ErrInvalidContractsCursor)
+	}
+	return
+}
