@@ -111,8 +111,12 @@ func (f *fakeExportStore) UpsertEvents(context.Context, []store.Event) (int64, e
 func (f *fakeExportStore) ReplaceEventsInRange(context.Context, []store.Event, int64, int64) error {
 	return nil
 }
-func (f *fakeExportStore) GetEvent(context.Context, string) (store.Event, error) {
+func (f *fakeExportStore) GetEvent(context.Context, string, store.Scope) (store.Event, error) {
 	return store.Event{}, store.ErrNotFound
+}
+func (f *fakeExportStore) EventExists(context.Context, string, store.Scope) (bool, error) {
+func (f *fakeExportStore) GetEventsByTxHash(context.Context, string, string) ([]store.Event, error) {
+	return nil, nil
 }
 func (f *fakeExportStore) EventExists(context.Context, string) (bool, error) {
 	return false, nil
@@ -151,16 +155,18 @@ func (f *fakeExportStore) ListOpenFindingsByRange(context.Context, int64, int64)
 func (f *fakeExportStore) CreateSubscription(context.Context, store.Subscription) (store.Subscription, error) {
 	return store.Subscription{}, nil
 }
-func (f *fakeExportStore) GetSubscription(context.Context, int64) (store.Subscription, error) {
+func (f *fakeExportStore) GetSubscription(context.Context, int64, store.SubscriptionOwner) (store.Subscription, error) {
 	return store.Subscription{}, store.ErrNotFound
 }
-func (f *fakeExportStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
+func (f *fakeExportStore) ListSubscriptions(context.Context, store.SubscriptionOwner) ([]store.Subscription, error) {
 	return nil, nil
 }
-func (f *fakeExportStore) UpdateSubscription(context.Context, store.Subscription) (store.Subscription, error) {
+func (f *fakeExportStore) UpdateSubscription(context.Context, store.Subscription, store.SubscriptionOwner) (store.Subscription, error) {
 	return store.Subscription{}, nil
 }
-func (f *fakeExportStore) DeleteSubscription(context.Context, int64) error { return nil }
+func (f *fakeExportStore) DeleteSubscription(context.Context, int64, store.SubscriptionOwner) error {
+	return nil
+}
 func (f *fakeExportStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
 	return nil, nil
 }
@@ -171,15 +177,17 @@ func (f *fakeExportStore) ResetSubscriptionFailures(context.Context, int64) erro
 func (f *fakeExportStore) RecordDeliveryAttempt(context.Context, store.DeliveryAttempt) (store.DeliveryAttempt, error) {
 	return store.DeliveryAttempt{}, nil
 }
-func (f *fakeExportStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
+func (f *fakeExportStore) ListDeliveryAttempts(context.Context, int64, int, store.SubscriptionOwner) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
 func (f *fakeExportStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
 }
 func (f *fakeExportStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
-func (f *fakeExportStore) Stats(context.Context) (store.Stats, error)                    { return store.Stats{}, nil }
-func (f *fakeExportStore) Ping(context.Context) error                                    { return nil }
+func (f *fakeExportStore) Stats(context.Context, store.Scope) (store.Stats, error) {
+	return store.Stats{}, nil
+}
+func (f *fakeExportStore) Ping(context.Context) error { return nil }
 
 // testServer wraps a Server with the fake store so handlers can be
 // exercised in isolation without the full chi stack.
@@ -303,3 +311,20 @@ func TestExport_RejectsInvalidContractID(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Contains(t, rec.Body.String(), "invalid contract id")
 }
+
+func (m *fakeExportStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	return nil, "", nil
+}
+func (m *fakeExportStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
+	return 0, nil
+}
+func (m *fakeExportStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
+	return store.DeadLetter{}, nil
+}
+func (m *fakeExportStore) ListDeadLetters(context.Context, string, int, string) ([]store.DeadLetter, string, error) {
+	return nil, "", nil
+}
+func (m *fakeExportStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, error) {
+	return store.DeadLetter{}, store.ErrNotFound
+}
+func (m *fakeExportStore) DeleteDeadLetter(context.Context, int64) error { return nil }

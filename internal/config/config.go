@@ -82,6 +82,12 @@ type Config struct {
 	// Negative disables compression entirely; 0 uses api.CompressMinSize.
 	CompressMinSize int `env:"COMPRESS_MIN_SIZE" envDefault:"0"`
 
+	// APIMaxLimit is the maximum page size accepted by the API for list
+	// endpoints (/events, /subscriptions/{id}/deliveries). Values above
+	// this are rejected with 400; the store still clamps internally as a
+	// safety net. Default 500 (up from the previous hardcoded 200).
+	APIMaxLimit int `env:"API_MAX_LIMIT" envDefault:"500"`
+
 	// CachePrivate flips the cacheable endpoints from Cache-Control: public
 	// to Cache-Control: private. Set this when the deployment serves
 	// per-user data behind an auth layer (#17, not yet merged) so shared
@@ -95,6 +101,29 @@ type Config struct {
 	// component shutdown may take before the process is killed. Zero means
 	// no timeout (wait indefinitely).
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"15s"`
+
+	// Multi-tenancy (#48). MULTI_TENANT=false (the default) means no
+	// authentication, no tenant boundary, and no usage accounting — every
+	// request runs with full access exactly as it did before. Turning it on
+	// makes an API key mandatory on every endpoint except /health.
+	MultiTenant bool `env:"MULTI_TENANT" envDefault:"false"`
+	// MultiTenantMaxWatched caps the union of all tenants' watch lists, so
+	// tenants collectively cannot push the ingester past the RPC budget the
+	// operator planned for. 0 disables the cap.
+	MultiTenantMaxWatched int `env:"MULTI_TENANT_MAX_WATCHED" envDefault:"250"`
+	// MultiTenantUsageFlush is how often accumulated per-tenant usage
+	// counters are written.
+	MultiTenantUsageFlush time.Duration `env:"MULTI_TENANT_USAGE_FLUSH" envDefault:"10s"`
+	// MultiTenantStreamScopeSync bounds how long an open stream can keep
+	// serving a contract whose grant has been revoked.
+	MultiTenantStreamScopeSync time.Duration `env:"MULTI_TENANT_STREAM_SCOPE_SYNC" envDefault:"30s"`
+	// MultiTenantBootstrapKey solves the chicken-and-egg of a fresh
+	// multi-tenant install: minting the first key requires an admin key,
+	// which requires minting a key. When set, this value is installed as an
+	// API key for the seeded "default" admin tenant at startup, so the
+	// operator has a way in. Treat it as a secret; rotate it by revoking
+	// through /admin once real keys exist.
+	MultiTenantBootstrapKey string `env:"MULTI_TENANT_BOOTSTRAP_KEY"`
 
 	// SweepConcurrency is the maximum number of filter batches that may be
 	// fetched concurrently during a windowSweep pass. The Stellar RPC's
@@ -135,6 +164,24 @@ type Config struct {
 	// (but continue serving the HTTP API), preventing double-processing.
 	// Default false — single-instance deployments keep today's behavior.
 	IngestionLockEnabled bool `env:"INGESTION_LOCK_ENABLED" envDefault:"false"`
+	// CORS configuration. Default policy is deny-all: an empty
+	// CORSAllowedOrigins list means no browser cross-origin request gets
+	// CORS headers, so the browser blocks the response. Allowing a single
+	// origin ("https://app.example.com") sets Access-Control-Allow-Origin
+	// to that exact value on every request with a matching Origin header;
+	// "*" is a special case that allows any origin (and intentionally
+	// voids the Vary: Origin contract because the response is identical
+	// regardless of origin — see parseAllowedOrigins).
+	//
+	// CORSAllowedMethods and CORSAllowedHeaders are returned on the
+	// preflight (OPTIONS) response so a browser knowing the allowed
+	// methods/headers can complete a non-simple cross-origin request.
+	// The defaults cover the surface this API actually exposes; operators
+	// adding custom routes (e.g. application/json PATCH) should extend
+	// these.
+	CORSAllowedOrigins []string `env:"CORS_ALLOWED_ORIGINS" envDefault:""`
+	CORSAllowedMethods []string `env:"CORS_ALLOWED_METHODS" envDefault:"GET,POST,PUT,DELETE,OPTIONS"`
+	CORSAllowedHeaders []string `env:"CORS_ALLOWED_HEADERS" envDefault:"Content-Type,X-API-Key,Accept"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -214,6 +261,17 @@ func (c Config) Validate() error {
 	if c.AuditFindingMaxLgrs == 0 {
 		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
 	}
+	if c.RetentionBatchSize <= 0 {
+		return fmt.Errorf("RETENTION_BATCH_SIZE must be positive")
+	}
+	if c.RetentionPause < 0 {
+		return fmt.Errorf("RETENTION_PAUSE must be non-negative")
+	}
+	if c.RetentionInterval <= 0 {
+		return fmt.Errorf("RETENTION_INTERVAL must be positive")
+	}
+	if c.RetentionMaxAge < 0 {
+		return fmt.Errorf("RETENTION_MAX_AGE must be non-negative")
 	if c.BackfillRateRPS <= 0 {
 		return fmt.Errorf("BACKFILL_RATE_RPS must be positive, got %v", c.BackfillRateRPS)
 	}
@@ -235,6 +293,9 @@ func (c Config) Validate() error {
 	if c.HTTPReadHeaderTimeout < 0 {
 		return fmt.Errorf("HTTP_READ_HEADER_TIMEOUT must be non-negative, got %s", c.HTTPReadHeaderTimeout)
 	}
+	if c.APIMaxLimit < 1 {
+		return fmt.Errorf("API_MAX_LIMIT must be positive, got %d", c.APIMaxLimit)
+	}
 	if c.ShutdownTimeout < 0 {
 		return fmt.Errorf("SHUTDOWN_TIMEOUT must be non-negative, got %s", c.ShutdownTimeout)
 	}
@@ -247,6 +308,9 @@ func (c Config) Validate() error {
 	if c.ExportMaxRange <= 0 {
 		return fmt.Errorf("EXPORT_MAX_RANGE must be positive, got %d", c.ExportMaxRange)
 	}
+	if err := validateCORSOrigins(c.CORSAllowedOrigins); err != nil {
+		return err
+	}
 	// Both must be set together: half-configured limits would silently
 	// behave like the disabled case (Enabled returns false when either is
 	// non-positive), which would confuse operators who set one and
@@ -254,7 +318,29 @@ func (c Config) Validate() error {
 	if (c.RateLimitRPS > 0) != (c.RateLimitBurst > 0) {
 		return fmt.Errorf("RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
 	}
+	if c.MultiTenantMaxWatched < 0 {
+		return fmt.Errorf("MULTI_TENANT_MAX_WATCHED must be non-negative")
+	}
+	if c.MultiTenantUsageFlush <= 0 {
+		return fmt.Errorf("MULTI_TENANT_USAGE_FLUSH must be positive")
+	}
+	if c.MultiTenantStreamScopeSync <= 0 {
+		return fmt.Errorf("MULTI_TENANT_STREAM_SCOPE_SYNC must be positive")
+	}
+	// Rejected rather than ignored: an operator who sets a bootstrap key
+	// without enabling multi-tenancy has configured a credential that
+	// authenticates nothing, and would reasonably assume the instance is
+	// protected when it is wide open.
+	if c.MultiTenantBootstrapKey != "" && !c.MultiTenant {
+		return fmt.Errorf("MULTI_TENANT_BOOTSTRAP_KEY is set but MULTI_TENANT is false")
+	}
 	return nil
+}
+
+// RetentionEnabled reports whether at least one retention policy is
+// configured — the pruner only runs when this is true.
+func (c Config) RetentionEnabled() bool {
+	return c.RetentionMaxAge > 0 || c.RetentionMinLedger > 0
 }
 
 // ValidContractID reports whether s looks like a Soroban contract strkey.
@@ -299,6 +385,31 @@ func cleanContractList(in []string) []string {
 	return out
 }
 
+// validateCORSOrigins rejects origin entries that can't be safely compared
+// to a browser-supplied Origin header. Rejecting "null" matters because
+// browsers send Origin: null for sandboxed iframes / file:// pages /
+// redirects — accepting it would mean any third-party page could call
+// the API with credentials if X-API-Key happened to be known.
+//
+// "*" is a valid literal but documented separately as a special case the
+// middleware recognizes (see API CORS handler).
+func validateCORSOrigins(in []string) error {
+	for _, o := range in {
+		o = strings.TrimSpace(o)
+		if o == "" || o == "*" {
+			continue
+		}
+		if strings.EqualFold(o, "null") {
+			return fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q is not allowed (sandboxed Origin: null is a credentialed-origin bypass)", o)
+		}
+		u, err := url.Parse(o)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q is not a valid origin (want scheme://host[:port])", o)
+		}
+	}
+	return nil
+}
+
 // LoggableFields returns the configuration as a map of fields suitable for logging,
 // with credentials redacted (e.g., from DATABASE_URL).
 func (c Config) LoggableFields() []any {
@@ -327,6 +438,7 @@ func (c Config) LoggableFields() []any {
 		"reorg_rescan_interval", c.ReorgRescanInterval,
 		"export_max_range", c.ExportMaxRange,
 		"ingestion_lock_enabled", c.IngestionLockEnabled,
+		"cors_allowed_origins", len(c.CORSAllowedOrigins),
 		"audit_enabled", c.AuditEnabled,
 	}
 }

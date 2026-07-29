@@ -21,6 +21,26 @@ about. `internal/store` and `internal/replay` share those tables, so the
 database suite runs with `go test -p 1` (already the case in `make test-db`
 and CI); don't drop that flag.
 
+## Fuzz testing
+
+The decoder fuzz targets run automatically on pull requests with a 30-second
+budget per target. To run the short local versions:
+
+```sh
+go test ./internal/decode -run '^$' -fuzz FuzzDecodeScVal -fuzztime 30s
+go test ./internal/decode -run '^$' -fuzz FuzzDecodeTopicArray -fuzztime 30s
+```
+
+For a longer local session, increase `-fuzztime`, for example:
+
+```sh
+go test ./internal/decode -run '^$' -fuzz FuzzDecodeScVal -fuzztime 30m
+go test ./internal/decode -run '^$' -fuzz FuzzDecodeTopicArray -fuzztime 30m
+```
+
+Fuzzing may save reproducing inputs under the package's `testdata/fuzz`
+directory. Commit any panic reproducer together with a regression test.
+
 ## Architecture
 
 ```
@@ -73,17 +93,19 @@ implementations, so each layer is independently testable and replaceable.
 
 ## Dependency management
 
-Dependency updates are handled by Dependabot, which opens grouped weekly PRs
-for Go modules, GitHub Actions, and the Docker base image. PRs with minor or
-patch bumps are grouped together to keep the review stream manageable; major
-version bumps come individually. The `vulncheck` CI job runs
+Dependency updates are handled by Dependabot, which opens grouped weekly
+PRs for Go modules, GitHub Actions, and the Docker base image. PRs with minor
+or patch bumps are grouped together to keep the review stream manageable;
+major version bumps come individually. The `vulncheck` CI job runs
 `govulncheck ./...` and fails if any reachable vulnerability is found, so
 known-vulnerable code paths are surfaced before they ship. Review dependency
-PRs promptly — a green check on `vulncheck` is a good signal that the bump
-can be merged without deep audit.
+PRs promptly — a green check on `vulncheck` is a good signal that the bump can
+be merged without deep audit.
 
 ## Pull requests
 
 - `go build ./...`, `make test` and `make lint` must pass.
 - Include tests for behavior changes.
 - Update the README's API reference and config table when you touch either.
+- Include `Closes #[issue_id]` and summarize fuzz findings, including when no
+  panics were found.
