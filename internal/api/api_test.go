@@ -1684,7 +1684,6 @@ func TestListEvents_ConfigurableMaxLimit(t *testing.T) {
 	}
 }
 
-
 func TestGetEventTransaction_Success(t *testing.T) {
 	st := &stubStore{
 		event: store.Event{ID: "0001-0001", TxHash: "abc123"},
