@@ -338,6 +338,21 @@ func (s *guardedStore) SetContractSpec(ctx context.Context, wasmHash, contractID
 	return err
 }
 
+func (s *guardedStore) DeleteEventsBeforeLedger(ctx context.Context, beforeLedger int64) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.DeleteEventsBeforeLedger")
+	defer cancel()
+	start := time.Now()
+	n, err := s.Store.DeleteEventsBeforeLedger(ctx, beforeLedger)
+	s.logSlowQuery("store.DeleteEventsBeforeLedger", start, err)
+	return n, err
+}
+
+func (s *guardedStore) MigrationVersion(ctx context.Context) (int, bool, error) {
+	// Migration version queries are cheap — no timeout needed.
+	return s.Store.MigrationVersion(ctx)
+}
+
+func (s *guardedStore) Stats(ctx context.Context) (Stats, error) {
 func (s *guardedStore) Stats(ctx context.Context, sc Scope) (Stats, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.Stats")
 	defer cancel()
