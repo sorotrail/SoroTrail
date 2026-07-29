@@ -490,6 +490,7 @@ func TestListETag_CoversEveryFilterField(t *testing.T) {
 		mutate func(f *store.EventFilter)
 	}{
 		{"ContractID", func(f *store.EventFilter) { f.ContractID = testContract }},
+		{"ContractIDPrefix", func(f *store.EventFilter) { f.ContractIDPrefix = "CABC" }},
 		{"Type", func(f *store.EventFilter) { f.Types = []string{"diagnostic"} }},
 		{"Topic", func(f *store.EventFilter) { f.Topic = json.RawMessage(`{"symbol":"transfer"}`) }},
 		{"Topic0", func(f *store.EventFilter) { f.Topic0 = json.RawMessage(`{"symbol":"transfer"}`) }},
@@ -498,6 +499,10 @@ func TestListETag_CoversEveryFilterField(t *testing.T) {
 		{"Topic3", func(f *store.EventFilter) { f.Topic3 = json.RawMessage(`{"symbol":"transfer"}`) }},
 		{"TopicContains", func(f *store.EventFilter) { f.TopicContains = json.RawMessage(`[{"u64":7}]`) }},
 		{"TxHash", func(f *store.EventFilter) { f.TxHash = "abc123def" }},
+		{"HasValueTrue", func(f *store.EventFilter) { t := true; f.HasValue = &t }},
+		{"HasValueFalse", func(f *store.EventFilter) { v := false; f.HasValue = &v }},
+		{"TxIndex", func(f *store.EventFilter) { v := int32(1); f.TxIndex = &v }},
+		{"OpIndex", func(f *store.EventFilter) { v := int32(0); f.OpIndex = &v }},
 		{"FromLedger", func(f *store.EventFilter) { f.FromLedger = 501 }},
 		{"ToLedger", func(f *store.EventFilter) { f.ToLedger = 998 }},
 		{"FromTime", func(f *store.EventFilter) { f.FromTime = time.Unix(1_000_000, 0).UTC() }},
