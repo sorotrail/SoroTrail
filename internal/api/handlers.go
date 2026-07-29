@@ -939,6 +939,30 @@ func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
 	return out
 }
 
+type contractsResponse struct {
+	Contracts []store.ContractEventCount `json:"contracts"`
+	Count     int                        `json:"count"`
+}
+
+// handleListContracts returns every distinct contract ID seen in the store
+// with a count of events each, ordered alphabetically by contract ID.
+func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
+	contracts, err := s.store.ListContracts(r.Context())
+	if err != nil {
+		loggerFromContext(r.Context()).Error("listing contracts", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
+		return
+	}
+	if contracts == nil {
+		contracts = []store.ContractEventCount{}
+	}
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, contractsResponse{
+		Contracts: contracts,
+		Count:     len(contracts),
+	})
+}
+
 // Stats summarizes what the indexer has stored plus, when the auditor is
 // running, the post-processing counters it has accumulated.
 

@@ -63,9 +63,15 @@ type stubStore struct {
 	ingestion    store.IngestionState
 	ingestionErr error
 
+
 	migrationVersion int
 	migrationDirty   bool
 	migrationErr     error
+	listContractsResult []store.ContractSummary
+	listContractsCursor string
+	listContractsErr    error
+	countContractsResult int64
+	countContractsErr    error
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -178,7 +184,13 @@ func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
 	return s.removeErr
 }
 
-func (s *stubStore) Ping(context.Context) error { return s.pingErr }
+func (s *stubStore) ListContracts(ctx context.Context, f store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	return s.listContractsResult, s.listContractsCursor, s.listContractsErr
+}
+
+func (s *stubStore) CountContracts(ctx context.Context, f store.ContractsFilter) (int64, error) {
+	return s.countContractsResult, s.countContractsErr
+}
 
 // Subscription stubs for the webhook feature.
 func (s *stubStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
@@ -478,6 +490,64 @@ func TestListEvents_TotalCountHeader(t *testing.T) {
 		resp, _ := doGet(t, newTestServer(st, nil), "/events")
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		assert.Equal(t, "0", resp.Header.Get("X-Total-Count"))
+	})
+}
+
+func TestListContracts(t *testing.T) {
+	t.Run("returns contracts with event counts", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractEventCount{
+				{ContractID: testContract, EventCount: 10},
+				{ContractID: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", EventCount: 5},
+			},
+		}
+		s := newTestServer(st, nil)
+		resp, body := doGet(t, s, "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out contractsResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		require.Len(t, out.Contracts, 2)
+		assert.Equal(t, testContract, out.Contracts[0].ContractID)
+		assert.Equal(t, int64(10), out.Contracts[0].EventCount)
+		assert.Equal(t, "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", out.Contracts[1].ContractID)
+		assert.Equal(t, int64(5), out.Contracts[1].EventCount)
+		assert.Equal(t, 2, out.Count)
+	})
+
+	t.Run("empty result returns empty array, not null", func(t *testing.T) {
+		st := &stubStore{}
+		s := newTestServer(st, nil)
+		resp, body := doGet(t, s, "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out contractsResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.Empty(t, out.Contracts)
+		assert.Equal(t, 0, out.Count)
+		assert.Contains(t, string(body), `"contracts":[]`)
+	})
+
+	t.Run("store error returns 500", func(t *testing.T) {
+		st := &stubStore{
+			listContractsErr: errors.New("db unavailable"),
+		}
+		s := newTestServer(st, nil)
+		resp, body := doGet(t, s, "/contracts")
+		require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+		var e map[string]string
+		require.NoError(t, json.Unmarshal(body, &e))
+		assert.Contains(t, e["error"], "listing contracts failed")
+	})
+
+	t.Run("no-cache cache header", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractEventCount{},
+		}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
 	})
 }
 
