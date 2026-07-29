@@ -954,6 +954,11 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			RPCRequests:           m.RPCRequests,
 		}
 	}
+	if p := getPruner(); p != nil {
+		m := p.Metrics()
+		stats.Pruner = store.PrunerStats{
+			RunsCompleted:   m.RunsCompleted,
+			TotalRowsPurged: m.TotalRowsPurged,
 	if c := getRPCCounter(); c != nil {
 		snap := c.Errors().Snapshot()
 		stats.RPCErrors = store.RPCErrorStats{

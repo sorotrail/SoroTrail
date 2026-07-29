@@ -889,6 +889,50 @@ func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
 	return s, nil
 }
 
+// DeleteEventsBefore deletes up to limit events that are strictly below
+// maxLedger and (if beforeTime is non-zero) older than beforeTime. It is
+// designed for the background pruner and intentionally never touches rows
+// at or above maxLedger, which must be ≤ last_ingested_ledger.
+//
+// When beforeTime is zero the time clause is omitted — deletion is based
+// solely on ledger, which is useful when RETENTION_MIN_LEDGER is set.
+//
+// The limit prevents a single DELETE from holding a long lock. The caller
+// should loop with a pause between calls until the return is < limit.
+//
+// Implementation note: PostgreSQL's DELETE grammar has no LIMIT clause
+// (it is a MySQL extension). The capped set of rows is picked by an inner
+// SELECT id … LIMIT and then deleted by id. The id-based outer DELETE
+// also keeps the FK ON DELETE CASCADE story simple for the future
+// `token_events` table — Postgres cascades from the outer DELETE using
+// real row identities, not a DELETE result set, so dependent rows come
+// along for free once that table lands.
+func (p *Postgres) DeleteEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	var where string
+	var args []any
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	// Always scope by ledger: never delete at or above maxLedger.
+	where = "ledger < " + arg(maxLedger)
+
+	if !beforeTime.IsZero() {
+		where += " AND created_at < " + arg(beforeTime)
+	}
+
+	q := fmt.Sprintf(`DELETE FROM events WHERE id IN (SELECT id FROM events WHERE %s LIMIT %d)`, where, limit)
+	tag, err := p.pool.Exec(ctx, q, args...)
+	if err != nil {
+		return 0, fmt.Errorf("deleting events before ledger %d: %w", maxLedger, err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (p *Postgres) Ping(ctx context.Context) error {
 	return p.pool.Ping(ctx)
 }

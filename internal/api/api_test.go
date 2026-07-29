@@ -102,6 +102,12 @@ func (s *stubStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 	return store.AuditFinding{}, store.ErrNotFound
 }
 
+// DeleteEventsBefore is unused by API tests but needed to satisfy
+// store.Store now that the pruner can call it.
+func (s *stubStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}
+
 func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
 	return s.event, s.eventErr
 }

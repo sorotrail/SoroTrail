@@ -196,6 +196,20 @@ func run() error {
 		api.SetAuditor(aud)
 	}
 
+	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
+	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
+	// returns immediately. Only when at least one retention policy is
+	// configured does it allocate a goroutine and a metrics struct.
+	prn := pruner.New(st, log, pruner.Options{
+		MaxAge:    cfg.RetentionMaxAge,
+		MinLedger: cfg.RetentionMinLedger,
+		BatchSize: cfg.RetentionBatchSize,
+		Pause:     cfg.RetentionPause,
+		Interval:  cfg.RetentionInterval,
+	})
+	if cfg.RetentionEnabled() {
+		api.SetPruner(prn)
+	}
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
 	// its cleanup goroutine is never started.
@@ -278,6 +292,21 @@ func run() error {
 			}
 		}()
 	}
+	go func() {
+		if cfg.RetentionEnabled() {
+			log.Info("pruner starting",
+				"max_age", cfg.RetentionMaxAge,
+				"min_ledger", cfg.RetentionMinLedger,
+				"batch_size", cfg.RetentionBatchSize,
+				"pause", cfg.RetentionPause,
+				"interval", cfg.RetentionInterval)
+		}
+		if err := prn.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errCh <- fmt.Errorf("pruner: %w", err)
+		} else {
+			errCh <- nil
+		}
+	}()
 
 	var firstErr error
 	remaining := 3 // ingester + http server + webhook

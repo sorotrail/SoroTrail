@@ -44,6 +44,37 @@ func SetAuditor(a *audit.Auditor) {
 	auditorMu.Unlock()
 }
 
+// SetPruner registers the binary's Pruner so /stats can surface its
+// Metrics counters. There is exactly one Pruner per process; like the
+// auditor, it is a no-op when retention is not configured.
+//
+// Like SetAuditor this MUST be called BEFORE the API starts serving
+// requests (i.e. before http.Server.ListenAndServe), so the first
+// /stats request observes a stable value rather than a nil pruner.
+// cmd/sorotrail/main does this in the wiring phase before constructing
+// the http.Server.
+//
+// The local variable name is `prn` (not `pruner`) because the pruner
+// package shares the name and a same-named variable would shadow it
+// inside this file. `prn` matches the shorthand already used in
+// cmd/sorotrail/main.go.
+var (
+	prunerMu sync.RWMutex
+	prn      *pruner.Pruner
+)
+
+func SetPruner(p *pruner.Pruner) {
+	prunerMu.Lock()
+	prn = p
+	prunerMu.Unlock()
+}
+
+func getPruner() *pruner.Pruner {
+	prunerMu.RLock()
+	defer prunerMu.RUnlock()
+	return prn
+}
+
 func getAuditor() *audit.Auditor {
 	auditorMu.RLock()
 	defer auditorMu.RUnlock()

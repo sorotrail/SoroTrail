@@ -232,6 +232,17 @@ func (c Config) Validate() error {
 	if c.AuditFindingMaxLgrs == 0 {
 		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
 	}
+	if c.RetentionBatchSize <= 0 {
+		return fmt.Errorf("RETENTION_BATCH_SIZE must be positive")
+	}
+	if c.RetentionPause < 0 {
+		return fmt.Errorf("RETENTION_PAUSE must be non-negative")
+	}
+	if c.RetentionInterval <= 0 {
+		return fmt.Errorf("RETENTION_INTERVAL must be positive")
+	}
+	if c.RetentionMaxAge < 0 {
+		return fmt.Errorf("RETENTION_MAX_AGE must be non-negative")
 	if c.BackfillRateRPS <= 0 {
 		return fmt.Errorf("BACKFILL_RATE_RPS must be positive, got %v", c.BackfillRateRPS)
 	}
@@ -279,6 +290,12 @@ func (c Config) Validate() error {
 		return fmt.Errorf("RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
 	}
 	return nil
+}
+
+// RetentionEnabled reports whether at least one retention policy is
+// configured — the pruner only runs when this is true.
+func (c Config) RetentionEnabled() bool {
+	return c.RetentionMaxAge > 0 || c.RetentionMinLedger > 0
 }
 
 // ValidContractID reports whether s looks like a Soroban contract strkey.

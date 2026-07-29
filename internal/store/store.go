@@ -432,6 +432,15 @@ type Stats struct {
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
+	// Pruner counters are populated only when retention is configured;
+	// omitted from JSON when the pruner is a no-op.
+	Pruner PrunerStats `json:"pruner,omitempty"`
+}
+
+// PrunerStats is a JSON-friendly view of pruner.Metrics.
+type PrunerStats struct {
+	RunsCompleted   uint64 `json:"runs_completed"`
+	TotalRowsPurged int64  `json:"total_rows_purged"`
 }
 
 // RPCErrorStats is a JSON-friendly snapshot of per-method RPC error counts.

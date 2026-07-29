@@ -1025,6 +1025,67 @@ Audit behaviour:
 Set `AUDIT_ENABLED=false` (the default) to disable the auditor entirely;
 the binary's behavior is identical to a pre-audit build.
 
+## Retention / pruning
+
+SoroTrail exists because the RPC drops history, but “keep everything
+forever” is not viable for everyone indexing busy contracts. The optional
+pruner bounds on-disk growth without requiring an external cron job.
+
+Configure **one or both** policies and the pruner runs in its own
+goroutine on the same lifecycle as the ingester:
+
+- `RETENTION_MAX_AGE` — delete events whose `created_at` is older than the
+  duration (e.g. `RETENTION_MAX_AGE=2160h` keeps ~90 days).
+- `RETENTION_MIN_LEDGER` — delete events **strictly below** this ledger.
+  Events at exactly `RETENTION_MIN_LEDGER` are kept. The SQL is
+  `ledger < bound`.
+
+If neither is set the pruner is a no-op goroutine that returns without
+deleting anything — matching the pre-pruner behaviour. Tuning knobs:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `RETENTION_BATCH_SIZE` | `5000` | Rows per `DELETE` statement; smaller = less lock pressure, slower. |
+| `RETENTION_PAUSE` | `100ms` | Sleep between DELETE batches so ingestion stays responsive. |
+| `RETENTION_INTERVAL` | `1h` | Sleep after a sweep that found nothing to delete. |
+
+**Safety guard.** The pruner never deletes an event whose ledger is at or
+above the last ingested ledger. `RETENTION_MIN_LEDGER` is therefore an
+**upper bound** on the cutoff whenever it is lower than the last ingested
+ledger, so a misconfiguration above the chain head (e.g. setting
+`RETENTION_MIN_LEDGER=200` when only ledger 100 has been ingested) is a
+no-op rather than a destructive mistake. Pruning runs in batches of
+`RETENTION_BATCH_SIZE` with a `RETENTION_PAUSE` between batches; rows are
+not selected in any particular order — the safety guarantee is the
+`ledger < last_ingested_ledger` predicate inside `DELETE FROM events`,
+not the scan order, so the ingester is never starved for IO.
+
+**Metrics.** `GET /stats` adds a `pruner` object when retention is
+configured:
+
+```json
+{
+  "total_events": 12345,
+  "last_ingested_ledger": 260123,
+  "..."": "...",
+  "pruner": { "runs_completed": 7, "total_rows_purged": 1804321 }
+}
+```
+
+`runs_completed` is the number of full sweeps; `total_rows_purged` is the
+cumulative rows deleted since the process started.
+
+**Lifecycle.** The pruner is a single background goroutine started from
+`cmd/sorotrail/main.go` alongside the ingester (and, when enabled, the
+auditor). On `SIGINT` / `SIGTERM` every goroutine drains through a shared
+error channel and the pruner exits the same way as the others — a
+context-cancelled return is not an error.
+
+**Dependent tables.** When the SEP-41 `token_events` table lands, it will
+be defined with a foreign key to `events(id)` and `ON DELETE CASCADE`. The
+pruner therefore deletes only from `events` and lets Postgres cascade the
+dependent rows; today's single-table DELETE is correct because no such
+table exists yet, and the contract is “derived tables ride along”.
 ## Caching
 
 Stored events are immutable — a row written by ingest is never rewritten
