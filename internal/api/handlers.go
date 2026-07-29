@@ -1477,6 +1477,8 @@ func listETag(f store.EventFilter) string {
 		TopicContains json.RawMessage `json:"pc,omitempty"`
 		TxHash        string          `json:"th,omitempty"`
 		HasValue      *bool           `json:"hv,omitempty"`
+		TxIndex       *int32          `json:"txi,omitempty"`
+		OpIndex       *int32          `json:"opi,omitempty"`
 		FromLedger    int64           `json:"fl"`
 		ToLedger      int64           `json:"tl"`
 		FromTime      string          `json:"ft,omitempty"`
@@ -1505,6 +1507,8 @@ func listETag(f store.EventFilter) string {
 		TopicContains: f.TopicContains,
 		TxHash:        f.TxHash,
 		HasValue:      f.HasValue,
+		TxIndex:       f.TxIndex,
+		OpIndex:       f.OpIndex,
 		FromLedger:    f.FromLedger,
 		ToLedger:      f.ToLedger,
 		FromTime:      timeOrEmpty(f.FromTime),
@@ -1776,12 +1780,21 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
 		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
 	}
-	if !f.FromTime.IsZero() && !f.ToTime.IsZero() && f.FromTime.After(f.ToTime) {
-		return f, fmt.Errorf("from_time %s is after to_time %s",
-			f.FromTime.Format(time.RFC3339), f.ToTime.Format(time.RFC3339))
-	}
 
-	f.TxHash = q.Get("tx_hash")
+	if rawTx := q.Get("tx_index"); rawTx != "" {
+		txIdx, err := strconv.Atoi(rawTx)
+		if err != nil || txIdx < 0 {
+			return f, fmt.Errorf("invalid tx_index %q (want a non-negative integer)", rawTx)
+		}
+		f.TxIndex = ptr(int32(txIdx))
+	}
+	if rawOp := q.Get("op_index"); rawOp != "" {
+		opIdx, err := strconv.Atoi(rawOp)
+		if err != nil || opIdx < 0 {
+			return f, fmt.Errorf("invalid op_index %q (want a non-negative integer)", rawOp)
+		}
+		f.OpIndex = ptr(int32(opIdx))
+	}
 
 	switch raw := q.Get("in_successful_call"); raw {
 	case "":
