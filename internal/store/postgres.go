@@ -928,6 +928,70 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	return events, next, nil
 }
 
+// AggregateEvents returns event counts grouped by ledger or by a
+// time interval. Buckets with zero events are omitted. Filters
+// (contract_id, type, etc.) are applied to the aggregation query.
+func (p *Postgres) AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error) {
+	f.Cursor = ""
+	f.Order = ""
+	f.OrderBy = ""
+	f.Limit = 0
+
+	where, args := buildEventWhereClause(f)
+
+	var (
+		groupCol  string
+		bucketCol string
+	)
+
+	switch bucket {
+	case "ledger":
+		groupCol = "ledger"
+		bucketCol = "ledger::text"
+	default:
+		dur, err := time.ParseDuration(bucket)
+		if err != nil {
+			return nil, fmt.Errorf("invalid bucket %q: %w", bucket, err)
+		}
+		if dur <= 0 {
+			return nil, fmt.Errorf("bucket duration must be positive")
+		}
+		bucketSeconds := int64(dur.Seconds())
+		groupCol = fmt.Sprintf("to_timestamp(floor(extract(epoch from created_at) / %d) * %d)", bucketSeconds, bucketSeconds)
+		bucketCol = fmt.Sprintf("to_char(%s, 'YYYY-MM-DD\"T\"HH24:MI:SS')", groupCol)
+	}
+
+	query := "SELECT " + bucketCol + " AS bucket, count(*)::bigint FROM events"
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY " + groupCol + " ORDER BY " + groupCol
+
+	var buckets []AggregateBucket
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("aggregating events: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var b AggregateBucket
+			if err := rows.Scan(&b.Bucket, &b.Count); err != nil {
+				return err
+			}
+			buckets = append(buckets, b)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("reading aggregation: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return buckets, nil
+}
+
 // CountEvents returns the total number of rows matching the filter,
 // ignoring pagination (cursor, order, and limit). It reuses the same
 // WHERE clause builder as QueryEvents so the two stay in lockstep.

@@ -128,6 +128,9 @@ func (f *fakeExportStore) EventExists(context.Context, string, store.Scope) (boo
 func (f *fakeExportStore) CountEvents(context.Context, store.EventFilter) (int64, error) {
 	return int64(len(f.events)), nil
 }
+func (f *fakeExportStore) AggregateEvents(context.Context, store.EventFilter, string) ([]store.AggregateBucket, error) {
+	return nil, nil
+}
 func (f *fakeExportStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]store.LedgerCensus, error) {
 	return nil, nil
 }
