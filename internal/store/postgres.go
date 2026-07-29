@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -28,12 +31,24 @@ const (
 	DefaultQueryLimit         = 50
 	MaxQueryLimit             = 500
 	DefaultEventPartitionSpan = 120960
+
+	poolHealthCheckInterval  = 5 * time.Second
+	poolHealthCheckTimeout   = 2 * time.Second
+	poolReconnectBaseBackoff = 100 * time.Millisecond
+	poolReconnectMaxBackoff  = 30 * time.Second
 )
 
 // Postgres implements Store on a pgx connection pool.
 type Postgres struct {
 	pool          *pgxpool.Pool
 	partitionSpan int64
+
+	// Health monitoring
+	healthMu      sync.RWMutex
+	healthyAtomic atomic.Bool
+	lastHealthErr error
+	databaseURL   string
+	stopHealthCk  context.CancelFunc
 }
 
 var _ Store = (*Postgres)(nil)
@@ -46,7 +61,144 @@ func NewPostgres(pool *pgxpool.Pool, partitionSpan ...int64) *Postgres {
 	if len(partitionSpan) > 0 && partitionSpan[0] > 0 {
 		span = partitionSpan[0]
 	}
-	return &Postgres{pool: pool, partitionSpan: span}
+	pg := &Postgres{pool: pool, partitionSpan: span}
+	pg.healthyAtomic.Store(true)
+	return pg
+}
+
+// NewPostgresWithHealthCheck creates a Postgres instance with health monitoring.
+// It wraps the pool and starts a periodic health check goroutine that will
+// automatically reconnect on transient failures. The context is used to stop
+// the health check; callers should ensure it's cancelled on shutdown.
+func NewPostgresWithHealthCheck(ctx context.Context, pool *pgxpool.Pool, databaseURL string, partitionSpan ...int64) *Postgres {
+	pg := NewPostgres(pool, partitionSpan...)
+	pg.databaseURL = databaseURL
+
+	healthCtx, cancel := context.WithCancel(ctx)
+	pg.stopHealthCk = cancel
+
+	go pg.runHealthCheck(healthCtx)
+
+	return pg
+}
+
+// StopHealthCheck stops the health check goroutine. The caller is responsible for
+// closing the underlying pool.
+func (p *Postgres) StopHealthCheck() {
+	if p.stopHealthCk != nil {
+		p.stopHealthCk()
+	}
+}
+
+func (p *Postgres) runHealthCheck(ctx context.Context) {
+	ticker := time.NewTicker(poolHealthCheckInterval)
+	defer ticker.Stop()
+
+	logger := slog.Default()
+	reconnectAttempt := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.performHealthCheck(ctx, logger, &reconnectAttempt)
+		}
+	}
+}
+
+func (p *Postgres) performHealthCheck(ctx context.Context, logger *slog.Logger, reconnectAttempt *int) {
+	pingCtx, cancel := context.WithTimeout(ctx, poolHealthCheckTimeout)
+	defer cancel()
+
+	err := p.pool.Ping(pingCtx)
+
+	p.healthMu.Lock()
+	wasHealthy := p.healthyAtomic.Load()
+	p.healthMu.Unlock()
+
+	if err == nil {
+		if !wasHealthy {
+			p.healthMu.Lock()
+			p.healthyAtomic.Store(true)
+			p.lastHealthErr = nil
+			*reconnectAttempt = 0
+			p.healthMu.Unlock()
+			logger.Info("postgres pool recovered")
+		}
+		return
+	}
+
+	p.healthMu.Lock()
+	p.lastHealthErr = err
+	if wasHealthy {
+		p.healthyAtomic.Store(false)
+		p.healthMu.Unlock()
+		logger.Warn("postgres pool unhealthy, starting reconnect attempts",
+			"error", err,
+		)
+	} else {
+		p.healthMu.Unlock()
+	}
+
+	*reconnectAttempt++
+
+	backoff := time.Duration(*reconnectAttempt) * poolReconnectBaseBackoff
+	if backoff > poolReconnectMaxBackoff {
+		backoff = poolReconnectMaxBackoff
+	}
+
+	logger.Warn("postgres pool health check failed, attempting reconnect",
+		"attempt", *reconnectAttempt,
+		"backoff", backoff,
+		"error", err,
+	)
+
+	time.Sleep(backoff)
+
+	if err := p.attemptReconnect(ctx, logger); err != nil {
+		logger.Warn("postgres pool reconnect failed, will retry",
+			"attempt", *reconnectAttempt,
+			"error", err,
+		)
+		return
+	}
+
+	p.healthMu.Lock()
+	p.healthyAtomic.Store(true)
+	p.lastHealthErr = nil
+	*reconnectAttempt = 0
+	p.healthMu.Unlock()
+	logger.Info("postgres pool reconnected successfully",
+		"attempts", *reconnectAttempt,
+	)
+}
+
+func (p *Postgres) attemptReconnect(ctx context.Context, logger *slog.Logger) error {
+	if p.databaseURL == "" {
+		return fmt.Errorf("database URL not available for reconnection")
+	}
+
+	newPool, err := pgxpool.New(ctx, p.databaseURL)
+	if err != nil {
+		return fmt.Errorf("creating new pool: %w", err)
+	}
+
+	pingCtx, cancel := context.WithTimeout(ctx, poolHealthCheckTimeout)
+	defer cancel()
+
+	if err := newPool.Ping(pingCtx); err != nil {
+		newPool.Close()
+		return fmt.Errorf("pinging new pool: %w", err)
+	}
+
+	p.healthMu.Lock()
+	oldPool := p.pool
+	p.pool = newPool
+	p.healthMu.Unlock()
+	oldPool.Close()
+
+	return nil
 }
 
 func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
@@ -1094,7 +1246,18 @@ func (p *Postgres) DeleteEventsBefore(ctx context.Context, maxLedger int64, befo
 }
 
 func (p *Postgres) Ping(ctx context.Context) error {
-	return p.pool.Ping(ctx)
+	p.healthMu.RLock()
+	defer p.healthMu.RUnlock()
+
+	if !p.healthyAtomic.Load() {
+		if p.lastHealthErr != nil {
+			return fmt.Errorf("pool unhealthy: %w", p.lastHealthErr)
+		}
+		return errors.New("pool unhealthy")
+	}
+
+	pool := p.pool
+	return pool.Ping(ctx)
 }
 
 // AdvisoryLockKey hashes an RPC URL into an int64 suitable for use with
