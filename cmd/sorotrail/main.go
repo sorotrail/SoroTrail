@@ -213,7 +213,15 @@ func run() error {
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
 	// its cleanup goroutine is never started.
-	limiter := api.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.RateLimitTrustedProxy)
+	limiterOpts := []api.LimiterOption{}
+	if cfg.MultiTenant {
+		// Key buckets on the authenticated tenant rather than the source
+		// IP, so a tenant's quota follows its identity across however many
+		// addresses it calls from.
+		limiterOpts = append(limiterOpts,
+			api.WithLimitResolver(api.TenantLimitResolver(cfg.RateLimitRPS, cfg.RateLimitBurst)))
+	}
+	limiter := api.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.RateLimitTrustedProxy, limiterOpts...)
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
@@ -243,6 +251,33 @@ func run() error {
 		return fmt.Errorf("constructing graphql handler: %w", gqlErr)
 	}
 	apiServer.SetGraphQLHandler(gqlHandler, gqlHandler.PlaygroundHandler())
+
+	if cfg.MultiTenant {
+		// Tenancy lives in tables (tenants, grants, api_keys, usage) that
+		// only the Postgres backend has. Refusing at startup is the whole
+		// point: silently running a ClickHouse deployment with MULTI_TENANT
+		// set would mean an operator believing a boundary is enforced when
+		// there is none, which is the one failure this feature must not have.
+		tenants, ok := st.(store.TenantStore)
+		if !ok {
+			return fmt.Errorf(
+				"MULTI_TENANT=true requires a backend with tenant storage, but %T has none; use a postgres:// DATABASE_URL", st)
+		}
+		apiServer = apiServer.WithMultiTenancy(tenants, api.MultiTenantOptions{
+			MaxWatchedContracts: cfg.MultiTenantMaxWatched,
+			UsageFlushInterval:  cfg.MultiTenantUsageFlush,
+			StreamScopeSync:     cfg.MultiTenantStreamScopeSync,
+		})
+		if err := bootstrapAdminKey(ctx, tenants, cfg.MultiTenantBootstrapKey, log); err != nil {
+			return err
+		}
+		usage := apiServer.Usage()
+		usage.Start(ctx)
+		defer usage.Stop()
+		log.Info("multi-tenant mode enabled",
+			"max_watched_contracts", cfg.MultiTenantMaxWatched,
+			"stream_scope_sync", cfg.MultiTenantStreamScopeSync)
+	}
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -333,6 +368,40 @@ func run() error {
 	}
 	log.Info("shutdown complete")
 	return firstErr
+}
+
+// bootstrapAdminKey installs MULTI_TENANT_BOOTSTRAP_KEY as a credential for
+// the seeded "default" admin tenant, so a fresh multi-tenant install has a
+// way to mint its first real keys.
+//
+// Without this an operator enabling MULTI_TENANT=true locks themselves out
+// completely: every endpoint demands a key, and the only endpoint that
+// issues keys demands an admin key. The bootstrap value is a plaintext
+// credential in the environment, which is why it is opt-in and why the log
+// line nudges toward replacing it — it exists to be used once and revoked.
+//
+// Re-running with the same value is a no-op, so restarts are safe.
+func bootstrapAdminKey(ctx context.Context, ts store.TenantStore, key string, log *slog.Logger) error {
+	if key == "" {
+		return nil
+	}
+	prefix, digest, ok := api.ParseAPIKeyForBootstrap(key)
+	if !ok {
+		return fmt.Errorf("MULTI_TENANT_BOOTSTRAP_KEY is not a valid key; " +
+			"generate one with `sorotrail help` format st_<12 chars>_<secret>")
+	}
+	tenant, err := ts.GetTenantByName(ctx, "default")
+	if err != nil {
+		return fmt.Errorf("loading default tenant: %w", err)
+	}
+	err = ts.CreateAPIKeyIfAbsent(ctx, tenant.ID, "bootstrap", prefix, digest)
+	if err != nil {
+		return fmt.Errorf("installing bootstrap key: %w", err)
+	}
+	log.Warn("bootstrap admin key installed from MULTI_TENANT_BOOTSTRAP_KEY; "+
+		"mint per-tenant keys via POST /admin/tenants/{id}/keys and revoke this one",
+		"tenant", tenant.Name, "prefix", prefix)
+	return nil
 }
 
 func newLogger(level, format string) *slog.Logger {

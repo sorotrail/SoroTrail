@@ -114,6 +114,11 @@ All configuration comes from environment variables (see `.env.example`):
 | `REORG_CONFIRMATION_WINDOW` | `64` | Number of ledgers behind the ingest frontier re-scanned on a schedule for RPC-side reorgs. Once a ledger is further behind the frontier than this, it is considered finalized and never rewritten. Zero disables reorg detection. |
 | `REORG_RESCAN_INTERVAL` | `1m` | Cadence of the periodic reorg re-scan over the recent finalized window. The re-scan shares the live RPC budget and runs after a successful ingest cycle. |
 | `EXPORT_MAX_RANGE` | `17280` | Maximum ledger span a single `/contracts/{id}/export` call may request (~24h at 5s/ledger). Returns `400` with the bound if exceeded. Raise for dedicated analytical deployments; lower for tighter abuse thresholds. |
+| `MULTI_TENANT` | `false` | Serve several consumers from one deployment, each scoped to its own contracts. Off means no authentication and no tenant boundary — identical to the pre-multi-tenancy build. See [Multi-tenancy](docs/multi-tenancy.md). |
+| `MULTI_TENANT_MAX_WATCHED` | `250` | Cap on the union of all tenants' watch lists, bounding the ingester's RPC cost. `0` disables the cap. |
+| `MULTI_TENANT_USAGE_FLUSH` | `10s` | How often accumulated per-tenant usage counters are persisted. |
+| `MULTI_TENANT_STREAM_SCOPE_SYNC` | `30s` | How often an open stream re-resolves its tenant's grants, bounding how long a revoked grant keeps being served. |
+| `MULTI_TENANT_BOOTSTRAP_KEY` | unset | Installs an admin API key for the seeded `default` tenant at startup, so a fresh multi-tenant install can mint its first keys. Rejected unless `MULTI_TENANT=true`. |
 
 ## Ingestion behavior
 
@@ -1125,15 +1130,21 @@ not-found status. We accept this self-healing delay rather than
 arbitrarily shortening the immutable max-age, because for un-deleted
 rows the long `max-age` is the whole point of the cache.
 
-### Auth'd deployments (#17)
+### Auth'd deployments
 
-When authentication lands, the spec calls out that caching must "never
-leak across keys". Today the API is unauthenticated, but the
-`CACHE_PRIVATE` config flag flips every cacheable response from
-`Cache-Control: public` to `Cache-Control: private` (with the same
-`max-age` and `immutable` preset), so the same build can serve shared
+Caching must never leak across keys. The `CACHE_PRIVATE` flag flips every
+cacheable response from `Cache-Control: public` to `Cache-Control: private`
+(same `max-age` and `immutable` preset), so the same build can serve shared
 caches in one deployment and per-user scenarios in another. Set
-`CACHE_PRIVATE=true` as soon as auth (#17) is in front of the API.
+`CACHE_PRIVATE=true` whenever an auth layer sits in front of the API.
+
+Under `MULTI_TENANT=true` this is not left to configuration. Responses are
+forced to `private`, `Vary` gains `Authorization` and `X-API-Key`, and the
+`ETag` incorporates a digest of the caller's scope — so two tenants issuing
+identical requests cannot share a cache entry, and a conditional request
+carrying another tenant's validator cannot be answered `304`. The last of
+those matters most: it is the only one of the three that does not need a CDN
+to misbehave. See [Caching](docs/multi-tenancy.md#caching).
 
 ## Development
 
