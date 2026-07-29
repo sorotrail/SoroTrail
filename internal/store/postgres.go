@@ -589,7 +589,26 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	if !f.Scope.IsWildcard() {
 		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
 	}
-	if f.ContractID != "" {
+	// When ContractIDs is non-empty, use = ANY(...) (SQL IN). When both
+	// ContractID and ContractIDs are set, combine them via a single
+	// = ANY(...) that includes both — the union matches an event for either.
+	if len(f.ContractIDs) > 0 {
+		ids := f.ContractIDs
+		if f.ContractID != "" {
+			// Deduplicate: ContractID might already be in ContractIDs.
+			has := false
+			for _, id := range ids {
+				if id == f.ContractID {
+					has = true
+					break
+				}
+			}
+			if !has {
+				ids = append(ids, f.ContractID)
+			}
+		}
+		where = append(where, "contract_id = ANY("+arg(ids)+")")
+	} else if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
 	if len(f.Types) > 0 {

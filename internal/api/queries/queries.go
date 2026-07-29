@@ -28,7 +28,14 @@ import (
 // from "explicitly set to the zero value" (REST treats absent as absent;
 // GraphQL has nil semantics naturally).
 type EventFilterArgs struct {
-	ContractID    string
+	// ContractID is a single contract ID, kept for backward compatibility.
+	// When ContractIDs is also set, both are used (union).
+	ContractID string
+	// ContractIDs is a parsed list of contract IDs. The REST handler
+	// populates it by splitting the comma-separated ?contract_id= value;
+	// GraphQL callers set it directly. Each element must be a valid
+	// contract strkey.
+	ContractIDs   []string
 	Types         []string
 	Topic         json.RawMessage
 	T0            json.RawMessage
@@ -95,6 +102,7 @@ type CursorProbe struct {
 func BuildEventFilter(args EventFilterArgs) (store.EventFilter, error) {
 	f := store.EventFilter{
 		ContractID:    args.ContractID,
+		ContractIDs:   args.ContractIDs,
 		Types:         args.Types,
 		Topic:         args.Topic,
 		Topic0:        args.T0,
@@ -115,6 +123,11 @@ func BuildEventFilter(args EventFilterArgs) (store.EventFilter, error) {
 
 	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
 		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
+	}
+	for _, id := range f.ContractIDs {
+		if !config.ValidContractID(id) {
+			return f, fmt.Errorf("invalid contract_id %q in contract_id list", id)
+		}
 	}
 	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
 		return f, fmt.Errorf("invalid cursor %q", f.Cursor)

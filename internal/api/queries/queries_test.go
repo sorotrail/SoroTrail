@@ -81,6 +81,45 @@ func TestBuildEventFilter_BadContractID(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid contract_id")
 }
 
+// TestBuildEventFilter_BadContractIDs rejects a slice where at least one
+// element is not a valid contract strkey.
+func TestBuildEventFilter_BadContractIDs(t *testing.T) {
+	_, err := BuildEventFilter(EventFilterArgs{
+		ContractIDs: []string{"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC", "not-a-cstrkey"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid contract_id")
+}
+
+// TestBuildEventFilter_ContractIDsPopulatesFilter verifies that ContractIDs
+// in EventFilterArgs is passed through to the returned store.EventFilter.
+func TestBuildEventFilter_ContractIDsPopulatesFilter(t *testing.T) {
+	ids := []string{
+		"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+		"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+	}
+	got, err := BuildEventFilter(EventFilterArgs{
+		ContractIDs: ids,
+		Limit:       10,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ids, got.ContractIDs)
+	assert.Equal(t, "", got.ContractID, "ContractID should be empty when ContractIDs is used")
+}
+
+// TestBuildEventFilter_ContractIDAndContractIDs verifies that both single
+// ContractID and ContractIDs can coexist.
+func TestBuildEventFilter_ContractIDAndContractIDs(t *testing.T) {
+	got, err := BuildEventFilter(EventFilterArgs{
+		ContractID:  "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+		ContractIDs: []string{"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+		Limit:       10,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC", got.ContractID)
+	assert.Equal(t, []string{"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}, got.ContractIDs)
+}
+
 // TestBuildEventFilter_BadOrder rejects unsupported sort directions.
 func TestBuildEventFilter_BadOrder(t *testing.T) {
 	_, err := BuildEventFilter(EventFilterArgs{Order: "reverse"})

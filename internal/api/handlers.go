@@ -1468,6 +1468,7 @@ func listETag(f store.EventFilter) string {
 	// the fields independently and fails when a new one is not added.
 	key := struct {
 		ContractID    string          `json:"c"`
+		ContractIDs   []string        `json:"cs,omitempty"`
 		Types         []string        `json:"t"`
 		Topic         json.RawMessage `json:"p,omitempty"`
 		Topic0        json.RawMessage `json:"p0,omitempty"`
@@ -1494,9 +1495,10 @@ func listETag(f store.EventFilter) string {
 		// server, with no CDN involved.
 		Scope string `json:"s"`
 	}{
-		ContractID: f.ContractID,
-		Types:      f.Types,
-		Topic:      f.Topic,
+		ContractID:  f.ContractID,
+		ContractIDs: f.ContractIDs,
+		Types:       f.Types,
+		Topic:       f.Topic,
 		// Each positional filter gets its own distinctly named key, so
 		// topic0={x} and topic1={x} — which select different events — cannot
 		// serialize identically.
@@ -1726,8 +1728,33 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return store.EventFilter{}, err
 	}
 
+	// contract_ids is a comma-separated list of contract IDs. When present,
+	// each element must be a valid contract strkey. The empty string (no
+	// parameter) or a single value without commas behave identically to the
+	// original ?contract_id= — no breaking change to existing callers.
+	var contractIDs []string
+	if raw := q.Get("contract_id"); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			contractIDs = append(contractIDs, part)
+		}
+	}
+	// Backward compatibility: a single contract_id without commas still
+	// sets ContractID so existing callers (handleContractEvents, GraphQL)
+	// are unaffected. When multiple IDs are given, ContractID is left empty
+	// and ContractIDs carries the full list.
+	var singleID string
+	if len(contractIDs) == 1 {
+		singleID = contractIDs[0]
+		contractIDs = nil
+	}
+
 	args := queries.EventFilterArgs{
-		ContractID:    q.Get("contract_id"),
+		ContractID:    singleID,
+		ContractIDs:   contractIDs,
 		Types:         types,
 		Topic:         topic,
 		T0:            t0,
