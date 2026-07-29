@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // bodyOf runs h behind the compression middleware and returns the response
@@ -303,4 +306,286 @@ func TestNegotiateEncoding(t *testing.T) {
 			assert.Equal(t, tt.want, negotiateEncoding(tt.header))
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Router-level integration tests: compression is scoped to list endpoints
+// via chi.Group so health/metrics/writes stay identity always.
+// ---------------------------------------------------------------------------
+
+// doGetWithAE sends a GET through s.Router() with an optional
+// Accept-Encoding header and returns the response plus body (raw, no decode).
+func doGetWithAE(t *testing.T, s *Server, path, acceptEncoding string) (*http.Response, []byte) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if acceptEncoding != "" {
+		req.Header.Set("Accept-Encoding", acceptEncoding)
+	}
+	rec := httptest.NewRecorder()
+	s.Router().ServeHTTP(rec, req)
+	resp := rec.Result()
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp, body
+}
+
+// decodeGzip decodes a gzip body and returns the uncompressed bytes.
+func decodeGzip(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	zr, err := gzip.NewReader(bytes.NewReader(raw))
+	require.NoError(t, err, "gzip decode failed")
+	defer zr.Close()
+	out, err := io.ReadAll(zr)
+	require.NoError(t, err)
+	return out
+}
+
+// bigListStore returns enough events that the serialized JSON response
+// will exceed CompressMinSize (1400). Each event ~120 bytes × 30 = ~3600.
+func bigListStore() *stubStore {
+	events := make([]store.Event, 30)
+	for i := range events {
+		events[i] = store.Event{
+			ID:         "0000000000000000001-000000000" + string(rune('0'+i%10)),
+			ContractID: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+			Ledger:     int64(100 + i),
+			Type:       "contract",
+			Topics:     json.RawMessage(`["transfer"]`),
+			Value:      json.RawMessage(`{"amount":"100","from":"GABC","to":"GDEF"}`),
+		}
+	}
+	return &stubStore{events: events, totalCount: int64(len(events))}
+}
+
+func TestCompress_ListEndpointGzippedWithAcceptEncoding(t *testing.T) {
+	st := bigListStore()
+	s := newTestServer(st, nil)
+
+	resp, body := doGetWithAE(t, s, "/events", "gzip")
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "gzip", resp.Header.Get("Content-Encoding"),
+		"list endpoint must compress when client advertises gzip")
+	assert.Contains(t, resp.Header.Get("Vary"), "Accept-Encoding")
+	assert.Empty(t, resp.Header.Get("Content-Length"),
+		"identity length must not describe a compressed body")
+
+	// Round-trip: decode and verify the events are intact.
+	decoded := decodeGzip(t, body)
+	var out eventsResponse
+	require.NoError(t, json.Unmarshal(decoded, &out))
+	assert.Len(t, out.Events, 30)
+	assert.Equal(t, int64(100), out.Events[0].Ledger)
+}
+
+func TestCompress_ListEndpointNotCompressedWithoutAcceptEncoding(t *testing.T) {
+	st := bigListStore()
+	s := newTestServer(st, nil)
+
+	resp, body := doGetWithAE(t, s, "/events", "")
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Content-Encoding"),
+		"without Accept-Encoding the response stays identity")
+
+	var out eventsResponse
+	require.NoError(t, json.Unmarshal(body, &out))
+	assert.Len(t, out.Events, 30)
+}
+
+func TestCompress_NonListEndpointNeverCompressed(t *testing.T) {
+	s := newTestServer(&stubStore{}, nil)
+
+	// /health is NOT in the compression Group — Accept-Encoding must not
+	// matter even if the client sends it. Health responses are always tiny
+	// and value identity encoding for probe simplicity.
+	resp, _ := doGetWithAE(t, s, "/health", "gzip")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Content-Encoding"),
+		"non-list endpoint /health must never be compressed")
+
+	resp, _ = doGetWithAE(t, s, "/livez", "gzip")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Content-Encoding"),
+		"non-list endpoint /livez must never be compressed")
+
+	resp, _ = doGetWithAE(t, s, "/version", "gzip")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Content-Encoding"),
+		"non-list endpoint /version must never be compressed")
+
+	resp, _ = doGetWithAE(t, s, "/stats", "gzip")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Content-Encoding"),
+		"non-list endpoint /stats must never be compressed")
+}
+
+func TestCompress_ContractEventsEndpointCompressed(t *testing.T) {
+	st := bigListStore()
+	s := newTestServer(st, nil)
+
+	resp, body := doGetWithAE(t, s,
+		"/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/events",
+		"gzip")
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "gzip", resp.Header.Get("Content-Encoding"),
+		"contract events endpoint must compress with Accept-Encoding: gzip")
+
+	decoded := decodeGzip(t, body)
+	var out eventsResponse
+	require.NoError(t, json.Unmarshal(decoded, &out))
+	assert.Len(t, out.Events, 30)
+}
+
+func TestCompress_DisabledViaNegativeMinSize(t *testing.T) {
+	st := bigListStore()
+	s := newTestServer(st, nil)
+	s.SetCompressMinSize(-1)
+
+	resp, body := doGetWithAE(t, s, "/events", "gzip")
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Content-Encoding"),
+		"negative compressMinSize must leave responses uncompressed")
+
+	var out eventsResponse
+	require.NoError(t, json.Unmarshal(body, &out))
+	assert.Len(t, out.Events, 30)
+}
+
+func TestCompress_ListEndpointSmallErrorNotCompressed(t *testing.T) {
+	st := &stubStore{}
+	s := newTestServer(st, nil)
+
+	// A 400 error body is well below CompressMinSize — the middleware
+	// must not compress it even though it's a list endpoint.
+	resp, body := doGetWithAE(t, s, "/events?type=bogus", "gzip")
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Content-Encoding"),
+		"small error bodies stay identity regardless of Accept-Encoding")
+
+	var e map[string]string
+	require.NoError(t, json.Unmarshal(body, &e))
+	assert.Contains(t, e["error"], "invalid type")
+}
+
+func TestCompress_CountEndpointCompressed(t *testing.T) {
+	// count response is small — won't compress in practice, but the
+	// middleware is present and sets Vary: Accept-Encoding.
+	st := &stubStore{totalCount: 42}
+	s := newTestServer(st, nil)
+
+	resp, body := doGetWithAE(t, s, "/events/count", "gzip")
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	// Body under threshold, so no compression — but Vary is still set.
+	assert.Empty(t, resp.Header.Get("Content-Encoding"))
+	assert.Contains(t, resp.Header.Get("Vary"), "Accept-Encoding")
+
+	var out countResponse
+	require.NoError(t, json.Unmarshal(body, &out))
+	assert.Equal(t, int64(42), out.Count)
+}
+
+func TestCompress_ListSubscriptionsEndpoint(t *testing.T) {
+	st := &stubStore{}
+	s := newTestServer(st, nil)
+
+	resp, _ := doGetWithAE(t, s, "/subscriptions", "gzip")
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, resp.Header.Get("Vary"), "Accept-Encoding",
+		"list subscriptions endpoint must set Vary: Accept-Encoding")
+}
+
+func TestCompress_GetSubscriptionEndpoint(t *testing.T) {
+	st := &stubStore{}
+	s := newTestServer(st, nil)
+
+	resp, _ := doGetWithAE(t, s, "/subscriptions/1", "gzip")
+
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"not found — but the route is in the compression group")
+	assert.Contains(t, resp.Header.Get("Vary"), "Accept-Encoding",
+		"error from a list-route must still carry Vary: Accept-Encoding")
+}
+
+func TestCompress_GetEventEndpointCompressed(t *testing.T) {
+	eventID := "0000000001-0000000001"
+	st := &stubStore{
+		event: store.Event{
+			ID:         eventID,
+			ContractID: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+			Ledger:     1,
+			Type:       "contract",
+			Topics:     json.RawMessage(`["transfer"]`),
+			Value:      json.RawMessage(`{"amount":"100"}`),
+		},
+	}
+	s := newTestServer(st, nil)
+
+	resp, _ := doGetWithAE(t, s, "/events/"+eventID, "gzip")
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, resp.Header.Get("Vary"), "Accept-Encoding",
+		"GET /events/{id} is in the compression group")
+}
+
+func TestCompress_WatchedContractsListEndpoint(t *testing.T) {
+	st := &stubStore{
+		watchedList: []store.WatchedContract{
+			{ContractID: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"},
+		},
+	}
+
+	t.Run("compressed when authed with Accept-Encoding: gzip", func(t *testing.T) {
+		s := newTestServerWithKey(st, nil, "test-key")
+		req := httptest.NewRequest(http.MethodGet, "/watched-contracts", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		req.Header.Set("X-API-Key", "test-key")
+		rec := httptest.NewRecorder()
+		s.Router().ServeHTTP(rec, req)
+		resp := rec.Result()
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Contains(t, resp.Header.Get("Vary"), "Accept-Encoding",
+			"authed watched-contracts list must set Vary: Accept-Encoding")
+	})
+}
+
+// The metrics endpoint is NOT in the compression Group — our compress
+// middleware must not touch it. The Prometheus client library may apply
+// its own encoding, but that's independent of our middleware.
+func TestCompress_MetricsEndpointOutsideGroup(t *testing.T) {
+	s := newTestServer(&stubStore{}, nil)
+
+	resp, _ := doGetWithAE(t, s, "/metrics", "gzip")
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	// The route is outside the Group so our compress middleware never
+	// runs — Vary: Accept-Encoding is not added by us.
+	assert.NotContains(t, resp.Header.Get("Vary"), "Accept-Encoding",
+		"/metrics is not in the compression group so our compress middleware doesn't touch it")
+}
+
+func TestCompress_ListEndpointDeflate(t *testing.T) {
+	st := bigListStore()
+	s := newTestServer(st, nil)
+
+	resp, body := doGetWithAE(t, s, "/events", "deflate")
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "deflate", resp.Header.Get("Content-Encoding"),
+		"must compress with deflate when client only advertises deflate")
+
+	// Round-trip decode
+	out, err := io.ReadAll(flate.NewReader(bytes.NewReader(body)))
+	require.NoError(t, err)
+	var evs eventsResponse
+	require.NoError(t, json.Unmarshal(out, &evs))
+	assert.Len(t, evs.Events, 30)
 }

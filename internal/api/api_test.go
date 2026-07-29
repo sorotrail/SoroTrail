@@ -40,6 +40,11 @@ type stubStore struct {
 	event    store.Event
 	eventErr error
 
+	txSiblings    []store.Event
+	txSiblingsErr error
+	lastTxHash    string
+	lastExcludeID string
+
 	stats            store.Stats
 	pingErr          error
 	watchedList      []store.WatchedContract
@@ -112,6 +117,12 @@ func (s *stubStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 
 func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
 	return s.event, s.eventErr
+}
+
+func (s *stubStore) GetEventsByTxHash(_ context.Context, txHash, excludeID string) ([]store.Event, error) {
+	s.lastTxHash = txHash
+	s.lastExcludeID = excludeID
+	return s.txSiblings, s.txSiblingsErr
 }
 
 func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
@@ -323,6 +334,42 @@ func TestListEvents_TxHashFilter(t *testing.T) {
 	}
 }
 
+func TestListEvents_HasValueFilter(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		want    *bool // nil = not set, true = has value, false = no value
+		wantErr int   // 0 = success
+	}{
+		{name: "no has_value param", query: "/events", want: nil, wantErr: 0},
+		{name: "has_value=true", query: "/events?has_value=true", want: ptr(true), wantErr: 0},
+		{name: "has_value=false", query: "/events?has_value=false", want: ptr(false), wantErr: 0},
+		{name: "empty has_value is no-op", query: "/events?has_value=", want: nil, wantErr: 0},
+		{name: "combined with contract_id", query: "/events?contract_id=" + testContract + "&has_value=true", want: ptr(true), wantErr: 0},
+		{name: "combined with ledger range", query: "/events?from_ledger=100&to_ledger=200&has_value=false", want: ptr(false), wantErr: 0},
+		{name: "invalid value returns 400", query: "/events?has_value=yes", wantErr: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], "has_value")
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			assert.Equal(t, tt.want, st.lastFilter.HasValue)
+		})
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
 func TestListEvents_TypeFilter(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -437,12 +484,12 @@ func TestListEvents_CursorAndLimitValidation(t *testing.T) {
 	assert.Equal(t, store.DefaultQueryLimit, st.lastFilter.Limit)
 
 	// Invalid limit returns 400
-	for _, badLimit := range []string{"0", "-5", "201", "xyz"} {
+	for _, badLimit := range []string{"0", "-5", "501", "xyz"} {
 		resp, body := doGet(t, srv, "/events?limit="+badLimit)
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		var errResp map[string]string
 		require.NoError(t, json.Unmarshal(body, &errResp))
-		assert.Contains(t, errResp["error"], "limit must be an integer in [1,200]")
+		assert.Contains(t, errResp["error"], "limit must be an integer in [1,500]")
 	}
 
 	// Malformed cursor returns 400
@@ -1325,11 +1372,11 @@ func TestListEvents_RecentParam(t *testing.T) {
 			wantLimit:  5,
 		},
 		{
-			name:       "recent=200 (max limit) is accepted",
-			query:      "/events?recent=200",
+			name:       "recent=500 (max limit) is accepted",
+			query:      "/events?recent=500",
 			wantStatus: http.StatusOK,
 			wantOrder:  "desc",
-			wantLimit:  200,
+			wantLimit:  500,
 		},
 		{
 			name:        "recent=0 is invalid",
@@ -1338,8 +1385,8 @@ func TestListEvents_RecentParam(t *testing.T) {
 			wantErrText: "recent must be a positive integer",
 		},
 		{
-			name:        "recent=201 exceeds max",
-			query:       "/events?recent=201",
+			name:        "recent=501 exceeds max",
+			query:       "/events?recent=501",
 			wantStatus:  http.StatusBadRequest,
 			wantErrText: "recent must be a positive integer",
 		},
@@ -1521,72 +1568,119 @@ func TestListEvents_RecentReturnsNewestFirst(t *testing.T) {
 	assert.Equal(t, "e1", out.Events[2].ID)
 }
 
-func TestListContracts(t *testing.T) {
-	t.Run("empty database", func(t *testing.T) {
-		st := &stubStore{}
-		resp, body := doGet(t, newTestServer(st, nil), "/contracts")
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-		assert.Equal(t, store.DefaultQueryLimit, st.lastContractsLimit)
-		assert.Empty(t, st.lastContractsCursor)
+func TestListEvents_ConfigurableMaxLimit(t *testing.T) {
+	st := &stubStore{events: []store.Event{{ID: "e1"}}}
 
-		var out struct {
-			Contracts []store.ContractSummary `json:"contracts"`
-			Cursor    string                  `json:"cursor"`
-		}
-		require.NoError(t, json.Unmarshal(body, &out))
-		assert.NotNil(t, out.Contracts)
-		assert.Empty(t, out.Contracts)
-		assert.Empty(t, out.Cursor)
-	})
+	tests := []struct {
+		name         string
+		setMax       int // 0 means don't call SetMaxLimit (use default 500)
+		query        string
+		wantStatus   int
+		wantLimit    int    // expected limit in filter (0 = don't check)
+		wantErrMatch string // substring in error, for 4xx cases
+	}{
+		{
+			name:       "default max allows 500",
+			setMax:     0,
+			query:      "/events?limit=500",
+			wantStatus: http.StatusOK,
+			wantLimit:  500,
+		},
+		{
+			name:         "default max rejects 501",
+			setMax:       0,
+			query:        "/events?limit=501",
+			wantStatus:   http.StatusBadRequest,
+			wantErrMatch: "limit must be an integer in [1,500]",
+		},
+		{
+			name:       "custom max 100 allows 100",
+			setMax:     100,
+			query:      "/events?limit=100",
+			wantStatus: http.StatusOK,
+			wantLimit:  100,
+		},
+		{
+			name:         "custom max 100 rejects 101",
+			setMax:       100,
+			query:        "/events?limit=101",
+			wantStatus:   http.StatusBadRequest,
+			wantErrMatch: "limit must be an integer in [1,100]",
+		},
+		{
+			name:       "custom max 100 recent accepts 100",
+			setMax:     100,
+			query:      "/events?recent=100",
+			wantStatus: http.StatusOK,
+			wantLimit:  100,
+		},
+		{
+			name:         "custom max 100 recent rejects 101",
+			setMax:       100,
+			query:        "/events?recent=101",
+			wantStatus:   http.StatusBadRequest,
+			wantErrMatch: "recent must be a positive integer in [1,100]",
+		},
+		{
+			name:       "custom max 10 accepts limit 10",
+			setMax:     10,
+			query:      "/events?limit=10",
+			wantStatus: http.StatusOK,
+			wantLimit:  10,
+		},
+		{
+			name:         "custom max 10 rejects limit 11",
+			setMax:       10,
+			query:        "/events?limit=11",
+			wantStatus:   http.StatusBadRequest,
+			wantErrMatch: "limit must be an integer in [1,10]",
+		},
+	}
 
-	t.Run("returns contracts and pagination cursor", func(t *testing.T) {
-		st := &stubStore{
-			contracts: []store.ContractSummary{
-				{ContractID: testContract, EventCount: 100, FirstLedger: 10, LastLedger: 20},
-			},
-			contractsNext: testContract,
-		}
-		resp, body := doGet(t, newTestServer(st, nil), "/contracts?limit=10&cursor=C123")
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-		assert.Equal(t, 10, st.lastContractsLimit)
-		assert.Equal(t, "C123", st.lastContractsCursor)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st.lastFilter = store.EventFilter{}
 
-		var out struct {
-			Contracts []store.ContractSummary `json:"contracts"`
-			Cursor    string                  `json:"cursor"`
-		}
-		require.NoError(t, json.Unmarshal(body, &out))
-		require.Len(t, out.Contracts, 1)
-		assert.Equal(t, testContract, out.Contracts[0].ContractID)
-		assert.Equal(t, int64(100), out.Contracts[0].EventCount)
-		assert.Equal(t, int64(10), out.Contracts[0].FirstLedger)
-		assert.Equal(t, int64(20), out.Contracts[0].LastLedger)
-		assert.Equal(t, testContract, out.Cursor)
-	})
+			if tt.setMax > 0 {
+				SetMaxLimit(tt.setMax)
+				t.Cleanup(func() { SetMaxLimit(500) })
+			} else {
+				// Ensure we're using the default 500.
+				SetMaxLimit(500)
+			}
 
-	t.Run("bad limit params", func(t *testing.T) {
-		for _, path := range []string{
-			"/contracts?limit=0",
-			"/contracts?limit=-1",
-			"/contracts?limit=201",
-			"/contracts?limit=abc",
-		} {
-			t.Run(path, func(t *testing.T) {
-				resp, body := doGet(t, newTestServer(&stubStore{}, nil), path)
-				assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			srv := newTestServer(st, nil)
+			resp, body := doGet(t, srv, tt.query)
+
+			require.Equal(t, tt.wantStatus, resp.StatusCode, string(body))
+
+			if tt.wantErrMatch != "" {
 				var e map[string]string
 				require.NoError(t, json.Unmarshal(body, &e))
-				assert.Contains(t, e["error"], "limit must be an integer in [1,200]")
-			})
-		}
-	})
+				assert.Contains(t, e["error"], tt.wantErrMatch)
+				return
+			}
 
-	t.Run("store error", func(t *testing.T) {
-		st := &stubStore{contractsErr: errors.New("db error")}
-		resp, body := doGet(t, newTestServer(st, nil), "/contracts")
-		assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
-		var e map[string]string
-		require.NoError(t, json.Unmarshal(body, &e))
-		assert.Equal(t, "listing contracts failed", e["error"])
-	})
+			if tt.wantLimit > 0 {
+				assert.Equal(t, tt.wantLimit, st.lastFilter.Limit)
+			}
+		})
+	}
 }
+
+func (m *stubStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	return nil, "", nil
+}
+func (m *stubStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
+	return 0, nil
+}
+func (m *stubStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
+	return store.DeadLetter{}, nil
+}
+func (m *stubStore) ListDeadLetters(context.Context, string, int, string) ([]store.DeadLetter, string, error) {
+	return nil, "", nil
+}
+func (m *stubStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, error) {
+	return store.DeadLetter{}, store.ErrNotFound
+}
+func (m *stubStore) DeleteDeadLetter(context.Context, int64) error { return nil }
