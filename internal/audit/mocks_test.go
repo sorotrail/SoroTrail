@@ -220,6 +220,10 @@ func (m *mockStore) CountEvents(context.Context, store.EventFilter) (int64, erro
 	return 0, nil
 }
 
+func (m *mockStore) AggregateEvents(context.Context, store.EventFilter, string) ([]store.AggregateBucket, error) {
+	return nil, nil
+}
+
 func (m *mockStore) LedgerRangeCensus(_ context.Context, from, to int64, idsOnly bool) ([]store.LedgerCensus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -382,6 +386,10 @@ func (m *mockStore) MigrationVersion(context.Context) (int, bool, error) {
 
 func (m *mockStore) Ping(context.Context) error { return nil }
 
+func (m *mockStore) QueryAnalyticsEvents(context.Context, store.AnalyticsFilter) ([]store.AnalyticsEventBucket, error) {
+	return nil, nil
+}
+func (m *mockStore) QueryAnalyticsTokenVolume(context.Context, store.AnalyticsFilter) ([]store.AnalyticsTokenVolume, error) {
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
 }

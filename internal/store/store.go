@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/sorotrail/sorotrail/internal/sep41"
 )
 
 // Event is a Soroban contract event as persisted by SoroTrail.
@@ -32,6 +34,34 @@ type Event struct {
 	// They are not part of the API representation.
 	RawTopicXDR []string `json:"-"`
 	RawValueXDR string   `json:"-"`
+
+	// SEP41Event carries the SEP-41 normalized envelope when the event's
+	// topics and value match the SEP-41 / CAP-46-6 shapes (transfer, mint,
+	// burn, clawback, approve). It is computed at render time by
+	// internal/sep41 and is nil for non-matching events, so the field is
+	// omitted entirely from the JSON.
+	SEP41Event *json.RawMessage `json:"sep41_event,omitempty"`
+}
+
+// WithSEP41 populates SEP41Event from the SEP-41 normalizer when the
+// event matches any of the SEP-41 / CAP-46-6 token event shapes
+// (transfer, mint, burn, clawback, approve). Non-matches leave the
+// field nil and the JSON output without the slot, which keeps the
+// augmentation additive and never destructive.
+//
+// Both delivery points (API render, webhook signing) call this before
+// JSON serialization so the same envelope surfaces in both
+// representations.
+func (e *Event) WithSEP41() {
+	if e == nil {
+		return
+	}
+	// sep41.Normalize returns a json.RawMessage ([]byte) value; nil on no
+	// match. We need to take its address so the field's pointer stays
+	// nil when nothing matched (omitempty drops the slot in JSON).
+	if n := sep41.Normalize(e.Topics, e.Value); n != nil {
+		e.SEP41Event = &n
+	}
 }
 
 // EnrichedEvent wraps an Event with decoded field information derived from
@@ -88,7 +118,16 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
+	// ContractID is a single contract ID to filter by. For backward
+	// compatibility with callers that set a single ID (e.g.
+	// handleContractEvents). When set alongside ContractIDs, the two are
+	// merged — an event matching either is returned.
 	ContractID string
+	// ContractIDs is a list of contract IDs to filter by (SQL IN / ANY).
+	// When non-empty, the store generates `contract_id = ANY($N)` instead
+	// of `contract_id = $N`. Together with ContractID the union is
+	// matched — an event for any of these contracts qualifies.
+	ContractIDs []string
 	// ContractIDPrefix matches events whose contract_id starts with this
 	// prefix via a LIKE query. Mutually exclusive with ContractID.
 	ContractIDPrefix string
@@ -180,10 +219,18 @@ func ValidOrderBy(s string) bool {
 	}
 }
 
+// AggregateBucket is one entry in an AggregateEvents result:
+// a bucket label and the number of events in that bucket.
+type AggregateBucket struct {
+	Bucket string `json:"bucket"`
+	Count  int64  `json:"count"`
+}
+
 // IngestionState tracks how far ingestion has progressed.
 type IngestionState struct {
 	LastIngestedLedger int64
 	LastCursor         string
+	LastSuccessfulPoll *time.Time
 	UpdatedAt          time.Time
 }
 
@@ -575,6 +622,36 @@ type EventDecoding struct {
 	Value  json.RawMessage
 }
 
+// AnalyticsEventBucket is one time-bucketed event count returned by the
+// analytics endpoints. BucketStart is a UTC timestamp truncated to the
+// requested granularity (hour or day).
+type AnalyticsEventBucket struct {
+	BucketStart time.Time `json:"bucket_start"`
+	ContractID  string    `json:"contract_id"`
+	Type        string    `json:"type"`
+	Count       int64     `json:"count"`
+}
+
+// AnalyticsTokenVolume is one time-bucketed transfer volume row.
+// Volume is a decimal string (i128-safe). UniqueAddressCount is the number
+// of distinct addresses appearing in transfer topics for the bucket.
+type AnalyticsTokenVolume struct {
+	BucketStart        time.Time `json:"bucket_start"`
+	ContractID         string    `json:"contract_id"`
+	Volume             string    `json:"volume"`
+	UniqueAddressCount int64     `json:"unique_address_count"`
+}
+
+// AnalyticsFilter narrows analytics queries. From/To are UTC timestamps;
+// zero means unbounded. Bucket is "hour" or "day".
+type AnalyticsFilter struct {
+	ContractID string
+	Type       string
+	From       time.Time
+	To         time.Time
+	Bucket     string // "hour" or "day"
+}
+
 // Store is the persistence boundary. The ingester, auditor, and API depend
 // on this interface, never on Postgres directly, so alternative backends can
 // be contributed by implementing it.
@@ -628,6 +705,10 @@ type Store interface {
 	// CountEvents returns the total number of events matching the filter
 	// (ignoring pagination: cursor, order, and limit are not applied).
 	CountEvents(ctx context.Context, f EventFilter) (int64, error)
+	// AggregateEvents returns event counts grouped by ledger or by a
+	// time interval. Buckets with zero events are omitted. Filters
+	// (contract_id, type, etc.) are applied to the aggregation query.
+	AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error)
 	// LedgerRangeCensus returns one LedgerCensus row per ledger in the
 	// inclusive [fromLedger, toLedger] range that contains at least one
 	// event, in ascending ledger order. idsOnly=true populates LedgerCensus.IDs
