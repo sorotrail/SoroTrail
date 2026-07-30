@@ -786,6 +786,7 @@ func listETag(f store.EventFilter) string {
 		ToLedger      int64           `json:"tl"`
 		FromTime      string          `json:"ft,omitempty"`
 		ToTime        string          `json:"tt,omitempty"`
+		HasValue      *bool           `json:"hv,omitempty"`
 		Cursor        string          `json:"cu,omitempty"`
 		Limit         int             `json:"l"`
 		Order         string          `json:"o,omitempty"`
@@ -805,6 +806,7 @@ func listETag(f store.EventFilter) string {
 		ToLedger:      f.ToLedger,
 		FromTime:      timeOrEmpty(f.FromTime),
 		ToTime:        timeOrEmpty(f.ToTime),
+		HasValue:      f.HasValue,
 		Cursor:        f.Cursor,
 		Limit:         resolvedLimit(f.Limit),
 		Order:         resolvedOrder(f.Order),
@@ -1024,6 +1026,21 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 	if f.FromLedger > 0 && f.ToLedger > 0 && f.FromLedger > f.ToLedger {
 		return f, fmt.Errorf("from_ledger %d is after to_ledger %d", f.FromLedger, f.ToLedger)
+	}
+
+	// has_value=true filters to events with non-null value payload;
+	// has_value=false filters to events with null value.
+	if raw := q.Get("has_value"); raw != "" {
+		switch raw {
+		case "true":
+			t := true
+			f.HasValue = &t
+		case "false":
+			v := false
+			f.HasValue = &v
+		default:
+			return f, fmt.Errorf("has_value must be true or false, got %q", raw)
+		}
 	}
 
 	if f.FromTime, err = parseTimeParam(q.Get("from_time"), "from_time"); err != nil {

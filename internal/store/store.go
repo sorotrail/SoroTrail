@@ -111,6 +111,10 @@ type EventFilter struct {
 	ToLedger      int64     // inclusive
 	FromTime      time.Time // inclusive, zero = no constraint
 	ToTime        time.Time // inclusive, zero = no constraint
+	// HasValue filters events by whether the value payload is present (true)
+	// or null/missing (false). A nil pointer means no constraint — the
+	// pre-existing behavior of returning both kinds.
+	HasValue *bool
 	// Cursor is the ID of the last event from the previous page.
 	Cursor string
 	Limit  int

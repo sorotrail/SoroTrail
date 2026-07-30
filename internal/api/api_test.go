@@ -257,6 +257,7 @@ func TestListEvents_BadParams(t *testing.T) {
 		"/events?limit=-1",
 		"/events?limit=99999",
 		"/events?topic_contains=not-valid-json",
+		"/events?has_value=maybe",
 	} {
 		t.Run(path, func(t *testing.T) {
 			resp, body := doGet(t, newTestServer(&stubStore{}, nil), path)
@@ -267,6 +268,46 @@ func TestListEvents_BadParams(t *testing.T) {
 		})
 	}
 }
+
+func TestListEvents_HasValueFilter(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		want    *bool
+		wantErr int // 0 = success
+	}{
+		{name: "not set", query: "/events", want: nil, wantErr: 0},
+		{name: "has_value=true", query: "/events?has_value=true", want: boolPtr(true), wantErr: 0},
+		{name: "has_value=false", query: "/events?has_value=false", want: boolPtr(false), wantErr: 0},
+		{name: "invalid value", query: "/events?has_value=maybe", wantErr: http.StatusBadRequest},
+		{name: "empty value", query: "/events?has_value=", want: nil, wantErr: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			s := newTestServer(st, nil)
+			resp, body := doGet(t, s, tt.query)
+			if tt.wantErr != 0 {
+				assert.Equal(t, tt.wantErr, resp.StatusCode)
+				var e map[string]string
+				require.NoError(t, json.Unmarshal(body, &e))
+				assert.Contains(t, e["error"], "has_value must be true or false")
+				return
+			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			if tt.want == nil {
+				assert.Nil(t, st.lastFilter.HasValue)
+			} else {
+				require.NotNil(t, st.lastFilter.HasValue)
+				assert.Equal(t, *tt.want, *st.lastFilter.HasValue)
+			}
+		})
+	}
+}
+
+// boolPtr returns a pointer to a bool for use in table-driven tests.
+func boolPtr(b bool) *bool { return &b }
 
 func TestListEvents_TypeFilter(t *testing.T) {
 	tests := []struct {

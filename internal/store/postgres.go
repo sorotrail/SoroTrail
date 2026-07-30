@@ -412,6 +412,13 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if !f.ToTime.IsZero() {
 		where = append(where, "created_at <= "+arg(f.ToTime))
 	}
+	if f.HasValue != nil {
+		if *f.HasValue {
+			where = append(where, "value IS NOT NULL")
+		} else {
+			where = append(where, "value IS NULL")
+		}
+	}
 
 	if !ValidOrderBy(f.OrderBy) {
 		return nil, "", fmt.Errorf("unsupported order_by %q", f.OrderBy)
