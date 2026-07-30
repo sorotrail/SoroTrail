@@ -1129,6 +1129,11 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 // events.
 func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	// Both the existence probe and the row fetch below run under this
+	// scope, so an event belonging to an ungranted contract is reported as
+	// absent on every path through this handler — including the 304 fast
+	// path, which would otherwise be a free existence oracle.
+	scope := scopeFrom(r.Context())
 
 	// Validate ?fields= before touching the store.
 	fields, err := parseFields(r.URL.Query().Get("fields"))
