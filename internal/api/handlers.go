@@ -18,6 +18,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
+	"github.com/khaylebfortune/sorotrail/internal/config"
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
+	"github.com/khaylebfortune/sorotrail/internal/store"
 	"github.com/sorotrail/sorotrail/internal/api/queries"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
@@ -291,6 +294,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, resp)
 }
 
+// handleMetrics serves the Prometheus /metrics endpoint. The response is
+// always cacheNoStore so scrapers never see a stale snapshot.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	metrics.Handler().ServeHTTP(w, r)
 // handleDeleteEvents is the admin-only bulk delete endpoint. It deletes all
 // events whose ledger is strictly less than the ?before_ledger= query parameter.
 // The endpoint is protected by apiKeyAuth middleware (same as watched-contracts).
