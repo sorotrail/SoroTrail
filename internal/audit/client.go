@@ -3,7 +3,7 @@ package audit
 import (
 	"context"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/rpc"
 )
 
 // Client is the audit-side view of the RPC. It is the same interface as
@@ -14,6 +14,7 @@ type Client interface {
 	GetEvents(ctx context.Context, req rpc.GetEventsRequest) (rpc.GetEventsResponse, error)
 	GetLatestLedger(ctx context.Context) (rpc.LatestLedger, error)
 	GetHealth(ctx context.Context) (rpc.Health, error)
+	GetLedgerEntries(ctx context.Context, req rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error)
 }
 
 // budgetedClient wraps an inner rpc.Client, accounting every call against
@@ -50,6 +51,13 @@ func (c *budgetedClient) GetHealth(ctx context.Context) (rpc.Health, error) {
 		return rpc.Health{}, err
 	}
 	return c.inner.GetHealth(ctx)
+}
+
+func (c *budgetedClient) GetLedgerEntries(ctx context.Context, req rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+	if err := c.budget.WaitAudit(ctx); err != nil {
+		return rpc.GetLedgerEntriesResponse{}, err
+	}
+	return c.inner.GetLedgerEntries(ctx, req)
 }
 
 // Compile-time check that we satisfy the audit Client interface.
