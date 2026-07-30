@@ -2,120 +2,69 @@ package audit
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
-	"sort"
 	"sync"
 
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
-// testLogger returns a slog.Logger that drops everything.
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// mockRPC scripts getEvents/getHealth responses in order and records every
-// request. It also exposes helper methods for tests to swap replays,
-// simulate RPC self-disagreement, etc.
+// mkEvents creates n rpc.Event for the given ledger with the given contract.
+func mkEvents(ledger uint32, n int, contractID string) []rpc.Event {
+	events := make([]rpc.Event, n)
+	for i := 0; i < n; i++ {
+		events[i] = rpc.Event{
+			ID:         fmt.Sprintf("%020d-%05d", ledger, i),
+			Ledger:     ledger,
+			ContractID: contractID,
+			Type:       "contract",
+			Topic:      []string{"AAAAAA=="},
+			Value:      "AAAAAA==",
+			TopicJSON:  []json.RawMessage{json.RawMessage(`{"symbol":"test"}`)},
+			ValueJSON:  json.RawMessage(`{"u64":1}`),
+		}
+	}
+	return events
+}
+
 type mockRPC struct {
-	mu sync.Mutex
-
-	health     rpc.Health
-	healthErrs []error
-
-	// eventsResps[i] is returned to the i-th getEvents call. Cycle via
-	// extraResponses when a test doesn't know up-front how many pages.
-	eventsResps    []rpc.GetEventsResponse
-	eventsRespsErr []error
-	eventsRequests []rpc.GetEventsRequest
+	mu             sync.Mutex
+	muAudit        sync.Mutex
+	health         rpc.Health
 	extraResponses func(callIdx int) (rpc.GetEventsResponse, error)
+	eventsResps    []rpc.GetEventsResponse
+	eventsRequests []rpc.GetEventsRequest
 }
 
 func (m *mockRPC) GetEvents(_ context.Context, req rpc.GetEventsRequest) (rpc.GetEventsResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.eventsRequests = append(m.eventsRequests, req)
-	idx := len(m.eventsRequests) - 1
-
-	// Apply the request's filters to the scripted response so tests can
-	// exercise filter parity the way a real RPC would: only events that
-	// match at least one filter survive. Both filter.Type and event.Type
-	// are treated as "match any type" when unset, mirroring production
-	// behavior.
-	filterEvents := func(evs []rpc.Event) []rpc.Event {
-		if len(req.Filters) == 0 {
-			return evs
-		}
-		out := evs[:0:0]
-		for _, e := range evs {
-			for _, f := range req.Filters {
-				if f.Type != "" && e.Type != "" && f.Type != e.Type {
-					continue
-				}
-				if len(f.ContractIDs) > 0 {
-					ok := false
-					for _, cid := range f.ContractIDs {
-						if cid == e.ContractID {
-							ok = true
-							break
-						}
-					}
-					if !ok {
-						continue
-					}
-				}
-				out = append(out, e)
-				break
-			}
-		}
-		return out
-	}
-
 	if m.extraResponses != nil {
-		resp, err := m.extraResponses(idx)
-		if err != nil {
-			return resp, err
-		}
-		resp.Events = filterEvents(resp.Events)
-		return resp, nil
+		return m.extraResponses(len(m.eventsRequests) - 1)
 	}
-	var resp rpc.GetEventsResponse
-	if idx < len(m.eventsResps) {
-		resp = m.eventsResps[idx]
-	}
-	resp.Events = filterEvents(resp.Events)
-	var err error
-	if idx < len(m.eventsRespsErr) {
-		err = m.eventsRespsErr[idx]
-	}
-	return resp, err
+	return rpc.GetEventsResponse{}, nil
 }
 
-func (m *mockRPC) GetLatestLedger(context.Context) (rpc.LatestLedger, error) {
+func (m *mockRPC) GetLatestLedger(_ context.Context) (rpc.LatestLedger, error) {
 	return rpc.LatestLedger{Sequence: m.health.LatestLedger}, nil
 }
 
-func (m *mockRPC) GetHealth(context.Context) (rpc.Health, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.healthErrs) > 0 {
-		err := m.healthErrs[0]
-		m.healthErrs = m.healthErrs[1:]
-		return m.health, err
-	}
+func (m *mockRPC) GetHealth(_ context.Context) (rpc.Health, error) {
 	return m.health, nil
 }
 
-func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+func (m *mockRPC) GetLedgerEntries(_ context.Context, _ rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
 	return rpc.GetLedgerEntriesResponse{}, nil
 }
 
-// mockStore is an in-memory implementation of store.Store good enough
-// for the auditor. It mirrors and extends the ingester test mock so we
-// don't import the ingester test package.
 type mockStore struct {
 	// Embedded so the mock keeps satisfying store.Store as the
 	// interface grows; unstubbed methods panic if a test calls them.
@@ -130,46 +79,47 @@ type mockStore struct {
 
 	findings []store.AuditFinding
 	nextFID  int64
-
-	watched []store.WatchedContract
-
-	// ledgers lets assertions check whether a finding record was written.
-	ledgerCensusCalls []struct {
-		From, To int64
-		IDsOnly  bool
-	}
-	replaceCalls []struct {
-		From, To int64
-		Count    int
-	}
 }
 
 func newMockStore() *mockStore {
 	return &mockStore{events: map[string]store.Event{}}
 }
 
+// seedLedgers creates one event per ledger with the given contract ID.
+func (m *mockStore) seedLedgers(ledgers []int, contractID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, ledger := range ledgers {
+		id := fmt.Sprintf("%020d-%05d", ledger, 0)
+		m.events[id] = store.Event{
+			ID:         id,
+			ContractID: contractID,
+			Ledger:     int64(ledger),
+			Type:       "contract",
+			Topics:     json.RawMessage(`[{"symbol":"test"}]`),
+			Value:      json.RawMessage(`{"u64":1}`),
+		}
+	}
+}
+
 func (m *mockStore) UpsertEvents(_ context.Context, events []store.Event) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var inserted int64
+	var n int64
 	for _, e := range events {
-		if _, dup := m.events[e.ID]; !dup {
-			m.events[e.ID] = e
-			inserted++
+		if _, ok := m.events[e.ID]; !ok {
+			n++
 		}
+		m.events[e.ID] = e
 	}
-	return inserted, nil
+	return n, nil
 }
 
-func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event, from, to int64) error {
+func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event, fromLedger, toLedger int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.replaceCalls = append(m.replaceCalls, struct {
-		From, To int64
-		Count    int
-	}{from, to, len(events)})
 	for id, e := range m.events {
-		if e.Ledger >= from && e.Ledger <= to {
+		if e.Ledger >= fromLedger && e.Ledger <= toLedger {
 			delete(m.events, id)
 		}
 	}
@@ -227,27 +177,19 @@ func (m *mockStore) AggregateEvents(context.Context, store.EventFilter, string) 
 func (m *mockStore) LedgerRangeCensus(_ context.Context, from, to int64, idsOnly bool) ([]store.LedgerCensus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.ledgerCensusCalls = append(m.ledgerCensusCalls, struct {
-		From, To int64
-		IDsOnly  bool
-	}{from, to, idsOnly})
 	byLedger := map[int64][]string{}
 	for _, e := range m.events {
-		if e.Ledger < from || e.Ledger > to {
+		if e.Ledger >= fromLedger && e.Ledger <= toLedger {
+			byLedger[e.Ledger] = append(byLedger[e.Ledger], e.ID)
+		}
+	}
+	var out []store.LedgerCensus
+	for l := fromLedger; l <= toLedger; l++ {
+		ids := byLedger[l]
+		if len(ids) == 0 {
 			continue
 		}
-		byLedger[e.Ledger] = append(byLedger[e.Ledger], e.ID)
-	}
-	ledgers := make([]int, 0, len(byLedger))
-	for l := range byLedger {
-		ledgers = append(ledgers, int(l))
-	}
-	sort.Ints(ledgers)
-	out := make([]store.LedgerCensus, 0, len(ledgers))
-	for _, l := range ledgers {
-		ids := byLedger[int64(l)]
-		sort.Strings(ids)
-		c := store.LedgerCensus{Ledger: int64(l), Count: len(ids)}
+		c := store.LedgerCensus{Ledger: l, Count: len(ids)}
 		if idsOnly {
 			c.IDs = ids
 		}
@@ -256,50 +198,42 @@ func (m *mockStore) LedgerRangeCensus(_ context.Context, from, to int64, idsOnly
 	return out, nil
 }
 
-func (m *mockStore) GetIngestionState(context.Context) (store.IngestionState, error) {
+func (m *mockStore) GetIngestionState(_ context.Context, _ string) (store.IngestionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.ingestionState == nil {
+	if m.ingress.LastIngestedLedger <= 0 && m.ingress.LastCursor == "" {
 		return store.IngestionState{}, store.ErrNotFound
 	}
-	return *m.ingestionState, nil
+	return m.ingress, nil
 }
 
 func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s2 := s
-	m.ingestionState = &s2
+	m.ingress = s
 	return nil
 }
 
-func (m *mockStore) GetAuditState(context.Context) (store.AuditState, error) {
+func (m *mockStore) GetAuditState(_ context.Context, _ string) (store.AuditState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.auditState == nil {
-		return store.AuditState{}, store.ErrNotFound
-	}
-	return *m.auditState, nil
+	return m.audit, nil
 }
 
 func (m *mockStore) SaveAuditState(_ context.Context, s store.AuditState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s2 := s
-	m.auditState = &s2
+	m.audit = s
 	return nil
 }
 
-func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, ledger int64) (store.AuditState, error) {
+func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, _ string, ledger int64) (store.AuditState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.auditState == nil {
-		m.auditState = &store.AuditState{}
+	if ledger > m.audit.VerifiedThroughLedger {
+		m.audit.VerifiedThroughLedger = ledger
 	}
-	if ledger > m.auditState.VerifiedThroughLedger {
-		m.auditState.VerifiedThroughLedger = ledger
-	}
-	return *m.auditState, nil
+	return m.audit, nil
 }
 
 func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
@@ -319,6 +253,22 @@ func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
 		}
 	}
 	return store.ErrNotFound
+}
+
+func (m *mockStore) GetContractCursor(_ context.Context, _ string) (store.ContractCursor, error) {
+	return store.ContractCursor{}, store.ErrNotFound
+}
+
+func (m *mockStore) SaveContractCursor(_ context.Context, _ store.ContractCursor) error {
+	return nil
+}
+
+func (m *mockStore) DeleteContractCursor(_ context.Context, _ string) error {
+	return nil
+}
+
+func (m *mockStore) ListContractCursors(context.Context) ([]store.ContractCursor, error) {
+	return nil, nil
 }
 
 func (m *mockStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) (store.AuditFinding, error) {
@@ -345,7 +295,7 @@ func (m *mockStore) UpdateAuditFinding(_ context.Context, f store.AuditFinding) 
 	return store.ErrNotFound
 }
 
-func (m *mockStore) ListOpenFindingsByRange(_ context.Context, from, to int64) (store.AuditFinding, error) {
+func (m *mockStore) ListOpenFindingsByRange(_ context.Context, _ string, from, to int64) (store.AuditFinding, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i := len(m.findings) - 1; i >= 0; i-- {
@@ -364,15 +314,7 @@ func (m *mockStore) Stats(context.Context, store.Scope) (store.Stats, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var s store.Stats
-	for range m.events {
-		s.TotalEvents++
-	}
-	if m.ingestionState != nil {
-		s.LastIngestedLedger = m.ingestionState.LastIngestedLedger
-	}
-	if m.auditState != nil {
-		s.VerifiedThroughLedger = m.auditState.VerifiedThroughLedger
-	}
+	s.TotalEvents = int64(len(m.events))
 	return s, nil
 }
 
@@ -386,16 +328,11 @@ func (m *mockStore) MigrationVersion(context.Context) (int, bool, error) {
 
 func (m *mockStore) Ping(context.Context) error { return nil }
 
-func (m *mockStore) QueryAnalyticsEvents(context.Context, store.AnalyticsFilter) ([]store.AnalyticsEventBucket, error) {
-	return nil, nil
-}
-func (m *mockStore) QueryAnalyticsTokenVolume(context.Context, store.AnalyticsFilter) ([]store.AnalyticsTokenVolume, error) {
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
 }
 func (m *mockStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
 
-// Subscription stubs for the webhook feature — unused by auditor tests.
 func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
 	sub.ID = 1
 	return sub, nil
@@ -427,40 +364,24 @@ func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int, store.Subs
 	return nil, nil
 }
 
-// seedLedgers records pre-existing events in m.events so tests can set up
-// "stored state that diverges from the RPC" without a database. IDs use
-// the same %020d-%05d format as mkEvents, so seeded events and RPC
-// events are comparable by id.
-func (m *mockStore) seedLedgers(ledgers []int, contractID string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, l := range ledgers {
-		id := fmt.Sprintf("%020d-00000", l)
-		m.events[id] = store.Event{
-			ID:         id,
-			ContractID: contractID,
-			Ledger:     int64(l),
-			Type:       "contract",
-		}
-	}
+func (m *mockStore) UpsertTokenBalances(ctx context.Context, network string, state store.TokenBalanceState, updates []store.TokenBalanceUpdate) error {
+	return nil
 }
 
-// mkEvents constructs `count` rpc.Event objects with stable IDs for ledger.
-// IDs use the same %020d-%05d format the auditor compares against, so seeded
-// events and RPC events align.
-func mkEvents(ledger uint32, count int, contractID string) []rpc.Event {
-	out := make([]rpc.Event, count)
-	for i := 0; i < count; i++ {
-		id := fmt.Sprintf("%020d-%05d", ledger, i)
-		out[i] = rpc.Event{
-			ID:         id,
-			ContractID: contractID,
-			TxHash:     "deadbeef",
-			Type:       "contract",
-			Ledger:     ledger,
-		}
-	}
-	return out
+func (m *mockStore) GetTokenBalances(ctx context.Context, contractID, network, minBalance string, cursor string, limit int) ([]store.TokenBalance, string, error) {
+	return nil, "", nil
+}
+
+func (m *mockStore) GetTokenBalanceState(ctx context.Context, network, contractID string) (store.TokenBalanceState, error) {
+	return store.TokenBalanceState{}, store.ErrNotFound
+}
+
+func (m *mockStore) UpsertTokenBalanceState(ctx context.Context, state store.TokenBalanceState) error {
+	return nil
+}
+
+func (m *mockStore) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {
+	return 0, nil
 }
 
 func (m *mockStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {

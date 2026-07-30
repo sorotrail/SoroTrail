@@ -256,6 +256,13 @@ func (s *Server) handleListDeliveries(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("listing delivery attempts failed"))
 		return
 	}
+	if r.URL.Query().Get("envelope") == "true" {
+		if attempts == nil {
+			attempts = []store.DeliveryAttempt{}
+		}
+		writeJSON(w, http.StatusOK, wrapEnvelope(attempts, ""))
+		return
+	}
 	writeJSON(w, http.StatusOK, attempts)
 }
 

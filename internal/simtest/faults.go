@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/rpc"
 )
 
 // FaultKind categorizes the types of faults the simulation can inject.

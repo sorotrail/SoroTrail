@@ -1,6 +1,5 @@
 // Package broadcast provides a pub-sub mechanism for distributing ingested
-// events to connected clients (SSE, WebSocket, etc.). It is the streaming
-// counterpart of the store package's query interface.
+// events to connected clients (SSE, WebSocket, etc.).
 package broadcast
 
 import (
@@ -14,8 +13,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
-// DefaultBufferSize is the per-subscriber channel buffer. When a subscriber's
-// channel is full the subscriber is evicted (slow-consumer policy).
+// DefaultBufferSize is the per-subscriber channel buffer.
 const DefaultBufferSize = 64
 
 // Broadcaster distributes events to subscribers whose filters match.
@@ -27,7 +25,6 @@ type Broadcaster struct {
 }
 
 // Subscription represents a single subscriber's connection to the event stream.
-// The caller receives events on Events() and must call Close() when done.
 type Subscription struct {
 	id     string
 	ch     chan store.Event
@@ -42,8 +39,7 @@ type Subscription struct {
 	scope   store.Scope
 }
 
-// New creates a Broadcaster. bufferSize is the per-subscriber channel
-// capacity; a subscriber that falls behind gets evicted.
+// New creates a Broadcaster.
 func New(bufferSize int) *Broadcaster {
 	if bufferSize <= 0 {
 		bufferSize = DefaultBufferSize
@@ -108,18 +104,13 @@ func (b *Broadcaster) unsubscribe(id string) {
 }
 
 // SubscriberCount returns the number of subscribers currently registered.
-// Exposed primarily for tests that need to verify the subscription
-// lifecycle (e.g. confirming that a handler's deferred sub.Close()
-// actually ran on connection teardown), but also useful for operators
-// who want to see how many live consumers the broadcaster is feeding.
 func (b *Broadcaster) SubscriberCount() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return len(b.subs)
 }
 
-// Publish sends events to all subscribers whose filter matches. Slow
-// consumers (full channel) are silently evicted.
+// Publish sends events to all subscribers whose filter matches.
 func (b *Broadcaster) Publish(ctx context.Context, events []store.Event) {
 	b.mu.RLock()
 	subs := make([]*Subscription, 0, len(b.subs))
@@ -164,16 +155,12 @@ func (b *Broadcaster) Publish(ctx context.Context, events []store.Event) {
 	}
 }
 
-// Events returns a receive-only channel of events matching the subscriber's
-// filter. The channel is closed when the subscription is terminated (either
-// by the caller calling Close() or by the broadcaster evicting a slow
-// consumer).
+// Events returns a receive-only channel of events matching the subscriber's filter.
 func (s *Subscription) Events() <-chan store.Event {
 	return s.ch
 }
 
-// Close terminates the subscription. The subscriber will receive no more
-// events.
+// Close terminates the subscription.
 func (s *Subscription) Close() {
 	s.once.Do(func() {
 		s.b.unsubscribe(s.id)
@@ -181,7 +168,6 @@ func (s *Subscription) Close() {
 }
 
 // eventMatches reports whether an event satisfies the given filter.
-// Zero-valued filter fields are treated as "no constraint".
 func eventMatches(ev store.Event, f store.EventFilter) bool {
 	// If both ContractID and ContractIDs are set, match if the event's
 	// contract matches either one.
@@ -219,6 +205,15 @@ func eventMatches(ev store.Event, f store.EventFilter) bool {
 			return false
 		}
 	}
+	if f.TopicCount != nil {
+		var arr []json.RawMessage
+		if err := json.Unmarshal(ev.Topics, &arr); err != nil {
+			return false
+		}
+		if len(arr) != *f.TopicCount {
+			return false
+		}
+	}
 	if f.FromLedger > 0 && ev.Ledger < f.FromLedger {
 		return false
 	}
@@ -231,11 +226,19 @@ func eventMatches(ev store.Event, f store.EventFilter) bool {
 	if !f.ToTime.IsZero() && ev.CreatedAt.After(f.ToTime) {
 		return false
 	}
+	if f.HasValue != nil {
+		hasPayload := len(ev.Value) > 0 && string(ev.Value) != "null"
+		if *f.HasValue && !hasPayload {
+			return false
+		}
+		if !*f.HasValue && hasPayload {
+			return false
+		}
+	}
 	return true
 }
 
-// topicContains reports whether the topics JSON array contains the needle
-// JSON value at any position (equivalent to Postgres's @> containment).
+// topicContains reports whether the topics JSON array contains the needle.
 func topicContains(topics json.RawMessage, needle json.RawMessage) bool {
 	var arr []json.RawMessage
 	if err := json.Unmarshal(topics, &arr); err != nil {

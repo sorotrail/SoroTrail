@@ -201,7 +201,7 @@ func (f *fakeExportStore) Ping(context.Context) error { return nil }
 func testServer(t *testing.T, st store.Store, maxRange int64) http.Handler {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := New(st, nil, logger, "")
+	s := New(st, nil, logger, "", 0)
 	s.SetExportMaxRange(maxRange)
 	return s.Router()
 }

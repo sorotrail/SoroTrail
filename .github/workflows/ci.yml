@@ -10,7 +10,22 @@ permissions:
   contents: read
 
 jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build
+        run: go build ./...
   test:
+    name: Test (Integration)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     services:
@@ -29,7 +44,36 @@ jobs:
           --health-interval 2s
           --health-timeout 2s
           --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/test_db?sslmode=disable
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run Postgres Integration Tests
+        run: make test-db
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.60
+        
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7.0.0
         with:
@@ -60,12 +104,64 @@ jobs:
       # and internal/replay share one database and truncate the same tables.
       # -race catches data races inside a single package's test binary.
       - name: Test (with Postgres integration tests)
+        # -p 1 serializes packages: the integration tests in internal/store
+        # and internal/replay share one database and truncate the same tables.
+        # The build integrates TEST_DATABASE_URL-based tests; the
+        # //go:build integration-tagged suite is exercised by the separate
+        # `integration` job below.
+        run: go test -p 1 ./... -count=1
         run: go test -p 1 ./... -count=1 -race -timeout=120s
         env:
           TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5433/sorotrail?sslmode=disable
       - name: Verify Benchmarks (compilation and short run)
         run: make bench-ci
 
+
+  # Issue #9: separate CI job for the integration test layer gated behind
+  # the `integration` build tag. Same Postgres service as the `test` job;
+  # `-p 1` is required because internal/store and internal/replay
+  # integration tests share the database and truncate the same tables.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sorotrail
+          POSTGRES_PASSWORD: sorotrail
+          POSTGRES_DB: sorotrail
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sorotrail"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build (integration tag)
+        run: go build -tags=integration ./...
+      - name: Vet (integration tag)
+        run: go vet -tags=integration ./...
+      - name: Run integration tests
+        # The integration tests cover:
+        #   1. migration up from empty
+        #     (internal/store/store_integration_test.go)
+        #   2. event upsert idempotency — same TOID twice → one row
+        #     (internal/store/events_integration_test.go)
+        #   3. ingestion_state save/resume across ingester restart
+        #     (internal/ingester/integration_test.go)
+        #   4. GET /events filter combinations against seeded data
+        #     (internal/api/api_integration_test.go)
+        # -p 1 because the integration tests in internal/store and
+        # internal/replay share the service Postgres and TRUNCATE the
+        # same tables between tests.
+        run: go test -tags=integration -p 1 ./... -count=1
+        env:
+          TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
 
   lint:
     runs-on: ubuntu-latest

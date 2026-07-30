@@ -115,7 +115,7 @@ func (c *ClickHouse) SaveIngestionState(ctx context.Context, s IngestionState) e
 	return nil
 }
 
-func (c *ClickHouse) GetAuditState(ctx context.Context) (AuditState, error) {
+func (c *ClickHouse) GetAuditState(ctx context.Context, network string) (AuditState, error) {
 	return AuditState{}, nil
 }
 
@@ -123,7 +123,7 @@ func (c *ClickHouse) SaveAuditState(ctx context.Context, s AuditState) error {
 	return nil
 }
 
-func (c *ClickHouse) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (AuditState, error) {
+func (c *ClickHouse) SaveAuditStateIfGreater(ctx context.Context, network string, ledger int64) (AuditState, error) {
 	return AuditState{}, nil
 }
 
@@ -139,6 +139,22 @@ func (c *ClickHouse) AddWatchedContract(ctx context.Context, contractID string) 
 	return nil
 }
 
+func (c *ClickHouse) GetContractCursor(context.Context, string) (ContractCursor, error) {
+	return ContractCursor{}, ErrNotFound
+}
+
+func (c *ClickHouse) SaveContractCursor(context.Context, ContractCursor) error {
+	return nil
+}
+
+func (c *ClickHouse) DeleteContractCursor(context.Context, string) error {
+	return nil
+}
+
+func (c *ClickHouse) ListContractCursors(context.Context) ([]ContractCursor, error) {
+	return nil, nil
+}
+
 func (c *ClickHouse) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
 	return f, nil
 }
@@ -147,7 +163,7 @@ func (c *ClickHouse) UpdateAuditFinding(ctx context.Context, f AuditFinding) err
 	return nil
 }
 
-func (c *ClickHouse) ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error) {
+func (c *ClickHouse) ListOpenFindingsByRange(ctx context.Context, network string, fromLedger, toLedger int64) (AuditFinding, error) {
 	return AuditFinding{}, ErrNotFound
 }
 
