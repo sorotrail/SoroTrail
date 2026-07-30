@@ -60,6 +60,26 @@ Database resolution, in order:
 Without the tag, `go test ./...` is unit-suite-only and stays fast
 (under ~10s).
 
+## Fuzz testing
+
+The decoder fuzz targets run automatically on pull requests with a 30-second
+budget per target. To run the short local versions:
+
+```sh
+go test ./internal/decode -run '^$' -fuzz FuzzDecodeScVal -fuzztime 30s
+go test ./internal/decode -run '^$' -fuzz FuzzDecodeTopicArray -fuzztime 30s
+```
+
+For a longer local session, increase `-fuzztime`, for example:
+
+```sh
+go test ./internal/decode -run '^$' -fuzz FuzzDecodeScVal -fuzztime 30m
+go test ./internal/decode -run '^$' -fuzz FuzzDecodeTopicArray -fuzztime 30m
+```
+
+Fuzzing may save reproducing inputs under the package's `testdata/fuzz`
+directory. Commit any panic reproducer together with a regression test.
+
 ## Architecture
 
 ```
@@ -114,6 +134,17 @@ testable and replaceable.
 - Keep functions small and packages focused. When in doubt, match the
   surrounding code.
 
+## Dependency management
+
+Dependency updates are handled by Dependabot, which opens grouped weekly
+PRs for Go modules, GitHub Actions, and the Docker base image. PRs with minor
+or patch bumps are grouped together to keep the review stream manageable;
+major version bumps come individually. The `vulncheck` CI job runs
+`govulncheck ./...` and fails if any reachable vulnerability is found, so
+known-vulnerable code paths are surfaced before they ship. Review dependency
+PRs promptly — a green check on `vulncheck` is a good signal that the bump can
+be merged without deep audit.
+
 ## Pull requests
 
 - `go build ./...`, `make test`, `make test-integration` and `make lint`
@@ -124,3 +155,5 @@ testable and replaceable.
 - Include tests for behavior changes; add a new integration test for any
   public API or schema change.
 - Update the README's API reference and config table when you touch either.
+- Include `Closes #[issue_id]` and summarize fuzz findings, including when no
+  panics were found.

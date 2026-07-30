@@ -18,14 +18,14 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/stellar/go/xdr"
+	"github.com/stellar/go-stellar-sdk/xdr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/khaylebfortune/sorotrail/internal/decode"
-	"github.com/khaylebfortune/sorotrail/internal/replay"
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/replay"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // rpcEvent builds the shape decode.EventTopicsValue consumes, mirroring how
@@ -125,7 +125,7 @@ func TestReplay_ImprovedDecoderRewritesStoredRows(t *testing.T) {
 	ctx := context.Background()
 	seedEvents(t, p, 5, true)
 
-	before, err := p.GetEvent(ctx, eventID(1))
+	before, err := p.GetEvent(ctx, eventID(1), store.SystemScope())
 	require.NoError(t, err)
 	assert.Contains(t, string(before.Topics), "unknown", "seeded with the stale decoding")
 
@@ -139,7 +139,7 @@ func TestReplay_ImprovedDecoderRewritesStoredRows(t *testing.T) {
 	assert.Zero(t, sum.Skipped)
 	assert.Zero(t, sum.Failed)
 
-	after, err := p.GetEvent(ctx, eventID(1))
+	after, err := p.GetEvent(ctx, eventID(1), store.SystemScope())
 	require.NoError(t, err)
 	assert.JSONEq(t, `[{"symbol":"transfer"}]`, string(after.Topics))
 	assert.JSONEq(t, `{"u64":101}`, string(after.Value))
@@ -154,7 +154,7 @@ func TestReplay_ImprovedDecoderRewritesStoredRows(t *testing.T) {
 	assert.EqualValues(t, 5, second.Processed)
 	assert.EqualValues(t, 0, second.Changed, "re-running an up-to-date replay rewrites nothing")
 
-	stillAfter, err := p.GetEvent(ctx, eventID(1))
+	stillAfter, err := p.GetEvent(ctx, eventID(1), store.SystemScope())
 	require.NoError(t, err)
 	assert.JSONEq(t, string(after.Topics), string(stillAfter.Topics))
 	assert.JSONEq(t, string(after.Value), string(stillAfter.Value))
