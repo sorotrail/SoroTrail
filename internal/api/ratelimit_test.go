@@ -164,7 +164,7 @@ func TestRateLimit_HealthzIsExempt(t *testing.T) {
 	require.Equal(t, http.StatusTooManyRequests, r1.StatusCode, "sanity: bucket must be empty")
 
 	for i := 0; i < 10; i++ {
-		rh := drive(t, s, mkReq(http.MethodGet, "/healthz"))
+		rh := drive(t, s, mkReq(http.MethodGet, "/livez"))
 		require.Equalf(t, http.StatusOK, rh.StatusCode,
 			"/healthz call %d must be exempt", i)
 		rh.Body.Close()

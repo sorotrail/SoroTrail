@@ -302,8 +302,6 @@ func (s *Server) Router() http.Handler {
 	r.Get("/contracts/{id}/export", s.handleContractExport)
 
 	r.Get("/stats", s.handleStats)
-	r.Get("/analytics/events", s.handleAnalyticsEvents)
-	r.Get("/analytics/token-volume", s.handleAnalyticsTokenVolume)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.

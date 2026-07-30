@@ -11,8 +11,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
@@ -64,7 +67,7 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	require.NoError(t, err)
 
 	_, err = pool.Exec(context.Background(),
-		`TRUNCATE events, ingestion_state, watched_contracts, replay_state, rollup_events, rollup_token_volume`)
+		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
 	require.NoError(t, err)
 
 	// Detach and drop all existing event partitions so a store with a different
@@ -88,24 +91,6 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	return NewPostgres(pool, span)
 }
 
-func testEvent(id string, ledger int64, contractID string) Event {
-	return Event{
-		ID:               id,
-		ContractID:       contractID,
-		Ledger:           ledger,
-		Type:             "contract",
-		TxHash:           "deadbeef",
-		InSuccessfulCall: true,
-		Topics:           json.RawMessage(`[{"symbol":"transfer"},{"u64":7}]`),
-		Value:            json.RawMessage(`{"i128":"1000"}`),
-	}
-}
-
-const (
-	contractA = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-	contractB = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-)
-
 // legacySchemaMigrationsVersion is the schema_migrations version the
 // legacy test simulates "already applied" by forcing it via UPDATE.
 // The test hand-ruptures the events table to non-partitioned then
@@ -128,27 +113,6 @@ const legacySchemaMigrationsVersion = 3
 
 // eventID builds IDs whose lexicographic order matches insertion order, like
 // real TOIDs.
-func eventID(n int) string { return fmt.Sprintf("%020d-%010d", n, 0) }
-
-func TestUpsertEvents_Idempotent(t *testing.T) {
-	st := testStore(t)
-	ctx := context.Background()
-
-	events := []Event{testEvent(eventID(1), 100, contractA), testEvent(eventID(2), 101, contractA)}
-	inserted, err := st.UpsertEvents(ctx, events)
-	require.NoError(t, err)
-	assert.Equal(t, int64(2), inserted)
-
-	inserted, err = st.UpsertEvents(ctx, events)
-	require.NoError(t, err)
-	assert.Zero(t, inserted, "duplicate IDs are ignored")
-
-	got, err := st.GetEvent(ctx, eventID(1), SystemScope())
-	require.NoError(t, err)
-	assert.Equal(t, contractA, got.ContractID)
-	assert.JSONEq(t, `[{"symbol":"transfer"},{"u64":7}]`, string(got.Topics))
-	assert.JSONEq(t, `{"i128":"1000"}`, string(got.Value))
-}
 
 func TestUpsertEvents_CreatesPartitionsAndIsIdempotent(t *testing.T) {
 	st := testStoreWithPartitionSpan(t, 10)
@@ -693,7 +657,7 @@ func TestAggregateEvents_ByLedger(t *testing.T) {
 	_, err := st.UpsertEvents(ctx, events)
 	require.NoError(t, err)
 
-	got, err := st.AggregateEvents(ctx, EventFilter{FromLedger: 100, ToLedger: 102}, "ledger")
+	got, err := st.AggregateEvents(ctx, EventFilter{FromLedger: 100, ToLedger: 102, Scope: WildcardScope()}, "ledger")
 	require.NoError(t, err)
 	require.Len(t, got, 3)
 	assert.Equal(t, "100", got[0].Bucket)
@@ -717,7 +681,7 @@ func TestAggregateEvents_ByTime(t *testing.T) {
 	_, err := st.UpsertEvents(ctx, events)
 	require.NoError(t, err)
 
-	got, err := st.AggregateEvents(ctx, EventFilter{FromLedger: 101, ToLedger: 104}, "24h")
+	got, err := st.AggregateEvents(ctx, EventFilter{FromLedger: 101, ToLedger: 104, Scope: WildcardScope()}, "24h")
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, "2026-07-20T00:00:00", got[0].Bucket)
@@ -742,7 +706,7 @@ func TestAggregateEvents_Filters(t *testing.T) {
 	require.NoError(t, err)
 
 	// contract_id filter
-	got, err := st.AggregateEvents(ctx, EventFilter{ContractID: contractA}, "ledger")
+	got, err := st.AggregateEvents(ctx, EventFilter{ContractID: contractA, Scope: WildcardScope()}, "ledger")
 	require.NoError(t, err)
 	assert.Len(t, got, 2) // ledgers 100 and 101
 	totalA := int64(0)
@@ -752,7 +716,7 @@ func TestAggregateEvents_Filters(t *testing.T) {
 	assert.Equal(t, int64(2), totalA)
 
 	// type filter
-	got, err = st.AggregateEvents(ctx, EventFilter{Types: []string{"system"}}, "ledger")
+	got, err = st.AggregateEvents(ctx, EventFilter{Types: []string{"system"}, Scope: WildcardScope()}, "ledger")
 	require.NoError(t, err)
 	assert.Len(t, got, 1)
 	assert.Equal(t, int64(1), got[0].Count)

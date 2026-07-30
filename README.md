@@ -189,21 +189,6 @@ only Soroban V3/V4 transactions carry events, and the public Stellar
 testnet Horizon retains everything from protocol 17 onward while
 mainnet varies.
 
-### `sorotrail rollup-rebuild`
-
-Reconstructs the rollup tables from stored events. Useful after backfills
-or replays, or when a decoder improvement changes which events are classified
-as transfers.
-
-```sh
-sorotrail rollup-rebuild --from-ledger N [--to-ledger M]
-```
-
-Only one rebuild may run at a time (advisory lock). Safe to run against a
-live database; targets historical ledger ranges — running it at the live
-ingestion frontier may transiently overcount events ingested during the
-rebuild.
-
 ## Decoder replay
 
 Decoders improve over time. `sorotrail replay` re-runs the current decoder
