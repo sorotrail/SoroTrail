@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -143,8 +144,16 @@ func TestListEvents_BadParams(t *testing.T) {
 		"/events?from_time=2026-07-21T00:00:00",
 		"/events?from_time=2026-07-21T00:00:00.123Z",
 		"/events?from_time=2026-07-22T00:00:00Z&to_time=2026-07-21T00:00:00Z",
+		// #223: limit must be a positive integer <= MaxQueryLimit.
 		"/events?limit=0",
+		"/events?limit=-1",
 		"/events?limit=99999",
+		"/events?limit=abc",
+		"/events?limit=1.5",
+		// #223: order must be asc, desc, or empty (case-sensitive).
+		"/events?order=foo",
+		"/events?order=ascending",
+		"/events?order=DESC",
 	} {
 		t.Run(path, func(t *testing.T) {
 			resp, body := doGet(t, newTestServer(&stubStore{}, nil), path)
@@ -217,3 +226,37 @@ func TestStats(t *testing.T) {
 	assert.Equal(t, int64(42), got.TotalEvents)
 	assert.Equal(t, int64(999), got.LastIngestedLedger)
 }
+
+// TestListEvents_LimitOrderAccepted is the companion to
+// TestListEvents_BadParams for #223: it pins down that valid limit and
+// order query parameters pass through filterFromQuery to the store
+// unchanged. Empty limit/order stay zero-valued downstream so the SQL
+// layer can apply store.DefaultQueryLimit and treat Order=="" as "asc".
+func TestListEvents_LimitOrderAccepted(t *testing.T) {
+	max := store.MaxQueryLimit
+	cases := []struct {
+		name      string
+		query     string
+		wantLimit int
+		wantOrder string
+	}{
+		{"defaults", "", 0, ""},
+		{"limit at lower bound", "?limit=1", 1, ""},
+		{"limit mid-range", "?limit=50", 50, ""},
+		{"limit at upper bound", "?limit=" + strconv.Itoa(max), max, ""},
+		{"order=asc", "?order=asc", 0, "asc"},
+		{"order=desc", "?order=desc", 0, "desc"},
+		{"limit and order combined", "?limit=10&order=desc", 10, "desc"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &stubStore{}
+			resp, body := doGet(t, newTestServer(st, nil), "/events"+tc.query)
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+			assert.Equal(t, tc.wantLimit, st.lastFilter.Limit)
+			assert.Equal(t, tc.wantOrder, st.lastFilter.Order)
+		})
+	}
+}
+
+
