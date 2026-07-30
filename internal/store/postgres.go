@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"math/big"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -251,7 +252,7 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 			RETURNING contract_id, type, ledger, topics, value`,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value,
-			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
+			nullableStringSlice(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
 	}
 

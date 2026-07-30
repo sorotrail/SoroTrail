@@ -126,10 +126,48 @@ type enrichedEventsResponse struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
+type eventWithXDR struct {
+	Event     store.Event `json:"-"`
+	TopicsXDR []string    `json:"topics_xdr"`
+	ValueXDR  *string     `json:"value_xdr,omitempty"`
+}
+
+type enrichedEventWithXDR struct {
+	eventWithXDR
+	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                          `json:"decoded"`
+}
+
+type enrichedEventsWithXDRResponse struct {
+	Events []enrichedEventWithXDR `json:"events"`
+	Cursor string                  `json:"cursor,omitempty"`
+}
+
 type eventsWithXDRResponse struct {
 	Events []eventWithXDR `json:"events"`
 	// Cursor is non-empty when another page exists.
 	Cursor string `json:"cursor,omitempty"`
+}
+
+// envelopeResponse is the JSON body returned when ?envelope=true is set on
+// any paginated list endpoint. It normalises the response shape across all
+// list endpoints so clients that prefer a consistent outer wrapper don't
+// have to inspect endpoint-specific field names.
+//
+// Fields:
+//
+//	data        – the page items (array, never null).
+//	next_cursor – opaque pagination cursor; empty/absent when exhausted.
+type envelopeResponse struct {
+	Data       any    `json:"data"`
+	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+// wrapEnvelope builds an envelopeResponse from a page of items and the
+// next-page cursor. It is a convenience constructor so call sites stay
+// single-line.
+func wrapEnvelope(data any, cursor string) envelopeResponse {
+	return envelopeResponse{Data: data, NextCursor: cursor}
 }
 
 type healthResponse struct {
@@ -685,6 +723,7 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	decoded := r.URL.Query().Get("decoded") == "true"
+	envelope := r.URL.Query().Get("envelope") == "true"
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), events)
@@ -693,28 +732,50 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		// shared cache could key ?decoded=true responses on URL alone.
 		writeVary(w)
 		if includeXDR {
+			items := enrichEventsWithXDR(enriched)
+			if envelope {
+				writeJSON(w, http.StatusOK, wrapEnvelope(items, cursor))
+				return
+			}
 			writeJSON(w, http.StatusOK, enrichedEventsWithXDRResponse{
-				Events: enrichEventsWithXDR(enriched),
+				Events: items,
 				Cursor: cursor,
 			})
+			return
+		}
+		if envelope {
+			writeJSON(w, http.StatusOK, wrapEnvelope(enriched, cursor))
 			return
 		}
 		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
 		return
 	}
 	if includeXDR {
+		items := eventsWithXDR(events)
+		if envelope {
+			writeJSON(w, http.StatusOK, wrapEnvelope(items, cursor))
+			return
+		}
 		writeJSON(w, http.StatusOK, eventsWithXDRResponse{
-			Events: eventsWithXDR(events),
+			Events: items,
 			Cursor: cursor,
 		})
 		return
 	}
 	if fields == nil {
+		if envelope {
+			writeJSON(w, http.StatusOK, wrapEnvelope(events, cursor))
+			return
+		}
 		writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
 	} else {
 		m := map[string]any{"events": projectEvents(events, fields)}
 		if cursor != "" {
 			m["cursor"] = cursor
+		}
+		if envelope {
+			writeJSON(w, http.StatusOK, wrapEnvelope(projectEvents(events, fields), cursor))
+			return
 		}
 		writeJSON(w, http.StatusOK, m)
 	}
@@ -924,6 +985,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	event.WithSEP41()
 
 	decoded := r.URL.Query().Get("decoded") == "true"
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {
@@ -1046,6 +1108,10 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 		items = []store.ContractSummary{}
 	}
 	writeCacheHeaders(w, cacheNoCache, 0, "")
+	if r.URL.Query().Get("envelope") == "true" {
+		writeJSON(w, http.StatusOK, wrapEnvelope(items, cursor))
+		return
+	}
 	writeJSON(w, http.StatusOK, contractListResponse{
 		Contracts: items,
 		Count:     len(items),
@@ -1092,6 +1158,13 @@ func (s *Server) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
+	if r.URL.Query().Get("envelope") == "true" {
+		if items == nil {
+			items = []store.DeadLetter{}
+		}
+		writeJSON(w, http.StatusOK, wrapEnvelope(items, cursor))
+		return
+	}
 	writeJSON(w, http.StatusOK, deadLetterListResponse{
 		DeadLetters: items,
 		Count:       len(items),
@@ -1355,6 +1428,11 @@ func (s *Server) handleAddressEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeCacheHeaders(w, cacheNoCache, 0, "")
+	envelope := r.URL.Query().Get("envelope") == "true"
+	if envelope {
+		writeJSON(w, http.StatusOK, wrapEnvelope(events, cursor))
+		return
+	}
 	writeJSON(w, http.StatusOK, addressEventsResponse{Events: events, Cursor: cursor})
 }
 
