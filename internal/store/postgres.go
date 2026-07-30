@@ -1879,12 +1879,3 @@ func (p *Postgres) GetAddressSummary(ctx context.Context, address string) (Addre
 	}
 	return s, nil
 }
-
-// nullableTextArray turns an empty slice into SQL NULL so a text[] column has
-// one representation of "absent" rather than two (NULL and '{}').
-func nullableTextArray(v []string) any {
-	if len(v) == 0 {
-		return nil
-	}
-	return v
-}

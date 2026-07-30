@@ -958,17 +958,6 @@ func (ing *Ingester) indexEventAddresses(ctx context.Context, events []store.Eve
 	return ing.store.UpsertAddressRefs(ctx, refs)
 }
 
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
-}
-
 // RunOnceForTest executes exactly one ingestion pass and reports whether the
 // indexer is caught up. It lets the simulation harness drive ingestion
 // deterministically, one cycle at a time, rather than starting Run and racing
