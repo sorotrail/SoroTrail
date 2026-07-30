@@ -10,6 +10,8 @@ SoroTrail does exactly that: it polls a Stellar RPC endpoint, stores contract
 events durably in Postgres or SQLite, and serves them back through a queryable
 HTTP API long after the RPC has forgotten them.
 
+[![CI](https://github.com/<owner>/<repo>/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/<repo>/actions/workflows/ci.yml)
+
 ```
  Stellar RPC ──getEvents──▶ ingester ──▶ Postgres/SQLite ◀── HTTP API ◀── you
 ```
