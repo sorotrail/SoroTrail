@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -28,12 +31,24 @@ const (
 	DefaultQueryLimit         = 50
 	MaxQueryLimit             = 500
 	DefaultEventPartitionSpan = 120960
+
+	poolHealthCheckInterval  = 5 * time.Second
+	poolHealthCheckTimeout   = 2 * time.Second
+	poolReconnectBaseBackoff = 100 * time.Millisecond
+	poolReconnectMaxBackoff  = 30 * time.Second
 )
 
 // Postgres implements Store on a pgx connection pool.
 type Postgres struct {
 	pool          *pgxpool.Pool
 	partitionSpan int64
+
+	// Health monitoring
+	healthMu      sync.RWMutex
+	healthyAtomic atomic.Bool
+	lastHealthErr error
+	databaseURL   string
+	stopHealthCk  context.CancelFunc
 }
 
 var _ Store = (*Postgres)(nil)
@@ -46,18 +61,376 @@ func NewPostgres(pool *pgxpool.Pool, partitionSpan ...int64) *Postgres {
 	if len(partitionSpan) > 0 && partitionSpan[0] > 0 {
 		span = partitionSpan[0]
 	}
-	return &Postgres{pool: pool, partitionSpan: span}
+	pg := &Postgres{pool: pool, partitionSpan: span}
+	pg.healthyAtomic.Store(true)
+	return pg
+}
+
+// NewPostgresWithHealthCheck creates a Postgres instance with health monitoring.
+// It wraps the pool and starts a periodic health check goroutine that will
+// automatically reconnect on transient failures. The context is used to stop
+// the health check; callers should ensure it's cancelled on shutdown.
+func NewPostgresWithHealthCheck(ctx context.Context, pool *pgxpool.Pool, databaseURL string, partitionSpan ...int64) *Postgres {
+	pg := NewPostgres(pool, partitionSpan...)
+	pg.databaseURL = databaseURL
+
+	healthCtx, cancel := context.WithCancel(ctx)
+	pg.stopHealthCk = cancel
+
+	go pg.runHealthCheck(healthCtx)
+
+	return pg
+}
+
+// StopHealthCheck stops the health check goroutine. The caller is responsible for
+// closing the underlying pool.
+func (p *Postgres) StopHealthCheck() {
+	if p.stopHealthCk != nil {
+		p.stopHealthCk()
+	}
+}
+
+func (p *Postgres) runHealthCheck(ctx context.Context) {
+	ticker := time.NewTicker(poolHealthCheckInterval)
+	defer ticker.Stop()
+
+	logger := slog.Default()
+	reconnectAttempt := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.performHealthCheck(ctx, logger, &reconnectAttempt)
+		}
+	}
+}
+
+func (p *Postgres) performHealthCheck(ctx context.Context, logger *slog.Logger, reconnectAttempt *int) {
+	pingCtx, cancel := context.WithTimeout(ctx, poolHealthCheckTimeout)
+	defer cancel()
+
+	err := p.pool.Ping(pingCtx)
+
+	p.healthMu.Lock()
+	wasHealthy := p.healthyAtomic.Load()
+	p.healthMu.Unlock()
+
+	if err == nil {
+		if !wasHealthy {
+			p.healthMu.Lock()
+			p.healthyAtomic.Store(true)
+			p.lastHealthErr = nil
+			*reconnectAttempt = 0
+			p.healthMu.Unlock()
+			logger.Info("postgres pool recovered")
+		}
+		return
+	}
+
+	p.healthMu.Lock()
+	p.lastHealthErr = err
+	if wasHealthy {
+		p.healthyAtomic.Store(false)
+		p.healthMu.Unlock()
+		logger.Warn("postgres pool unhealthy, starting reconnect attempts",
+			"error", err,
+		)
+	} else {
+		p.healthMu.Unlock()
+	}
+
+	*reconnectAttempt++
+
+	backoff := time.Duration(*reconnectAttempt) * poolReconnectBaseBackoff
+	if backoff > poolReconnectMaxBackoff {
+		backoff = poolReconnectMaxBackoff
+	}
+
+	logger.Warn("postgres pool health check failed, attempting reconnect",
+		"attempt", *reconnectAttempt,
+		"backoff", backoff,
+		"error", err,
+	)
+
+	time.Sleep(backoff)
+
+	if err := p.attemptReconnect(ctx, logger); err != nil {
+		logger.Warn("postgres pool reconnect failed, will retry",
+			"attempt", *reconnectAttempt,
+			"error", err,
+		)
+		return
+	}
+
+	p.healthMu.Lock()
+	p.healthyAtomic.Store(true)
+	p.lastHealthErr = nil
+	*reconnectAttempt = 0
+	p.healthMu.Unlock()
+	logger.Info("postgres pool reconnected successfully",
+		"attempts", *reconnectAttempt,
+	)
+}
+
+func (p *Postgres) attemptReconnect(ctx context.Context, logger *slog.Logger) error {
+	if p.databaseURL == "" {
+		return fmt.Errorf("database URL not available for reconnection")
+	}
+
+	newPool, err := pgxpool.New(ctx, p.databaseURL)
+	if err != nil {
+		return fmt.Errorf("creating new pool: %w", err)
+	}
+
+	pingCtx, cancel := context.WithTimeout(ctx, poolHealthCheckTimeout)
+	defer cancel()
+
+	if err := newPool.Ping(pingCtx); err != nil {
+		newPool.Close()
+		return fmt.Errorf("pinging new pool: %w", err)
+	}
+
+	p.healthMu.Lock()
+	oldPool := p.pool
+	p.pool = newPool
+	p.healthMu.Unlock()
+	oldPool.Close()
+
+	return nil
+}
+
+// bucketHour returns the UTC hour bucket for a ledger using the
+// approximation that each Stellar ledger is ~5 seconds. Exact values
+// don't matter for bucketing — the only requirement is consistency.
+// The same ledger always maps to the same bucket.
+func bucketHour(ledger int64) time.Time {
+	// Reference: Soroban Protocol 20 launch ~2024-01-30 near ledger 53M.
+	const refLedger = 53_000_000
+	const refUnix = 1706572800 // 2024-01-30 00:00:00 UTC
+	sec := refUnix + (ledger-refLedger)*5
+	return time.Unix(sec, 0).UTC().Truncate(time.Hour)
+}
+
+// bucketKey is the compound key for rollup delta accumulation.
+type bucketKey struct {
+	bucketStart time.Time
+	contractID  string
+	eventType   string
+}
+
+// volDelta accumulates token transfer volume and unique addresses for one
+// rollup bucket from newly inserted events.
+type volDelta struct {
+	volume    *big.Int
+	addresses map[string]struct{}
 }
 
 func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
 	if len(events) == 0 {
 		return 0, nil
 	}
-	rows, err := p.upsertEvents(ctx, events, false)
+
+	tx, err := p.pool.Begin(ctx)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("begin upsert tx: %w", err)
 	}
-	return rows, nil
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Batch INSERT with RETURNING so only newly inserted rows (not
+	// duplicate-ID skipped rows) are visible for rollup deltas.
+	batch := &pgx.Batch{}
+	for _, e := range events {
+		batch.Queue(`
+			INSERT INTO events
+				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+				 in_successful_call, topics, value, raw_topic_xdr, raw_value_xdr)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			ON CONFLICT (id) DO NOTHING
+			RETURNING contract_id, type, ledger, topics, value`,
+			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value,
+			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
+		)
+	}
+
+	results := tx.SendBatch(ctx, batch)
+	defer results.Close()
+
+	// Aggregate deltas from newly inserted rows.
+	eventDeltas := make(map[bucketKey]int64)
+	volumeDeltas := make(map[bucketKey]*volDelta)
+
+	var inserted int64
+	for range events {
+		var (
+			contractID, eventType string
+			ledger                int64
+			topics, value         json.RawMessage
+		)
+		err := results.QueryRow().Scan(&contractID, &eventType, &ledger, &topics, &value)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue // ON CONFLICT DO NOTHING — duplicate, not inserted
+		}
+		if err != nil {
+			return inserted, fmt.Errorf("upserting events: %w", err)
+		}
+		inserted++
+
+		key := bucketKey{
+			bucketStart: bucketHour(ledger),
+			contractID:  contractID,
+			eventType:   eventType,
+		}
+		eventDeltas[key]++
+
+		// Detect token transfer events for rollup_token_volume (#1).
+		if amt, addrs, ok := tryExtractTransfer(topics, value); ok {
+			vd, exists := volumeDeltas[key]
+			if !exists {
+				vd = &volDelta{volume: new(big.Int), addresses: make(map[string]struct{})}
+				volumeDeltas[key] = vd
+			}
+			vd.volume.Add(vd.volume, amt)
+			for _, a := range addrs {
+				vd.addresses[a] = struct{}{}
+			}
+		}
+	}
+
+	if err := results.Close(); err != nil {
+		return inserted, fmt.Errorf("closing insert batch: %w", err)
+	}
+
+	// Apply rollup_events deltas.
+	if len(eventDeltas) > 0 {
+		if err := applyEventRollups(ctx, tx, eventDeltas); err != nil {
+			return inserted, err
+		}
+	}
+
+	// Apply rollup_token_volume deltas.
+	if len(volumeDeltas) > 0 {
+		if err := applyVolumeRollups(ctx, tx, volumeDeltas); err != nil {
+			return inserted, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return inserted, fmt.Errorf("committing upsert tx: %w", err)
+	}
+
+	return inserted, nil
+}
+
+// applyEventRollups upserts rollup_events deltas from newly inserted events.
+func applyEventRollups(ctx context.Context, tx pgx.Tx, deltas map[bucketKey]int64) error {
+	batch := &pgx.Batch{}
+	for key, delta := range deltas {
+		batch.Queue(`
+			INSERT INTO rollup_events (bucket_start, contract_id, type, count)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (bucket_start, contract_id, type)
+			DO UPDATE SET count = rollup_events.count + EXCLUDED.count`,
+			key.bucketStart, key.contractID, key.eventType, delta,
+		)
+	}
+	results := tx.SendBatch(ctx, batch)
+	defer results.Close()
+	for range deltas {
+		if _, err := results.Exec(); err != nil {
+			return fmt.Errorf("applying rollup deltas: %w", err)
+		}
+	}
+	return results.Close()
+}
+
+// applyVolumeRollups upserts rollup_token_volume deltas from newly inserted
+// transfer events.
+//
+// contributors: unique_address_count is additive per-batch (COALESCE + COALESCE)
+// rather than truly distinct across batches. Replace with a proper address-tracking
+// table (e.g. rollup_addresses keyed by (bucket_start, contract_id, address)) when
+// #1 lands so the count is an actual COUNT(DISTINCT).
+func applyVolumeRollups(ctx context.Context, tx pgx.Tx, deltas map[bucketKey]*volDelta) error {
+	batch := &pgx.Batch{}
+	for key, vd := range deltas {
+		batch.Queue(`
+			INSERT INTO rollup_token_volume
+				(bucket_start, contract_id, volume, unique_address_count)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (bucket_start, contract_id) DO UPDATE SET
+				volume = rollup_token_volume.volume + EXCLUDED.volume,
+				unique_address_count =
+					rollup_token_volume.unique_address_count + EXCLUDED.unique_address_count`,
+			key.bucketStart, key.contractID,
+			vd.volume.String(), int64(len(vd.addresses)),
+		)
+	}
+	results := tx.SendBatch(ctx, batch)
+	defer results.Close()
+	for range deltas {
+		if _, err := results.Exec(); err != nil {
+			return fmt.Errorf("applying volume rollup deltas: %w", err)
+		}
+	}
+	return results.Close()
+}
+
+// tryExtractTransfer inspects the decoded topics/value of an event to
+// detect SEP-41-style transfer events. Returns (amount, addresses, true)
+// when the event looks like a transfer, or (nil, nil, false) otherwise.
+//
+// Transfers are recognized by topics[0] == {"symbol":"transfer"} and
+// value containing an i128 amount. Topics[1] and [2] carry address entries
+// for the sender and receiver.
+func tryExtractTransfer(topics, value json.RawMessage) (*big.Int, []string, bool) {
+	var topicList []json.RawMessage
+	if err := json.Unmarshal(topics, &topicList); err != nil || len(topicList) < 3 {
+		return nil, nil, false
+	}
+
+	// First topic must be {"symbol":"transfer"}.
+	var firstTopic map[string]string
+	if err := json.Unmarshal(topicList[0], &firstTopic); err != nil || firstTopic["symbol"] != "transfer" {
+		return nil, nil, false
+	}
+
+	// Value must carry an i128 amount.
+	var valMap map[string]json.RawMessage
+	if err := json.Unmarshal(value, &valMap); err != nil {
+		return nil, nil, false
+	}
+	amountRaw, ok := valMap["i128"]
+	if !ok {
+		return nil, nil, false
+	}
+	var amountStr string
+	if err := json.Unmarshal(amountRaw, &amountStr); err != nil {
+		return nil, nil, false
+	}
+	amt, ok := new(big.Int).SetString(amountStr, 10)
+	if !ok {
+		return nil, nil, false
+	}
+
+	// Extract addresses from topics[1] and [2] (SEP-41 transfer has
+	// exactly 3 topics: symbol, from, to). Limit to the first two
+	// positions after the symbol to avoid picking up non-address
+	// topics that happen to carry an "address" key.
+	var addrs []string
+	for _, t := range topicList[1:min(len(topicList), 3)] {
+		var m map[string]string
+		if err := json.Unmarshal(t, &m); err != nil {
+			continue
+		}
+		if a, ok := m["address"]; ok && a != "" {
+			addrs = append(addrs, a)
+		}
+	}
+
+	return amt, addrs, true
 }
 
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
@@ -589,8 +962,30 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	if !f.Scope.IsWildcard() {
 		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
 	}
-	if f.ContractID != "" {
+	// When ContractIDs is non-empty, use = ANY(...) (SQL IN). When both
+	// ContractID and ContractIDs are set, combine them via a single
+	// = ANY(...) that includes both — the union matches an event for either.
+	if len(f.ContractIDs) > 0 {
+		ids := f.ContractIDs
+		if f.ContractID != "" {
+			// Deduplicate: ContractID might already be in ContractIDs.
+			has := false
+			for _, id := range ids {
+				if id == f.ContractID {
+					has = true
+					break
+				}
+			}
+			if !has {
+				ids = append(ids, f.ContractID)
+			}
+		}
+		where = append(where, "contract_id = ANY("+arg(ids)+")")
+	} else if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
+	}
+	if f.ContractIDPrefix != "" {
+		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
 	}
 	if len(f.Types) > 0 {
 		where = append(where, "type = ANY("+arg(f.Types)+")")
@@ -626,6 +1021,12 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 		} else {
 			where = append(where, "value IS NULL")
 		}
+	}
+	if f.TxIndex != nil {
+		where = append(where, "tx_index = "+arg(*f.TxIndex))
+	}
+	if f.OpIndex != nil {
+		where = append(where, "op_index = "+arg(*f.OpIndex))
 	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))
@@ -748,6 +1149,70 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	return events, next, nil
 }
 
+// AggregateEvents returns event counts grouped by ledger or by a
+// time interval. Buckets with zero events are omitted. Filters
+// (contract_id, type, etc.) are applied to the aggregation query.
+func (p *Postgres) AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error) {
+	f.Cursor = ""
+	f.Order = ""
+	f.OrderBy = ""
+	f.Limit = 0
+
+	where, args := buildEventWhereClause(f)
+
+	var (
+		groupCol  string
+		bucketCol string
+	)
+
+	switch bucket {
+	case "ledger":
+		groupCol = "ledger"
+		bucketCol = "ledger::text"
+	default:
+		dur, err := time.ParseDuration(bucket)
+		if err != nil {
+			return nil, fmt.Errorf("invalid bucket %q: %w", bucket, err)
+		}
+		if dur <= 0 {
+			return nil, fmt.Errorf("bucket duration must be positive")
+		}
+		bucketSeconds := int64(dur.Seconds())
+		groupCol = fmt.Sprintf("to_timestamp(floor(extract(epoch from created_at) / %d) * %d)", bucketSeconds, bucketSeconds)
+		bucketCol = fmt.Sprintf("to_char(%s, 'YYYY-MM-DD\"T\"HH24:MI:SS')", groupCol)
+	}
+
+	query := "SELECT " + bucketCol + " AS bucket, count(*)::bigint FROM events"
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY " + groupCol + " ORDER BY " + groupCol
+
+	var buckets []AggregateBucket
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("aggregating events: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var b AggregateBucket
+			if err := rows.Scan(&b.Bucket, &b.Count); err != nil {
+				return err
+			}
+			buckets = append(buckets, b)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("reading aggregation: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return buckets, nil
+}
+
 // CountEvents returns the total number of rows matching the filter,
 // ignoring pagination (cursor, order, and limit). It reuses the same
 // WHERE clause builder as QueryEvents so the two stay in lockstep.
@@ -785,8 +1250,8 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 	var s IngestionState
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx,
-			`SELECT last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE id = 1`,
-		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.UpdatedAt)
+			`SELECT last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state WHERE id = 1`,
+		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.LastSuccessfulPoll, &s.UpdatedAt)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return IngestionState{}, ErrNotFound
@@ -799,13 +1264,14 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 
 func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) error {
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO ingestion_state (id, last_ingested_ledger, last_cursor, updated_at)
-		VALUES (1, $1, $2, now())
+		INSERT INTO ingestion_state (id, last_ingested_ledger, last_cursor, last_successful_poll, updated_at)
+		VALUES (1, $1, $2, $3, now())
 		ON CONFLICT (id) DO UPDATE SET
 			last_ingested_ledger = EXCLUDED.last_ingested_ledger,
 			last_cursor          = EXCLUDED.last_cursor,
+			last_successful_poll = EXCLUDED.last_successful_poll,
 			updated_at           = now()`,
-		s.LastIngestedLedger, s.LastCursor,
+		s.LastIngestedLedger, s.LastCursor, s.LastSuccessfulPoll,
 	)
 	if err != nil {
 		return fmt.Errorf("saving ingestion state: %w", err)
@@ -1088,7 +1554,18 @@ func (p *Postgres) DeleteEventsBefore(ctx context.Context, maxLedger int64, befo
 }
 
 func (p *Postgres) Ping(ctx context.Context) error {
-	return p.pool.Ping(ctx)
+	p.healthMu.RLock()
+	defer p.healthMu.RUnlock()
+
+	if !p.healthyAtomic.Load() {
+		if p.lastHealthErr != nil {
+			return fmt.Errorf("pool unhealthy: %w", p.lastHealthErr)
+		}
+		return errors.New("pool unhealthy")
+	}
+
+	pool := p.pool
+	return pool.Ping(ctx)
 }
 
 // AdvisoryLockKey hashes an RPC URL into an int64 suitable for use with
@@ -1459,4 +1936,167 @@ func scanEvent(row pgx.Row) (Event, error) {
 		e.RawValueXDR = *rawValue
 	}
 	return e, nil
+}
+
+// UpsertAddressRefs inserts address→event index rows idempotently.
+// Duplicate (address, event_id, role) combinations are silently ignored
+// by the ON CONFLICT DO NOTHING clause, so re-ingesting an event never
+// duplicates its address rows.
+func (p *Postgres) UpsertAddressRefs(ctx context.Context, refs []AddressRef) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, r := range refs {
+		batch.Queue(`
+			INSERT INTO event_addresses (address, event_id, role)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (address, event_id, role) DO NOTHING`,
+			r.Address, r.EventID, r.Role)
+	}
+	results := p.pool.SendBatch(ctx, batch)
+	defer results.Close()
+	for range refs {
+		if _, err := results.Exec(); err != nil {
+			return fmt.Errorf("upserting address refs: %w", err)
+		}
+	}
+	return nil
+}
+
+// QueryAddressEvents returns events involving the given address, in
+// chronological order (by event_id), cursor-paginated. Supports the same
+// filter params as the main events listing (contract_id, type, ledger range
+// via from_ledger/to_ledger).
+func (p *Postgres) QueryAddressEvents(ctx context.Context, address string, f EventFilter) ([]Event, string, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+
+	var (
+		where []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	// Join with event_addresses to find events for this address.
+	where = append(where, "ea.address = "+arg(address))
+	where = append(where, "e.id = ea.event_id")
+
+	if f.ContractID != "" {
+		where = append(where, "e.contract_id = "+arg(f.ContractID))
+	}
+	if len(f.Types) > 0 {
+		where = append(where, "e.type = ANY("+arg(f.Types)+")")
+	}
+	if f.FromLedger > 0 {
+		where = append(where, "e.ledger >= "+arg(f.FromLedger))
+	}
+	if f.ToLedger > 0 {
+		where = append(where, "e.ledger <= "+arg(f.ToLedger))
+	}
+
+	// Cursor: event_id-based pagination (paging by event ID in chronological order).
+	orderDir := "ASC"
+	cursorOp := ">"
+	if f.Order == "desc" {
+		orderDir = "DESC"
+		cursorOp = "<"
+	}
+	orderCols := "e.id " + orderDir
+
+	if f.Cursor != "" {
+		where = append(where, "e.id "+cursorOp+" "+arg(f.Cursor))
+	}
+
+	query := `SELECT ` + eventColumns + `
+		FROM events e
+		INNER JOIN event_addresses ea ON ea.event_id = e.id`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY " + orderCols + " LIMIT " + arg(limit+1)
+
+	var events []Event
+	next := ""
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("querying address events for %s: %w", address, err)
+		}
+		defer rows.Close()
+
+		events = make([]Event, 0, limit)
+		for rows.Next() {
+			e, err := scanEvent(rows)
+			if err != nil {
+				return err
+			}
+			events = append(events, e)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("reading address events: %w", err)
+		}
+
+		if len(events) > limit {
+			events = events[:limit]
+			next = events[limit-1].ID
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return events, next, nil
+}
+
+// CountAddressEvents returns the total number of events involving the given
+// address (ignoring pagination).
+func (p *Postgres) CountAddressEvents(ctx context.Context, address string) (int64, error) {
+	var total int64
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT count(*) FROM events e
+			INNER JOIN event_addresses ea ON ea.event_id = e.id
+			WHERE ea.address = $1`, address,
+		).Scan(&total)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("counting address events for %s: %w", address, err)
+	}
+	return total, nil
+}
+
+// GetAddressSummary returns aggregate information about an address\'s event
+// history: first/last seen ledger, total event count, and distinct contracts
+// interacted with.
+func (p *Postgres) GetAddressSummary(ctx context.Context, address string) (AddressSummary, error) {
+	var s AddressSummary
+	s.Address = address
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT
+				min(e.ledger),
+				max(e.ledger),
+				count(*),
+				array_agg(DISTINCT e.contract_id ORDER BY e.contract_id) FILTER (WHERE e.contract_id IS NOT NULL)
+			FROM events e
+			INNER JOIN event_addresses ea ON ea.event_id = e.id
+			WHERE ea.address = $1`, address,
+		).Scan(&s.FirstSeenLedger, &s.LastSeenLedger, &s.EventCount, &s.DistinctContracts)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return s, ErrNotFound
+	}
+	if err != nil {
+		return AddressSummary{}, fmt.Errorf("loading address summary for %s: %w", address, err)
+	}
+	return s, nil
 }

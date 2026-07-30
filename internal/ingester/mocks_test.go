@@ -209,6 +209,10 @@ func (m *mockStore) CountEvents(context.Context, store.EventFilter) (int64, erro
 	return 0, nil
 }
 
+func (m *mockStore) AggregateEvents(context.Context, store.EventFilter, string) ([]store.AggregateBucket, error) {
+	return nil, nil
+}
+
 // LedgerRangeCensus is unused by ingester tests but needed to satisfy
 // the expanded store.Store interface.
 func (m *mockStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]store.LedgerCensus, error) {
@@ -289,6 +293,10 @@ func (m *mockStore) Stats(context.Context, store.Scope) (store.Stats, error) {
 }
 func (m *mockStore) Ping(context.Context) error { return nil }
 
+func (m *mockStore) QueryAnalyticsEvents(context.Context, store.AnalyticsFilter) ([]store.AnalyticsEventBucket, error) {
+	return nil, nil
+}
+func (m *mockStore) QueryAnalyticsTokenVolume(context.Context, store.AnalyticsFilter) ([]store.AnalyticsTokenVolume, error) {
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
 }
@@ -356,4 +364,13 @@ func (passthroughDecoder) DecodeScVal(string) (json.RawMessage, error) {
 // DeleteEventsBefore satisfies store.Store; this mock never prunes.
 func (m *mockStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
 	return 0, nil
+}
+
+func (m *mockStore) UpsertAddressRefs(context.Context, []store.AddressRef) error { return nil }
+func (m *mockStore) QueryAddressEvents(context.Context, string, store.EventFilter) ([]store.Event, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) CountAddressEvents(context.Context, string) (int64, error) { return 0, nil }
+func (m *mockStore) GetAddressSummary(context.Context, string) (store.AddressSummary, error) {
+	return store.AddressSummary{}, nil
 }

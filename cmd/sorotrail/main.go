@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	_ "modernc.org/sqlite"
 
 	"github.com/sorotrail/sorotrail/internal/api"
 	"github.com/sorotrail/sorotrail/internal/api/graphql"
@@ -58,6 +60,8 @@ func dispatch(args []string) error {
 		return runReplay(args[1:])
 	case "backfill":
 		return runBackfill(args[1:])
+	case "index-addresses":
+		return runIndexAddresses(args[1:])
 	case "healthcheck":
 		// The healthcheck subcommand manages its own exit codes
 		// (0 healthy, 1 unhealthy, 2 usage error) — the docker
@@ -88,6 +92,8 @@ subcommands:
                (sorotrail replay --help)
   backfill     ingest historical contract events from Horizon
                (sorotrail backfill --help)
+  index-addresses  rebuild the address→event inverted index from stored events
+               (sorotrail index-addresses --help)
   healthcheck  probe /health and exit (used by docker HEALTHCHECK)
                (sorotrail healthcheck --help)
 `)
@@ -112,6 +118,7 @@ func run() error {
 	var (
 		st   store.Store
 		pool *pgxpool.Pool
+		pg   *store.Postgres
 	)
 	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
 		st, err = store.NewStoreFromURL(cfg.DatabaseURL)
@@ -160,7 +167,9 @@ func run() error {
 			return fmt.Errorf("pinging postgres after %d retries: %w", maxRetries, pingErr)
 		}
 		log.Info("postgres connection established")
-		st = store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+		pg = store.NewPostgresWithHealthCheck(ctx, pool, cfg.DatabaseURL, int64(cfg.PartitionLedgerSpan))
+		defer pg.StopHealthCheck()
+		st = pg
 	}
 	for _, id := range cfg.WatchedContracts {
 		if err := st.AddWatchedContract(ctx, id); err != nil {

@@ -303,14 +303,18 @@ func (s *Server) Router() http.Handler {
 
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/count", s.handleCountEvents)
+	r.Get("/events/aggregate", s.handleAggregateEvents)
 	r.Get("/events/{id}/raw", s.handleGetEventRaw)
 	r.Get("/events/{id}/transaction", s.handleGetEventTransaction)
 	r.Get("/events/{id}", s.handleGetEvent)
+	r.Get("/events.csv", s.handleEventsCSV)
+	r.Get("/contracts", s.handleListContracts)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/contracts/{id}/export", s.handleContractExport)
 
-	r.Get("/contracts", s.handleListContracts)
 	r.Get("/stats", s.handleStats)
+	r.Get("/analytics/events", s.handleAnalyticsEvents)
+	r.Get("/analytics/token-volume", s.handleAnalyticsTokenVolume)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.
@@ -372,6 +376,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/events/{id}", s.handleGetEvent)
 		r.Get("/contracts/{id}/events", s.handleContractEvents)
 		r.Get("/contracts/{id}/export", s.handleContractExport)
+		r.Get("/events.csv", s.handleEventsCSV)
 		r.Get("/subscriptions", s.handleListSubscriptions)
 		r.Get("/subscriptions/{id}", s.handleGetSubscription)
 		r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
@@ -406,6 +411,10 @@ func (s *Server) Router() http.Handler {
 		r.Post("/admin/tenants/{id}/keys", s.handleCreateTenantKey)
 		r.Delete("/admin/keys/{key_id}", s.handleRevokeTenantKey)
 	})
+
+	// Address activity index (#46).
+	r.Get("/addresses/{address}/events", s.handleAddressEvents)
+	r.Get("/addresses/{address}/summary", s.handleAddressSummary)
 
 	return r
 }
