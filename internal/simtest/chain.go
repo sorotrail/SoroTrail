@@ -438,3 +438,10 @@ func BuildEvent(id string, ledger uint32, contractID string) rpc.Event {
 		TopicJSON:  []json.RawMessage{json.RawMessage(`{"symbol":"test"}`)},
 	}
 }
+
+// GetLedgerEntries satisfies rpc.Client. The virtual chain models events
+// only, not ledger state, so contract-spec lookups return no entries rather
+// than fabricating data a simulation would then assert against.
+func (c *VirtualChain) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+	return rpc.GetLedgerEntriesResponse{}, nil
+}

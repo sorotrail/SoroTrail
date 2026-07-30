@@ -53,6 +53,14 @@ func RealJitter(max time.Duration) time.Duration { return rand.N(max) }
 
 // Options configure an Ingester.
 type Options struct {
+	// Clock supplies time and sleeping. Defaults to RealClock; simulations
+	// inject a virtual clock so a test can cover hours of ingestion without
+	// waiting for them.
+	Clock Clock
+	// Jitter randomises backoff so restarts don't thundering-herd a shared
+	// RPC endpoint. Defaults to RealJitter; simulations inject a seeded
+	// generator for determinism.
+	Jitter JitterFunc
 	// PollInterval is how long to sleep once caught up. Default 5s.
 	PollInterval time.Duration
 	// StartLedger, when non-zero, overrides the cold-start position.
@@ -142,6 +150,12 @@ func (o *Options) applyDefaults() {
 	}
 	if o.LagMetrics == nil {
 		o.LagMetrics = noopLagMetrics{}
+	}
+	if o.Clock == nil {
+		o.Clock = RealClock{}
+	}
+	if o.Jitter == nil {
+		o.Jitter = RealJitter
 	}
 	// LagWarnLedgers intentionally NOT defaulted to 100 here: see
 	// Options.LagWarnLedgers doc comment. The env-config layer applies
@@ -953,4 +967,13 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+// RunOnceForTest executes exactly one ingestion pass and reports whether the
+// indexer is caught up. It lets the simulation harness drive ingestion
+// deterministically, one cycle at a time, rather than starting Run and racing
+// its internal sleeps. Run owns the backoff, lag alarm and reorg cadence that
+// this deliberately skips, so it is not a production entry point.
+func (ing *Ingester) RunOnceForTest(ctx context.Context) (bool, error) {
+	return ing.runOnce(ctx)
 }

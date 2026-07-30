@@ -132,6 +132,28 @@ type eventsWithXDRResponse struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
+// eventWithXDR is an event plus the raw XDR it was decoded from, returned
+// when ?include_xdr=true. ValueXDR is a pointer so an event with no value
+// serialises as null rather than an empty string.
+type eventWithXDR struct {
+	store.Event
+	TopicsXDR []string `json:"topics_xdr"`
+	ValueXDR  *string  `json:"value_xdr"`
+}
+
+// enrichedEventWithXDR combines the raw-XDR view with spec-decoded fields.
+type enrichedEventWithXDR struct {
+	eventWithXDR
+	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                        `json:"decoded"`
+}
+
+type enrichedEventsWithXDRResponse struct {
+	Events []enrichedEventWithXDR `json:"events"`
+	// Cursor is non-empty when another page exists.
+	Cursor string `json:"cursor,omitempty"`
+}
+
 type healthResponse struct {
 	Status string            `json:"status"` // ok | degraded
 	Checks map[string]string `json:"checks"`
