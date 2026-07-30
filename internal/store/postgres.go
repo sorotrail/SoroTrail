@@ -366,6 +366,7 @@ func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fro
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("committing repair tx: %w", err)
 	}
+	metrics.DBWriteDuration.Observe(time.Since(start).Seconds())
 	return nil
 }
 

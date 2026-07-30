@@ -1205,3 +1205,10 @@ func (ing *Ingester) earliestStartLedger(ctx context.Context, health rpc.Health)
 	}
 	return earliest, nil
 }
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}

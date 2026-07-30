@@ -342,6 +342,7 @@ func (s *Server) router() chi.Router {
 	r.Get("/contracts/{id}/export", s.handleContractExport)
 
 	r.Get("/stats", s.handleStats)
+	r.Handle("/metrics", promhttp.Handler())
 	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.

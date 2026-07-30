@@ -797,6 +797,37 @@ func TestListEvents_ReturnsCursor(t *testing.T) {
 	assert.Equal(t, "e2", out.Cursor)
 }
 
+func TestListEvents_EmitsPaginationLinks(t *testing.T) {
+	st := &stubStore{
+		events:     []store.Event{{ID: "e1"}, {ID: "e2"}},
+		nextCursor: "e2",
+	}
+	resp, _ := doGet(t, newTestServer(st, nil), "/events?contract_id="+testContract+"&limit=2")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	linkHeader := resp.Header.Get("Link")
+	assert.Contains(t, linkHeader, `rel="next"`)
+	assert.Contains(t, linkHeader, `cursor=e2`)
+	assert.Contains(t, linkHeader, `contract_id=`+testContract)
+	assert.Contains(t, linkHeader, `limit=2`)
+}
+
+func TestContractEvents_EmitsPaginationLinks(t *testing.T) {
+	st := &stubStore{
+		events:     []store.Event{{ID: "e1"}, {ID: "e2"}},
+		nextCursor: "e2",
+	}
+	resp, _ := doGet(t, newTestServer(st, nil), "/contracts/"+testContract+"/events?limit=2&cursor=prev-cursor")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	linkHeader := resp.Header.Get("Link")
+	assert.Contains(t, linkHeader, `rel="prev"`)
+	assert.Contains(t, linkHeader, `rel="next"`)
+	assert.Contains(t, linkHeader, `/contracts/`+testContract+`/events`)
+	assert.Contains(t, linkHeader, `limit=2`)
+	assert.NotContains(t, linkHeader, `cursor=prev-cursor`)
+}
+
 func TestListEvents_IncludeXDR(t *testing.T) {
 	event := store.Event{
 		ID:          "e1",
