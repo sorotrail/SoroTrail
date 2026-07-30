@@ -14,6 +14,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 )
 
 // Client is the RPC boundary. The ingester and API depend on this interface
@@ -176,10 +180,10 @@ type response struct {
 	Error   *Error          `json:"error"`
 }
 
-func (c *HTTPClient) call(ctx context.Context, method string, params, result any) (err error) {
-	if c.requestObserver != nil {
-		defer func() { c.requestObserver.ObserveRPCRequest(method, err) }()
-	}
+func (c *HTTPClient) call(ctx context.Context, method string, params, result any) error {
+	timer := prometheus.NewTimer(metrics.RPCCallLatency)
+	defer timer.ObserveDuration()
+
 	if err := c.limiter.Wait(ctx); err != nil {
 		return err
 	}
