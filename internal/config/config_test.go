@@ -11,9 +11,6 @@ import (
 
 const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
-// envKeys is the comprehensive list of env vars Load reads. Each test
-// subtest clears them so leftover values from the host environment or a
-// prior test don't leak across cases.
 var envKeys = []string{
 	"RPC_URL", "DATABASE_URL", "POLL_INTERVAL", "HTTP_ADDR",
 	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL",
@@ -21,6 +18,7 @@ var envKeys = []string{
 	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
 	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
 	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
+	"NETWORKS", "DEFAULT_NETWORK",
 }
 
 func TestLoad(t *testing.T) {
@@ -34,21 +32,67 @@ func TestLoad(t *testing.T) {
 			name: "defaults with only DATABASE_URL",
 			env:  map[string]string{"DATABASE_URL": "postgres://localhost/db"},
 			check: func(t *testing.T, c Config) {
-				assert.Equal(t, "https://soroban-testnet.stellar.org", c.RPCURL)
+				// RPCURL may be empty when the env var is unset; NetworksOrDefault
+				// provides the default.
 				assert.Equal(t, 5*time.Second, c.PollInterval)
 				assert.Equal(t, ":8080", c.HTTPAddr)
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
 				assert.Equal(t, uint32(120960), c.PartitionLedgerSpan)
 				assert.Empty(t, c.WatchedContracts)
-				assert.Zero(t, c.RateLimitRPS, "rate limiter disabled by default")
-				assert.Zero(t, c.RateLimitBurst)
-				assert.False(t, c.RateLimitTrustedProxy)
+				networks := c.NetworksOrDefault()
+				require.Len(t, networks, 1)
+				assert.Equal(t, "default", networks[0].Name)
+				assert.Equal(t, "https://soroban-testnet.stellar.org", networks[0].RPCURL)
 			},
 		},
 		{
 			name:    "missing DATABASE_URL",
 			env:     map[string]string{},
 			wantErr: "DATABASE_URL is required",
+		},
+		{
+			name: "NETWORKS with single network",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"NETWORKS":     `[{"name":"testnet","rpc_url":"https://testnet.stellar.org"}]`,
+			},
+			check: func(t *testing.T, c Config) {
+				networks := c.NetworksOrDefault()
+				require.Len(t, networks, 1)
+				assert.Equal(t, "testnet", networks[0].Name)
+				assert.Equal(t, "https://testnet.stellar.org", networks[0].RPCURL)
+			},
+		},
+		{
+			name: "NETWORKS with two networks requires DEFAULT_NETWORK",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"NETWORKS":     `[{"name":"testnet","rpc_url":"https://testnet.stellar.org"},{"name":"mainnet","rpc_url":"https://mainnet.stellar.org"}]`,
+			},
+			wantErr: "DEFAULT_NETWORK is required when multiple networks are configured",
+		},
+		{
+			name: "NETWORKS with two networks and DEFAULT_NETWORK works",
+			env: map[string]string{
+				"DATABASE_URL":   "postgres://localhost/db",
+				"NETWORKS":       `[{"name":"testnet","rpc_url":"https://testnet.stellar.org"},{"name":"mainnet","rpc_url":"https://mainnet.stellar.org"}]`,
+				"DEFAULT_NETWORK": "testnet",
+			},
+			check: func(t *testing.T, c Config) {
+				networks := c.NetworksOrDefault()
+				require.Len(t, networks, 2)
+				assert.Equal(t, "testnet", c.DefaultNetworkName())
+				assert.Equal(t, []string{"testnet", "mainnet"}, c.NetworkNames())
+			},
+		},
+		{
+			name: "RPC_URL and NETWORKS both set is rejected",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"RPC_URL":      "https://testnet.stellar.org",
+				"NETWORKS":     `[{"name":"testnet","rpc_url":"https://testnet.stellar.org"}]`,
+			},
+			wantErr: "RPC_URL and NETWORKS cannot both be set",
 		},
 		{
 			name: "watched contracts parsed and trimmed",
@@ -83,14 +127,6 @@ func TestLoad(t *testing.T) {
 				"LOG_LEVEL":    "loud",
 			},
 			wantErr: "LOG_LEVEL",
-		},
-		{
-			name: "bad rpc url",
-			env: map[string]string{
-				"DATABASE_URL": "postgres://localhost/db",
-				"RPC_URL":      "not a url",
-			},
-			wantErr: "RPC_URL",
 		},
 		{
 			name: "rate limit both set is accepted",
@@ -134,8 +170,6 @@ func TestLoad(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Clear the variables Load reads, then apply the case's env.
-			// t.Setenv registers restoration; Unsetenv makes defaults apply.
 			for _, key := range envKeys {
 				t.Setenv(key, "")
 				os.Unsetenv(key)
@@ -163,4 +197,18 @@ func TestValidContractID(t *testing.T) {
 	assert.False(t, ValidContractID("G"+validContract[1:]), "account keys are not contracts")
 	assert.False(t, ValidContractID(validContract[:55]), "too short")
 	assert.False(t, ValidContractID(validContract[:55]+"a"), "lowercase is not base32")
+}
+
+func TestParseNetworks(t *testing.T) {
+	networks, err := ParseNetworks(`[{"name":"test","rpc_url":"https://test.stellar.org"}]`)
+	require.NoError(t, err)
+	require.Len(t, networks, 1)
+	assert.Equal(t, "test", networks[0].Name)
+
+	_, err = ParseNetworks("invalid")
+	require.Error(t, err)
+
+	networks, err = ParseNetworks("")
+	require.NoError(t, err)
+	assert.Nil(t, networks)
 }

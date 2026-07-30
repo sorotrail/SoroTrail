@@ -18,16 +18,6 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
 
-// SetAuditor registers the binary's Auditor so /stats can surface its
-// Metrics counters. There is exactly one Auditor per process; its
-// lifetime is the lifetime of main(). SetAuditor must be called BEFORE
-// ListenAndServe so the first /stats request observes a stable value.
-// The setter is guarded by a RWMutex so concurrent reader goroutines in
-// /stats handlers can never observe a torn pointer.
-//
-// When AUDIT_ENABLED=false the function is never called and /stats
-// returns Stats with the embedded AuditStats struct zero-valued (and
-// omitted from JSON, courtesy of its `omitempty` tag).
 var (
 	auditorMu sync.RWMutex
 	auditor   *audit.Auditor
@@ -46,7 +36,6 @@ func getAuditor() *audit.Auditor {
 }
 
 // Enricher is the spec-based event enrichment interface used by the API.
-// Defined here so the API package doesn't import internal/spec directly.
 type Enricher interface {
 	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
 }
@@ -59,10 +48,14 @@ type Server struct {
 	log      *slog.Logger
 	limiter  *RateLimiter
 	bcast    *broadcast.Broadcaster
+	// NetworkNames is the list of configured network names, used for
+	// validating the ?network= query parameter.
+	NetworkNames []string
+	// HasMultipleNetworks is true when more than one network is configured.
+	HasMultipleNetworks bool
 }
 
-// New builds the API server. rpcClient is only used by /health.
-// enricher is optional — pass nil to disable spec decoding.
+// New builds the API server.
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enricher) *Server {
 	s := &Server{store: st, rpc: rpcClient, log: log}
 	if len(enricher) > 0 {
@@ -71,15 +64,19 @@ func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enr
 	return s
 }
 
-// SetRateLimiter wires a per-client rate limiter into the router. Pass
-// nil to leave the limiter disabled (the default — no behavior change).
-// The limiter's Start/Stop lifecycle is owned by main, not by the Server.
+// SetNetworks configures the network names for multi-network support.
+func (s *Server) SetNetworks(names []string) {
+	s.NetworkNames = names
+	s.HasMultipleNetworks = len(names) > 1
+}
+
+// SetRateLimiter wires a per-client rate limiter into the router.
 func (s *Server) SetRateLimiter(l *RateLimiter) {
 	s.limiter = l
 }
 
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
-// (SSE, WebSocket) can deliver events as they arrive.
+// can deliver events as they arrive.
 func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 	s.bcast = b
 	return s
@@ -92,9 +89,6 @@ func (s *Server) Router() http.Handler {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
 	if s.limiter != nil {
-		// Limiter sits inside Timeout and Recoverer so its instant 429
-		// response always makes it back through the deadline cleanly, and
-		// a panic inside the limiter can't take down the server.
 		r.Use(s.limiter.Middleware)
 	}
 
@@ -105,10 +99,6 @@ func (s *Server) Router() http.Handler {
 	r.Get("/stats", s.handleStats)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
-	// contributors: new read endpoints go here. Anything that writes (e.g.
-	// managing watched contracts at runtime) should come with auth first.
-
-	// Subscription CRUD and delivery history.
 	r.Post("/subscriptions", s.handleCreateSubscription)
 	r.Get("/subscriptions", s.handleListSubscriptions)
 	r.Get("/subscriptions/{id}", s.handleGetSubscription)

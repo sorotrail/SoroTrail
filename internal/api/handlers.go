@@ -19,47 +19,17 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
 
-// cachePrivate is the package-wide override that flips Cache-Control
-// directives from `public` to `private`. Production code sets it once at
-// startup via SetCachePrivate (mirrors SetAuditor's "set before serve"
-// pattern). Tests use the same entry point with t.Cleanup to reset.
-//
-// Why this exists: when auth (#17) lands, a single deployment can serve
-// per-user data behind authentication. `private` keeps the response in
-// the user's own browser cache while preventing CDNs/proxies from
-// sharing it across accounts — the bug the spec calls out as "must
-// never leak across keys".
 var cachePrivate atomic.Bool
 
-// SetCachePrivate flips the public→private override for all cacheable
-// endpoints. Call once at startup before serving requests.
 func SetCachePrivate(v bool) { cachePrivate.Store(v) }
 
-// immutableMaxAge is the max-age used for cacheable responses on
-// immutable resources (single events and list pages whose entire
-// upper bound sits behind the ingest frontier). One year matches what
-// most guides and browsers recommend for `immutable` responses; longer
-// values don't help, since the `immutable` directive already prevents
-// revalidation for the cached lifetime.
 const immutableMaxAge = 365 * 24 * time.Hour
 
-// cacheability kinds a handler can ask for. The mapping to header
-// directives lives in writeCacheHeaders so handlers never write
-// Cache-Control themselves.
 type cacheability int
 
 const (
-	// cacheImmutable: long-lived, public (or private when CACHE_PRIVATE
-	// is on), with the `immutable` directive. Used only when the server
-	// can prove the response will not change.
 	cacheImmutable cacheability = iota
-	// cacheNoCache: must revalidate (Cache-Control: no-cache). Safe for
-	// any growing-page response — it's never optimistic, never implies
-	// staleness is OK.
 	cacheNoCache
-	// cacheNoStore: do not cache anywhere (Cache-Control: no-store).
-	// Reserved for /health and /stats — operational data, not
-	// shareable across users or even across requests on the same box.
 	cacheNoStore
 )
 
@@ -69,18 +39,16 @@ type errorResponse struct {
 
 type eventsResponse struct {
 	Events []store.Event `json:"events"`
-	// Cursor is non-empty when another page exists; pass it back as ?cursor=.
-	Cursor string `json:"cursor,omitempty"`
+	Cursor string        `json:"cursor,omitempty"`
 }
 
 type enrichedEventsResponse struct {
 	Events []store.EnrichedEvent `json:"events"`
-	// Cursor is non-empty when another page exists.
-	Cursor string `json:"cursor,omitempty"`
+	Cursor string                `json:"cursor,omitempty"`
 }
 
 type healthResponse struct {
-	Status string            `json:"status"` // ok | degraded
+	Status string            `json:"status"`
 	Checks map[string]string `json:"checks"`
 }
 
@@ -88,7 +56,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok", "rpc": "ok"}}
+	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok"}}
 	status := http.StatusOK
 
 	if err := s.store.Ping(ctx); err != nil {
@@ -107,7 +75,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
-	filter, err := filterFromQuery(r)
+	filter, err := s.filterFromQuery(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -116,7 +84,7 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
-	filter, err := filterFromQuery(r)
+	filter, err := s.filterFromQuery(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -130,17 +98,9 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 	s.serveEvents(w, r, filter)
 }
 
-// serveEvents is the shared body for /events and /contracts/{id}/events.
-// It runs the cacheability decision (frontier vs. upper bound) BEFORE the
-// SQL query, so an immutable page with a matching If-None-Match never
-// touches the events table at all — only the cheap ingestion_state row
-// used to read the frontier.
 func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter store.EventFilter) {
 	policy, etag, err := s.listCachePolicy(r.Context(), filter)
 	if err != nil {
-		// "When in doubt, don't cache" is the explicit guidance: any
-		// failure to read the frontier falls back to no-cache rather
-		// than guessing the page is safe.
 		s.log.Warn("deciding list cache policy", "error", err)
 	} else if etag != "" && ifNoneMatch(r, etag) {
 		writeNotModified(w, etag, policy)
@@ -167,18 +127,8 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	// Strong ETag: the event ID is itself a perfect validator for an
-	// immutable resource (each ID maps to exactly one row, that row's
-	// body never changes). Using the ID instead of a body hash skips a
-	// scan-and-hash on the cache-miss path and keeps 304s cheap.
 	etag := `"` + id + `"`
 
-	// 304 fast path: conditional GET with a matching validator. We
-	// avoid the row-serialization path entirely (GetEvent is not
-	// called), and instead probe presence with EventExists so retention
-	// /pruning (#8) can't let a deleted event masquerade as still
-	// present. A miss in EventExists is reported as 404, matching the
-	// unconditional code path.
 	if ifNoneMatch(r, etag) {
 		exists, err := s.store.EventExists(r.Context(), id)
 		if err != nil {
@@ -187,10 +137,6 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !exists {
-			// Retention/pruning (#8) deleted the row out from under cached
-			// clients. writeError carries Cache-Control: no-store so a CDN
-			// that warmed on the ETag-bearing 200 doesn't happily pool
-			// this 404 for the immutable max-age.
 			writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
 			return
 		}
@@ -221,8 +167,6 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, event)
 }
 
-// Stats summarizes what the indexer has stored plus, when the auditor is
-// running, the post-processing counters it has accumulated.
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.Stats(r.Context())
 	if err != nil {
@@ -246,24 +190,6 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
-// listCachePolicy decides whether a list page is cacheable as immutable
-// based on the ingest frontier. The whole point of this function is
-// correctness against a moving frontier: a 1-ledger mistake either
-// way lets a stale row into a cache or strands one behind it, so the
-// comparison is deliberately strict and biases toward no-cache.
-//
-// Rule: a page is only safe (= can't gain rows) when to_ledger is set
-// AND strictly less than the last ingested ledger. Equality is folded
-// into the unsafe bucket: at the frontier, ingestion may still be in
-// progress and the boundary ledger's row count isn't guaranteed.
-//
-// Time-only filters (no ledger bound) are never cacheable: translating
-// created_at to ledgers would need a maintained lookup and the spec
-// says "when in doubt, don't cache". Time filters can still be applied
-// alongside ledger bounds and the policy falls through correctly
-// because the ledger-side comparison decides.
-//
-// On any failure to read frontier, the policy is no-cache.
 func (s *Server) listCachePolicy(ctx context.Context, filter store.EventFilter) (cacheability, string, error) {
 	if filter.ToLedger <= 0 {
 		return cacheNoCache, "", nil
@@ -273,24 +199,20 @@ func (s *Server) listCachePolicy(ctx context.Context, filter store.EventFilter) 
 		return cacheNoCache, "", err
 	}
 	if filter.ToLedger >= frontier {
-		// Includes the boundary case by design. See the rationale above.
 		return cacheNoCache, "", nil
 	}
 	return cacheImmutable, listETag(filter), nil
 }
 
-// lastIngestedLedger reads the frontier from the persisted ingestion
-// state. We deliberately reuse GetIngestionState (the narrow index-only
-// row already on the hot path) rather than Stats, whose count-aggregates
-// scan the events table — the spec wants the existing value via the
-// store, not a fancier query just for caching.
-//
-// A miss (cold start, no row yet) is treated as frontier=0 so every
-// to_ledger is "not strictly below" and the caller returns no-cache.
-// This is conservative on the safe side: nothing gets the immutable
-// header until at least one ledger is ingested.
 func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
-	state, err := s.store.GetIngestionState(ctx)
+	// Use the first network for cache policy. In multi-network scenario
+	// the frontier is network-specific, but the cache policy is conservative
+	// (falls back to no-cache on uncertainty).
+	network := "default"
+	if len(s.NetworkNames) > 0 {
+		network = s.NetworkNames[0]
+	}
+	state, err := s.store.GetIngestionState(ctx, network)
 	if errors.Is(err, store.ErrNotFound) {
 		return 0, nil
 	}
@@ -300,23 +222,6 @@ func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
 	return state.LastIngestedLedger, nil
 }
 
-// listETag is the strong validator for a list call. The frontier is
-// deliberately NOT included in the hash: once a page is verified
-// cacheable immutable, its ETag stays valid as the frontier moves
-// forward, so a warmed cache isn't invalidated on every ingest cycle.
-// Distinct filters produce distinct ETags because every component is
-// marshaled to JSON (no separator-collision worries).
-//
-// Order and Limit are normalized to the values QueryEvents will
-// actually use: the SQL layer treats Order=="" as "asc" and Limit<=0
-// as DefaultQueryLimit. Hashing the unresolved values would give us
-// different ETags for requests that produce identical bodies
-// (e.g. ?order=asc vs no order param), which thrashes caches for no
-// reason.
-//
-// DefaultQueryLimit is the value the store applies; copying it here
-// (instead of importing `store`) keeps the cache layer unaware of the
-// store's pagination rules and we re-verify by test.
 func listETag(f store.EventFilter) string {
 	key := struct {
 		ContractID string          `json:"c"`
@@ -329,6 +234,7 @@ func listETag(f store.EventFilter) string {
 		Cursor     string          `json:"cu,omitempty"`
 		Limit      int             `json:"l"`
 		Order      string          `json:"o,omitempty"`
+		Network    string          `json:"n,omitempty"`
 	}{
 		ContractID: f.ContractID,
 		Type:       f.Type,
@@ -340,17 +246,13 @@ func listETag(f store.EventFilter) string {
 		Cursor:     f.Cursor,
 		Limit:      resolvedLimit(f.Limit),
 		Order:      resolvedOrder(f.Order),
+		Network:    f.Network,
 	}
 	b, _ := json.Marshal(key)
 	sum := sha256.Sum256(b)
 	return fmt.Sprintf(`"%x"`, sum)
 }
 
-// resolvedLimit mirrors the default applied in QueryEvents. Pulling
-// the constant from the store package keeps the cache layer from
-// drifting if the store-side default ever moves: any change shows up
-// immediately in the build, and the cache-stopping behavior updates
-// in lockstep.
 func resolvedLimit(n int) int {
 	if n <= 0 {
 		return store.DefaultQueryLimit
@@ -365,9 +267,6 @@ func resolvedOrder(o string) string {
 	return o
 }
 
-// timeOrEmpty renders a zero time as "" so two unset times don't both
-// serialize to "0001-01-01T00:00:00Z" (which would otherwise be a
-// distinct value from one caller that didn't set the field at all).
 func timeOrEmpty(t time.Time) string {
 	if t.IsZero() {
 		return ""
@@ -375,10 +274,6 @@ func timeOrEmpty(t time.Time) string {
 	return t.Format(time.RFC3339)
 }
 
-// ifNoneMatch reports whether the request's If-None-Match header
-// matches the supplied strong ETag. RFC 7232 §3.2: the comparison for
-// strong ETags is byte-exact after stripping the W/ weakness prefix.
-// `*` matches any present representation.
 func ifNoneMatch(r *http.Request, etag string) bool {
 	raw := r.Header.Get("If-None-Match")
 	if raw == "" || etag == "" {
@@ -396,17 +291,6 @@ func ifNoneMatch(r *http.Request, etag string) bool {
 	return false
 }
 
-// writeCacheHeaders is the single place in the package that writes
-// ETag, Cache-Control, Vary. Handlers pick a cacheability kind and an
-// etag string; nothing else needs to know about header semantics.
-//
-// Vary: Accept-Encoding is set proactively so the future compression
-// middleware (#25) can plug in without re-encoding responses already
-// cached as gzip or vice versa; the header is the contract a shared
-// cache uses to keep distinct variants. If a future middleware (auth
-// #17, or any content-negotiating layer) has already populated Vary,
-// we MERGE rather than overwrite so distinct dimensions coexist in
-// the comma-separated value the cache uses.
 func writeCacheHeaders(w http.ResponseWriter, kind cacheability, maxAge time.Duration, etag string) {
 	vary := w.Header().Get("Vary")
 	if !strings.Contains(vary, "Accept-Encoding") {
@@ -428,9 +312,6 @@ func writeCacheHeaders(w http.ResponseWriter, kind cacheability, maxAge time.Dur
 	case cacheImmutable:
 		scope := "public"
 		if cachePrivate.Load() {
-			// Auth'd deployments get `private`: caching stays scoped to
-			// the authenticated user (browser cache works), but shared
-			// caches (CDN/proxy) cannot pool responses across users.
 			scope = "private"
 		}
 		w.Header().Set("Cache-Control",
@@ -438,26 +319,36 @@ func writeCacheHeaders(w http.ResponseWriter, kind cacheability, maxAge time.Dur
 	}
 }
 
-// writeNotModified sends a 304 with the same cache-validation headers
-// the original response would have carried. RFC 7232 §4.1 says a 304
-// should mirror the 200 response's Content-Type so strict intermediaries
-// can probe the body's media type before serving a stale entry — we
-// set it before WriteHeader for that reason. The cache validators
-// (Vary, ETag, Cache-Control) are emitted from the same writeCacheHeaders
-// path the full response would use, so they're guaranteed identical.
 func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 	w.Header().Set("Content-Type", "application/json")
 	writeCacheHeaders(w, kind, immutableMaxAge, etag)
 	w.WriteHeader(http.StatusNotModified)
 }
 
-// filterFromQuery parses the shared event-filter query params:
-// contract_id, type, topic, from_ledger, to_ledger, from_time, to_time, cursor, limit.
-func filterFromQuery(r *http.Request) (store.EventFilter, error) {
+// filterFromQuery parses the shared event-filter query params including network.
+func (s *Server) filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	q := r.URL.Query()
 	f := store.EventFilter{
 		ContractID: q.Get("contract_id"),
 		Cursor:     q.Get("cursor"),
+		Network:    q.Get("network"),
+	}
+
+	// Validate network parameter.
+	if f.Network == "" && s.HasMultipleNetworks {
+		return f, fmt.Errorf("network is required when multiple networks are configured")
+	}
+	if f.Network != "" && len(s.NetworkNames) > 0 {
+		valid := false
+		for _, name := range s.NetworkNames {
+			if f.Network == name {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return f, fmt.Errorf("invalid network %q (valid: %v)", f.Network, s.NetworkNames)
+		}
 	}
 
 	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
@@ -485,7 +376,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return quoted, nil
 	}
 
-	// order controls sort direction for paginated results.
 	order := q.Get("order")
 	switch order {
 	case "", "asc", "desc":
@@ -562,8 +452,6 @@ func parseLedgerParam(raw, name string) (int64, error) {
 	return n, nil
 }
 
-// parseTimeParam parses an RFC 3339 timestamp query parameter.
-// Sub-second precision and missing timezone offset are rejected.
 func parseTimeParam(raw, name string) (time.Time, error) {
 	if raw == "" {
 		return time.Time{}, nil
@@ -584,15 +472,12 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filter, err := filterFromQuery(r)
+	filter, err := s.filterFromQuery(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 
-	// InsecureSkipVerify disables WebSocket Origin checking: the WS endpoint
-	// is server-to-client only (no client messages are read), so a forged
-	// Origin header cannot influence what the client sees.
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true,
 	})
@@ -606,12 +491,8 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	defer sub.Close()
 
 	ctx := r.Context()
-
-	// Use CloseRead to get a context cancelled when the client disconnects
-	// and to ensure the library processes control frames (ping/pong/close).
 	ctx = c.CloseRead(ctx)
 
-	// Periodic ping to detect stale connections.
 	pingCtx, pingCancel := context.WithCancel(ctx)
 	defer pingCancel()
 	go func() {
@@ -660,11 +541,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {
-	// Every error response is marked no-store so neither CDNs nor
-	// browsers can pool a 4xx/5xx behind a success response's
-	// validator. The prime motivator is the 404-on-eviction path in
-	// handleGetEvent: a stale cache otherwise keeps returning "not
-	// found" for an event that briefly aged out but never came back.
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, status, errorResponse{Error: err.Error()})
 }

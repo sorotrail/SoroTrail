@@ -18,21 +18,13 @@ import (
 
 // Options configure an Ingester.
 type Options struct {
-	// PollInterval is how long to sleep once caught up. Default 5s.
-	PollInterval time.Duration
-	// StartLedger, when non-zero, overrides the cold-start position.
-	StartLedger uint32
-	// RetentionLedgers is how far behind the latest ledger a cold start
-	// reaches when StartLedger is unset. Default 17280 (~24h).
+	PollInterval     time.Duration
+	StartLedger      uint32
 	RetentionLedgers uint32
-	// PageLimit is the getEvents pagination limit per request. Default 1000.
-	PageLimit uint
-	// MaxBackoff caps the error backoff. Default 1m.
-	MaxBackoff time.Duration
-	// SweepWindow bounds the ledger range scanned per pass when the watched
-	// list needs more than one getEvents request (see buildFilterBatches).
-	// Default 1000 ledgers.
-	SweepWindow uint32
+	PageLimit        uint
+	MaxBackoff       time.Duration
+	SweepWindow      uint32
+	Network          string
 }
 
 func (o *Options) applyDefaults() {
@@ -51,6 +43,9 @@ func (o *Options) applyDefaults() {
 	if o.SweepWindow == 0 {
 		o.SweepWindow = 1000
 	}
+	if o.Network == "" {
+		o.Network = "default"
+	}
 }
 
 // EventNotifier is notified after events are persisted so external
@@ -66,33 +61,28 @@ type Ingester struct {
 	decoder  decode.Decoder
 	log      *slog.Logger
 	opts     Options
-	notifier EventNotifier // optional; nil means no notification
+	notifier EventNotifier
 	bcast    *broadcast.Broadcaster
 }
 
-// New wires an Ingester. All dependencies are interfaces so tests can supply
-// mocks.
+// New wires an Ingester.
 func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, opts Options) *Ingester {
 	opts.applyDefaults()
 	return &Ingester{client: client, store: st, decoder: dec, log: log, opts: opts}
 }
 
-// SetNotifier attaches an optional EventNotifier that is called after
-// every successful event persistence. When nil (the default) no
-// notification is sent — the ingester behaves exactly as before.
+// SetNotifier attaches an optional EventNotifier.
 func (ing *Ingester) SetNotifier(n EventNotifier) {
 	ing.notifier = n
 }
 
-// WithBroadcaster attaches a live event broadcaster so ingested events are
-// pushed to streaming subscribers.
+// WithBroadcaster attaches a live event broadcaster.
 func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
 	ing.bcast = b
 	return ing
 }
 
-// Run polls until ctx is canceled. Errors are logged and retried with
-// exponential backoff; the only terminal condition is context cancellation.
+// Run polls until ctx is canceled.
 func (ing *Ingester) Run(ctx context.Context) error {
 	backoff := time.Second
 	for {
@@ -101,10 +91,8 @@ func (ing *Ingester) Run(ctx context.Context) error {
 		case ctx.Err() != nil:
 			return ctx.Err()
 		case err != nil:
-			// Jittered exponential backoff so restarts don't thundering-herd
-			// a shared endpoint.
 			sleep := backoff/2 + rand.N(backoff/2)
-			ing.log.Error("ingestion pass failed", "error", err, "retry_in", sleep)
+			ing.log.Error("ingestion pass failed", "network", ing.opts.Network, "error", err, "retry_in", sleep)
 			if !sleepCtx(ctx, sleep) {
 				return ctx.Err()
 			}
@@ -122,11 +110,6 @@ func (ing *Ingester) Run(ctx context.Context) error {
 	}
 }
 
-// runOnce advances ingestion by one step and reports whether we are caught
-// up with the chain. With at most one request's worth of filters it ingests
-// a single page (resumable via the persisted cursor); with more watched
-// contracts than one request allows it sweeps a bounded ledger window once
-// per filter batch.
 func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
 	startLedger, cursor, err := ing.resolvePosition(ctx)
 	if err != nil {
@@ -142,8 +125,6 @@ func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
 	return ing.windowSweep(ctx, startLedger, batches)
 }
 
-// singlePage issues one getEvents call and persists the page plus the resume
-// cursor, so even huge backfills make durable progress request by request.
 func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor string, filters []rpc.EventFilter) (bool, error) {
 	resp, err := ing.client.GetEvents(ctx, rpc.GetEventsRequest{
 		StartLedger: startLedger,
@@ -163,28 +144,16 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 
 	state, caughtUp := nextState(resp, ing.opts.PageLimit)
 	if state.LastCursor == "" && state.LastIngestedLedger <= 0 {
-		// Degenerate response (no events, no cursor, no latestLedger):
-		// hold position rather than regressing to a cold start.
 		state.LastIngestedLedger = int64(startLedger) - 1
 	}
+	state.Network = ing.opts.Network
 	if err := ing.store.SaveIngestionState(ctx, state); err != nil {
 		return false, err
 	}
 	return caughtUp, nil
 }
 
-// ReingestRange re-fetches events for the closed range [fromLedger, toLedger]
-// using the caller-supplied client (the auditor passes its budget-paced
-// client so repair traffic is accounted against the audit pool), then
-// calls the store's replace-in-range so orphans (rows the RPC no longer
-// reports) are deleted and same-ID rows are updated (topic/value drift on
-// the RPC side is corrected). It does NOT advance the ingester's
-// persisted cursor — the auditor uses this to repair specific ledger
-// ranges without disturbing the ongoing ingestion frontier.
-//
-// All events the RPC returns with ledger > toLedger are dropped: the RPC's
-// cursor pagination strips endLedger from the request, so the last page
-// may legitimately spill past the requested end.
+// ReingestRange re-fetches events for the closed range [fromLedger, toLedger].
 func (ing *Ingester) ReingestRange(ctx context.Context, client rpc.Client, fromLedger, toLedger uint32) (int, error) {
 	if fromLedger > toLedger {
 		return 0, fmt.Errorf("ReingestRange: from %d > to %d", fromLedger, toLedger)
@@ -207,8 +176,6 @@ func (ing *Ingester) ReingestRange(ctx context.Context, client rpc.Client, fromL
 	return repaired, nil
 }
 
-// reingestBatch pages one filter batch over [fromLedger, toLedger] in
-// memory, then hands the post-filtered result to the store.
 func (ing *Ingester) reingestBatch(ctx context.Context, client rpc.Client, fromLedger, toLedger uint32, batch []rpc.EventFilter) (int, error) {
 	endLedgerExcl := toLedger + 1
 	var collected []rpc.Event
@@ -221,15 +188,11 @@ func (ing *Ingester) reingestBatch(ctx context.Context, client rpc.Client, fromL
 			Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
 		})
 		if rpc.IsLedgerOutOfRange(err) {
-			// Aged out during repair — not an error, just an empty answer.
 			return 0, nil
 		}
 		if err != nil {
 			return 0, fmt.Errorf("ReingestRange getEvents [%d,%d]: %w", fromLedger, toLedger, err)
 		}
-		// Defensive post-filter: cursor pagination strips endLedger from
-		// the request, so the tail of a full page may legitimately include
-		// events past our toLedger bound.
 		for _, e := range resp.Events {
 			if e.Ledger <= toLedger {
 				collected = append(collected, e)
@@ -262,27 +225,17 @@ func (ing *Ingester) reingestBatch(ctx context.Context, client rpc.Client, fromL
 }
 
 // BuildFilterBatches converts the watched-contract list into getEvents
-// filter batches respecting the RPC caps (≤5 contractIds per filter,
-// ≤5 filters per request, ≤25 watched contracts per request chain).
-// Exported so the auditor can fetch with the exact same filter set as
-// ingest — events outside this filter set were intentionally not stored
-// and must not be flagged as audit discrepancies.
+// filter batches respecting the RPC caps.
 func (ing *Ingester) BuildFilterBatches(ctx context.Context) ([][]rpc.EventFilter, error) {
 	return ing.buildFilterBatches(ctx)
 }
 
-// PageLimit returns the getEvents pagination cap the ingester uses for
-// its own loop. The auditor reuses this so it can never silently
-// disagree on page size for an RPC round trip.
+// PageLimit returns the getEvents pagination cap.
 func (ing *Ingester) PageLimit() uint { return ing.opts.PageLimit }
 
-// nextState derives the resume position after a page. A full page means more
-// data is likely waiting: keep paging via cursor immediately. A short page
-// means the RPC gave us everything it has, so we are caught up — but we
-// still prefer resuming by cursor, because startLedger must stay within the
-// server's retained range and "latest + 1" is rejected. Only when no cursor
-// is available (old server, empty page) do we fall back to re-scanning the
-// latest ledger; idempotent upserts make the overlap harmless.
+// Network returns the network this ingester is responsible for.
+func (ing *Ingester) Network() string { return ing.opts.Network }
+
 func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState, bool) {
 	caughtUp := uint(len(resp.Events)) < pageLimit
 
@@ -302,18 +255,13 @@ func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState
 	return store.IngestionState{LastIngestedLedger: int64(resp.LatestLedger) - 1}, caughtUp
 }
 
-// windowSweep ingests the ledger window [start, end] by paging each filter
-// batch through it separately, then advances state past the window. One
-// shared cursor can't track several concurrent request chains, so within a
-// window each batch pages to completion in memory; idempotent upserts make
-// re-scanning after a crash harmless.
 func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]rpc.EventFilter) (bool, error) {
 	health, err := ing.client.GetHealth(ctx)
 	if err != nil {
 		return false, fmt.Errorf("getHealth for sweep window: %w", err)
 	}
 	if start > health.LatestLedger {
-		return true, nil // nothing new yet
+		return true, nil
 	}
 	end := min(start+ing.opts.SweepWindow-1, health.LatestLedger)
 
@@ -322,7 +270,7 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 		for {
 			resp, err := ing.client.GetEvents(ctx, rpc.GetEventsRequest{
 				StartLedger: start,
-				EndLedger:   end + 1, // endLedger is exclusive
+				EndLedger:   end + 1,
 				Filters:     filters,
 				Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
 			})
@@ -338,8 +286,6 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 			if uint(len(resp.Events)) < ing.opts.PageLimit {
 				break
 			}
-			// Cursor requests can't carry the ledger range, so enforce the
-			// window bound here once a page crosses it.
 			if resp.Events[len(resp.Events)-1].Ledger > end {
 				break
 			}
@@ -349,15 +295,14 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 		}
 	}
 
-	// Resume from end+1 next pass — unless the window reached the chain
-	// head, where end-1 keeps the next startLedger within the server's
-	// retained range (a startLedger past latest is rejected). The one
-	// re-scanned ledger is deduplicated by the idempotent upserts.
 	lastIngested := int64(end)
 	if end >= health.LatestLedger {
 		lastIngested = int64(end) - 1
 	}
-	err = ing.store.SaveIngestionState(ctx, store.IngestionState{LastIngestedLedger: lastIngested})
+	err = ing.store.SaveIngestionState(ctx, store.IngestionState{
+		Network:            ing.opts.Network,
+		LastIngestedLedger: lastIngested,
+	})
 	if err != nil {
 		return false, err
 	}
@@ -381,12 +326,11 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		return err
 	}
 	ing.log.Info("ingested events",
+		"network", ing.opts.Network,
 		"count", len(events), "new", inserted,
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
 		"latest_ledger", latestLedger)
 
-	// Notify webhooks (or other listeners) after successful persistence.
-	// This is a fire-and-forget call — it must never block ingestion.
 	if ing.notifier != nil {
 		ing.notifier.NotifyEvents(ctx, events)
 	}
@@ -396,11 +340,8 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	return nil
 }
 
-// resolvePosition decides where the next pass starts: the saved cursor
-// (mid-pagination), the ledger after the last ingested one (warm start), or
-// latest-minus-retention (cold start).
 func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, cursor string, err error) {
-	state, err := ing.store.GetIngestionState(ctx)
+	state, err := ing.store.GetIngestionState(ctx, ing.opts.Network)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return 0, "", err
 	}
@@ -411,7 +352,6 @@ func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, c
 		return uint32(state.LastIngestedLedger) + 1, "", nil
 	}
 
-	// Cold start.
 	if ing.opts.StartLedger > 0 {
 		return ing.opts.StartLedger, "", nil
 	}
@@ -424,32 +364,26 @@ func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, c
 		start = oldest
 	}
 	if start < 2 {
-		start = 2 // ledger 1 predates any events; the RPC rejects 0
+		start = 2
 	}
-	ing.log.Info("cold start", "start_ledger", start, "latest_ledger", health.LatestLedger)
+	ing.log.Info("cold start", "network", ing.opts.Network, "start_ledger", start, "latest_ledger", health.LatestLedger)
 	return uint32(start), "", nil
 }
 
-// reclampToOldest handles a resume point that aged out of the RPC's
-// retention window (e.g. the indexer was down for days): skip ahead to the
-// oldest retained ledger and accept the gap.
 func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) error {
 	health, err := ing.client.GetHealth(ctx)
 	if err != nil {
 		return fmt.Errorf("getHealth while re-clamping: %w", err)
 	}
-	ing.log.Warn("resume ledger fell outside RPC retention window; skipping ahead — events in the gap are lost",
+	ing.log.Warn("resume ledger fell outside RPC retention window; skipping ahead",
+		"network", ing.opts.Network,
 		"requested_ledger", requested, "oldest_retained", health.OldestLedger)
 	return ing.store.SaveIngestionState(ctx, store.IngestionState{
+		Network:            ing.opts.Network,
 		LastIngestedLedger: int64(health.OldestLedger) - 1,
 	})
 }
 
-// buildFilterBatches converts the watched-contract list into getEvents
-// filter batches respecting the RPC caps: ≤5 contractIds per filter and ≤5
-// filters per request, so ≤25 watched contracts fit in one request. Larger
-// lists spill into additional batches, each requiring its own request chain.
-// An empty watch list means one type-only filter, i.e. all contract events.
 func (ing *Ingester) buildFilterBatches(ctx context.Context) ([][]rpc.EventFilter, error) {
 	watched, err := ing.store.ListWatchedContracts(ctx)
 	if err != nil {
@@ -492,17 +426,12 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 		Topics:           topics,
 		Value:            value,
 		CreatedAt:        createdAt,
-		// Keep the raw XDR so `sorotrail replay` can re-decode this event
-		// with a future decoder. Empty when the RPC delivered JSON directly
-		// (xdrFormat "json") — there is no XDR to keep in that case, and
-		// replay skips such rows.
-		RawTopicXDR: re.Topic,
-		RawValueXDR: re.Value,
+		Network:          ing.opts.Network,
+		RawTopicXDR:      re.Topic,
+		RawValueXDR:      re.Value,
 	}, nil
 }
 
-// sleepCtx sleeps for d or until ctx is done; it reports whether the full
-// sleep completed.
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()

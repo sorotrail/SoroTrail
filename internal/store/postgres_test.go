@@ -367,13 +367,13 @@ func TestIngestionStateRoundTrip(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 
-	_, err := st.GetIngestionState(ctx)
+	_, err := st.GetIngestionState(ctx, "default")
 	assert.ErrorIs(t, err, ErrNotFound, "fresh database has no state")
 
-	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 42, LastCursor: "c1"}))
-	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 43}))
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{Network: "default", LastIngestedLedger: 42, LastCursor: "c1"}))
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{Network: "default", LastIngestedLedger: 43}))
 
-	got, err := st.GetIngestionState(ctx)
+	got, err := st.GetIngestionState(ctx, "default")
 	require.NoError(t, err)
 	assert.Equal(t, int64(43), got.LastIngestedLedger)
 	assert.Empty(t, got.LastCursor, "state is a single row, fully replaced")
@@ -401,7 +401,7 @@ func TestStats(t *testing.T) {
 		testEvent(eventID(2), 101, contractB),
 	})
 	require.NoError(t, err)
-	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 101}))
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{Network: "default", LastIngestedLedger: 101}))
 	require.NoError(t, st.AddWatchedContract(ctx, contractA))
 
 	stats, err := st.Stats(ctx)

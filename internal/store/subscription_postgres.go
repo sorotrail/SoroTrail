@@ -9,18 +9,16 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// --- Subscription CRUD ---
-
 func (p *Postgres) CreateSubscription(ctx context.Context, s Subscription) (Subscription, error) {
 	filtersJSON, err := json.Marshal(s.Filters)
 	if err != nil {
 		return Subscription{}, fmt.Errorf("marshaling subscription filters: %w", err)
 	}
 	err = p.pool.QueryRow(ctx, `
-		INSERT INTO subscriptions (url, filters, secret, enabled)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO subscriptions (url, filters, secret, enabled, network)
+		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, failure_count, created_at`,
-		s.URL, filtersJSON, s.Secret, s.Enabled,
+		s.URL, filtersJSON, s.Secret, s.Enabled, s.Filters.Network,
 	).Scan(&s.ID, &s.FailureCount, &s.CreatedAt)
 	if err != nil {
 		return Subscription{}, fmt.Errorf("creating subscription: %w", err)
@@ -32,11 +30,12 @@ func (p *Postgres) GetSubscription(ctx context.Context, id int64) (Subscription,
 	var (
 		s       Subscription
 		filters []byte
+		network *string
 	)
 	err := p.pool.QueryRow(ctx, `
-		SELECT id, url, filters, secret, enabled, failure_count, created_at
+		SELECT id, url, filters, secret, enabled, failure_count, created_at, network
 		FROM subscriptions WHERE id = $1`, id,
-	).Scan(&s.ID, &s.URL, &filters, &s.Secret, &s.Enabled, &s.FailureCount, &s.CreatedAt)
+	).Scan(&s.ID, &s.URL, &filters, &s.Secret, &s.Enabled, &s.FailureCount, &s.CreatedAt, &network)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Subscription{}, ErrNotFound
 	}
@@ -46,12 +45,15 @@ func (p *Postgres) GetSubscription(ctx context.Context, id int64) (Subscription,
 	if err := json.Unmarshal(filters, &s.Filters); err != nil {
 		return Subscription{}, fmt.Errorf("unmarshaling subscription filters: %w", err)
 	}
+	if network != nil {
+		s.Filters.Network = *network
+	}
 	return s, nil
 }
 
 func (p *Postgres) ListSubscriptions(ctx context.Context) ([]Subscription, error) {
 	rows, err := p.pool.Query(ctx, `
-		SELECT id, url, filters, secret, enabled, failure_count, created_at
+		SELECT id, url, filters, secret, enabled, failure_count, created_at, network
 		FROM subscriptions ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing subscriptions: %w", err)
@@ -71,11 +73,11 @@ func (p *Postgres) UpdateSubscription(ctx context.Context, s Subscription) (Subs
 			url    = $2,
 			filters = $3,
 			secret  = $4,
-			enabled = $5
+			enabled = $5,
+			network = $6
 		WHERE id = $1
 		RETURNING filters`,
-
-		s.ID, s.URL, filtersJSON, s.Secret, s.Enabled,
+		s.ID, s.URL, filtersJSON, s.Secret, s.Enabled, s.Filters.Network,
 	).Scan(&updatedFilters)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Subscription{}, ErrNotFound
@@ -86,7 +88,6 @@ func (p *Postgres) UpdateSubscription(ctx context.Context, s Subscription) (Subs
 	if err := json.Unmarshal(updatedFilters, &s.Filters); err != nil {
 		return Subscription{}, fmt.Errorf("unmarshaling subscription filters: %w", err)
 	}
-	// Re-read to get failure_count and created_at (not updated here).
 	return p.GetSubscription(ctx, s.ID)
 }
 
@@ -101,11 +102,9 @@ func (p *Postgres) DeleteSubscription(ctx context.Context, id int64) error {
 	return nil
 }
 
-// --- Enabled subscriptions ---
-
 func (p *Postgres) ListEnabledSubscriptions(ctx context.Context) ([]Subscription, error) {
 	rows, err := p.pool.Query(ctx, `
-		SELECT id, url, filters, secret, enabled, failure_count, created_at
+		SELECT id, url, filters, secret, enabled, failure_count, created_at, network
 		FROM subscriptions WHERE enabled = true ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing enabled subscriptions: %w", err)
@@ -113,8 +112,6 @@ func (p *Postgres) ListEnabledSubscriptions(ctx context.Context) ([]Subscription
 	defer rows.Close()
 	return scanSubscriptions(rows)
 }
-
-// --- Failure counting ---
 
 func (p *Postgres) IncrementSubscriptionFailures(ctx context.Context, id int64, maxFailures int) (int, bool, error) {
 	var newCount int
@@ -144,8 +141,6 @@ func (p *Postgres) ResetSubscriptionFailures(ctx context.Context, id int64) erro
 	}
 	return nil
 }
-
-// --- Delivery attempts ---
 
 func (p *Postgres) RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (DeliveryAttempt, error) {
 	err := p.pool.QueryRow(ctx, `
@@ -199,28 +194,29 @@ func (p *Postgres) ListDeliveryAttempts(ctx context.Context, subscriptionID int6
 	return attempts, nil
 }
 
-// --- helpers ---
-
 func scanSubscriptions(rows pgx.Rows) ([]Subscription, error) {
 	var subs []Subscription
 	for rows.Next() {
 		var (
 			s       Subscription
 			filters []byte
+			network *string
 		)
 		if err := rows.Scan(&s.ID, &s.URL, &filters, &s.Secret, &s.Enabled,
-			&s.FailureCount, &s.CreatedAt); err != nil {
+			&s.FailureCount, &s.CreatedAt, &network); err != nil {
 			return nil, fmt.Errorf("scanning subscription: %w", err)
 		}
 		if err := json.Unmarshal(filters, &s.Filters); err != nil {
 			return nil, fmt.Errorf("unmarshaling subscription filters: %w", err)
+		}
+		if network != nil {
+			s.Filters.Network = *network
 		}
 		subs = append(subs, s)
 	}
 	return subs, rows.Err()
 }
 
-// Delivery status constants.
 const (
 	DeliverySuccess = "success"
 	DeliveryFailed  = "failed"

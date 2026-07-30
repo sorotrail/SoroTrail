@@ -1,9 +1,5 @@
 // Command sorotrail runs the SoroTrail indexer: a Stellar RPC event ingester
 // and a query API in one process.
-//
-// With no arguments it runs the indexer. Subcommands cover maintenance:
-//
-//	sorotrail replay --from-ledger N [--to-ledger M]
 package main
 
 import (
@@ -44,8 +40,6 @@ func main() {
 	}
 }
 
-// dispatch routes to a subcommand, defaulting to the indexer so existing
-// deployments (and the Dockerfile entrypoint) keep working unchanged.
 func dispatch(args []string) error {
 	if len(args) == 0 {
 		return run()
@@ -86,6 +80,17 @@ func run() error {
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
+
+	// Tag any events that have empty network with the default network.
+	// This handles the upgrade path for single-network deployments.
+	defaultNetwork := cfg.DefaultNetworkName()
+	if defaultNetwork == "" {
+		networks := cfg.NetworksOrDefault()
+		if len(networks) > 0 {
+			defaultNetwork = networks[0].Name
+		}
+	}
+
 	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return fmt.Errorf("connecting to postgres: %w", err)
@@ -102,55 +107,90 @@ func run() error {
 		}
 	}
 
-	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
-	// Webhook delivery runs alongside ingestion — the notifier is attached
-	// to the ingester so events flow to subscriber callbacks asynchronously.
-	wh := webhook.NewNotifier(st, log)
-
-	// Wire the spec cache and enricher for spec-decoded event views.
-	specCache := spec.NewCache(st)
-	specFetcher := spec.NewFetcher(rpcClient)
-	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
-
-	bcast := broadcast.New(broadcast.DefaultBufferSize)
-	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
-		PollInterval:     cfg.PollInterval,
-		StartLedger:      cfg.StartLedger,
-		RetentionLedgers: cfg.RetentionLedgers,
-	}).WithBroadcaster(bcast)
-	ing.SetNotifier(wh)
-
-	// The auditor and its request-rate budget are constructed lazily:
-	// AUDIT_ENABLED=false (the default) means a binary identical to a
-	// pre-audit build, so we skip every allocation.
-	var aud *audit.Auditor
-	if cfg.AuditEnabled {
-		budget, err := rpc.NewBudget(cfg.AuditMaxRPS, cfg.AuditBudgetShare)
-		if err != nil {
-			return err
-		}
-		auditClient := audit.NewBudgetedClient(rpcClient, budget)
-		aud = audit.New(auditClient, st, ing, log, audit.Options{
-			PollInterval:      cfg.AuditPollInterval,
-			BatchLedgers:      cfg.AuditBatchLedgers,
-			LagThreshold:      cfg.AuditLagThreshold,
-			MaxRepairAttempts: cfg.AuditMaxRepair,
-			FindingMaxLedgers: cfg.AuditFindingMaxLgrs,
-		})
-		// Expose the auditor's counters via /stats so operators don't need
-		// to parse logs to see pass/finding rates.
-		api.SetAuditor(aud)
+	// Tag legacy rows with the default network.
+	if _, err := pool.Exec(ctx, `UPDATE events SET network = $1 WHERE network = '' OR network IS NULL`, defaultNetwork); err != nil {
+		log.Warn("tagging legacy events with default network", "error", err)
+	}
+	// Tag legacy ingestion_state and audit_state rows.
+	if _, err := pool.Exec(ctx, `INSERT INTO ingestion_state (network, last_ingested_ledger, last_cursor, updated_at)
+		SELECT $1, last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE network = '' OR network IS NULL
+		ON CONFLICT (network) DO NOTHING`, defaultNetwork); err != nil {
+		log.Warn("migrating ingestion state", "error", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO audit_state (network, verified_through_ledger, updated_at)
+		SELECT $1, verified_through_ledger, updated_at FROM audit_state WHERE network = '' OR network IS NULL
+		ON CONFLICT (network) DO NOTHING`, defaultNetwork); err != nil {
+		log.Warn("migrating audit state", "error", err)
 	}
 
-	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
-	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
-	// its cleanup goroutine is never started.
+	// Shared broadcaster for live event streaming across all networks.
+	bcast := broadcast.New(broadcast.DefaultBufferSize)
+
+	// Build per-network components.
+	networks := cfg.NetworksOrDefault()
+	type networkIngester struct {
+		ing     *ingester.Ingester
+		auditor *audit.Auditor
+		rpc     rpc.Client
+	}
+	ingesters := make([]networkIngester, 0, len(networks))
+	specCache := spec.NewCache(st)
+
+	for _, net := range networks {
+		rpcClient := rpc.NewHTTPClient(net.RPCURL)
+
+		ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
+			PollInterval:     cfg.PollInterval,
+			StartLedger:      cfg.StartLedger,
+			RetentionLedgers: cfg.RetentionLedgers,
+			Network:          net.Name,
+		}).WithBroadcaster(bcast)
+
+		sni := networkIngester{
+			ing: ing,
+			rpc: rpcClient,
+		}
+
+		// Build auditor per network (one per ingester).
+		if cfg.AuditEnabled {
+			budget, err := rpc.NewBudget(cfg.AuditMaxRPS, cfg.AuditBudgetShare)
+			if err != nil {
+				return fmt.Errorf("creating budget for network %q: %w", net.Name, err)
+			}
+			auditClient := audit.NewBudgetedClient(rpcClient, budget)
+			aud := audit.New(auditClient, st, ing, log, audit.Options{
+				PollInterval:      cfg.AuditPollInterval,
+				BatchLedgers:      cfg.AuditBatchLedgers,
+				LagThreshold:      cfg.AuditLagThreshold,
+				MaxRepairAttempts: cfg.AuditMaxRepair,
+				FindingMaxLedgers: cfg.AuditFindingMaxLgrs,
+			})
+			sni.auditor = aud
+		}
+
+		ingesters = append(ingesters, sni)
+	}
+
+	// Webhook delivery runs alongside ingestion.
+	wh := webhook.NewNotifier(st, log)
+
+	// Wire spec enricher for the API using the first network's fetcher.
+	firstSpecFetcher := spec.NewFetcher(ingesters[0].rpc)
+	firstSpecEnricher := spec.NewEnricher(firstSpecFetcher, specCache, log)
+
+	// Set up the API server.
 	limiter := api.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.RateLimitTrustedProxy)
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	apiServer := api.New(st, rpcClient, log, specEnricher).WithBroadcaster(bcast)
+	apiServer := api.New(st, ingesters[0].rpc, log, firstSpecEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
+	apiServer.SetNetworks(cfg.NetworkNames())
+
+	// Connect notifier to all ingesters.
+	for _, ni := range ingesters {
+		ni.ing.SetNotifier(wh)
+	}
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -158,18 +198,36 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	errCh := make(chan error, 4)
-	go func() {
-		go wh.Run(ctx)
-	}()
-	go func() {
-		log.Info("ingester starting", "rpc_url", cfg.RPCURL, "poll_interval", cfg.PollInterval)
-		if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			errCh <- fmt.Errorf("ingester: %w", err)
-		} else {
-			errCh <- nil
+	// Error channel: one per ingester + HTTP server + webhook + auditor per network.
+	errCh := make(chan error, 4+len(ingesters))
+
+	// Start webhook notifier.
+	go wh.Run(ctx)
+
+	// Start one ingester + auditor per network.
+	for _, ni := range ingesters {
+		ni := ni // capture
+		go func() {
+			log.Info("ingester starting", "network", ni.ing.Network(), "rpc_url", networks[0].RPCURL)
+			if err := ni.ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("ingester[%s]: %w", ni.ing.Network(), err)
+			} else {
+				errCh <- nil
+			}
+		}()
+		if ni.auditor != nil {
+			go func() {
+				log.Info("auditor starting", "network", ni.ing.Network())
+				if err := ni.auditor.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					errCh <- fmt.Errorf("auditor[%s]: %w", ni.ing.Network(), err)
+				} else {
+					errCh <- nil
+				}
+			}()
 		}
-	}()
+	}
+
+	// Start HTTP server.
 	go func() {
 		log.Info("http api listening", "addr", cfg.HTTPAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -178,32 +236,22 @@ func run() error {
 			errCh <- nil
 		}
 	}()
-	if aud != nil {
-		go func() {
-			log.Info("auditor starting",
-				"budget_share", cfg.AuditBudgetShare,
-				"batch_ledgers", cfg.AuditBatchLedgers,
-				"lag_threshold", cfg.AuditLagThreshold,
-				"max_repair_attempts", cfg.AuditMaxRepair)
-			if err := aud.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				errCh <- fmt.Errorf("auditor: %w", err)
-			} else {
-				errCh <- nil
-			}
-		}()
+
+	// Wait for first error or shutdown signal.
+	var firstErr error
+	remaining := 2 + len(ingesters) // http server + webhook + ingesters
+	for _, ni := range ingesters {
+		if ni.auditor != nil {
+			remaining++
+		}
 	}
 
-	var firstErr error
-	remaining := 3 // ingester + http server + webhook
-	if aud != nil {
-		remaining = 4
-	}
 	select {
 	case <-ctx.Done():
 		log.Info("shutdown signal received")
 	case firstErr = <-errCh:
 		remaining--
-		stop() // one component failed; wind down the others
+		stop()
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

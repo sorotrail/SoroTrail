@@ -9,8 +9,6 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/store"
 )
 
-// mockRPC scripts getEvents responses in order and records the requests it
-// received.
 type mockRPC struct {
 	mu             sync.Mutex
 	health         rpc.Health
@@ -48,7 +46,6 @@ func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest)
 	return rpc.GetLedgerEntriesResponse{}, nil
 }
 
-// mockStore is an in-memory Store.
 type mockStore struct {
 	mu       sync.Mutex
 	events   map[string]store.Event
@@ -99,9 +96,6 @@ func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) 
 	return e, nil
 }
 
-// EventExists is the cheap existence probe added to the Store interface
-// for the API's 304 path. Unused by ingester tests but needed to
-// satisfy the interface.
 func (m *mockStore) EventExists(_ context.Context, id string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -113,24 +107,20 @@ func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Eve
 	return nil, "", nil
 }
 
-// LedgerRangeCensus is unused by ingester tests but needed to satisfy
-// the expanded store.Store interface.
 func (m *mockStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]store.LedgerCensus, error) {
 	return nil, nil
 }
 
-// GetAuditState / SaveAuditState are unused by ingester tests.
-func (m *mockStore) GetAuditState(context.Context) (store.AuditState, error) {
+func (m *mockStore) GetAuditState(context.Context, string) (store.AuditState, error) {
 	return store.AuditState{}, store.ErrNotFound
 }
-func (m *mockStore) SaveAuditState(_ context.Context, s store.AuditState) error {
+func (m *mockStore) SaveAuditState(context.Context, store.AuditState) error {
 	return nil
 }
-func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, ledger int64) (store.AuditState, error) {
+func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, network string, ledger int64) (store.AuditState, error) {
 	return store.AuditState{VerifiedThroughLedger: ledger}, nil
 }
 
-// Record/Update/ListOpenFindings are unused by ingester tests.
 func (m *mockStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) (store.AuditFinding, error) {
 	f.ID = 1
 	return f, nil
@@ -142,7 +132,7 @@ func (m *mockStore) ListOpenFindingsByRange(context.Context, int64, int64) (stor
 	return store.AuditFinding{}, store.ErrNotFound
 }
 
-func (m *mockStore) GetIngestionState(context.Context) (store.IngestionState, error) {
+func (m *mockStore) GetIngestionState(_ context.Context, network string) (store.IngestionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.state == nil {
@@ -175,12 +165,11 @@ func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 }
 func (m *mockStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
 
-// Subscription stubs for the webhook feature.
 func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
 	sub.ID = 1
 	return sub, nil
 }
-func (m *mockStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
+func (m *mockStore) GetSubscription(context.Context, int64) (store.Subscription, error) {
 	return store.Subscription{}, store.ErrNotFound
 }
 func (m *mockStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
@@ -205,7 +194,6 @@ func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.D
 	return nil, nil
 }
 
-// passthroughDecoder avoids XDR fixtures in ingester tests.
 type passthroughDecoder struct{}
 
 func (passthroughDecoder) DecodeScVal(string) (json.RawMessage, error) {

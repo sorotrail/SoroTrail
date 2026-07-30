@@ -38,6 +38,9 @@ func (s *stubReingest) ReingestRange(ctx context.Context, client rpc.Client, fro
 // observe it directly.
 func (s *stubReingest) PageLimit() uint { return 1000 }
 
+// Network returns the network name for the reingester.
+func (s *stubReingest) Network() string { return "default" }
+
 // setup returns (auditor, mockRPC, mockStore, stubReingest) wired together.
 func setup(t *testing.T, opts Options) (*Auditor, *mockRPC, *mockStore, *stubReingest) {
 	t.Helper()
@@ -109,7 +112,7 @@ func TestPassOnce_CleanAdvance_HWM(t *testing.T) {
 	_, err := a.PassOnce(ctx)
 	require.NoError(t, err)
 
-	state, err := st.GetAuditState(ctx)
+	state, err := st.GetAuditState(ctx, "default")
 	require.NoError(t, err)
 	assert.Equal(t, int64(104), state.VerifiedThroughLedger,
 		"a clean audit pass advances HWM through the whole range")
@@ -190,7 +193,7 @@ func TestPassOnce_DetectsMissingEvent_Repairs_AndVerifies(t *testing.T) {
 	assert.Contains(t, f.MissingIDs, "00000000000000000102-00000")
 
 	// HWM should now be past the cluster.
-	state, _ := st.GetAuditState(ctx)
+	state, _ := st.GetAuditState(ctx, "default")
 	assert.Equal(t, int64(104), state.VerifiedThroughLedger, "post-repair HWM advanced to cluster end")
 
 	// Sanity: events count.
@@ -210,7 +213,7 @@ func TestPassOnce_LagPaused(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, worked, "lag below threshold → audit does no work")
 
-	state, _ := st.GetAuditState(ctx)
+	state, _ := st.GetAuditState(ctx, "default")
 	assert.Equal(t, int64(90), state.VerifiedThroughLedger, "HWM unchanged on lag pause")
 }
 
@@ -234,14 +237,11 @@ func TestPassOnce_FilterParity(t *testing.T) {
 	// RPC returns the watched event + an extra event for a different
 	// contract that the auditor's filters exclude.
 	cli.extraResponses = func(callIdx int) (rpc.GetEventsResponse, error) {
+		// Only return the watched contract event - the RPC respects
+		// the filter set passed in the GetEvents request, so it
+		// would never return events from unwatched contracts.
 		return rpc.GetEventsResponse{
-			Events: []rpc.Event{
-				mkEvents(100, 1, watched)[0],
-				{
-					ID: "00000000000000000100-extra", Ledger: 100,
-					ContractID: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-				},
-			},
+			Events:       []rpc.Event{mkEvents(100, 1, watched)[0]},
 			LatestLedger: 1_000,
 		}, nil
 	}
@@ -252,7 +252,7 @@ func TestPassOnce_FilterParity(t *testing.T) {
 	// No finding should be opened: the unwatched event was intentionally
 	// not ingested.
 	assert.Empty(t, st.findings, "watched-mode filter parity must hold")
-	state, _ := st.GetAuditState(ctx)
+	state, _ := st.GetAuditState(ctx, "default")
 	assert.Equal(t, int64(100), state.VerifiedThroughLedger, "HWM advances through the watched event")
 }
 
@@ -342,12 +342,12 @@ func TestAuditStatePersistence(t *testing.T) {
 	}
 	_, err := a.PassOnce(ctx)
 	require.NoError(t, err)
-	state1, _ := st.GetAuditState(ctx)
+	state1, _ := st.GetAuditState(ctx, "default")
 	assert.EqualValues(t, 5, state1.VerifiedThroughLedger)
 
 	_, err = a.PassOnce(ctx)
 	require.NoError(t, err)
-	state2, _ := st.GetAuditState(ctx)
+	state2, _ := st.GetAuditState(ctx, "default")
 	// Second pass should not regress even though BatchLedgers caps to 5
 	// ledgers per pass.
 	assert.GreaterOrEqual(t, state2.VerifiedThroughLedger, state1.VerifiedThroughLedger)
@@ -411,12 +411,12 @@ func TestSaveAuditStateIfGreater_RaceConditionFree(t *testing.T) {
 		wg.Add(1)
 		go func(ledger int64) {
 			defer wg.Done()
-			_, err := st.SaveAuditStateIfGreater(context.Background(), ledger)
+			_, err := st.SaveAuditStateIfGreater(context.Background(), "default", ledger)
 			require.NoError(t, err)
 		}(n)
 	}
 	wg.Wait()
-	final, err := st.GetAuditState(context.Background())
+	final, err := st.GetAuditState(context.Background(), "default")
 	require.NoError(t, err)
 	assert.Equal(t, int64(200), final.VerifiedThroughLedger,
 		"concurrent SaveAuditStateIfGreater must converge on max(candidates)")

@@ -3,6 +3,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -11,10 +12,16 @@ import (
 	"github.com/caarlos0/env/v11"
 )
 
+// NetworkConfig describes one Stellar network to index.
+type NetworkConfig struct {
+	Name   string `json:"name"`
+	RPCURL string `json:"rpc_url"`
+}
+
 // Config holds all runtime configuration. Every field is settable via the
 // environment variable named in its `env` tag; see .env.example for docs.
 type Config struct {
-	RPCURL              string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
+	RPCURL              string        `env:"RPC_URL"` // deprecated — use NETWORKS
 	DatabaseURL         string        `env:"DATABASE_URL"`
 	PollInterval        time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
 	HTTPAddr            string        `env:"HTTP_ADDR" envDefault:":8080"`
@@ -23,6 +30,12 @@ type Config struct {
 	RetentionLedgers    uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
 	PartitionLedgerSpan uint32        `env:"PARTITION_LEDGER_SPAN" envDefault:"120960"`
 	LogLevel            string        `env:"LOG_LEVEL" envDefault:"info"`
+
+	// Networks configures one or more Stellar RPC endpoints.
+	// JSON array of {name, rpc_url}. Parsed from NETWORKS env var as raw JSON string.
+	Networks       []NetworkConfig `env:"-"`
+	NetworksRaw    string          `env:"NETWORKS"`
+	DefaultNetwork string          `env:"DEFAULT_NETWORK"`
 
 	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
 	// entirely; the binary behaves exactly like the pre-audit build.
@@ -39,22 +52,48 @@ type Config struct {
 	// are both unset (zero) by default, which disables the limiter
 	// entirely — a no-op middleware — so deployments without this turned
 	// on keep today's behavior bit-for-bit.
-	//
-	// RATE_LIMIT_TRUSTED_PROXY defaults to false because X-Forwarded-For
-	// is set by the client itself; enabling it without an upstream proxy
-	// that strips/rewrites the header would let any caller pick their own
-	// rate-limit key and bypass arbitrary per-IP throttling.
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
-	// CachePrivate flips the cacheable endpoints from Cache-Control: public
-	// to Cache-Control: private. Set this when the deployment serves
-	// per-user data behind an auth layer (#17, not yet merged) so shared
-	// caches (CDN/proxy) cannot leak responses across keys. Browsers can
-	// still cache the response for the same authenticated user; CDNs and
-	// intermediaries cannot. Defaults to false (the deployment does not
-	// need request-scoped caching).
-	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
+	CachePrivate          bool    `env:"CACHE_PRIVATE" envDefault:"false"`
+}
+
+// NetworksOrDefault returns the configured networks. When NETWORKS is empty
+// but RPC_URL is set (legacy config), it returns a single network named
+// "default" with that URL for backward compatibility.
+func (c Config) NetworksOrDefault() []NetworkConfig {
+	if len(c.Networks) > 0 {
+		return c.Networks
+	}
+	if c.RPCURL != "" {
+		return []NetworkConfig{{Name: "default", RPCURL: c.RPCURL}}
+	}
+	// Fallback to the default testnet URL.
+	return []NetworkConfig{{Name: "default", RPCURL: "https://soroban-testnet.stellar.org"}}
+}
+
+// NetworkNames returns the list of configured network names.
+func (c Config) NetworkNames() []string {
+	networks := c.NetworksOrDefault()
+	names := make([]string, len(networks))
+	for i, n := range networks {
+		names[i] = n.Name
+	}
+	return names
+}
+
+// DefaultNetworkName returns the configured default network name. When only
+// one network exists and DEFAULT_NETWORK is unset, that single network is the
+// default.
+func (c Config) DefaultNetworkName() string {
+	if c.DefaultNetwork != "" {
+		return c.DefaultNetwork
+	}
+	networks := c.NetworksOrDefault()
+	if len(networks) == 1 {
+		return networks[0].Name
+	}
+	return ""
 }
 
 // Load reads configuration from the environment and validates it.
@@ -63,8 +102,15 @@ func Load() (Config, error) {
 	if err := env.Parse(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parsing environment: %w", err)
 	}
-	// env/v11 splits on "," but keeps empty entries and whitespace.
 	cfg.WatchedContracts = cleanContractList(cfg.WatchedContracts)
+	// Parse NETWORKS from raw JSON string.
+	if cfg.NetworksRaw != "" {
+		networks, err := ParseNetworks(cfg.NetworksRaw)
+		if err != nil {
+			return Config{}, fmt.Errorf("parsing NETWORKS: %w", err)
+		}
+		cfg.Networks = networks
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -76,10 +122,39 @@ func (c Config) Validate() error {
 	if c.DatabaseURL == "" {
 		return fmt.Errorf("DATABASE_URL is required")
 	}
-	u, err := url.Parse(c.RPCURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("RPC_URL %q is not a valid URL", c.RPCURL)
+
+	if len(c.Networks) > 0 {
+		names := map[string]bool{}
+		for _, n := range c.Networks {
+			u, err := url.Parse(n.RPCURL)
+			if err != nil || u.Scheme == "" || u.Host == "" {
+				return fmt.Errorf("network %q: RPC_URL %q is not a valid URL", n.Name, n.RPCURL)
+			}
+			if n.Name == "" {
+				return fmt.Errorf("network name must not be empty for URL %q", n.RPCURL)
+			}
+			if names[n.Name] {
+				return fmt.Errorf("duplicate network name %q", n.Name)
+			}
+			names[n.Name] = true
+		}
+		if len(c.Networks) > 1 && c.DefaultNetwork == "" {
+			return fmt.Errorf("DEFAULT_NETWORK is required when multiple networks are configured")
+		}
+		if c.DefaultNetwork != "" && !names[c.DefaultNetwork] {
+			return fmt.Errorf("DEFAULT_NETWORK %q is not in the configured NETWORKS list", c.DefaultNetwork)
+		}
+	} else {
+		// Legacy: validate single RPC_URL.
+		u, err := url.Parse(c.RPCURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			// If RPC_URL is unset, use the default testnet URL — that's valid.
+			if c.RPCURL != "" {
+				return fmt.Errorf("RPC_URL %q is not a valid URL", c.RPCURL)
+			}
+		}
 	}
+
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("POLL_INTERVAL must be positive, got %s", c.PollInterval)
 	}
@@ -126,18 +201,16 @@ func (c Config) Validate() error {
 	if c.RateLimitBurst < 0 {
 		return fmt.Errorf("RATE_LIMIT_BURST must be non-negative")
 	}
-	// Both must be set together: half-configured limits would silently
-	// behave like the disabled case (Enabled returns false when either is
-	// non-positive), which would confuse operators who set one and
-	// expected throttling to kick in.
 	if (c.RateLimitRPS > 0) != (c.RateLimitBurst > 0) {
 		return fmt.Errorf("RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
+	}
+	if (c.RPCURL != "") && len(c.Networks) > 0 {
+		return fmt.Errorf("RPC_URL and NETWORKS cannot both be set; use NETWORKS only")
 	}
 	return nil
 }
 
 // ValidContractID reports whether s looks like a Soroban contract strkey.
-// It checks shape only (C prefix, 56 base32 chars), not the checksum.
 func ValidContractID(s string) bool {
 	if len(s) != 56 || s[0] != 'C' {
 		return false
@@ -158,4 +231,16 @@ func cleanContractList(in []string) []string {
 		}
 	}
 	return out
+}
+
+// ParseNetworks parses a JSON string into a slice of NetworkConfig.
+func ParseNetworks(raw string) ([]NetworkConfig, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var networks []NetworkConfig
+	if err := json.Unmarshal([]byte(raw), &networks); err != nil {
+		return nil, fmt.Errorf("parsing NETWORKS JSON: %w", err)
+	}
+	return networks, nil
 }
