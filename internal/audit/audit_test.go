@@ -9,8 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 ) // stubReingest is a stand-in for ingester.Ingester. It records filter-batches
 // and reingest-range calls so tests can verify the auditor's path.
 type stubReingest struct {
@@ -420,4 +420,9 @@ func TestSaveAuditStateIfGreater_RaceConditionFree(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(200), final.VerifiedThroughLedger,
 		"concurrent SaveAuditStateIfGreater must converge on max(candidates)")
+}
+
+// DeleteEventsBefore satisfies store.Store; this mock never prunes.
+func (m *mockStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
 }
