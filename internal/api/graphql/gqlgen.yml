@@ -1,0 +1,23 @@
+# gqlgen configuration for SoroTrail GraphQL package.
+#
+# models: gqlgen's default scalar bindings (Int → int32, ID → string,
+# String → string, DateTime → time.Time, JSON → any, Cursor → string)
+# match the field types we use in the schema. We deliberately do NOT
+# override them — gqlgen v0.17.x treats the list-form `model:` value
+# as a union/interface hint, not a scalar override, and using that
+# form on a scalar silently skips the mapping. Keep this section slim
+# to avoid that footgun.
+schema:
+  - schema.graphqls
+
+exec:
+  filename: generated.go
+  package: graphql
+
+model:
+  filename: models_gen.go
+  package: graphql
+
+resolver:
+  filename: resolver.go
+  package: graphql

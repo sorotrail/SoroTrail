@@ -27,7 +27,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/stellar/go/xdr"
+	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/store"

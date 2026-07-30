@@ -131,6 +131,12 @@ CREATE TABLE events_default PARTITION OF events DEFAULT;
 -- runtime callers produce a complete ledger coverage if they want
 -- queries to skip events_default entirely.
 
+-- Ensure raw-XDR columns exist on the legacy table; they were absent in
+-- very early schemas.
+ALTER TABLE events_legacy
+    ADD COLUMN IF NOT EXISTS raw_topic_xdr text[],
+    ADD COLUMN IF NOT EXISTS raw_value_xdr text;
+
 INSERT INTO events (
     id, contract_id, ledger, type, tx_hash, tx_index, op_index,
     in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr

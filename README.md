@@ -1,21 +1,21 @@
-# SoroTrail
-
+SoroTrail
 A contract event indexer for the Stellar/Soroban network.
 
-Stellar RPC's `getEvents` method only retains contract events for roughly 24
+Stellar RPC's getEvents method only retains contract events for roughly 24
 hours to 7 days. Anyone who needs historical Soroban event data — dapp
 dashboards, analytics, audits, notification services — must ingest and store
 events themselves before the RPC drops them.
 
 SoroTrail does exactly that: it polls a Stellar RPC endpoint, stores contract
-events durably in Postgres, and serves them back through a queryable HTTP API
-long after the RPC has forgotten them.
+events durably in Postgres or SQLite, and serves them back through a queryable
+HTTP API long after the RPC has forgotten them.
 
 ```
- Stellar RPC ──getEvents──▶ ingester ──▶ Postgres ◀── HTTP API ◀── you
+ Stellar RPC ──getEvents──▶ ingester ──▶ Postgres/SQLite ◀── HTTP API ◀── you
 ```
 
 ## Quickstart
+text
 
 ### Published image (fastest)
 
@@ -37,18 +37,13 @@ the full list of environment variables.
 
 Brings up Postgres and the indexer together — no external database required:
 
-```sh
 docker compose up --build
-```
-
 This starts Postgres and the indexer against the public Stellar testnet RPC.
 The API is on http://localhost:8080; watch the logs to see events flow in.
 
 To watch specific contracts instead of everything:
 
-```sh
-WATCHED_CONTRACTS=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC docker compose up --build
-```
+Shell
 
 **Container health.** The published image ships with a `HEALTHCHECK` that
 probes `/health` via the in-binary `sorotrail healthcheck` subcommand
@@ -64,11 +59,16 @@ wins a race against a half-up database.
 
 ### Bare metal
 
-```sh
 docker compose up -d postgres     # or bring your own Postgres
 cp .env.example .env              # adjust as needed
 set -a; source .env; set +a
 make run
+```
+
+No Postgres? Use SQLite instead for a zero-dependency run:
+
+```sh
+DATABASE_URL=sqlite:./sorotrail.db make run
 ```
 
 Migrations run automatically on startup.
@@ -114,6 +114,11 @@ All configuration comes from environment variables (see `.env.example`):
 | `REORG_CONFIRMATION_WINDOW` | `64` | Number of ledgers behind the ingest frontier re-scanned on a schedule for RPC-side reorgs. Once a ledger is further behind the frontier than this, it is considered finalized and never rewritten. Zero disables reorg detection. |
 | `REORG_RESCAN_INTERVAL` | `1m` | Cadence of the periodic reorg re-scan over the recent finalized window. The re-scan shares the live RPC budget and runs after a successful ingest cycle. |
 | `EXPORT_MAX_RANGE` | `17280` | Maximum ledger span a single `/contracts/{id}/export` call may request (~24h at 5s/ledger). Returns `400` with the bound if exceeded. Raise for dedicated analytical deployments; lower for tighter abuse thresholds. |
+| `MULTI_TENANT` | `false` | Serve several consumers from one deployment, each scoped to its own contracts. Off means no authentication and no tenant boundary — identical to the pre-multi-tenancy build. See [Multi-tenancy](docs/multi-tenancy.md). |
+| `MULTI_TENANT_MAX_WATCHED` | `250` | Cap on the union of all tenants' watch lists, bounding the ingester's RPC cost. `0` disables the cap. |
+| `MULTI_TENANT_USAGE_FLUSH` | `10s` | How often accumulated per-tenant usage counters are persisted. |
+| `MULTI_TENANT_STREAM_SCOPE_SYNC` | `30s` | How often an open stream re-resolves its tenant's grants, bounding how long a revoked grant keeps being served. |
+| `MULTI_TENANT_BOOTSTRAP_KEY` | unset | Installs an admin API key for the seeded `default` tenant at startup, so a fresh multi-tenant install can mint its first keys. Rejected unless `MULTI_TENANT=true`. |
 
 ## Ingestion behavior
 
@@ -129,6 +134,14 @@ All configuration comes from environment variables (see `.env.example`):
   project exists to prevent).
 - Requests are rate-limited (~10/s, matching public endpoint limits) and
   errors are retried with jittered exponential backoff.
+- **Ingest-lag alarm**: every poll cycle compares the chain head (fetched via
+  `getLatestLedger`) to the last ingested ledger. When the gap exceeds
+  `LAG_WARN_LEDGERS` (default `100`), a single WARN-level structured log is
+  emitted; a single INFO log fires when the gap closes. Hysteresis keeps the
+  alarm quiet between crossings, so a stuck indexer logs once on crossing
+  and once on recovery rather than spamming. No log is emitted on cold
+  start (no baseline yet) or when the alarm is disabled
+  (`LAG_WARN_LEDGERS=0`).
 - Topics/values are stored as JSON. When the RPC supports `xdrFormat: "json"`
   its decoding is used verbatim; otherwise the base64 XDR is decoded locally
   into shapes like `{"symbol":"transfer"}`, `{"u64":42}`, `{"i128":"-1000"}`,
@@ -176,22 +189,90 @@ only Soroban V3/V4 transactions carry events, and the public Stellar
 testnet Horizon retains everything from protocol 17 onward while
 mainnet varies.
 
+### `sorotrail rollup-rebuild`
+
+Reconstructs the rollup tables from stored events. Useful after backfills
+or replays, or when a decoder improvement changes which events are classified
+as transfers.
+
+```sh
+sorotrail rollup-rebuild --from-ledger N [--to-ledger M]
+```
+
+Only one rebuild may run at a time (advisory lock). Safe to run against a
+live database; targets historical ledger ranges — running it at the live
+ingestion frontier may transiently overcount events ingested during the
+rebuild.
+
 ## Decoder replay
 
 Decoders improve over time. `sorotrail replay` re-runs the current decoder
+Migrations run automatically on startup.
+
+Configuration
+All configuration comes from environment variables (see 
+.env.example
+):
+
+Variable	Default	Description
+RPC_URL	https://soroban-testnet.stellar.org	Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet.
+DATABASE_URL	— (required)	Postgres connection string.
+POLL_INTERVAL	5s	Sleep between polls once caught up.
+HTTP_ADDR	:8080	API listen address.
+WATCHED_CONTRACTS	empty	Comma-separated contract IDs (C...). Empty = ingest all contract events.
+START_LEDGER	unset	Force cold-start ingestion from this ledger.
+RETENTION_LEDGERS	17280	Cold-start reach-back in ledgers (~24h at 5s/ledger).
+LOG_LEVEL	info	debug | info | warn | error.
+AUDIT_ENABLED	false	Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build.
+AUDIT_POLL_INTERVAL	30s	Sleep between audit passes.
+AUDIT_BATCH_LEDGERS	100	Ledger range covered by one audit pass.
+AUDIT_LAG_THRESHOLD	200	Auditor sleeps until ingest is at least this many ledgers past the verified mark.
+AUDIT_BUDGET_SHARE	0.10	Fraction of the request budget the audit pool gets (rest goes to ingest).
+AUDIT_MAX_RPS	10	Total request budget (split between ingest and audit).
+AUDIT_MAX_REPAIR_ATTEMPTS	3	Repair iterations before a finding is kept open as unrecoverable.
+AUDIT_FINDING_MAX_LEDGERS	100	Largest range a single finding is allowed to span.
+RATE_LIMIT_RPS	unset	Per-client HTTP request rate limit (requests/second). Both RATE_LIMIT_RPS and RATE_LIMIT_BURST must be set together; otherwise no rate limiting is applied.
+RATE_LIMIT_BURST	unset	Maximum instantaneous burst size for the rate limiter. Pairs with RATE_LIMIT_RPS.
+RATE_LIMIT_TRUSTED_PROXY	false	Honor X-Forwarded-For for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control X-Forwarded-For themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key.
+CACHE_PRIVATE	false	Flip cacheable responses from Cache-Control: public to private. Set this when the deployment serves per-user data behind an auth layer (see Caching).
+Ingestion behavior
+Cold start (empty database): begins at latest ledger − RETENTION_LEDGERS
+(clamped to what the RPC still retains) so it captures as much recent history
+as possible, then follows the chain head. START_LEDGER overrides this.
+Warm start: resumes from the persisted cursor / last ingested ledger.
+Events are upserted idempotently by ID, so re-scans and restarts never
+duplicate rows.
+If the indexer is down long enough that its resume point falls out of the
+RPC's retention window, it logs a warning and skips ahead to the oldest
+retained ledger (the gap is unrecoverable from RPC — that's the problem this
+project exists to prevent).
+Requests are rate-limited (~10/s, matching public endpoint limits) and
+errors are retried with jittered exponential backoff.
+Topics/values are stored as JSON. When the RPC supports xdrFormat: "json"
+its decoding is used verbatim; otherwise the base64 XDR is decoded locally
+into shapes like {"symbol":"transfer"}, {"u64":42}, {"i128":"-1000"},
+{"address":"C..."}.
+The raw base64 XDR is stored alongside the decoded JSON, so an improved
+decoder can be applied to already-indexed events — see
+decoder replay. This intentionally duplicates payload
+data in events.topics_xdr and events.value_xdr; budget extra event-table
+storage for deployments that retain large event histories.
+Decoder replay
+Decoders improve over time. sorotrail replay re-runs the current decoder
 over stored raw XDR and rewrites the decoded columns, so improvements apply
 to everything already indexed instead of only to future events.
 
-```sh
+Shell
+
 sorotrail replay --from-ledger 250000 --dry-run   # see what would change
 sorotrail replay --from-ledger 250000             # rewrite it
-```
-
 It is batched, resumable (Ctrl-C and re-run picks up where it stopped),
 idempotent, and safe to run against a live database while ingestion
 continues; a Postgres advisory lock prevents two replays at once.
 
-See [docs/replay.md](docs/replay.md) for flags, the summary output, the
+See 
+docs/replay.md
+ for flags, the summary output, the
 advisory-lock strategy, and the derivation order for dependent tables.
 
 ## Compression
@@ -230,7 +311,9 @@ match, since `If-None-Match` comparison ignores the `W/` prefix.
 
 ## API reference
 
-All responses are JSON. Errors look like `{"error": "message"}`.
+GET /health
+Reports the API's view of its dependencies. 200 when both the database and
+the RPC are reachable and healthy, 503 otherwise.
 
 ### Pagination
 
@@ -262,19 +345,11 @@ curl -s 'localhost:8080/events?cursor=0001099511627776-0000000009&limit=10'
 
 ### `GET /health`
 
-Reports the API's view of its dependencies. `200` when both the database and
-the RPC are reachable and healthy, `503` otherwise.
-
-```sh
 curl -s localhost:8080/health
-```
+JSON
 
-```json
 {"status":"ok","checks":{"database":"ok","rpc":"ok"}}
-```
-
-### `GET /events`
-
+GET /events
 Lists stored events in ascending (oldest-first) or descending (newest-first) order. Defaults to ascending.
 
 Query parameters (all optional, combinable):
@@ -289,6 +364,8 @@ Query parameters (all optional, combinable):
 | `topic1` | `{"address":"G..."}` | Exact match against topic position 1. |
 | `topic2` | `{"address":"G..."}` | Exact match against topic position 2. |
 | `topic3` | `{"u64":7}` | Exact match against topic position 3. |
+| `tx_hash` | `9f5c...` | Only events from this transaction hash. |
+| `in_successful_call` | `true` | `true` \| `false`; filters by whether the enclosing call succeeded. Omitted — no constraint. |
 | `from_ledger` | `250000` | Inclusive lower ledger bound. |
 | `to_ledger` | `260000` | Inclusive upper ledger bound. |
 | `from_time` | `2026-07-21T00:00:00Z` | Inclusive lower `created_at` bound (RFC 3339). Sub-second precision and missing timezone are rejected. |
@@ -366,45 +443,89 @@ curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"G
   ],
   "cursor": "0001099511627776-0000000001"
 }
-```
-
-`cursor` is present when more results exist; pass it back as `?cursor=` for
+cursor is present when more results exist; pass it back as ?cursor= for
 the next page.
 
-When `include_xdr=true`, events also include the original base64 XDR payload:
+When include_xdr=true, events also include the original base64 XDR payload:
 
-```json
+JSON
+
 {
   "topics_xdr": ["AAAADwAAAAh0cmFuc2Zlcg=="],
   "value_xdr": "AAAACgAAAAAAAAAB"
 }
 ```
 
+Events whose topics and value match a SEP-41 token standard shape
+(`transfer`, `mint`, `burn`, `clawback`, `approve` per SEP-41 / CAP-46-6)
+are also tagged with a `sep41_event` object carrying the normalized
+fields — addresses stay as the original `G…`/`C…` strings, amounts stay
+as decimal strings (no float precision loss), muxed transfers expose
+`to_muxed_id` from the data map, and CAP-0067 trailing SEP-0011 asset
+strings surface as `asset`. Non-matching events get no extra field; the
+augmentation is additive, never destructive.
+
+```json
+{
+  "sep41_event": {
+    "standard": "sep41",
+    "event": "transfer",
+    "from": "GA…",
+    "to": "GB…",
+    "amount": "10000000",
+    "asset": "native"
+  }
+}
+```
+
+A `mint` / `burn` / `clawback` event omits the irrelevant side
+(`transfer` has `from` and `to`; `mint` has only `to`; `burn` and
+`clawback` have only `from`; `approve` has `from`, `spender`,
+`expiration_ledger`).
+
 Time filtering narrows results and does not change ordering (events remain in
-ascending event-ID order, which agrees with `created_at` order because both
+ascending event-ID order, which agrees with created_at order because both
 follow ledger sequence).
 
-```sh
+Shell
+
 curl -s 'localhost:8080/events?from_time=2026-07-21T14:00:00Z&to_time=2026-07-21T15:00:00Z'
-```
-
-### `GET /events/{id}`
-
+GET /events/{id}
 Fetch a single event by its ID (the TOID-based identifier from the RPC).
-`404` if unknown.
+404 if unknown.
 
-```sh
+Shell
+
 curl -s localhost:8080/events/0001099511627776-0000000001
-```
-
-### `GET /contracts/{id}/events`
-
-Convenience wrapper for `GET /events?contract_id={id}`; accepts the same
+GET /contracts/{id}/events
+Convenience wrapper for GET /events?contract_id={id}; accepts the same
 remaining query parameters.
 
-```sh
+Shell
+
 curl -s localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/events?limit=10
-```
+Webhooks
+Consumers can register callback URLs that receive matching events as they are
+ingested. Delivery is asynchronous — it never blocks ingestion — and includes
+HMAC-SHA256 signatures so subscribers can verify payload authenticity.
+
+POST /subscriptions
+Register a new webhook subscription.
+
+Shell
+
+curl -s -X POST localhost:8080/subscriptions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com/webhook",
+    "secret": "whsec_z8eP5qL3vR2xK9yB4w",
+    "filters": {
+      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "type": "contract",
+      "topic": {"symbol":"transfer"}
+    }
+  }'
+Response (201 Created):
 
 ### `GET /contracts/{id}/export`
 
@@ -466,6 +587,189 @@ A SIGINT or SIGTERM cancels the root context, which propagates into:
 This guarantees no panics and no truncated writes on `Ctrl-C` / `kill`,
 and the cursor is always persisted so the next process picks up exactly
 where the previous one stopped.
+
+### GraphQL API
+
+Read-only GraphQL endpoint at `POST /graphql`, schema-first with
+Shared query-builder helpers in `internal/api/queries` so REST and
+GraphQL validate filters identically. Same `EventFilter` shape,
+same `Cursor` semantics, no drift between transports.
+
+#### Endpoints
+
+- **`POST /graphql`** — accepts a JSON body
+  `{"query": "...", "variables": {...}, "operationName": "..."}`. Returns
+  the standard GraphQL envelope `{"data": ..., "errors": ...}`.
+- **`GET /graphql?query=...`** — same handler; useful for browser
+  playground GET hits.
+- **`GET /graphiql`** — dev-mode GraphiQL playground. Disabled by
+  default; set `GRAPHQL_PLAYGROUND=true` to serve it.
+
+#### Limits
+
+To prevent abuse, every operation runs through two pre-flight checks
+before any resolver runs:
+
+- **Depth**: 10 (hard cap). Anything deeper is rejected with an
+  `errors[].message` describing the violation.
+- **Complexity**: 1000 (hard cap). Connection-style fields cost 25,
+  leaf fields 1, plus a 5-unit operation overhead. Wide fanout sits
+  comfortably within the cap; a pathological 100k-field request is
+  rejected before SQL touches the events table.
+
+Both limits are configurable in `internal/api/graphql/limits.go`.
+Bumping them requires rebaselining against real client queries.
+
+#### Schema highlights
+
+Queries (read-only, no mutations):
+
+- `events(filter: EventFilterInput, page: PageInput): EventConnection!`
+- `tokenEvents(filter: EventFilterInput, page: PageInput): TokenEventConnection!`
+- `contracts(page: PageInput): ContractConnection!`
+- `event(id: ID!): Event` — single event lookup, null when missing.
+- `contract(id: ID!): Contract` — single watched-contract lookup.
+
+Filter input fields mirror the REST `GET /events` query parameters:
+
+- `contractId`, `types[]`, `topic`, `topics.t0..t3`, `topicContains`,
+  `txHash`, `fromLedger`/`toLedger`, `fromTime`/`toTime`.
+
+Pagination input is Relay-style: `first`/`after` for forward,
+`last`/`before` for backward (currently unsupported and rejected
+with an error message — see `queries.ResolvePage`). Sort: `order`
++ `orderBy` (defaults ASC/id).
+
+#### Example 1 — list events with filter + cursor pagination
+
+```graphql
+query EventsForContract($id: ID!, $first: Int!) {
+  events(
+    filter: { contractId: $id, type: CONTRACT }
+    page: { first: $first, orderBy: LEDGER, order: ASC }
+  ) {
+    edges {
+      cursor
+      node { id contractId ledger type topics value createdAt }
+    }
+    nodes { id ledger createdAt }
+    pageInfo { hasNextPage endCursor }
+    totalCount
+  }
+}
+```
+
+Variables:
+
+```json
+{
+  "id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+  "first": 10
+}
+```
+
+Response (200 OK):
+
+```json
+{
+  "data": {
+    "events": {
+      "edges": [
+        {
+          "cursor": "eyJpZCI6IjAwMDEwOTk1MTE2Mjc3NzYtMDAwMDAwMDAwMSIsIm9yZGVyX2J5IjoiaWQiLCJvcmRlciI6ImFzYyJ9",
+          "node": {
+            "id": "0001099511627776-0000000001",
+            "contractId": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+            "ledger": 256000,
+            "type": "contract",
+            "topics": [{"symbol":"transfer"}, {"address":"G..."}],
+            "value": {"i128":"10000000"},
+            "createdAt": "2026-07-16T12:00:00Z"
+          }
+        }
+      ],
+      "nodes": [
+        {
+          "id": "0001099511627776-0000000001",
+          "ledger": 256000,
+          "createdAt": "2026-07-16T12:00:00Z"
+        }
+      ],
+      "pageInfo": { "hasNextPage": true, "endCursor": "eyJpZCI6..." },
+      "totalCount": 4321
+    }
+  }
+}
+```
+
+Pass `endCursor` back as `page.after` to retrieve the next page.
+Cursors are opaque — base64-JSON `{LastID, OrderBy, Order}` — so
+clients should treat them as strings.
+
+#### Example 2 — list token events with spec decoding
+
+```graphql
+query TokenEvents($id: ID!) {
+  tokenEvents(
+    filter: { contractId: $id, topic: "transfer", topicContains: [{"symbol":"transfer"}] }
+    page: { first: 5, orderBy: LEDGER, order: DESC }
+  ) {
+    edges { cursor node { id ledger } }
+    nodes {
+      id
+      decoded
+      decodedEvent { name fields }
+      topics
+      value
+    }
+    pageInfo { hasNextPage endCursor }
+    totalCount
+  }
+}
+```
+
+Variables:
+
+```json
+{ "id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC" }
+```
+
+Response (200 OK; `decodedEvent.fields` is only populated when
+`decoded == true`):
+
+```json
+{
+  "data": {
+    "tokenEvents": {
+      "edges": [{"cursor": "...", "node": {"id": "...", "ledger": 256100}}],
+      "nodes": [
+        {
+          "id": "0001099511627776-0000000042",
+          "decoded": true,
+          "decodedEvent": {
+            "name": "transfer",
+            "fields": {"from": "G...", "to": "G...", "amount": "10000000"}
+          },
+          "topics": [{"symbol":"transfer"}, {"address":"G..."}, {"address":"G..."}],
+          "value": {"i128":"10000000"}
+        }
+      ],
+      "pageInfo": { "hasNextPage": false, "endCursor": null },
+      "totalCount": 1
+    }
+  }
+}
+```
+
+#### Filter + pagination parity with REST
+
+Both transports share `internal/api/queries`: type whitelists, topic
+positional rules, ledger/time bounds, cursor validation, page-size
+caps are identical. A REST request rejected with `400 invalid cursor`
+returns the same `errors[].message` from GraphQL. Conversely a
+GraphQL topic/topic0 conflict returns the same `errors[].message` as
+the REST `/events?topic=…&topic0=…` handler.
+
 
 ### Webhooks
 
@@ -608,6 +912,15 @@ hex-encoded HMAC-SHA256 digest of the request body, keyed with the
 subscription's secret. Subscribers **must verify** this signature to
 confirm the payload came from SoroTrail and has not been tampered with.
 
+When the event matches the SEP-41 token standard, the payload also
+includes the `sep41_event` envelope described under `GET /events` —
+subscribers can rely on `payload.event.sep41_event` (inside the existing
+`event` field of the posted JSON) to identify the transfer / mint /
+burn / clawback / approve semantics without re-implementing SEP-41
+themselves. The signature is computed over the full body including the
+`sep41_event` field, so subscribers who add or remove the field would
+change the signature and fail verification.
+
 **Verifying signatures — code samples:**
 
 <details>
@@ -717,9 +1030,8 @@ async function verifySignature(req: Request, secret: string): Promise<boolean> {
 
 ### `GET /stats`
 
-```sh
 curl -s localhost:8080/stats
-```
+JSON
 
 ```json
 {"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"oldest_stored_ledger":242001,"chain_head_ledger":260130,"ingest_lag_ledgers":7,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
@@ -734,7 +1046,7 @@ the stored fields populated and the RPC-derived freshness fields
 
 `verified_through_ledger` is the inclusive highest ledger whose stored
 events have been proven to match a fresh RPC fetch by the auditor. When
-`AUDIT_ENABLED=false` it stays at `0`. See the Data integrity section
+AUDIT_ENABLED=false it stays at 0. See the Data integrity section
 below for the contract the field implies.
 
 ### `GET /metrics`
@@ -798,42 +1110,102 @@ A background auditor walks recently-ingested ledger ranges (behind the
 ingest frontier, inside the RPC's retention window) and re-fetches each
 range with the same filter configuration the ingester uses, comparing
 the stored event counts and IDs against the fresh response. Mismatches
-are logged, recorded in the `audit_findings` table, and auto-repaired
-by re-ingesting the affected range with `ReplaceEventsInRange` (which
+are logged, recorded in the audit_findings table, and auto-repaired
+by re-ingesting the affected range with ReplaceEventsInRange (which
 deletes orphans and updates same-ID rows so topic/value drift on the
 RPC side is corrected).
 
-Each pass advances an audit-only `verified_through_ledger` high-water
+Each pass advances an audit-only verified_through_ledger high-water
 mark past the clean prefix of the audited range; that field, exposed via
-`GET /stats`, is the strongest trust signal SoroTrail can offer: it
-names the highest ledger whose stored events have been *verified* against
-the RPC, not merely *ingested*.
+GET /stats, is the strongest trust signal SoroTrail can offer: it
+names the highest ledger whose stored events have been verified against
+the RPC, not merely ingested.
 
 Audit behaviour:
 
-- **Filter parity**: the auditor uses the ingester's exact filter batch
-  (see `Ingester.BuildFilterBatches`), so events the RPC has for
-  contracts you're not watching are intentionally not checked and never
-  produce false findings.
-- **Idempotency**: re-running the auditor over a clean range is a no-op;
-  crashes mid-repair leave the finding open so the next pass can retry.
-- **Budget**: the auditor shares the request-rate budget with the
-  ingester via `rpc.Budget`; `AUDIT_BUDGET_SHARE` (default 10%) caps
-  the audit pool while the ingest pool gets the remainder.
-- **Lag pause**: if ingest hasn't moved at least `AUDIT_LAG_THRESHOLD`
-  ledgers past `verified_through_ledger`, the auditor sleeps until it
-  does — it never races ingestion.
-- **Retention edges**: when a finding's range ages out of the RPC's
-  retention window during repair, the auditor moves the finding to
-  `status='unverifiable'` instead of crashing or false-alarming.
-- **Self-disagreement**: if the RPC keeps returning different events
-  for the same range across repair iterations, the auditor stops after
-  `AUDIT_MAX_REPAIR_ATTEMPTS` attempts and keeps the finding visible
-  with `status='unrecoverable'` — operators see it via `/stats`.
-
-Set `AUDIT_ENABLED=false` (the default) to disable the auditor entirely;
+Filter parity: the auditor uses the ingester's exact filter batch
+(see Ingester.BuildFilterBatches), so events the RPC has for
+contracts you're not watching are intentionally not checked and never
+produce false findings.
+Idempotency: re-running the auditor over a clean range is a no-op;
+crashes mid-repair leave the finding open so the next pass can retry.
+Budget: the auditor shares the request-rate budget with the
+ingester via rpc.Budget; AUDIT_BUDGET_SHARE (default 10%) caps
+the audit pool while the ingest pool gets the remainder.
+Lag pause: if ingest hasn't moved at least AUDIT_LAG_THRESHOLD
+ledgers past verified_through_ledger, the auditor sleeps until it
+does — it never races ingestion.
+Retention edges: when a finding's range ages out of the RPC's
+retention window during repair, the auditor moves the finding to
+status='unverifiable' instead of crashing or false-alarming.
+Self-disagreement: if the RPC keeps returning different events
+for the same range across repair iterations, the auditor stops after
+AUDIT_MAX_REPAIR_ATTEMPTS attempts and keeps the finding visible
+with status='unrecoverable' — operators see it via /stats.
+Set AUDIT_ENABLED=false (the default) to disable the auditor entirely;
 the binary's behavior is identical to a pre-audit build.
 
+## Retention / pruning
+
+SoroTrail exists because the RPC drops history, but “keep everything
+forever” is not viable for everyone indexing busy contracts. The optional
+pruner bounds on-disk growth without requiring an external cron job.
+
+Configure **one or both** policies and the pruner runs in its own
+goroutine on the same lifecycle as the ingester:
+
+- `RETENTION_MAX_AGE` — delete events whose `created_at` is older than the
+  duration (e.g. `RETENTION_MAX_AGE=2160h` keeps ~90 days).
+- `RETENTION_MIN_LEDGER` — delete events **strictly below** this ledger.
+  Events at exactly `RETENTION_MIN_LEDGER` are kept. The SQL is
+  `ledger < bound`.
+
+If neither is set the pruner is a no-op goroutine that returns without
+deleting anything — matching the pre-pruner behaviour. Tuning knobs:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `RETENTION_BATCH_SIZE` | `5000` | Rows per `DELETE` statement; smaller = less lock pressure, slower. |
+| `RETENTION_PAUSE` | `100ms` | Sleep between DELETE batches so ingestion stays responsive. |
+| `RETENTION_INTERVAL` | `1h` | Sleep after a sweep that found nothing to delete. |
+
+**Safety guard.** The pruner never deletes an event whose ledger is at or
+above the last ingested ledger. `RETENTION_MIN_LEDGER` is therefore an
+**upper bound** on the cutoff whenever it is lower than the last ingested
+ledger, so a misconfiguration above the chain head (e.g. setting
+`RETENTION_MIN_LEDGER=200` when only ledger 100 has been ingested) is a
+no-op rather than a destructive mistake. Pruning runs in batches of
+`RETENTION_BATCH_SIZE` with a `RETENTION_PAUSE` between batches; rows are
+not selected in any particular order — the safety guarantee is the
+`ledger < last_ingested_ledger` predicate inside `DELETE FROM events`,
+not the scan order, so the ingester is never starved for IO.
+
+**Metrics.** `GET /stats` adds a `pruner` object when retention is
+configured:
+
+```json
+{
+  "total_events": 12345,
+  "last_ingested_ledger": 260123,
+  "..."": "...",
+  "pruner": { "runs_completed": 7, "total_rows_purged": 1804321 }
+}
+```
+
+`runs_completed` is the number of full sweeps; `total_rows_purged` is the
+cumulative rows deleted since the process started.
+
+**Lifecycle.** The pruner is a single background goroutine started from
+`cmd/sorotrail/main.go` alongside the ingester (and, when enabled, the
+auditor). On `SIGINT` / `SIGTERM` every goroutine drains through a shared
+error channel and the pruner exits the same way as the others — a
+context-cancelled return is not an error.
+
+**Dependent tables.** When the SEP-41 `token_events` table lands, it will
+be defined with a foreign key to `events(id)` and `ON DELETE CASCADE`. The
+pruner therefore deletes only from `events` and lets Postgres cascade the
+dependent rows; today's single-table DELETE is correct because no such
+table exists yet, and the contract is “derived tables ride along”.
 ## Caching
 
 Stored events are immutable — a row written by ingest is never rewritten
@@ -862,30 +1234,35 @@ All cacheable responses set `Vary: Accept-Encoding` so a future
 compression middleware (#25) can serve distinct encoded variants
 without reconciling caches that warmed on a non-encoded version.
 
-### Retention/pruning (#8)
-
+Retention/pruning (#8)
 Immutability is conditional on the row existing. When pruning deletes an
 event that was previously cached by a client or CDN, that cache will
-hold a stale copy until its `max-age` expires — clients can hit the
-fresh `404` immediately by sending their `If-None-Match` validator, at
-which point SoroTrail's `EventExists` probe correctly returns the
+hold a stale copy until its max-age expires — clients can hit the
+fresh 404 immediately by sending their If-None-Match validator, at
+which point SoroTrail's EventExists probe correctly returns the
 not-found status. We accept this self-healing delay rather than
 arbitrarily shortening the immutable max-age, because for un-deleted
 rows the long `max-age` is the whole point of the cache.
 
-### Auth'd deployments (#17)
+### Auth'd deployments
 
-When authentication lands, the spec calls out that caching must "never
-leak across keys". Today the API is unauthenticated, but the
-`CACHE_PRIVATE` config flag flips every cacheable response from
-`Cache-Control: public` to `Cache-Control: private` (with the same
-`max-age` and `immutable` preset), so the same build can serve shared
+Caching must never leak across keys. The `CACHE_PRIVATE` flag flips every
+cacheable response from `Cache-Control: public` to `Cache-Control: private`
+(same `max-age` and `immutable` preset), so the same build can serve shared
 caches in one deployment and per-user scenarios in another. Set
-`CACHE_PRIVATE=true` as soon as auth (#17) is in front of the API.
+`CACHE_PRIVATE=true` whenever an auth layer sits in front of the API.
 
-## Development
+Under `MULTI_TENANT=true` this is not left to configuration. Responses are
+forced to `private`, `Vary` gains `Authorization` and `X-API-Key`, and the
+`ETag` incorporates a digest of the caller's scope — so two tenants issuing
+identical requests cannot share a cache entry, and a conditional request
+carrying another tenant's validator cannot be answered `304`. The last of
+those matters most: it is the only one of the three that does not need a CDN
+to misbehave. See [Caching](docs/multi-tenancy.md#caching).
 
-```sh
+Development
+Shell
+
 make build        # compile to bin/sorotrail
 make test         # unit tests (Postgres tests skip without a database)
 make test-db      # full suite incl. Postgres integration tests
@@ -897,8 +1274,7 @@ See [docs/architecture.md](docs/architecture.md) for the full system architectur
 diagram and component descriptions. [CONTRIBUTING.md](CONTRIBUTING.md) covers extension
 points and development conventions.
 
-## Roadmap / future work
-
+Roadmap / future work
 Deliberately out of scope for the MVP, with seams left for contributors:
 
 - Per-standard event decoders (e.g. SEP-41 token transfers) on top of
@@ -909,6 +1285,31 @@ Deliberately out of scope for the MVP, with seams left for contributors:
 - GraphQL / websocket subscriptions.
 - Metrics (Prometheus) and tracing.
 - Alternative storage backends behind `store.Store`.
+
+## API documentation UI
+
+The OpenAPI 3.1 specification lives at [`api/openapi.yaml`](api/openapi.yaml) and
+is browsable through a self-hosted Swagger UI at `/docs` when the server is
+running:
+
+```
+http://localhost:8080/docs/
+```
+
+No external CDN is required — all assets (HTML, CSS, JS) are compiled into the
+binary via Go's `//go:embed` mechanism.
+
+### Route-drift validation
+
+A dedicated test ensures the router and the OpenAPI spec stay in sync:
+
+```sh
+go test ./pkg/docs/ -run TestNoRouteDrift -v
+```
+
+The test reads `api/openapi.yaml`, walks the live chi router tree, and fails
+with `t.Fatalf` if the two diverge in either direction. Run it as part of CI
+to catch endpoint/spec drift before it reaches production.
 
 ## License
 
