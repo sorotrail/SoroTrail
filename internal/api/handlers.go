@@ -34,24 +34,41 @@ import (
 	"github.com/sorotrail/sorotrail/internal/api/queries"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
+
 	"github.com/sorotrail/sorotrail/internal/config"
+
 	"github.com/sorotrail/sorotrail/internal/store"
+
 )
 
+
+
 // decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
+
 // unknown fields so a typo like {"contractID": "..."} doesn't fall
+
 // through with an empty contract_id and a confusing 400 from a later
 // check.
 func decodeJSONBody(r *http.Request, dst any) error {
+
 	if r.Body == nil {
+
 		return errors.New("request body is empty")
+
 	}
+
 	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<10))
+
 	dec.DisallowUnknownFields()
+
 	if err := dec.Decode(dst); err != nil {
+
 		return fmt.Errorf("invalid JSON body: %w", err)
+
 	}
+
 	return nil
+
 }
 
 var cachePrivate atomic.Bool
@@ -144,7 +161,10 @@ type enrichedEventWithXDR struct {
 	Decoded      bool                          `json:"decoded"`
 }
 
+
+
 type enrichedEventsWithXDRResponse struct {
+
 	Events []enrichedEventWithXDR `json:"events"`
 	Cursor string                  `json:"cursor,omitempty"`
 }
@@ -161,16 +181,24 @@ type eventsWithXDRResponse struct {
 // when ?include_xdr=true. ValueXDR is a pointer so an event with no value
 // serialises as null rather than an empty string.
 type eventWithXDR struct {
+
 	store.Event
+
 	TopicsXDR []string `json:"topics_xdr"`
+
 	ValueXDR  *string  `json:"value_xdr"`
+
 }
 
 // enrichedEventWithXDR combines the raw-XDR view with spec-decoded fields.
 type enrichedEventWithXDR struct {
+
 	eventWithXDR
+
 	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
+
 	Decoded      bool                        `json:"decoded"`
+
 }
 
 type enrichedEventsWithXDRResponse struct {
@@ -566,8 +594,11 @@ type AggregateBucket = store.AggregateBucket
 func (s *Server) handleAggregateEvents(w http.ResponseWriter, r *http.Request) {
 	filter, _, err := parseFilterAndFields(r)
 	if err != nil {
+
 		writeError(w, http.StatusBadRequest, err)
+
 		return
+
 	}
 	filter.Cursor = ""
 	filter.Order = ""
@@ -814,7 +845,9 @@ func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 	if !filter.Scope.Allows(contractID) {
 		writeForbiddenContract(w, contractID)
 		return
+
 	}
+
 	filter.ContractID = contractID
 
 	s.serveEvents(w, r, filter, fields)
@@ -856,6 +889,8 @@ func writeForbiddenContract(w http.ResponseWriter, contractID string) {
 	writeError(w, http.StatusForbidden,
 		errForbiddenContract{contractID: contractID})
 }
+
+
 
 // serveEvents is the shared body for /events and /contracts/{id}/events.
 func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter store.EventFilter, fields map[string]bool) {
@@ -911,6 +946,8 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	for i := range events {
 		events[i].WithSEP41()
 	}
+
+
 
 	// Total matching count (ignoring pagination) as a response header.
 
@@ -969,7 +1006,9 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		if envelope {
 			writeJSON(w, http.StatusOK, wrapEnvelope(enriched, cursor))
 			return
+
 		}
+
 		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
 
 		return
@@ -1012,6 +1051,7 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 			writeJSON(w, http.StatusOK, wrapEnvelope(projectEvents(events, fields), cursor))
 			return
 		}
+
 		writeJSON(w, http.StatusOK, m)
 
 	}
@@ -1092,20 +1132,30 @@ func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Reques
 
 	// Validate ?fields= before touching the store.
 	fields, err := parseFields(r.URL.Query().Get("fields"))
+
 	if err != nil {
+
 		writeError(w, http.StatusBadRequest, err)
+
 		return
+
 	}
 
 	event, err := s.store.GetEvent(r.Context(), id, scopeFrom(r.Context()))
 	if errors.Is(err, store.ErrNotFound) {
+
 		writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
+
 		return
+
 	}
+
 	if err != nil {
 		loggerFromContext(r.Context()).Error("loading event for transaction siblings", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
+
 		return
+
 	}
 
 	// If the event has no transaction hash (should not normally happen),
@@ -1533,7 +1583,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			RunsCompleted:   m.RunsCompleted,
 			TotalRowsPurged: m.TotalRowsPurged,
 		}
+
 	}
+
 	if c := getRPCCounter(); c != nil {
 
 		snap := c.Errors().Snapshot()
@@ -2232,7 +2284,10 @@ func writeVary(w http.ResponseWriter) {
 	if vary != "" {
 		w.Header().Set("Vary", vary)
 	}
+
 }
+
+
 
 // writeNotModified sends a 304 with the same cache-validation headers
 
@@ -2277,6 +2332,7 @@ func ptr[T any](v T) *T { return &v }
 // exactly one source of truth for which topic positions are valid, what
 // counts as an "invalid order", etc.
 func filterFromQuery(r *http.Request) (store.EventFilter, error) {
+
 	q := r.URL.Query()
 
 	var fromLedger, toLedger int64
@@ -2448,6 +2504,8 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	default:
 		return f, fmt.Errorf("invalid in_successful_call %q (want true or false)", raw)
 	}
+
+
 
 	if raw := q.Get("limit"); raw != "" {
 
@@ -2650,6 +2708,8 @@ func (s *Server) handleContractHolders(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+
+
 func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 
 	if s.bcast == nil {
@@ -2833,6 +2893,8 @@ func prettyMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 
 	w.Header().Set("Content-Type", "application/json")
@@ -2854,4 +2916,5 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 
 	writeJSON(w, status, errorResponse{Error: err.Error()})
+
 }
