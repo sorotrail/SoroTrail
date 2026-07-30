@@ -1,0 +1,13 @@
+apiVersion: v2
+name: sorotrail
+description: Helm chart for SoroTrail — a Stellar/Soroban contract-event indexer
+type: application
+version: 0.1.0
+appVersion: "latest"
+keywords:
+  - stellar
+  - soroban
+  - blockchain
+  - indexer
+sources:
+  - https://github.com/sorotrail/sorotrail
