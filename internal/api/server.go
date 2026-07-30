@@ -105,6 +105,7 @@ type Enricher interface {
 // Server holds the API's dependencies.
 type Server struct {
 	store     store.Store
+	enableMetrics bool
 	rpc       rpc.Client
 	enricher  Enricher
 	log       *slog.Logger
@@ -144,12 +145,18 @@ type Server struct {
 	cors CORSConfig
 }
 
+
 // SetCompressMinSize overrides the body size at which responses are
 // compressed. Pass a negative value to disable compression.
 func (s *Server) SetCompressMinSize(n int) {
 	s.compressMinSize = n
 }
 
+
+
+// SetMetricsEnabled enables or disables the /metrics endpoint.
+func (s *Server) SetMetricsEnabled(enabled bool) {
+	s.enableMetrics = enabled
 // maxLimit is the API's upper bound for page-size parameters (limit and
 // recent). It is set once at startup via SetMaxLimit (driven by the
 // API_MAX_LIMIT env var) before any requests are served so no mutex is

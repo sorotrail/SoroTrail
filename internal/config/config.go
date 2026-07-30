@@ -62,6 +62,7 @@ type Config struct {
 	HorizonURL      string  `env:"HORIZON_URL" envDefault:"https://horizon-testnet.stellar.org"`
 	BackfillRateRPS float64 `env:"BACKFILL_RATE_RPS" envDefault:"10"`
 
+	MetricsEnabled bool `env:"METRICS_ENABLED" envDefault:"false"`
 	// RPC retry/backoff configuration. These control how many times a
 	// failing RPC call is retried, the base (exponential) backoff duration,
 	// the maximum backoff cap, and whether random jitter is added between
@@ -108,6 +109,9 @@ type Config struct {
 	// Negative disables compression entirely; 0 uses api.CompressMinSize.
 	CompressMinSize int `env:"COMPRESS_MIN_SIZE" envDefault:"0"`
 
+
+	// EnableMetrics exposes the Prometheus /metrics endpoint.
+	EnableMetrics bool `env:"ENABLE_METRICS" envDefault:"false"`
 	// APIMaxLimit is the maximum page size accepted by the API for list
 	// endpoints (/events, /subscriptions/{id}/deliveries). Values above
 	// this are rejected with 400; the store still clamps internally as a
@@ -515,6 +519,7 @@ func (c Config) LoggableFields() []any {
 	}
 	return []any{
 		"rpc_url", c.RPCURL,
+		"metrics_enabled", c.MetricsEnabled,
 		"rpc_max_attempts", c.RPCMaxAttempts,
 		"rpc_base_backoff", c.RPCBaseBackoff,
 		"rpc_max_backoff", c.RPCMaxBackoff,
