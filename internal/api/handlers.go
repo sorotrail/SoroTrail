@@ -896,6 +896,78 @@ func parseTimeParam(raw, name string) (time.Time, error) {
 	return t, nil
 }
 
+// Holders endpoint types.
+
+type holderResponse struct {
+	Address    string `json:"address"`
+	Balance    string `json:"balance"`
+	LastLedger int64  `json:"last_ledger"`
+}
+
+type holdersResponse struct {
+	ContractID     string           `json:"contract_id"`
+	EarliestLedger int64            `json:"earliest_ledger"`
+	Holders        []holderResponse `json:"holders"`
+	Cursor         string           `json:"cursor,omitempty"`
+}
+
+func (s *Server) handleContractHolders(w http.ResponseWriter, r *http.Request) {
+	contractID := chi.URLParam(r, "id")
+	if !config.ValidContractID(contractID) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid contract ID %q", contractID))
+		return
+	}
+
+	network, err := s.resolveNetwork(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	minBalance := r.URL.Query().Get("min_balance")
+	cursor := r.URL.Query().Get("cursor")
+	limit := store.DefaultQueryLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		limit = parsed
+	}
+
+	// Determine the earliest ledger for coverage indication.
+	earliestLedger, err := s.store.GetEarliestLedger(r.Context(), network, contractID)
+	if err != nil {
+		// non-fatal; surface as 0 to indicate unknown coverage
+		loggerFromContext(r.Context()).Warn("getting earliest ledger", "contract_id", contractID, "error", err)
+	}
+
+	balances, next, err := s.store.GetTokenBalances(r.Context(), contractID, network, minBalance, cursor, limit)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("querying token holders", "contract_id", contractID, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("querying token holders failed"))
+		return
+	}
+
+	holders := make([]holderResponse, len(balances))
+	for i, tb := range balances {
+		holders[i] = holderResponse{
+			Address:    tb.Address,
+			Balance:    tb.Balance,
+			LastLedger: tb.LastLedger,
+		}
+	}
+
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, holdersResponse{
+		ContractID:     contractID,
+		EarliestLedger: earliestLedger,
+		Holders:        holders,
+		Cursor:         next,
+	})
+}
+
 func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	if s.bcast == nil {
 		http.Error(w, "streaming not configured", http.StatusNotImplemented)

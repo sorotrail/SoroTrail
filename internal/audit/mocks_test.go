@@ -307,3 +307,23 @@ func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
+
+func (m *mockStore) UpsertTokenBalances(ctx context.Context, network string, state store.TokenBalanceState, updates []store.TokenBalanceUpdate) error {
+	return nil
+}
+
+func (m *mockStore) GetTokenBalances(ctx context.Context, contractID, network, minBalance string, cursor string, limit int) ([]store.TokenBalance, string, error) {
+	return nil, "", nil
+}
+
+func (m *mockStore) GetTokenBalanceState(ctx context.Context, network, contractID string) (store.TokenBalanceState, error) {
+	return store.TokenBalanceState{}, store.ErrNotFound
+}
+
+func (m *mockStore) UpsertTokenBalanceState(ctx context.Context, state store.TokenBalanceState) error {
+	return nil
+}
+
+func (m *mockStore) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {
+	return 0, nil
+}

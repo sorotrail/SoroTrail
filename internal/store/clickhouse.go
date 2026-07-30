@@ -190,6 +190,26 @@ func (c *ClickHouse) Stats(ctx context.Context, network string) (Stats, error) {
 	return Stats{}, nil
 }
 
+func (c *ClickHouse) UpsertTokenBalances(ctx context.Context, network string, state TokenBalanceState, updates []TokenBalanceUpdate) error {
+	return nil
+}
+
+func (c *ClickHouse) GetTokenBalances(ctx context.Context, contractID, network, minBalance string, cursor string, limit int) ([]TokenBalance, string, error) {
+	return nil, "", nil
+}
+
+func (c *ClickHouse) GetTokenBalanceState(ctx context.Context, network, contractID string) (TokenBalanceState, error) {
+	return TokenBalanceState{}, ErrNotFound
+}
+
+func (c *ClickHouse) UpsertTokenBalanceState(ctx context.Context, state TokenBalanceState) error {
+	return nil
+}
+
+func (c *ClickHouse) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {
+	return 0, nil
+}
+
 func (c *ClickHouse) Ping(ctx context.Context) error {
 	return nil
 }

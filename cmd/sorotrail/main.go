@@ -33,6 +33,15 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/webhook"
 )
 
+// compositeNotifier fans out to multiple EventNotifiers.
+type compositeNotifier []ingester.EventNotifier
+
+func (n compositeNotifier) NotifyEvents(ctx context.Context, events []store.Event) {
+	for _, notifier := range n {
+		notifier.NotifyEvents(ctx, events)
+	}
+}
+
 var errInterrupted = errors.New("interrupted")
 
 func main() {
@@ -203,6 +212,9 @@ func run() error {
 	// Webhook delivery runs alongside ingestion.
 	wh := webhook.NewNotifier(st, log)
 
+	// Token balance processor derives SEP-41 holder balances from ingested events.
+	tokenProc := ingester.NewTokenBalanceProcessor(st, log)
+
 	// Wire spec enricher for the API using the first network's fetcher.
 	firstSpecFetcher := spec.NewFetcher(ingesters[0].rpc)
 	firstSpecEnricher := spec.NewEnricher(firstSpecFetcher, specCache, log)
@@ -227,7 +239,7 @@ func run() error {
 
 	// Connect notifier to all ingesters.
 	for _, ni := range ingesters {
-		ni.ing.SetNotifier(wh)
+		ni.ing.SetNotifier(compositeNotifier{wh, tokenProc})
 	}
 
 	server := &http.Server{

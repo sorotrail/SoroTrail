@@ -201,6 +201,26 @@ func (s *stubStore) ListDeliveryAttempts(ctx context.Context, subscriptionID int
 	return nil, nil
 }
 
+func (s *stubStore) UpsertTokenBalances(ctx context.Context, network string, state store.TokenBalanceState, updates []store.TokenBalanceUpdate) error {
+	return nil
+}
+
+func (s *stubStore) GetTokenBalances(ctx context.Context, contractID, network, minBalance string, cursor string, limit int) ([]store.TokenBalance, string, error) {
+	return nil, "", nil
+}
+
+func (s *stubStore) GetTokenBalanceState(ctx context.Context, network, contractID string) (store.TokenBalanceState, error) {
+	return store.TokenBalanceState{}, store.ErrNotFound
+}
+
+func (s *stubStore) UpsertTokenBalanceState(ctx context.Context, state store.TokenBalanceState) error {
+	return nil
+}
+
+func (s *stubStore) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {
+	return 0, nil
+}
+
 type stubRPC struct {
 	rpc.Client
 

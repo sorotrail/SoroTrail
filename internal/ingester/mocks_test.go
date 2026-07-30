@@ -204,6 +204,32 @@ func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.D
 	return nil, nil
 }
 
+func (m *mockStore) UpsertTokenBalances(ctx context.Context, network string, state store.TokenBalanceState, updates []store.TokenBalanceUpdate) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return nil
+}
+
+func (m *mockStore) GetTokenBalances(ctx context.Context, contractID, network, minBalance string, cursor string, limit int) ([]store.TokenBalance, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return nil, "", nil
+}
+
+func (m *mockStore) GetTokenBalanceState(ctx context.Context, network, contractID string) (store.TokenBalanceState, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return store.TokenBalanceState{}, store.ErrNotFound
+}
+
+func (m *mockStore) UpsertTokenBalanceState(ctx context.Context, state store.TokenBalanceState) error {
+	return nil
+}
+
+func (m *mockStore) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {
+	return 0, nil
+}
+
 type passthroughDecoder struct{}
 
 func (passthroughDecoder) DecodeScVal(string) (json.RawMessage, error) {

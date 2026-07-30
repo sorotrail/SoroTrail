@@ -571,6 +571,173 @@ func (p *Postgres) Stats(ctx context.Context, network string) (Stats, error) {
 	return s, nil
 }
 
+func (p *Postgres) UpsertTokenBalances(ctx context.Context, network string, state TokenBalanceState, updates []TokenBalanceUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin token balance tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Upsert each balance row.
+	for _, u := range updates {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO token_balances (network, contract_id, address, balance, last_ledger, updated_at)
+			VALUES ($1, $2, $3, $4, $5, now())
+			ON CONFLICT (network, contract_id, address) DO UPDATE SET
+				balance     = EXCLUDED.balance,
+				last_ledger = EXCLUDED.last_ledger,
+				updated_at  = now()`,
+			network, state.ContractID, u.Address, u.Balance.String(), u.LastLedger,
+		)
+		if err != nil {
+			return fmt.Errorf("upserting token balance for %s/%s: %w", state.ContractID, u.Address, err)
+		}
+	}
+
+	// Update the balance state.
+	_, err = tx.Exec(ctx, `
+		INSERT INTO token_balance_state (network, contract_id, last_applied_event, last_ledger, updated_at)
+		VALUES ($1, $2, $3, $4, now())
+		ON CONFLICT (network, contract_id) DO UPDATE SET
+			last_applied_event = EXCLUDED.last_applied_event,
+			last_ledger        = EXCLUDED.last_ledger,
+			updated_at         = now()
+		WHERE token_balance_state.last_ledger <= EXCLUDED.last_ledger`,
+		state.Network, state.ContractID, state.LastAppliedEventID, state.LastLedger,
+	)
+	if err != nil {
+		return fmt.Errorf("upserting token balance state for %s: %w", state.ContractID, err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) GetTokenBalances(ctx context.Context, contractID, network, minBalance string, cursor string, limit int) ([]TokenBalance, string, error) {
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+
+	var where []string
+	var args []any
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	where = append(where, "contract_id = "+arg(contractID))
+	where = append(where, "network = "+arg(network))
+
+	if minBalance != "" {
+		// Compare as decimal text: shorter strings are smaller, equal-length strings compare lexicographically.
+		// This works because big.Int decimal strings have no leading zeros.
+		mb := minBalance
+		where = append(where, "(length(balance) > length("+arg(mb)+") OR (length(balance) = length("+arg(mb)+") AND balance >= "+arg(mb)+"))")
+	}
+
+	if cursor != "" {
+		// Cursor is the last balance value (text) from the previous page.
+		// Since sorting is by balance DESC, we fetch rows with balance < cursor.
+		// But handling ties requires a secondary key. Use (balance, address) as the composite cursor.
+		cursorParts := strings.SplitN(cursor, ":", 2)
+		if len(cursorParts) == 2 {
+			// cursor format: balance:address
+			where = append(where, "(balance < "+arg(cursorParts[0])+" OR (balance = "+arg(cursorParts[0])+" AND address > "+arg(cursorParts[1])+"))")
+		} else {
+			where = append(where, "balance <= "+arg(cursorParts[0]))
+		}
+	}
+
+	query := `SELECT contract_id, address, balance, last_ledger, created_at, updated_at FROM token_balances`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY balance DESC, address ASC LIMIT " + arg(limit+1)
+
+	var rows []TokenBalance
+	next := ""
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		result, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("querying token balances: %w", err)
+		}
+		defer result.Close()
+
+		rows = make([]TokenBalance, 0, limit)
+		for result.Next() {
+			var tb TokenBalance
+			if err := result.Scan(&tb.ContractID, &tb.Address, &tb.Balance, &tb.LastLedger, &tb.CreatedAt, &tb.UpdatedAt); err != nil {
+				return err
+			}
+			rows = append(rows, tb)
+		}
+		if err := result.Err(); err != nil {
+			return err
+		}
+		if len(rows) > limit {
+			rows = rows[:limit]
+			next = rows[limit-1].Balance + ":" + rows[limit-1].Address
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return rows, next, nil
+}
+
+func (p *Postgres) GetTokenBalanceState(ctx context.Context, network, contractID string) (TokenBalanceState, error) {
+	var s TokenBalanceState
+	err := p.pool.QueryRow(ctx, `
+		SELECT network, contract_id, last_applied_event, last_ledger, updated_at
+		FROM token_balance_state
+		WHERE network = $1 AND contract_id = $2`,
+		network, contractID,
+	).Scan(&s.Network, &s.ContractID, &s.LastAppliedEventID, &s.LastLedger, &s.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TokenBalanceState{}, ErrNotFound
+	}
+	if err != nil {
+		return TokenBalanceState{}, fmt.Errorf("loading token balance state for %s/%s: %w", network, contractID, err)
+	}
+	return s, nil
+}
+
+func (p *Postgres) UpsertTokenBalanceState(ctx context.Context, state TokenBalanceState) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO token_balance_state (network, contract_id, last_applied_event, last_ledger, updated_at)
+		VALUES ($1, $2, $3, $4, now())
+		ON CONFLICT (network, contract_id) DO UPDATE SET
+			last_applied_event = EXCLUDED.last_applied_event,
+			last_ledger        = EXCLUDED.last_ledger,
+			updated_at         = now()
+		WHERE token_balance_state.last_ledger <= EXCLUDED.last_ledger`,
+		state.Network, state.ContractID, state.LastAppliedEventID, state.LastLedger,
+	)
+	if err != nil {
+		return fmt.Errorf("upserting token balance state for %s/%s: %w", state.Network, state.ContractID, err)
+	}
+	return nil
+}
+
+func (p *Postgres) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {
+	var minLedger int64
+	err := p.pool.QueryRow(ctx, `
+		SELECT COALESCE(min(ledger), 0) FROM events
+		WHERE network = $1 AND contract_id = $2`,
+		network, contractID,
+	).Scan(&minLedger)
+	if err != nil {
+		return 0, fmt.Errorf("getting earliest ledger for %s/%s: %w", network, contractID, err)
+	}
+	return minLedger, nil
+}
+
 func (p *Postgres) Ping(ctx context.Context) error {
 	return p.pool.Ping(ctx)
 }

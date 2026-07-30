@@ -4,6 +4,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"math/big"
 	"time"
 )
 
@@ -398,8 +399,48 @@ type Store interface {
 	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
 	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
 
+	// TokenBalance methods
+	// UpsertTokenBalances atomically applies balance changes and updates the
+	// balance state for one contract in a single transaction.
+	UpsertTokenBalances(ctx context.Context, network string, state TokenBalanceState, updates []TokenBalanceUpdate) error
+	// GetTokenBalances returns token holders for a contract, sorted by balance desc.
+	GetTokenBalances(ctx context.Context, contractID, network, minBalance string, cursor string, limit int) ([]TokenBalance, string, error)
+	// GetTokenBalanceState returns the last-applied event for a contract, or ErrNotFound.
+	GetTokenBalanceState(ctx context.Context, network, contractID string) (TokenBalanceState, error)
+	// UpsertTokenBalanceState atomically updates the last-applied event for a contract.
+	UpsertTokenBalanceState(ctx context.Context, state TokenBalanceState) error
+	// GetEarliestLedger returns the minimum ledger for which events exist for
+	// the given contract and network. Returns 0 when no events are found.
+	GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error)
+
 	Stats(ctx context.Context, network string) (Stats, error)
 	Ping(ctx context.Context) error
+}
+
+// TokenBalance holds the derived SEP-41 token balance for one (contract, address) pair.
+type TokenBalance struct {
+	ContractID string    `json:"contract_id"`
+	Address    string    `json:"address"`
+	Balance    string    `json:"balance"` // big.Int as decimal string
+	LastLedger int64     `json:"last_ledger"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// TokenBalanceState tracks the most recent event applied for a contract's balance derivation.
+type TokenBalanceState struct {
+	Network            string
+	ContractID         string
+	LastAppliedEventID string
+	LastLedger         int64
+	UpdatedAt          time.Time
+}
+
+// TokenBalanceUpdate is one address's balance change.
+type TokenBalanceUpdate struct {
+	Address    string   // Stellar address (C... or G...)
+	Balance    *big.Int // new balance after applying the event
+	LastLedger int64
 }
 
 var ErrNotFound = func() error {
