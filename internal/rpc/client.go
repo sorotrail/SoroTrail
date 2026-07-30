@@ -14,6 +14,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 )
 
 // Client is the RPC boundary. The ingester and API depend on this interface
@@ -26,6 +30,13 @@ type Client interface {
 	// Keys are base64-encoded LedgerKey XDR, returned entries include the
 	// base64-encoded LedgerEntry XDR.
 	GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error)
+}
+
+// RequestObserver is called after each RPC call completes so callers can
+// instrument request counts by method and outcome without the rpc package
+// importing a metrics library.
+type RequestObserver interface {
+	ObserveRPCRequest(method string, err error)
 }
 
 // Error is a JSON-RPC 2.0 error object returned by the server.
@@ -65,6 +76,9 @@ type HTTPClient struct {
 	// xdrJSONUnsupported flips to true once the server rejects the xdrFormat
 	// param, so we stop sending it and callers decode raw XDR instead.
 	xdrJSONUnsupported atomic.Bool
+
+	// requestObserver, when non-nil, is called after every call() completes.
+	requestObserver RequestObserver
 }
 
 var _ Client = (*HTTPClient)(nil)
@@ -81,6 +95,12 @@ func WithHTTPClient(hc *http.Client) Option {
 // Zero disables rate limiting.
 func WithMinRequestInterval(d time.Duration) Option {
 	return func(c *HTTPClient) { c.limiter = newIntervalLimiter(d) }
+}
+
+// WithRequestObserver sets an observer that is called after every RPC call
+// with the JSON-RPC method name and any error that occurred.
+func WithRequestObserver(obs RequestObserver) Option {
+	return func(c *HTTPClient) { c.requestObserver = obs }
 }
 
 // NewHTTPClient creates a client for the RPC server at url. By default
@@ -161,6 +181,9 @@ type response struct {
 }
 
 func (c *HTTPClient) call(ctx context.Context, method string, params, result any) error {
+	timer := prometheus.NewTimer(metrics.RPCCallLatency)
+	defer timer.ObserveDuration()
+
 	if err := c.limiter.Wait(ctx); err != nil {
 		return err
 	}
