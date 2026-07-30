@@ -360,6 +360,15 @@ func (ing *Ingester) rescanForReorg(ctx context.Context) error {
 // contracts than one request allows it sweeps a bounded ledger window once
 // per filter batch.
 func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
+	ctx, span := ing.tracer.Start(ctx, "ingester.poll_cycle")
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	startLedger, cursor, err := ing.resolvePosition(ctx)
 	if err != nil {
 		return false, err
@@ -375,6 +384,14 @@ func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
 }
 
 func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor string, filters []rpc.EventFilter) (bool, error) {
+	ctx, span := ing.tracer.Start(ctx, "ingester.fetch_page")
+	defer span.End()
+	span.SetAttributes(
+		attribute.Int64("ingester.start_ledger", int64(startLedger)),
+		attribute.String("ingester.cursor", cursor),
+		attribute.Int("ingester.filter_count", len(filters)),
+	)
+
 	resp, err := ing.client.GetEvents(ctx, rpc.GetEventsRequest{
 		StartLedger: startLedger,
 		Filters:     filters,
@@ -386,6 +403,7 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 		return false, err
 	}
 	if rpc.IsLedgerOutOfRange(err) {
+		span.AddEvent("retention_clamp")
 		return false, ing.reclampToOldest(ctx, startLedger)
 	}
 	if err != nil {
@@ -629,6 +647,9 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	if len(rpcEvents) == 0 {
 		return nil
 	}
+	ctx, span := ing.tracer.Start(ctx, "ingester.persist_events")
+	defer span.End()
+	span.SetAttributes(attribute.Int("ingester.event_count", len(rpcEvents)), attribute.Int64("ingester.latest_ledger", int64(latestLedger)))
 	events := make([]store.Event, 0, len(rpcEvents))
 	for _, re := range rpcEvents {
 		ev, err := ing.toStoreEvent(re)

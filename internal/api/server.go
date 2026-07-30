@@ -11,6 +11,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	otelhttp "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
@@ -167,6 +171,19 @@ func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, 
 	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New()}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
+	}
+	if s.store != nil {
+		s.store = store.NewTracingStore(s.store, s.tracer)
+	}
+	return s
+}
+
+func (s *Server) WithTracer(tracer trace.Tracer) *Server {
+	if tracer != nil {
+		s.tracer = tracer
+		if s.store != nil {
+			s.store = store.NewTracingStore(s.store, s.tracer)
+		}
 	}
 	return s
 }
@@ -398,7 +415,7 @@ func (s *Server) router() chi.Router {
 	r.Get("/addresses/{address}/events", s.handleAddressEvents)
 	r.Get("/addresses/{address}/summary", s.handleAddressSummary)
 
-	return r
+	return otelhttp.NewHandler(r, "HTTP")
 }
 
 // handleOpenAPI serves the embedded OpenAPI 3.1 specification.

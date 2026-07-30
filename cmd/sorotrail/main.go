@@ -117,6 +117,14 @@ func run() error {
 	log.Info("startup configuration", cfg.LoggableFields()...)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	provider, shutdown, err := telemetry.Configure(ctx, log)
+	if err != nil {
+		return fmt.Errorf("configuring tracing: %w", err)
+	}
+	defer func() {
+		_ = shutdown(context.Background())
+	}()
+	_ = provider
 	defer stop()
 
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {

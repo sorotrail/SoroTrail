@@ -14,6 +14,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -538,6 +540,43 @@ func TestReclamp_WhenResumePointAgedOut(t *testing.T) {
 	assert.Equal(t, int64(39_999), state.LastIngestedLedger,
 		"next pass resumes from the oldest retained ledger")
 	assert.Empty(t, state.LastCursor)
+}
+
+func TestRunOnce_EmitsCycleSpans(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	tp := trace.NewTracerProvider(trace.WithSpanProcessor(sr))
+	tracer := tp.Tracer("test")
+
+	client := &mockRPC{health: rpc.Health{Status: "healthy", LatestLedger: 1_000}, eventsResps: []rpc.GetEventsResponse{{
+		Events:       []rpc.Event{rpcEvent("e1", 100)},
+		LatestLedger: 1_000,
+	}}}
+	st := newMockStore()
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 10}).WithTracer(tracer)
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+
+	spans := sr.Ended()
+	require.NotEmpty(t, spans)
+
+	var cycleSpan, fetchSpan, persistSpan trace.ReadOnlySpan
+	for _, span := range spans {
+		switch span.Name() {
+		case "ingester.poll_cycle":
+			cycleSpan = span
+		case "ingester.fetch_page":
+			fetchSpan = span
+		case "ingester.persist_events":
+			persistSpan = span
+		}
+	}
+	require.NotNil(t, cycleSpan)
+	require.NotNil(t, fetchSpan)
+	require.NotNil(t, persistSpan)
+	assert.Equal(t, cycleSpan.SpanContext().TraceID(), fetchSpan.SpanContext().TraceID())
+	assert.Equal(t, cycleSpan.SpanContext().SpanID(), fetchSpan.Parent().SpanID())
+	assert.Equal(t, cycleSpan.SpanContext().TraceID(), persistSpan.SpanContext().TraceID())
 }
 
 func TestRunOnce_PropagatesRPCErrors(t *testing.T) {
