@@ -1720,19 +1720,13 @@ func statementTimeoutFromContext(ctx context.Context) (time.Duration, bool) {
 
 func scanEvent(row pgx.Row) (Event, error) {
 	var (
-		e         Event
-		rawTopics []string
-		rawValue  *string
+		e Event
 	)
 	err := row.Scan(&e.Network, &e.ID, &e.ContractID, &e.Ledger, &e.Type, &e.TxHash,
 		&e.TxIndex, &e.OpIndex, &e.InSuccessfulCall, &e.Topics, &e.Value,
-		&e.CreatedAt, &rawTopics, &rawValue)
+		&e.CreatedAt)
 	if err != nil {
 		return Event{}, err
-	}
-	e.RawTopicXDR = rawTopics
-	if rawValue != nil {
-		e.RawValueXDR = *rawValue
 	}
 	return e, nil
 }

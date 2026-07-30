@@ -546,3 +546,10 @@ func newLogger(level, format string) *slog.Logger {
 func graphqlServerDeps(st store.Store, enricher api.Enricher) api.ServerDeps {
 	return api.ServerDeps{Store: st, Enricher: enricher}
 }
+
+func rpcURLsForLog(cfg config.Config) []string {
+	if len(cfg.RPCURLS) > 0 {
+		return cfg.RPCURLS
+	}
+	return []string{cfg.RPCURL}
+}

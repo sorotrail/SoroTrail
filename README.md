@@ -132,8 +132,8 @@ All configuration comes from environment variables (see `.env.example`):
 | Variable | Default | Description |
 | --- | --- | --- |
 | `RPC_URL` | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet. |
-| `HORIZON_URL` | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. |
-| `BACKFILL_RATE_RPS` | `10` | Pace against Horizon when backfilling. 10 req/s is the public-instance cap; private deployments can lift this. |
+| `RPC_URLS` | unset | Comma-separated, priority-ordered list of Stellar RPC endpoints. When set, `RPC_URL` is ignored and the multi-provider failover client is used. List order is priority: index 0 is tried first. |
+| `RPC_RATE_LIMIT_RPS` | `10` | Per-provider request rate limit (`requests/second`) applied to each RPC endpoint independently. Only used when `RPC_URLS` is set. |
 | `DATABASE_URL` | — (required) | Postgres connection string. |
 | `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. |
 | `HTTP_ADDR` | `:8080` | API listen address. |
@@ -171,6 +171,58 @@ All configuration comes from environment variables (see `.env.example`):
 | `MULTI_TENANT_USAGE_FLUSH` | `10s` | How often accumulated per-tenant usage counters are persisted. |
 | `MULTI_TENANT_STREAM_SCOPE_SYNC` | `30s` | How often an open stream re-resolves its tenant's grants, bounding how long a revoked grant keeps being served. |
 | `MULTI_TENANT_BOOTSTRAP_KEY` | unset | Installs an admin API key for the seeded `default` tenant at startup, so a fresh multi-tenant install can mint its first keys. Rejected unless `MULTI_TENANT=true`. |
+
+## Multi-provider failover
+
+`RPC_URL` is a single point of failure. Setting `RPC_URLS` enables a
+multi-provider failover client that wraps each endpoint with health
+scoring and automatic promotion/demotion:
+
+- **Priority order**: providers are tried in list order; the
+  highest-priority healthy provider receives all traffic.
+- **Passive health scoring**: real request outcomes drive demotion.
+  Network errors (DNS, connection refused, timeout) and HTTP 5xx
+  responses count toward the error budget. Semantic errors
+  (`IsLedgerOutOfRange`, HTTP 4xx) never demote a healthy provider.
+- **Demotion**: after 3 consecutive demotable errors a provider is
+  `degraded` (still eligible but deprioritised); after 3 further
+  errors it becomes `down` and is excluded from traffic.
+- **Probes**: `StateDown` providers receive periodic `getHealth`
+  probes (every 30s). After 2 consecutive successful probes the
+  provider is promoted back to `active`. Active providers are never
+  probed — rate limit is reserved for real work.
+- **Cursor re-anchor**: when a provider switch occurs mid-pagination
+  (a `getEvents` request carries a cursor), the failover client
+  returns `ErrFailoverReanchor`. The ingester discards the cursor and
+  resumes from the last persisted ledger position; idempotent upserts
+  absorb the overlap.
+- **All-down**: when every provider is `down`, the client enters
+  jittered exponential backoff with clear logging.
+- **Per-provider rate limits**: each provider gets its own token
+  bucket at `RPC_RATE_LIMIT_RPS` (default 10/s).
+- **Head skew tolerance**: small chain-head differences (≤3 ledgers)
+  between providers do not cause flaps.
+- **Backward compatible**: omitting `RPC_URLS` keeps the single-URL
+  behaviour unchanged. `RPC_URL` still works and is still the default.
+
+```sh
+# Single provider (unchanged)
+RPC_URL=https://soroban-testnet.stellar.org
+
+# Multi-provider failover
+RPC_URLS=https://rpc1.example.com,https://rpc2.example.com,https://rpc3.example.com
+RPC_RATE_LIMIT_RPS=15
+```
+
+### Mixed-retention caveat
+
+Providers with different retention windows present a known risk: a
+failover from a long-retention provider to a short-retention one may
+cause `IsLedgerOutOfRange` errors for older ledger queries. The
+indexer handles this by re-clamping to the oldest retained ledger
+(accepting the gap), but deployments with heterogeneous providers
+should ensure the shortest retention window is ≥ the ingester's
+`RETENTION_LEDGERS` setting.
 
 ## Ingestion behavior
 

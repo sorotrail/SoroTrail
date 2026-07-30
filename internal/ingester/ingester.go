@@ -380,6 +380,11 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 		Filters:     filters,
 		Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
 	})
+	if rpc.IsFailoverReanchor(err) {
+		ing.log.Warn("failover re-anchor: discarding cursor, re-scanning from last ingested ledger")
+		ing.discardCursor(ctx)
+		return false, err
+	}
 	if rpc.IsLedgerOutOfRange(err) {
 		return false, ing.reclampToOldest(ctx, startLedger)
 	}
