@@ -1,0 +1,945 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "SoroTrail API",
+    "version": "1.0.0",
+    "description": "A contract event indexer for the Stellar/Soroban network. Ingest and query historical Soroban contract events via a REST API and WebSocket stream.",
+    "license": {
+      "name": "Apache-2.0",
+      "url": "https://github.com/khaylebfortune/sorotrail/blob/main/LICENSE"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "Local development server"
+    }
+  ],
+  "tags": [
+    { "name": "Events", "description": "Query indexed contract events" },
+    { "name": "Health", "description": "Service health checks" },
+    { "name": "Stats", "description": "Indexer statistics" },
+    { "name": "Subscriptions", "description": "Webhook subscription management" },
+    { "name": "Deliveries", "description": "Webhook delivery attempt history" }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Health check",
+        "description": "Reports the API's view of its dependencies. Returns 200 when both the database and the RPC are reachable and healthy, 503 otherwise.",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "All dependencies healthy",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" }
+              }
+            }
+          },
+          "503": {
+            "description": "One or more dependencies degraded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/events": {
+      "get": {
+        "tags": ["Events"],
+        "summary": "List events",
+        "description": "Lists stored events in ascending (oldest-first) or descending (newest-first) order. Supports filtering by contract, type, topic, ledger range, time range, and pagination.",
+        "operationId": "listEvents",
+        "parameters": [
+          { "$ref": "#/components/parameters/contractId" },
+          { "$ref": "#/components/parameters/eventType" },
+          { "$ref": "#/components/parameters/topic" },
+          { "$ref": "#/components/parameters/topic0" },
+          { "$ref": "#/components/parameters/topic1" },
+          { "$ref": "#/components/parameters/topic2" },
+          { "$ref": "#/components/parameters/topic3" },
+          { "$ref": "#/components/parameters/topicContains" },
+          { "$ref": "#/components/parameters/fromLedger" },
+          { "$ref": "#/components/parameters/toLedger" },
+          { "$ref": "#/components/parameters/fromTime" },
+          { "$ref": "#/components/parameters/toTime" },
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/cursor" },
+          { "$ref": "#/components/parameters/order" },
+          { "$ref": "#/components/parameters/decoded" },
+          { "$ref": "#/components/parameters/includeXDR" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated list of events. Response shape depends on query params: plain events, ?include_xdr=true adds raw XDR fields, ?decoded=true enriches events, and both can be combined.",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETag" },
+              "Cache-Control": { "$ref": "#/components/headers/CacheControl" }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/EventsResponse" },
+                    { "$ref": "#/components/schemas/EventsWithXDRResponse" },
+                    { "$ref": "#/components/schemas/EnrichedEventsResponse" },
+                    { "$ref": "#/components/schemas/EnrichedEventsWithXDRResponse" }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query parameters",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/events/{id}": {
+      "get": {
+        "tags": ["Events"],
+        "summary": "Get a single event",
+        "description": "Fetch a single event by its ID (the TOID-based identifier from the RPC). Returns 404 if unknown. Supports ETag-based conditional requests.",
+        "operationId": "getEvent",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "The event ID (TOID-based identifier, e.g. 0001099511627776-0000000001)"
+          },
+          { "$ref": "#/components/parameters/decoded" },
+          { "$ref": "#/components/parameters/includeXDR" }
+        ],
+        "responses": {
+          "200": {
+            "description": "The requested event. Response shape depends on query params: plain event, ?include_xdr=true adds raw XDR fields, ?decoded=true enriches the event, and both can be combined.",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETag" },
+              "Cache-Control": { "$ref": "#/components/headers/CacheControl" }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/Event" },
+                    { "$ref": "#/components/schemas/EventWithXDR" },
+                    { "$ref": "#/components/schemas/EnrichedEvent" },
+                    { "$ref": "#/components/schemas/EnrichedEventWithXDR" }
+                  ]
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Not modified (conditional GET with matching If-None-Match)"
+          },
+          "404": {
+            "description": "Event not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/events/ws": {
+      "get": {
+        "tags": ["Events"],
+        "summary": "WebSocket live event stream",
+        "description": "Pushes ingested events to the client over a WebSocket connection as soon as they are written to the store. No replay — the stream starts at connection time. Accepts the same filter parameters as GET /events.",
+        "operationId": "streamEvents",
+        "parameters": [
+          { "$ref": "#/components/parameters/contractId" },
+          { "$ref": "#/components/parameters/eventType" },
+          { "$ref": "#/components/parameters/topic" },
+          { "$ref": "#/components/parameters/topic0" },
+          { "$ref": "#/components/parameters/topic1" },
+          { "$ref": "#/components/parameters/topic2" },
+          { "$ref": "#/components/parameters/topic3" },
+          { "$ref": "#/components/parameters/topicContains" },
+          { "$ref": "#/components/parameters/fromLedger" },
+          { "$ref": "#/components/parameters/toLedger" },
+          { "$ref": "#/components/parameters/fromTime" },
+          { "$ref": "#/components/parameters/toTime" }
+        ],
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade successful. Server sends one JSON-encoded Event per text frame."
+          },
+          "400": {
+            "description": "Invalid filter parameters (returned before WebSocket upgrade)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "501": {
+            "description": "Streaming not configured (broadcaster not wired)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/contracts/{id}/events": {
+      "get": {
+        "tags": ["Events"],
+        "summary": "List events for a contract",
+        "description": "Convenience wrapper for GET /events?contract_id={id}. Accepts the same query parameters as /events except contract_id (which is taken from the path).",
+        "operationId": "listContractEvents",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" },
+            "description": "The Soroban contract ID (strkey, 56 characters starting with C)"
+          },
+          { "$ref": "#/components/parameters/eventType" },
+          { "$ref": "#/components/parameters/topic" },
+          { "$ref": "#/components/parameters/topic0" },
+          { "$ref": "#/components/parameters/topic1" },
+          { "$ref": "#/components/parameters/topic2" },
+          { "$ref": "#/components/parameters/topic3" },
+          { "$ref": "#/components/parameters/topicContains" },
+          { "$ref": "#/components/parameters/fromLedger" },
+          { "$ref": "#/components/parameters/toLedger" },
+          { "$ref": "#/components/parameters/fromTime" },
+          { "$ref": "#/components/parameters/toTime" },
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/cursor" },
+          { "$ref": "#/components/parameters/order" },
+          { "$ref": "#/components/parameters/decoded" },
+          { "$ref": "#/components/parameters/includeXDR" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated list of events for the contract. Response shape depends on query params (see /events).",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETag" },
+              "Cache-Control": { "$ref": "#/components/headers/CacheControl" }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/EventsResponse" },
+                    { "$ref": "#/components/schemas/EventsWithXDRResponse" },
+                    { "$ref": "#/components/schemas/EnrichedEventsResponse" },
+                    { "$ref": "#/components/schemas/EnrichedEventsWithXDRResponse" }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query parameters or contract ID",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/stats": {
+      "get": {
+        "tags": ["Stats"],
+        "summary": "Indexer statistics",
+        "description": "Returns indexer statistics including total events, last ingested ledger, contract count, and auditor metrics when the auditor is enabled.",
+        "operationId": "getStats",
+        "responses": {
+          "200": {
+            "description": "Current indexer statistics",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Stats" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subscriptions": {
+      "get": {
+        "tags": ["Subscriptions"],
+        "summary": "List all subscriptions",
+        "description": "Returns all registered webhook subscriptions ordered by ID.",
+        "operationId": "listSubscriptions",
+        "responses": {
+          "200": {
+            "description": "List of subscriptions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/Subscription" }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["Subscriptions"],
+        "summary": "Create a subscription",
+        "description": "Register a new webhook subscription. When an ingested event matches the subscription's filters, SoroTrail POSTs the event to the subscription's URL with an HMAC-SHA256 signature header.",
+        "operationId": "createSubscription",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateSubscriptionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Subscription created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Subscription" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request body",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subscriptions/{id}": {
+      "get": {
+        "tags": ["Subscriptions"],
+        "summary": "Get a subscription",
+        "description": "Fetch a single subscription by ID. Returns 404 if unknown.",
+        "operationId": "getSubscription",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "int64", "minimum": 1 },
+            "description": "The subscription ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The requested subscription",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Subscription" }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": ["Subscriptions"],
+        "summary": "Update a subscription",
+        "description": "Update a subscription. Only fields present in the body are changed; omit a field to leave it unchanged.",
+        "operationId": "updateSubscription",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "int64", "minimum": 1 },
+            "description": "The subscription ID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UpdateSubscriptionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscription updated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Subscription" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request body",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": ["Subscriptions"],
+        "summary": "Delete a subscription",
+        "description": "Delete a subscription and its delivery history. Returns 204 No Content on success.",
+        "operationId": "deleteSubscription",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "int64", "minimum": 1 },
+            "description": "The subscription ID"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Subscription deleted"
+          },
+          "404": {
+            "description": "Subscription not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subscriptions/{id}/deliveries": {
+      "get": {
+        "tags": ["Deliveries"],
+        "summary": "List delivery attempts",
+        "description": "List delivery attempts for a subscription, newest first.",
+        "operationId": "listDeliveries",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "int64", "minimum": 1 },
+            "description": "The subscription ID"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
+            "description": "Maximum number of delivery attempts to return (1–200)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of delivery attempts (newest first)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/DeliveryAttempt" }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid limit or subscription ID",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "contractId": {
+        "name": "contract_id",
+        "in": "query",
+        "schema": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" },
+        "description": "Only events from this contract (Soroban strkey)."
+      },
+      "eventType": {
+        "name": "type",
+        "in": "query",
+        "schema": { "type": "string", "enum": ["contract", "system", "diagnostic"] },
+        "description": "Filter by event type."
+      },
+      "topic": {
+        "name": "topic",
+        "in": "query",
+        "schema": { "type": "string" },
+        "description": "Exact JSON match against any topic position. A bare word is treated as a JSON string. Cannot be combined with topic0..topic3."
+      },
+      "topic0": {
+        "name": "topic0",
+        "in": "query",
+        "schema": { "type": "string" },
+        "description": "Exact JSON match against topic position 0. Cannot be combined with topic."
+      },
+      "topic1": {
+        "name": "topic1",
+        "in": "query",
+        "schema": { "type": "string" },
+        "description": "Exact JSON match against topic position 1. Cannot be combined with topic."
+      },
+      "topic2": {
+        "name": "topic2",
+        "in": "query",
+        "schema": { "type": "string" },
+        "description": "Exact JSON match against topic position 2. Cannot be combined with topic."
+      },
+      "topic3": {
+        "name": "topic3",
+        "in": "query",
+        "schema": { "type": "string" },
+        "description": "Exact JSON match against topic position 3. Cannot be combined with topic."
+      },
+      "topicContains": {
+        "name": "topic_contains",
+        "in": "query",
+        "schema": { "type": "string" },
+        "description": "JSONB containment filter on topics. Must be valid JSON. A single-element array is unwrapped to its element."
+      },
+      "fromLedger": {
+        "name": "from_ledger",
+        "in": "query",
+        "schema": { "type": "integer", "format": "int64", "minimum": 1 },
+        "description": "Inclusive lower ledger bound."
+      },
+      "toLedger": {
+        "name": "to_ledger",
+        "in": "query",
+        "schema": { "type": "integer", "format": "int64", "minimum": 1 },
+        "description": "Inclusive upper ledger bound."
+      },
+      "fromTime": {
+        "name": "from_time",
+        "in": "query",
+        "schema": { "type": "string", "format": "date-time" },
+        "description": "Inclusive lower created_at bound (RFC 3339, e.g. 2026-07-21T00:00:00Z). Sub-second precision rejected."
+      },
+      "toTime": {
+        "name": "to_time",
+        "in": "query",
+        "schema": { "type": "string", "format": "date-time" },
+        "description": "Inclusive upper created_at bound (RFC 3339, e.g. 2026-07-22T00:00:00Z). Sub-second precision rejected."
+      },
+      "limit": {
+        "name": "limit",
+        "in": "query",
+        "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
+        "description": "Page size (1–200, default 50)."
+      },
+      "cursor": {
+        "name": "cursor",
+        "in": "query",
+        "schema": { "type": "string" },
+        "description": "Opaque pagination cursor from a previous response."
+      },
+      "order": {
+        "name": "order",
+        "in": "query",
+        "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" },
+        "description": "Sort direction. Defaults to asc (oldest-first)."
+      },
+      "decoded": {
+        "name": "decoded",
+        "in": "query",
+        "schema": { "type": "boolean" },
+        "description": "When true, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data."
+      },
+      "includeXDR": {
+        "name": "include_xdr",
+        "in": "query",
+        "schema": { "type": "boolean" },
+        "description": "When true, includes raw base64 XDR for topics and value alongside decoded fields."
+      }
+    },
+    "headers": {
+      "ETag": {
+        "schema": { "type": "string" },
+        "description": "Entity tag for conditional requests (RFC 7232)."
+      },
+      "CacheControl": {
+        "schema": { "type": "string" },
+        "description": "Cache-Control directive. Immutable resources get long max-age; open-ended pages get no-cache; operational endpoints get no-store."
+      }
+    },
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "type": "string", "description": "Human-readable error message." }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": ["status", "checks"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": ["ok", "degraded"],
+            "description": "Overall health status."
+          },
+          "checks": {
+            "type": "object",
+            "properties": {
+              "database": { "type": "string" },
+              "rpc": { "type": "string" }
+            }
+          }
+        }
+      },
+      "Event": {
+        "type": "object",
+        "required": ["id", "contract_id", "ledger", "type", "tx_hash", "tx_index", "op_index", "in_successful_call", "topics", "value", "created_at"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The RPC's TOID-based event identifier (zero-padded, lexicographic order = chronological)."
+          },
+          "contract_id": {
+            "type": "string",
+            "pattern": "^C[A-Z2-7]{55}$",
+            "description": "The Soroban contract ID that emitted this event."
+          },
+          "ledger": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The Stellar ledger sequence number."
+          },
+          "type": {
+            "type": "string",
+            "enum": ["contract", "system", "diagnostic"],
+            "description": "Event type."
+          },
+          "tx_hash": {
+            "type": "string",
+            "description": "The transaction hash that produced this event."
+          },
+          "tx_index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Transaction index within the ledger."
+          },
+          "op_index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Operation index within the transaction."
+          },
+          "in_successful_call": {
+            "type": "boolean",
+            "description": "Whether the event was emitted in a successful contract call."
+          },
+          "topics": {
+            "type": "array",
+            "description": "Decoded event topics as JSON values.",
+            "items": {}
+          },
+          "value": {
+            "description": "Decoded event value as a JSON ScVal representation."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Timestamp when the event was ingested."
+          }
+        }
+      },
+      "EventWithXDR": {
+        "type": "object",
+        "required": ["id", "contract_id", "ledger", "type", "tx_hash", "tx_index", "op_index", "in_successful_call", "topics", "value", "created_at"],
+        "properties": {
+          "id": { "type": "string" },
+          "contract_id": { "type": "string" },
+          "ledger": { "type": "integer", "format": "int64" },
+          "type": { "type": "string" },
+          "tx_hash": { "type": "string" },
+          "tx_index": { "type": "integer", "format": "int32" },
+          "op_index": { "type": "integer", "format": "int32" },
+          "in_successful_call": { "type": "boolean" },
+          "topics": { "type": "array", "items": {} },
+          "value": {},
+          "created_at": { "type": "string", "format": "date-time" },
+          "topics_xdr": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Raw base64 XDR for each topic element."
+          },
+          "value_xdr": {
+            "description": "Raw base64 XDR for value. Can be null when no raw XDR exists.",
+            "type": ["string", "null"]
+          }
+        }
+      },
+      "EventsWithXDRResponse": {
+        "type": "object",
+        "required": ["events"],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/EventWithXDR" }
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor."
+          }
+        }
+      },
+      "EnrichedEventWithXDR": {
+        "type": "object",
+        "required": ["id", "contract_id", "ledger", "type", "tx_hash", "tx_index", "op_index", "in_successful_call", "topics", "value", "created_at", "decoded"],
+        "properties": {
+          "id": { "type": "string" },
+          "contract_id": { "type": "string" },
+          "ledger": { "type": "integer", "format": "int64" },
+          "type": { "type": "string" },
+          "tx_hash": { "type": "string" },
+          "tx_index": { "type": "integer", "format": "int32" },
+          "op_index": { "type": "integer", "format": "int32" },
+          "in_successful_call": { "type": "boolean" },
+          "topics": { "type": "array", "items": {} },
+          "value": {},
+          "created_at": { "type": "string", "format": "date-time" },
+          "topics_xdr": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Raw base64 XDR for each topic element."
+          },
+          "value_xdr": {
+            "description": "Raw base64 XDR for value. Can be null when no raw XDR exists.",
+            "type": ["string", "null"]
+          },
+          "decoded": {
+            "type": "boolean",
+            "description": "Whether the event was successfully enriched with spec-driven field names."
+          },
+          "decoded_event": {
+            "$ref": "#/components/schemas/DecodedEvent"
+          }
+        }
+      },
+      "EnrichedEventsWithXDRResponse": {
+        "type": "object",
+        "required": ["events"],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/EnrichedEventWithXDR" }
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor."
+          }
+        }
+      },
+      "EnrichedEvent": {
+        "type": "object",
+        "required": ["id", "contract_id", "ledger", "type", "tx_hash", "tx_index", "op_index", "in_successful_call", "topics", "value", "created_at", "decoded"],
+        "properties": {
+          "id": { "type": "string" },
+          "contract_id": { "type": "string" },
+          "ledger": { "type": "integer", "format": "int64" },
+          "type": { "type": "string" },
+          "tx_hash": { "type": "string" },
+          "tx_index": { "type": "integer", "format": "int32" },
+          "op_index": { "type": "integer", "format": "int32" },
+          "in_successful_call": { "type": "boolean" },
+          "topics": { "type": "array", "items": {} },
+          "value": {},
+          "created_at": { "type": "string", "format": "date-time" },
+          "decoded": {
+            "type": "boolean",
+            "description": "Whether the event was successfully enriched with spec-driven field names."
+          },
+          "decoded_event": {
+            "$ref": "#/components/schemas/DecodedEvent"
+          }
+        }
+      },
+      "DecodedEvent": {
+        "type": "object",
+        "properties": {
+          "event": { "type": "string", "description": "The event name from the contract spec." },
+          "fields": { "type": "object", "description": "Named fields and their decoded values.", "additionalProperties": true }
+        }
+      },
+      "EnrichedEventsResponse": {
+        "type": "object",
+        "required": ["events"],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/EnrichedEvent" }
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor."
+          }
+        }
+      },
+      "EventsResponse": {
+        "type": "object",
+        "required": ["events"],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Event" }
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor. Present when more results exist; pass back as ?cursor= for next page."
+          }
+        }
+      },
+      "Stats": {
+        "type": "object",
+        "required": ["total_events", "last_ingested_ledger", "verified_through_ledger", "oldest_stored_ledger", "contract_count", "watched_contracts"],
+        "properties": {
+          "total_events": { "type": "integer", "format": "int64", "description": "Total number of events stored." },
+          "last_ingested_ledger": { "type": "integer", "format": "int64", "description": "Most recently ingested ledger." },
+          "verified_through_ledger": { "type": "integer", "format": "int64", "description": "Highest ledger verified by the auditor (0 when auditor disabled)." },
+          "oldest_stored_ledger": { "type": "integer", "format": "int64", "description": "Oldest ledger with events in the store." },
+          "contract_count": { "type": "integer", "format": "int64", "description": "Number of distinct contracts indexed." },
+          "watched_contracts": { "type": "integer", "format": "int64", "description": "Number of actively watched contracts." },
+          "chain_head_ledger": { "type": "integer", "format": "int64", "description": "Current chain tip ledger (from RPC). Omitted when RPC is unreachable." },
+          "ingest_lag_ledgers": { "type": "integer", "format": "int64", "description": "Ledger lag: chain_head_ledger minus last_ingested_ledger. Omitted when RPC is unreachable." },
+          "auditor": {
+            "$ref": "#/components/schemas/AuditStats"
+          }
+        }
+      },
+      "AuditStats": {
+        "type": "object",
+        "properties": {
+          "passes_run": { "type": "integer", "format": "uint64" },
+          "ledgers_checked": { "type": "integer", "format": "uint64" },
+          "findings_opened": { "type": "integer", "format": "uint64" },
+          "findings_repaired": { "type": "integer", "format": "uint64" },
+          "findings_unverifiable": { "type": "integer", "format": "uint64" },
+          "findings_unrecoverable": { "type": "integer", "format": "uint64" },
+          "rpc_requests": { "type": "integer", "format": "uint64" }
+        }
+      },
+      "SubscriptionFilter": {
+        "type": "object",
+        "properties": {
+          "contract_id": { "type": "string", "description": "Only deliver events from this contract." },
+          "type": { "type": "string", "enum": ["contract", "system", "diagnostic"], "description": "Only deliver events of this type." },
+          "topic": { "type": "string", "description": "Exact JSON match against any topic position." },
+          "topic_contains": { "type": "string", "description": "JSONB containment filter on topics. Must be valid JSON." },
+          "from_ledger": { "type": "integer", "format": "int64", "minimum": 1, "description": "Inclusive lower ledger bound." },
+          "to_ledger": { "type": "integer", "format": "int64", "minimum": 1, "description": "Inclusive upper ledger bound." }
+        }
+      },
+      "CreateSubscriptionRequest": {
+        "type": "object",
+        "required": ["url", "secret"],
+        "properties": {
+          "url": { "type": "string", "format": "uri", "description": "The callback URL to POST events to." },
+          "secret": { "type": "string", "description": "The HMAC-SHA256 signing secret (prefixed with whsec_)." },
+          "filters": {
+            "$ref": "#/components/schemas/SubscriptionFilter",
+            "description": "Event filter. An empty object {} matches every event."
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Whether the subscription is active. Defaults to true."
+          }
+        }
+      },
+      "UpdateSubscriptionRequest": {
+        "type": "object",
+        "properties": {
+          "url": { "type": "string", "format": "uri", "description": "New callback URL." },
+          "secret": { "type": "string", "description": "New signing secret." },
+          "filters": {
+            "$ref": "#/components/schemas/SubscriptionFilter",
+            "description": "New event filter."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Enable or disable the subscription."
+          }
+        },
+        "description": "Only fields present in the body are changed. Omit a field to leave it unchanged."
+      },
+      "Subscription": {
+        "type": "object",
+        "required": ["id", "url", "filters", "secret", "enabled", "failure_count", "created_at"],
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "url": { "type": "string", "format": "uri" },
+          "filters": { "$ref": "#/components/schemas/SubscriptionFilter" },
+          "secret": { "type": "string" },
+          "enabled": { "type": "boolean" },
+          "failure_count": { "type": "integer", "description": "Consecutive delivery failures. Resets to 0 on success." },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "DeliveryAttempt": {
+        "type": "object",
+        "required": ["id", "subscription_id", "event_id", "status", "response_code", "duration_ms", "created_at"],
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "subscription_id": { "type": "integer", "format": "int64" },
+          "event_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["success", "failed"], "description": "Delivery outcome." },
+          "response_code": { "type": "integer", "description": "HTTP status code from the subscriber." },
+          "duration_ms": { "type": "integer", "description": "Request duration in milliseconds." },
+          "error": { "type": "string", "description": "Error message when status is failed." },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    }
+  }
+}

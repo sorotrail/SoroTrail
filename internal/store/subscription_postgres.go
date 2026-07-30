@@ -47,6 +47,7 @@ func (p *Postgres) GetSubscription(ctx context.Context, id int64, owner Subscrip
 	var (
 		s       Subscription
 		filters []byte
+		network *string
 	)
 	pred, args := ownerPredicate(owner, 2)
 	err := p.pool.QueryRow(ctx,
@@ -61,6 +62,9 @@ func (p *Postgres) GetSubscription(ctx context.Context, id int64, owner Subscrip
 	}
 	if err := json.Unmarshal(filters, &s.Filters); err != nil {
 		return Subscription{}, fmt.Errorf("unmarshaling subscription filters: %w", err)
+	}
+	if network != nil {
+		s.Filters.Network = *network
 	}
 	return s, nil
 }
@@ -140,8 +144,6 @@ func (p *Postgres) ListEnabledSubscriptions(ctx context.Context) ([]Subscription
 	return scanSubscriptions(rows)
 }
 
-// --- Failure counting ---
-
 func (p *Postgres) IncrementSubscriptionFailures(ctx context.Context, id int64, maxFailures int) (int, bool, error) {
 	var newCount int
 	var stillEnabled bool
@@ -170,8 +172,6 @@ func (p *Postgres) ResetSubscriptionFailures(ctx context.Context, id int64) erro
 	}
 	return nil
 }
-
-// --- Delivery attempts ---
 
 func (p *Postgres) RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (DeliveryAttempt, error) {
 	err := p.pool.QueryRow(ctx, `
@@ -231,14 +231,13 @@ func (p *Postgres) ListDeliveryAttempts(ctx context.Context, subscriptionID int6
 	return attempts, nil
 }
 
-// --- helpers ---
-
 func scanSubscriptions(rows pgx.Rows) ([]Subscription, error) {
 	var subs []Subscription
 	for rows.Next() {
 		var (
 			s       Subscription
 			filters []byte
+			network *string
 		)
 		if err := rows.Scan(&s.ID, &s.URL, &filters, &s.Secret, &s.Enabled,
 			&s.FailureCount, &s.CreatedAt, &s.TenantID); err != nil {
@@ -247,12 +246,14 @@ func scanSubscriptions(rows pgx.Rows) ([]Subscription, error) {
 		if err := json.Unmarshal(filters, &s.Filters); err != nil {
 			return nil, fmt.Errorf("unmarshaling subscription filters: %w", err)
 		}
+		if network != nil {
+			s.Filters.Network = *network
+		}
 		subs = append(subs, s)
 	}
 	return subs, rows.Err()
 }
 
-// Delivery status constants.
 const (
 	DeliverySuccess = "success"
 	DeliveryFailed  = "failed"

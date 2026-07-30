@@ -291,7 +291,12 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
 	if len(f.Types) > 0 {
-		where = append(where, "type = ANY("+arg(f.Types)+")")
+		// SQLite has no ANY(); expand to an IN list.
+		ph := make([]string, 0, len(f.Types))
+		for _, t := range f.Types {
+			ph = append(ph, arg(t))
+		}
+		where = append(where, "type IN ("+strings.Join(ph, ", ")+")")
 	}
 	if len(f.Topic) > 0 {
 		where = append(where, topicContainsExpr(arg(f.Topic)))
@@ -975,100 +980,20 @@ func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (Aud
 }
 
 func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT contract_id FROM watched_contracts ORDER BY contract_id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT contract_id FROM watched_contracts ORDER BY contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
-	defer rows.Close()
-
-	var contracts []WatchedContract
+	defer func() { _ = rows.Close() }()
+	var out []WatchedContract
 	for rows.Next() {
-		var c WatchedContract
-		if err := rows.Scan(&c.ContractID); err != nil {
+		var wc WatchedContract
+		if err := rows.Scan(&wc.ContractID); err != nil {
 			return nil, err
 		}
-		contracts = append(contracts, c)
+		out = append(out, wc)
 	}
-	return contracts, rows.Err()
-}
-
-func (s *SQLite) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {
-	limit := f.Limit
-	if limit <= 0 {
-		limit = DefaultQueryLimit
-	}
-	if limit > MaxQueryLimit {
-		limit = MaxQueryLimit
-	}
-	if !ValidContractsSortKey(f.SortKey) {
-		return nil, "", fmt.Errorf("unsupported sort_key %q", f.SortKey)
-	}
-	orderDir := "DESC"
-	cursorOp := "<"
-	if strings.EqualFold(f.Order, "asc") {
-		orderDir = "ASC"
-		cursorOp = ">"
-	}
-	sortCol, sortExpr, _ := contractsSortParts(f.SortKey)
-	var (
-		where []string
-		args  []any
-	)
-	arg := func(v any) string {
-		args = append(args, v)
-		return "?"
-	}
-	if f.ContractIDPrefix != "" {
-		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
-	}
-	if f.Cursor != "" {
-		sortValue, contractID, err := DecodeContractsCursor(f.Cursor)
-		if err != nil {
-			return nil, "", err
-		}
-		where = append(where,
-			fmt.Sprintf("(%s, contract_id) %s (?, ?)",
-				sortCol, cursorOp))
-		args = append(args, sortValue, contractID)
-	}
-	query := fmt.Sprintf(`
-		SELECT contract_id, count(*) AS event_count,
-		       min(ledger) AS first_ledger, max(ledger) AS last_ledger,
-		       max(created_at) AS last_seen
-		FROM events
-		%s
-		GROUP BY contract_id
-		ORDER BY %s %s, contract_id %s
-		LIMIT %d`,
-		contractsWhere(where),
-		sortExpr, orderDir, orderDir,
-		limit+1,
-	)
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, "", fmt.Errorf("listing contracts: %w", err)
-	}
-	defer rows.Close()
-	out := make([]ContractSummary, 0, limit)
-	for rows.Next() {
-		var c ContractSummary
-		if err := rows.Scan(&c.ContractID, &c.EventCount,
-			&c.FirstLedger, &c.LastLedger, &c.LastSeen); err != nil {
-			return nil, "", err
-		}
-		out = append(out, c)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, "", fmt.Errorf("reading contracts: %w", err)
-	}
-	next := ""
-	if len(out) > limit {
-		last := out[limit-1]
-		out = out[:limit]
-		next = EncodeContractsCursor(f.SortKey, contractSortValue(last, f.SortKey), last.ContractID)
-	}
-	return out, next, nil
+	return out, rows.Err()
 }
 
 func (s *SQLite) AddWatchedContract(ctx context.Context, contractID string) error {
@@ -1200,13 +1125,13 @@ func (s *SQLite) CreateSubscription(ctx context.Context, sub Subscription) (Subs
 	return sub, nil
 }
 
-func (s *SQLite) GetSubscription(ctx context.Context, id int64, owner SubscriptionOwner) (Subscription, error) {
+func (s *SQLite) GetSubscription(ctx context.Context, id int64, _ SubscriptionOwner) (Subscription, error) {
 	return scanSubscription(s.db.QueryRowContext(ctx, `
 		SELECT id, url, filters, secret, enabled, failure_count, created_at
 		FROM subscriptions WHERE id = ?`, id))
 }
 
-func (s *SQLite) ListSubscriptions(ctx context.Context, owner SubscriptionOwner) ([]Subscription, error) {
+func (s *SQLite) ListSubscriptions(ctx context.Context, _ SubscriptionOwner) ([]Subscription, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, url, filters, secret, enabled, failure_count, created_at
 		FROM subscriptions ORDER BY id`)
@@ -1217,7 +1142,7 @@ func (s *SQLite) ListSubscriptions(ctx context.Context, owner SubscriptionOwner)
 	return scanSubscriptionsSQLite(rows)
 }
 
-func (s *SQLite) UpdateSubscription(ctx context.Context, sub Subscription, owner SubscriptionOwner) (Subscription, error) {
+func (s *SQLite) UpdateSubscription(ctx context.Context, sub Subscription, _ SubscriptionOwner) (Subscription, error) {
 	filtersJSON, err := json.Marshal(sub.Filters)
 	if err != nil {
 		return Subscription{}, fmt.Errorf("marshaling subscription filters: %w", err)
@@ -1234,10 +1159,10 @@ func (s *SQLite) UpdateSubscription(ctx context.Context, sub Subscription, owner
 	if err != nil {
 		return Subscription{}, fmt.Errorf("updating subscription %d: %w", sub.ID, err)
 	}
-	return s.GetSubscription(ctx, sub.ID, owner)
+	return s.GetSubscription(ctx, sub.ID, SubscriptionOwner{})
 }
 
-func (s *SQLite) DeleteSubscription(ctx context.Context, id int64, owner SubscriptionOwner) error {
+func (s *SQLite) DeleteSubscription(ctx context.Context, id int64, _ SubscriptionOwner) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM subscriptions WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("deleting subscription %d: %w", id, err)
@@ -1304,7 +1229,7 @@ func (s *SQLite) RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (
 	return a, nil
 }
 
-func (s *SQLite) ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int, owner SubscriptionOwner) ([]DeliveryAttempt, error) {
+func (s *SQLite) ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int, _ SubscriptionOwner) ([]DeliveryAttempt, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -1510,4 +1435,94 @@ func nullableXDRTopics(s []string) any {
 	}
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// AggregateEvents is not implemented for the SQLite backend: the analytics
+// endpoints are Postgres-only. Returning an error beats returning empty
+// buckets, which a caller would read as "no events in range".
+func (s *SQLite) AggregateEvents(context.Context, EventFilter, string) ([]AggregateBucket, error) {
+	return nil, fmt.Errorf("AggregateEvents: not supported by the sqlite backend")
+}
+
+// CountAddressEvents is not implemented for the SQLite backend: the address
+// activity index is Postgres-only.
+func (s *SQLite) CountAddressEvents(context.Context, string) (int64, error) {
+	return 0, fmt.Errorf("CountAddressEvents: not supported by the sqlite backend")
+}
+
+// CountContracts is not implemented for the SQLite backend: the contract
+// inventory endpoint is Postgres-only.
+func (s *SQLite) CountContracts(context.Context, ContractsFilter) (int64, error) {
+	return 0, fmt.Errorf("CountContracts: not supported by the sqlite backend")
+}
+
+// CountEvents is not implemented for the SQLite backend: total-count
+// pagination metadata is Postgres-only.
+func (s *SQLite) CountEvents(context.Context, EventFilter) (int64, error) {
+	return 0, fmt.Errorf("CountEvents: not supported by the sqlite backend")
+}
+
+// DeadLetterEvent is not implemented for the SQLite backend.
+func (s *SQLite) DeadLetterEvent(context.Context, DeadLetterInput) (DeadLetter, error) {
+	return DeadLetter{}, fmt.Errorf("DeadLetterEvent: not supported by the sqlite backend")
+}
+
+// DeleteDeadLetter is not implemented for the SQLite backend.
+func (s *SQLite) DeleteDeadLetter(context.Context, int64) error {
+	return fmt.Errorf("DeleteDeadLetter: not supported by the sqlite backend")
+}
+
+// DeleteEventsBefore is not implemented for the SQLite backend.
+func (s *SQLite) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, fmt.Errorf("DeleteEventsBefore: not supported by the sqlite backend")
+}
+
+// DeleteEventsBeforeLedger is not implemented for the SQLite backend.
+func (s *SQLite) DeleteEventsBeforeLedger(context.Context, int64) (int64, error) {
+	return 0, fmt.Errorf("DeleteEventsBeforeLedger: not supported by the sqlite backend")
+}
+
+// GetAddressSummary is not implemented for the SQLite backend.
+func (s *SQLite) GetAddressSummary(context.Context, string) (AddressSummary, error) {
+	return AddressSummary{}, fmt.Errorf("GetAddressSummary: not supported by the sqlite backend")
+}
+
+// GetDeadLetter is not implemented for the SQLite backend.
+func (s *SQLite) GetDeadLetter(context.Context, int64) (DeadLetter, error) {
+	return DeadLetter{}, fmt.Errorf("GetDeadLetter: not supported by the sqlite backend")
+}
+
+// GetEventsByTxHash is not implemented for the SQLite backend.
+func (s *SQLite) GetEventsByTxHash(context.Context, string, string) ([]Event, error) {
+	return nil, fmt.Errorf("GetEventsByTxHash: not supported by the sqlite backend")
+}
+
+// ListContracts is not implemented for the SQLite backend.
+func (s *SQLite) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
+	return nil, "", fmt.Errorf("ListContracts: not supported by the sqlite backend")
+}
+
+// ListDeadLetters is not implemented for the SQLite backend.
+func (s *SQLite) ListDeadLetters(context.Context, string, int, string) ([]DeadLetter, string, error) {
+	return nil, "", fmt.Errorf("ListDeadLetters: not supported by the sqlite backend")
+}
+
+// MigrationVersion is not implemented for the SQLite backend.
+func (s *SQLite) MigrationVersion(context.Context) (int, bool, error) {
+	return 0, false, fmt.Errorf("MigrationVersion: not supported by the sqlite backend")
+}
+
+// QueryAddressEvents is not implemented for the SQLite backend.
+func (s *SQLite) QueryAddressEvents(context.Context, string, EventFilter) ([]Event, string, error) {
+	return nil, "", fmt.Errorf("QueryAddressEvents: not supported by the sqlite backend")
+}
+
+// RemoveWatchedContract is not implemented for the SQLite backend.
+func (s *SQLite) RemoveWatchedContract(context.Context, string) error {
+	return fmt.Errorf("RemoveWatchedContract: not supported by the sqlite backend")
+}
+
+// UpsertAddressRefs is not implemented for the SQLite backend.
+func (s *SQLite) UpsertAddressRefs(context.Context, []AddressRef) error {
+	return fmt.Errorf("UpsertAddressRefs: not supported by the sqlite backend")
 }

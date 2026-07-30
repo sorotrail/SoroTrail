@@ -1,3 +1,5 @@
+//go:build integration
+
 package replay_test
 
 // End-to-end replay against a real database. Skipped unless

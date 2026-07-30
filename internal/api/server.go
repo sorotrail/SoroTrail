@@ -24,16 +24,6 @@ type ctxKey string
 
 const loggerCtxKey ctxKey = "logger"
 
-// SetAuditor registers the binary's Auditor so /stats can surface its
-// Metrics counters. There is exactly one Auditor per process; its
-// lifetime is the lifetime of main(). SetAuditor must be called BEFORE
-// ListenAndServe so the first /stats request observes a stable value.
-// The setter is guarded by a RWMutex so concurrent reader goroutines in
-// /stats handlers can never observe a torn pointer.
-//
-// When AUDIT_ENABLED=false the function is never called and /stats
-// returns Stats with the embedded AuditStats struct zero-valued (and
-// omitted from JSON, courtesy of its `omitempty` tag).
 var (
 	auditorMu sync.RWMutex
 	auditor   *audit.Auditor
@@ -104,7 +94,6 @@ func getRPCCounter() *rpc.CountingClient {
 }
 
 // Enricher is the spec-based event enrichment interface used by the API.
-// Defined here so the API package doesn't import internal/spec directly.
 type Enricher interface {
 	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
 }
@@ -174,8 +163,6 @@ func SetMaxLimit(n int) {
 // New builds the API server. rpcClient is used by /health, /readyz, and /stats.
 // apiKey gates the watched-contracts management endpoints; pass "" to
 // fail closed (every request gets a 503 with "API_KEY not configured").
-// See apiKeyAuth for the exact contract. The trailing enricher is optional —
-// pass nil to disable spec decoding, or one Enricher to enable it.
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
 	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New()}
 	if len(enricher) > 0 {
@@ -226,7 +213,7 @@ func (s *Server) SetRateLimiter(l *RateLimiter) {
 }
 
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
-// (SSE, WebSocket) can deliver events as they arrive.
+// can deliver events as they arrive.
 func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 	s.bcast = b
 	return s
@@ -249,6 +236,13 @@ func (s *Server) SetCORSConfig(cfg CORSConfig) { s.cors = cfg }
 
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
+	return s.router()
+}
+
+// router builds the chi router with middleware and all routes. Returned
+// as chi.Router (not http.Handler) so tests can walk the route tree with
+// chi.Walk to verify spec coverage.
+func (s *Server) router() chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
@@ -262,9 +256,6 @@ func (s *Server) Router() http.Handler {
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 	if s.limiter != nil {
-		// Limiter sits inside Timeout and Recoverer so its instant 429
-		// response always makes it back through the deadline cleanly, and
-		// a panic inside the limiter can't take down the server.
 		r.Use(s.limiter.Middleware)
 	}
 	// authenticate must run before any handler that reads events: it is what
@@ -286,10 +277,14 @@ func (s *Server) Router() http.Handler {
 	// Non-list routes: health, metrics, writes — responses are always
 	// small, so compression is just overhead with no benefit.
 	r.Get("/health", s.handleHealth)
+	r.Get("/metrics", s.handleMetrics)
 	r.Get("/livez", s.handleLivez)
 	r.Get("/readyz", s.handleReadyz)
 	r.Get("/version", s.handleVersion)
-	r.Handle("/metrics", s.metrics.Handler())
+	// Registered as GET, not Handle: Handle advertises every method (the
+	// route-drift test then demands CONNECT/TRACE entries in the OpenAPI
+	// spec), and scraping is a GET.
+	r.Get("/metrics", s.metrics.Handler().ServeHTTP)
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/count", s.handleCountEvents)
 	r.Get("/events/aggregate", s.handleAggregateEvents)
@@ -302,8 +297,6 @@ func (s *Server) Router() http.Handler {
 	r.Get("/contracts/{id}/export", s.handleContractExport)
 
 	r.Get("/stats", s.handleStats)
-	r.Get("/analytics/events", s.handleAnalyticsEvents)
-	r.Get("/analytics/token-volume", s.handleAnalyticsTokenVolume)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.
@@ -408,6 +401,22 @@ func (s *Server) Router() http.Handler {
 	return r
 }
 
+// handleOpenAPI serves the embedded OpenAPI 3.1 specification.
+func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(openapiSpec)
+}
+
+// handleDocs serves the Swagger UI page that renders /openapi.json.
+func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(swaggerUI))
+}
+
 func (s *Server) requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
@@ -421,6 +430,13 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 			"status", ww.Status(),
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
+		if s.metrics != nil {
+			path := chi.RouteContext(r.Context()).RoutePattern()
+			if path == "" {
+				path = r.URL.Path
+			}
+			s.metrics.RecordHTTPRequest(path, ww.Status(), time.Since(start).Seconds())
+		}
 	})
 }
 
