@@ -471,6 +471,7 @@ func run() error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
+	broker.Shutdown()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Error("http shutdown", "error", err)
 	}

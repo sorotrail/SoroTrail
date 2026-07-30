@@ -202,15 +202,11 @@ func (p *Postgres) attemptReconnect(ctx context.Context, logger *slog.Logger) er
 	return nil
 }
 
-func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
+func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) ([]Event, error) {
 	if len(events) == 0 {
-		return 0, nil
+		return nil, nil
 	}
-	rows, err := p.upsertEvents(ctx, events, false)
-	if err != nil {
-		return 0, err
-	}
-	return rows, nil
+	return p.upsertEvents(ctx, events, false)
 }
 
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
@@ -300,7 +296,7 @@ func (p *Postgres) ensureEventPartitions(ctx context.Context, events []Event) er
 
 func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bool) (int64, error) {
 	if len(events) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	if err := p.ensureEventPartitions(ctx, events); err != nil {
 		return 0, err
@@ -308,15 +304,17 @@ func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bo
 	results := p.pool.SendBatch(ctx, insertEventsBatch(events, onUpdate))
 	defer results.Close()
 
-	var affected int64
-	for range events {
+	var inserted []Event
+	for i := range events {
 		tag, err := results.Exec()
 		if err != nil {
-			return affected, fmt.Errorf("upserting events: %w", err)
+			return nil, fmt.Errorf("upserting events: %w", err)
 		}
-		affected += tag.RowsAffected()
+		if tag.RowsAffected() > 0 {
+			inserted = append(inserted, events[i])
+		}
 	}
-	return affected, nil
+	return inserted, nil
 }
 
 func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error {
