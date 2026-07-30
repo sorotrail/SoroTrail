@@ -217,6 +217,15 @@ func eventMatches(ev store.Event, f store.EventFilter) bool {
 	if !f.ToTime.IsZero() && ev.CreatedAt.After(f.ToTime) {
 		return false
 	}
+	if f.HasValue != nil {
+		hasPayload := len(ev.Value) > 0 && string(ev.Value) != "null"
+		if *f.HasValue && !hasPayload {
+			return false
+		}
+		if !*f.HasValue && hasPayload {
+			return false
+		}
+	}
 	return true
 }
 

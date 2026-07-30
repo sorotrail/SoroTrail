@@ -1476,6 +1476,7 @@ func listETag(f store.EventFilter) string {
 		ToLedger:      f.ToLedger,
 		FromTime:      timeOrEmpty(f.FromTime),
 		ToTime:        timeOrEmpty(f.ToTime),
+		HasValue:      f.HasValue,
 		Cursor:        f.Cursor,
 		Limit:         resolvedLimit(f.Limit),
 		Order:         resolvedOrder(f.Order),

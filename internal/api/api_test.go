@@ -488,6 +488,7 @@ func TestListEvents_BadParams(t *testing.T) {
 		"/events?cursor=%3Cscript%3E",
 		"/events?cursor=cursor%27OR%271%3D%271",
 		"/events?topic_contains=not-valid-json",
+		"/events?has_value=maybe",
 	} {
 		t.Run(path, func(t *testing.T) {
 			resp, body := doGet(t, newTestServer(&stubStore{}, nil), path)
