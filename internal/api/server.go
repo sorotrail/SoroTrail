@@ -289,7 +289,10 @@ func (s *Server) Router() http.Handler {
 	r.Get("/livez", s.handleLivez)
 	r.Get("/readyz", s.handleReadyz)
 	r.Get("/version", s.handleVersion)
-	r.Handle("/metrics", s.metrics.Handler())
+	// Registered as GET, not Handle: Handle advertises every method (the
+	// route-drift test then demands CONNECT/TRACE entries in the OpenAPI
+	// spec), and scraping is a GET.
+	r.Get("/metrics", s.metrics.Handler().ServeHTTP)
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/count", s.handleCountEvents)
 	r.Get("/events/aggregate", s.handleAggregateEvents)
@@ -302,8 +305,6 @@ func (s *Server) Router() http.Handler {
 	r.Get("/contracts/{id}/export", s.handleContractExport)
 
 	r.Get("/stats", s.handleStats)
-	r.Get("/analytics/events", s.handleAnalyticsEvents)
-	r.Get("/analytics/token-volume", s.handleAnalyticsTokenVolume)
 	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.

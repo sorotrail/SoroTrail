@@ -223,6 +223,15 @@ func Load() (Config, error) {
 	if err := cfg.ValidateAll(); err != nil {
 		return Config{}, err
 	}
+	// Validate() holds the per-field rules that predate ValidateAll
+	// (API_QUERY_TIMEOUT, LOG_FORMAT, the HTTP_* timeouts, audit and
+	// retention bounds). It is called here rather than from ValidateAll
+	// because it assumes envDefaults have been applied, which is only true
+	// on this path; ValidateAll also runs against hand-built Configs in
+	// tests. Without this call those rules were silently unenforced.
+	if err := cfg.Validate(); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -249,7 +258,10 @@ func (c Config) Validate() error {
 			return fmt.Errorf("sqlite DATABASE_URL %q must be an absolute or relative path (or :memory:)", c.DatabaseURL)
 		}
 	}
-	if u, err := url.Parse(c.HorizonURL); err != nil || u.Scheme == "" || u.Host == "" {
+	// Empty means "unused": HORIZON_URL is only read by `sorotrail backfill`
+	// and Load supplies a default, so an unset value is not a misconfigured
+	// indexer. Validate the shape only when someone actually set one.
+	if u, err := url.Parse(c.HorizonURL); c.HorizonURL != "" && (err != nil || u.Scheme == "" || u.Host == "") {
 		return fmt.Errorf("HORIZON_URL %q is not a valid URL", c.HorizonURL)
 	}
 	if c.PollInterval <= 0 {
