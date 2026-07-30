@@ -10,7 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // DefaultBufferSize is the per-subscriber channel buffer.
@@ -31,6 +31,12 @@ type Subscription struct {
 	filter store.EventFilter
 	b      *Broadcaster
 	once   sync.Once
+
+	// scopeMu guards scope, which — unlike the rest of filter — changes
+	// during the subscription's life. A long-lived stream must react to
+	// grants and revocations that happen after it was opened; see SetScope.
+	scopeMu sync.RWMutex
+	scope   store.Scope
 }
 
 // New creates a Broadcaster.
@@ -44,7 +50,13 @@ func New(bufferSize int) *Broadcaster {
 	}
 }
 
-// Subscribe registers a new subscriber with the given filter.
+// Subscribe registers a new subscriber with the given filter. The returned
+// Subscription receives matching events on Events() until Close() is called.
+//
+// The filter's Scope is the subscriber's authorization boundary and is
+// enforced on every dispatch, not merely at subscribe time. As everywhere
+// else, its zero value grants nothing: a subscriber registered with a
+// hand-built filter receives no events rather than all of them.
 func (b *Broadcaster) Subscribe(filter store.EventFilter) *Subscription {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -53,10 +65,33 @@ func (b *Broadcaster) Subscribe(filter store.EventFilter) *Subscription {
 		id:     id,
 		ch:     make(chan store.Event, b.bufferSize),
 		filter: filter,
+		scope:  filter.Scope,
 		b:      b,
 	}
 	b.subs[id] = s
 	return s
+}
+
+// SetScope replaces the subscription's authorization boundary in place.
+//
+// This is how a stream handles a tenant's grants changing while it is open.
+// Capturing the scope once at subscribe time would mean a revoked tenant
+// keeps receiving a contract's events for as long as it holds the
+// connection open — indefinitely — which makes revocation advisory rather
+// than real. Re-resolving instead bounds the exposure to one sync interval,
+// and does so symmetrically: a contract granted mid-stream starts flowing
+// within the same interval without the client reconnecting.
+func (s *Subscription) SetScope(sc store.Scope) {
+	s.scopeMu.Lock()
+	s.scope = sc
+	s.scopeMu.Unlock()
+}
+
+// currentScope reads the live scope under the read lock.
+func (s *Subscription) currentScope() store.Scope {
+	s.scopeMu.RLock()
+	defer s.scopeMu.RUnlock()
+	return s.scope
 }
 
 func (b *Broadcaster) unsubscribe(id string) {
@@ -86,7 +121,16 @@ func (b *Broadcaster) Publish(ctx context.Context, events []store.Event) {
 
 	var evict []string
 	for _, s := range subs {
+		// Read the scope once per subscriber per publish rather than once
+		// per event: it cannot change mid-batch in a way that matters, and
+		// taking the lock per event would put it on the hot path.
+		scope := s.currentScope()
 		for _, ev := range events {
+			// Authorization first, and independently of the user's filter,
+			// so no filter expression can be crafted to bypass it.
+			if !scope.Allows(ev.ContractID) {
+				continue
+			}
 			if !eventMatches(ev, s.filter) {
 				continue
 			}
@@ -125,14 +169,36 @@ func (s *Subscription) Close() {
 
 // eventMatches reports whether an event satisfies the given filter.
 func eventMatches(ev store.Event, f store.EventFilter) bool {
-	if f.Network != "" && ev.Network != f.Network {
-		return false
+	// If both ContractID and ContractIDs are set, match if the event's
+	// contract matches either one.
+	if f.ContractID != "" || len(f.ContractIDs) > 0 {
+		matched := false
+		if f.ContractID != "" && ev.ContractID == f.ContractID {
+			matched = true
+		}
+		if !matched {
+			for _, id := range f.ContractIDs {
+				if ev.ContractID == id {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			return false
+		}
 	}
-	if f.ContractID != "" && ev.ContractID != f.ContractID {
-		return false
-	}
-	if f.Type != "" && ev.Type != f.Type {
-		return false
+	if len(f.Types) > 0 {
+		ok := false
+		for _, t := range f.Types {
+			if ev.Type == t {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
 	}
 	if len(f.Topic) > 0 {
 		if !topicContains(ev.Topics, f.Topic) {

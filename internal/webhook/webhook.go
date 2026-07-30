@@ -17,7 +17,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 const (
@@ -150,7 +150,13 @@ func (n *Notifier) worker(ctx context.Context) {
 // resets the subscription's failure count. On final failure it
 // auto-disables the subscription.
 func (n *Notifier) deliverWithRetry(ctx context.Context, task deliveryTask) {
-	payload := Payload{Event: task.Event}
+	// Stamp the SEP-41 normalized envelope (when applicable) before signing
+	// the body — subscribers verify the signature against the exact bytes
+	// POSTed, so the augmentation has to land here, not in a post-decode
+	// step on the subscriber side.
+	event := task.Event
+	event.WithSEP41()
+	payload := Payload{Event: event}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		// JSON marshal failure is terminal (won't fix itself on retry).
