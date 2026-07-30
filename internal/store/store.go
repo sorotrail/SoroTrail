@@ -562,6 +562,10 @@ type Stats struct {
 	// Set by the guarded store wrapper; zero when the store is used
 	// directly or when no errors have occurred.
 	QueryErrors uint64 `json:"query_errors"`
+	// EventsIngestedTotal is the total number of events successfully
+	// persisted to the store since process start. Populated by the
+	// ingester; zero when the ingester is not wired.
+	EventsIngestedTotal uint64 `json:"events_ingested_total"`
 	// PanicsRecovered is the number of panics the HTTP middleware has
 	// recovered since process start. Set by the API handler.
 	PanicsRecovered uint64 `json:"panics_recovered"`

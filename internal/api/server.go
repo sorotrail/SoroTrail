@@ -97,6 +97,27 @@ func getRPCCounter() *rpc.CountingClient {
 	return rpcCounter
 }
 
+// SetIngester registers the Ingester so /stats can surface its
+// EventsIngestedTotal counter. Call this before ListenAndServe.
+// The setter is guarded by a RWMutex so concurrent /stats readers
+// never observe a torn pointer.
+var (
+	ingesterMu sync.RWMutex
+	ing        *ingester.Ingester
+)
+
+func SetIngester(i *ingester.Ingester) {
+	ingesterMu.Lock()
+	ing = i
+	ingesterMu.Unlock()
+}
+
+func getIngester() *ingester.Ingester {
+	ingesterMu.RLock()
+	defer ingesterMu.RUnlock()
+	return ing
+}
+
 // Enricher is the spec-based event enrichment interface used by the API.
 type Enricher interface {
 	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent

@@ -143,6 +143,9 @@ func newMockStore() *mockStore {
 func (m *mockStore) UpsertEvents(_ context.Context, events []store.Event) ([]store.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.upsertErr != nil {
+		return 0, m.upsertErr
+	}
 	m.upserted = append(m.upserted, events)
 	var inserted []store.Event
 	for _, e := range events {

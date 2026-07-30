@@ -21,6 +21,74 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
+func TestEventsIngestedTotal_SingleSuccess(t *testing.T) {
+	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{
+		Events:       []rpc.Event{rpcEvent("e1", 100), rpcEvent("e2", 100), rpcEvent("e3", 100)},
+		LatestLedger: 500,
+	}}}
+	st := newMockStore()
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(3), ing.EventsIngestedTotal(),
+		"counter must equal the number of events persisted in one successful write")
+}
+
+func TestEventsIngestedTotal_CumulativeMultipleWrites(t *testing.T) {
+	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{
+		{Events: []rpc.Event{rpcEvent("e1", 100), rpcEvent("e2", 101)}, LatestLedger: 500},
+		{Events: []rpc.Event{rpcEvent("e3", 102), rpcEvent("e4", 103), rpcEvent("e5", 104)}, LatestLedger: 500},
+	}}
+	st := newMockStore()
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 2})
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(2), ing.EventsIngestedTotal(), "after first pass")
+
+	_, err = ing.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), ing.EventsIngestedTotal(),
+		"counter must accumulate across multiple successful writes")
+}
+
+func TestEventsIngestedTotal_FailedWriteDoesNotIncrement(t *testing.T) {
+	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{
+		Events:       []rpc.Event{rpcEvent("e1", 100)},
+		LatestLedger: 500,
+	}}}
+	st := newMockStore()
+	st.upsertErr = fmt.Errorf("database connection lost")
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
+
+	_, err := ing.runOnce(context.Background())
+	assert.Error(t, err)
+	assert.Equal(t, uint64(0), ing.EventsIngestedTotal(),
+		"counter must not increment when the store write fails")
+}
+
+func TestEventsIngestedTotal_MixedSuccessAndFailure(t *testing.T) {
+	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{
+		{Events: []rpc.Event{rpcEvent("e1", 100), rpcEvent("e2", 101)}, LatestLedger: 500},
+		{Events: []rpc.Event{rpcEvent("e3", 102)}, LatestLedger: 500},
+	}}
+	st := newMockStore()
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
+
+	// First pass succeeds.
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(2), ing.EventsIngestedTotal())
+
+	// Inject failure for second pass.
+	st.upsertErr = fmt.Errorf("deadlock detected")
+	_, err = ing.runOnce(context.Background())
+	assert.Error(t, err)
+	assert.Equal(t, uint64(2), ing.EventsIngestedTotal(),
+		"failed write must not change the counter; prior successes preserved")
+}
+
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
