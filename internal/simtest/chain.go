@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/rpc"
 )
 
 // LedgerDuration is the virtual time between ledger closes in the simulation.
@@ -437,4 +437,11 @@ func BuildEvent(id string, ledger uint32, contractID string) rpc.Event {
 		ValueJSON:  json.RawMessage(`{"u64":1}`),
 		TopicJSON:  []json.RawMessage{json.RawMessage(`{"symbol":"test"}`)},
 	}
+}
+
+// GetLedgerEntries satisfies rpc.Client. The virtual chain models events
+// only, not ledger state, so contract-spec lookups return no entries rather
+// than fabricating data a simulation would then assert against.
+func (c *VirtualChain) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+	return rpc.GetLedgerEntriesResponse{}, nil
 }
