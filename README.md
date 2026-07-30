@@ -57,7 +57,9 @@ service_healthy` on Postgres, a fresh `docker compose up --build`
 brings the stack up in the right order instead of hoping the indexer
 wins a race against a half-up database.
 
-### Bare metal
+WATCHED_CONTRACTS=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC docker compose up --build
+Bare metal
+Shell
 
 docker compose up -d postgres     # or bring your own Postgres
 cp .env.example .env              # adjust as needed
@@ -73,6 +75,56 @@ DATABASE_URL=sqlite:./sorotrail.db make run
 
 Migrations run automatically on startup.
 
+Configuration
+All configuration comes from environment variables (see 
+.env.example
+):
+
+Variable	Default	Description
+RPC_URL	https://soroban-testnet.stellar.org	Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet.
+DATABASE_URL	— (required)	Postgres connection string.
+POLL_INTERVAL	5s	Sleep between polls once caught up.
+HTTP_ADDR	:8080	API listen address.
+WATCHED_CONTRACTS	empty	Comma-separated contract IDs (C...). Empty = ingest all contract events.
+START_LEDGER	unset	Force cold-start ingestion from this ledger.
+RETENTION_LEDGERS	17280	Cold-start reach-back in ledgers (~24h at 5s/ledger).
+LOG_LEVEL	info	debug | info | warn | error.
+AUDIT_ENABLED	false	Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build.
+AUDIT_POLL_INTERVAL	30s	Sleep between audit passes.
+AUDIT_BATCH_LEDGERS	100	Ledger range covered by one audit pass.
+AUDIT_LAG_THRESHOLD	200	Auditor sleeps until ingest is at least this many ledgers past the verified mark.
+AUDIT_BUDGET_SHARE	0.10	Fraction of the request budget the audit pool gets (rest goes to ingest).
+AUDIT_MAX_RPS	10	Total request budget (split between ingest and audit).
+AUDIT_MAX_REPAIR_ATTEMPTS	3	Repair iterations before a finding is kept open as unrecoverable.
+AUDIT_FINDING_MAX_LEDGERS	100	Largest range a single finding is allowed to span.
+RATE_LIMIT_RPS	unset	Per-client HTTP request rate limit (requests/second). Both RATE_LIMIT_RPS and RATE_LIMIT_BURST must be set together; otherwise no rate limiting is applied.
+RATE_LIMIT_BURST	unset	Maximum instantaneous burst size for the rate limiter. Pairs with RATE_LIMIT_RPS.
+RATE_LIMIT_TRUSTED_PROXY	false	Honor X-Forwarded-For for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control X-Forwarded-For themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key.
+CACHE_PRIVATE	false	Flip cacheable responses from Cache-Control: public to private. Set this when the deployment serves per-user data behind an auth layer (see Caching).
+Ingestion behavior
+Cold start (empty database): begins at latest ledger − RETENTION_LEDGERS
+(clamped to what the RPC still retains) so it captures as much recent history
+as possible, then follows the chain head. START_LEDGER overrides this.
+Warm start: resumes from the persisted cursor / last ingested ledger.
+Events are upserted idempotently by ID, so re-scans and restarts never
+duplicate rows.
+If the indexer is down long enough that its resume point falls out of the
+RPC's retention window, it logs a warning and skips ahead to the oldest
+retained ledger (the gap is unrecoverable from RPC — that's the problem this
+project exists to prevent).
+Requests are rate-limited (~10/s, matching public endpoint limits) and
+errors are retried with jittered exponential backoff.
+Topics/values are stored as JSON. When the RPC supports xdrFormat: "json"
+its decoding is used verbatim; otherwise the base64 XDR is decoded locally
+into shapes like {"symbol":"transfer"}, {"u64":42}, {"i128":"-1000"},
+{"address":"C..."}.
+The raw base64 XDR is stored alongside the decoded JSON, so an improved
+decoder can be applied to already-indexed events — see
+decoder replay. This intentionally duplicates payload
+data in events.topics_xdr and events.value_xdr; budget extra event-table
+storage for deployments that retain large event histories.
+Decoder replay
+Decoders improve over time. sorotrail replay re-runs the current decoder
 ## Configuration
 
 All configuration comes from environment variables (see `.env.example`):
@@ -80,8 +132,8 @@ All configuration comes from environment variables (see `.env.example`):
 | Variable | Default | Description |
 | --- | --- | --- |
 | `RPC_URL` | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet. |
-| `HORIZON_URL` | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. |
-| `BACKFILL_RATE_RPS` | `10` | Pace against Horizon when backfilling. 10 req/s is the public-instance cap; private deployments can lift this. |
+| `RPC_URLS` | unset | Comma-separated, priority-ordered list of Stellar RPC endpoints. When set, `RPC_URL` is ignored and the multi-provider failover client is used. List order is priority: index 0 is tried first. |
+| `RPC_RATE_LIMIT_RPS` | `10` | Per-provider request rate limit (`requests/second`) applied to each RPC endpoint independently. Only used when `RPC_URLS` is set. |
 | `DATABASE_URL` | — (required) | Postgres connection string. |
 | `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. |
 | `HTTP_ADDR` | `:8080` | API listen address. |
@@ -120,6 +172,58 @@ All configuration comes from environment variables (see `.env.example`):
 | `MULTI_TENANT_STREAM_SCOPE_SYNC` | `30s` | How often an open stream re-resolves its tenant's grants, bounding how long a revoked grant keeps being served. |
 | `MULTI_TENANT_BOOTSTRAP_KEY` | unset | Installs an admin API key for the seeded `default` tenant at startup, so a fresh multi-tenant install can mint its first keys. Rejected unless `MULTI_TENANT=true`. |
 
+## Multi-provider failover
+
+`RPC_URL` is a single point of failure. Setting `RPC_URLS` enables a
+multi-provider failover client that wraps each endpoint with health
+scoring and automatic promotion/demotion:
+
+- **Priority order**: providers are tried in list order; the
+  highest-priority healthy provider receives all traffic.
+- **Passive health scoring**: real request outcomes drive demotion.
+  Network errors (DNS, connection refused, timeout) and HTTP 5xx
+  responses count toward the error budget. Semantic errors
+  (`IsLedgerOutOfRange`, HTTP 4xx) never demote a healthy provider.
+- **Demotion**: after 3 consecutive demotable errors a provider is
+  `degraded` (still eligible but deprioritised); after 3 further
+  errors it becomes `down` and is excluded from traffic.
+- **Probes**: `StateDown` providers receive periodic `getHealth`
+  probes (every 30s). After 2 consecutive successful probes the
+  provider is promoted back to `active`. Active providers are never
+  probed — rate limit is reserved for real work.
+- **Cursor re-anchor**: when a provider switch occurs mid-pagination
+  (a `getEvents` request carries a cursor), the failover client
+  returns `ErrFailoverReanchor`. The ingester discards the cursor and
+  resumes from the last persisted ledger position; idempotent upserts
+  absorb the overlap.
+- **All-down**: when every provider is `down`, the client enters
+  jittered exponential backoff with clear logging.
+- **Per-provider rate limits**: each provider gets its own token
+  bucket at `RPC_RATE_LIMIT_RPS` (default 10/s).
+- **Head skew tolerance**: small chain-head differences (≤3 ledgers)
+  between providers do not cause flaps.
+- **Backward compatible**: omitting `RPC_URLS` keeps the single-URL
+  behaviour unchanged. `RPC_URL` still works and is still the default.
+
+```sh
+# Single provider (unchanged)
+RPC_URL=https://soroban-testnet.stellar.org
+
+# Multi-provider failover
+RPC_URLS=https://rpc1.example.com,https://rpc2.example.com,https://rpc3.example.com
+RPC_RATE_LIMIT_RPS=15
+```
+
+### Mixed-retention caveat
+
+Providers with different retention windows present a known risk: a
+failover from a long-retention provider to a short-retention one may
+cause `IsLedgerOutOfRange` errors for older ledger queries. The
+indexer handles this by re-clamping to the oldest retained ledger
+(accepting the gap), but deployments with heterogeneous providers
+should ensure the shortest retention window is ≥ the ingester's
+`RETENTION_LEDGERS` setting.
+
 ## Ingestion behavior
 
 - **Cold start** (empty database): begins at `latest ledger − RETENTION_LEDGERS`
@@ -148,9 +252,7 @@ All configuration comes from environment variables (see `.env.example`):
   `{"address":"C..."}`.
 - The raw base64 XDR is stored alongside the decoded JSON, so an improved
   decoder can be applied to already-indexed events — see
-  [decoder replay](#decoder-replay). This intentionally duplicates payload
-  data in `events.topics_xdr` and `events.value_xdr`; budget extra event-table
-  storage for deployments that retain large event histories.
+  [decoder replay](#decoder-replay).
 
 ## Backfilling historical events
 
@@ -188,21 +290,6 @@ notably: Horizon must retain historical meta for the target network,
 only Soroban V3/V4 transactions carry events, and the public Stellar
 testnet Horizon retains everything from protocol 17 onward while
 mainnet varies.
-
-### `sorotrail rollup-rebuild`
-
-Reconstructs the rollup tables from stored events. Useful after backfills
-or replays, or when a decoder improvement changes which events are classified
-as transfers.
-
-```sh
-sorotrail rollup-rebuild --from-ledger N [--to-ledger M]
-```
-
-Only one rebuild may run at a time (advisory lock). Safe to run against a
-live database; targets historical ledger ranges — running it at the live
-ingestion frontier may transiently overcount events ingested during the
-rebuild.
 
 ## Decoder replay
 
@@ -354,12 +441,33 @@ Lists stored events in ascending (oldest-first) or descending (newest-first) ord
 
 Query parameters (all optional, combinable):
 
+Param	Example	Meaning
+contract_id	CDLZ...CYSC	Only events from this contract.
+type	contract	contract | system | diagnostic.
+topic	{"symbol":"transfer"}	Exact match against any topic position. A bare word is treated as a JSON string.
+topic_contains	[{"address":"G..."}]	Postgres jsonb containment (@>) against the topics array. Pass an array to match one or more topic elements: [{"address":"G..."}] matches any event where a topic contains that address; [{"symbol":"transfer"},{"address":"G..."}] requires both. Must be parseable JSON (400 otherwise). Uses the GIN index on topics.
+topic0	{"symbol":"transfer"}	Exact match against topic position 0.
+topic1	{"address":"G..."}	Exact match against topic position 1.
+topic2	{"address":"G..."}	Exact match against topic position 2.
+topic3	{"u64":7}	Exact match against topic position 3.
+from_ledger	250000	Inclusive lower ledger bound.
+to_ledger	260000	Inclusive upper ledger bound.
+from_time	2026-07-21T00:00:00Z	Inclusive lower created_at bound (RFC 3339). Sub-second precision and missing timezone are rejected.
+to_time	2026-07-22T00:00:00Z	Inclusive upper created_at bound (RFC 3339). Sub-second precision and missing timezone are rejected.
+limit	50	Page size, 1–200 (default 50). Values outside [1, 200] or non-integers return HTTP 400.
+cursor	0001234...	Opaque pagination cursor from a previous response. Must consist of alphanumeric characters, hyphens, underscores, dots, or colons (up to 128 characters). Malformed cursors return HTTP 400.
+order	desc	asc
+decoded	true	When true, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with "decoded": false.
+include_xdr	true	When true, includes raw base64 topics_xdr and value_xdr on each event. Omitted by default to keep responses small.
+Topic filters may use topic for any-position matching, or topic0..topic3 for position-specific matching. topic and positional topic filters cannot be combined.
+
+Shell
+
 | Param | Example | Meaning |
 | --- | --- | --- |
 | `contract_id` | `CDLZ...CYSC` | Only events from this contract. |
 | `type` | `contract` | `contract` \| `system` \| `diagnostic`. |
 | `topic` | `{"symbol":"transfer"}` | Exact match against any topic position. A bare word is treated as a JSON string. |
-| `topic_contains` | `[{"address":"G..."}]` | Postgres jsonb containment (`@>`) against the topics array. Pass an array to match one or more topic elements: `[{"address":"G..."}]` matches any event where a topic contains that address; `[{"symbol":"transfer"},{"address":"G..."}]` requires both. Must be parseable JSON (400 otherwise). Uses the GIN index on `topics`. |
 | `topic0` | `{"symbol":"transfer"}` | Exact match against topic position 0. |
 | `topic1` | `{"address":"G..."}` | Exact match against topic position 1. |
 | `topic2` | `{"address":"G..."}` | Exact match against topic position 2. |
@@ -375,7 +483,6 @@ Query parameters (all optional, combinable):
 | `order` | `desc` | `asc` \| `desc`, defaults to asc. Sort direction. |
 | `order_by` | `created_at` | `id` \| `ledger` \| `created_at`, defaults to `id`. Sort column. Anything else is a `400`. |
 | `decoded` | `true` | When `true`, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with `"decoded": false`. |
-| `include_xdr` | `true` | When `true`, includes raw base64 `topics_xdr` and `value_xdr` on each event. Omitted by default to keep responses small. |
 
 Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
 
@@ -401,24 +508,26 @@ working.
 
 ```sh
 curl -s 'localhost:8080/events?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic={"symbol":"transfer"}&limit=2'
-```
-
-Containment search (`topic_contains`) lets you filter by partial topic
+Containment search (topic_contains) lets you filter by partial topic
 structure — e.g. any event involving a specific address, even when you
 don't know the full topic shape:
 
-```sh
+Shell
+
 # Events whose topics include a specific address
 curl -s 'localhost:8080/events?topic_contains=[{"address":"GA...5WI"}]&limit=5'
 # Events with both a transfer symbol and a specific address
 curl -s 'localhost:8080/events?topic_contains=[{"symbol":"transfer"},{"address":"GA...5WI"}]&limit=5'
-```
-
-**Semantics**: `topic_contains` uses Postgres jsonb containment (`@>`),
-not substring matching. `topic_contains=[{"address":"G..."}]` means
+Semantics: topic_contains uses Postgres jsonb containment (@>),
+not substring matching. topic_contains=[{"address":"G..."}] means
 "the topics array contains an element that itself jsonb-contains
-`{"address":"G..."}`", so `{"address":"G...","symbol":"transfer"}`
-matches. For exact element equality use `topic` instead.
+{"address":"G..."}", so {"address":"G...","symbol":"transfer"}
+matches. For exact element equality use topic instead.
+
+Shell
+
+curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"GABC..."}&topic2={"address":"GDEF..."}'
+JSON
 
 ```sh
 curl -s 'localhost:8080/events?topic0={"symbol":"transfer"}&topic1={"address":"GABC..."}&topic2={"address":"GDEF..."}'
@@ -990,6 +1099,9 @@ function verifySignature(body, signatureHeader, secret) {
 //   const { event } = JSON.parse(req.body);
 //   // process event
 // });
+</details><details> <summary>TypeScript (Bun / Deno)</summary>
+TypeScript
+
 ```
 
 </details>
@@ -1011,6 +1123,20 @@ async function verifySignature(req: Request, secret: string): Promise<boolean> {
     new TextEncoder().encode(sigHeader)
   );
 }
+</details>
+Delivery semantics
+Delivery is at-least-once: a subscriber may receive the same event more
+than once. Deduplicate by event id.
+Failed deliveries are retried up to 5 times with exponential backoff
+(1s → 2s → 4s → 8s → 16s).
+After 5 consecutive failures the subscription is auto-disabled. A
+successful delivery resets the failure counter to 0.
+Delivery attempts are recorded in delivery_attempts and queryable via
+GET /subscriptions/{id}/deliveries.
+Subscribers should return a 2xx status code to acknowledge receipt.
+Non-2xx responses are treated as failures and retried.
+GET /stats
+Shell
 ```
 
 </details>
@@ -1071,6 +1197,9 @@ as soon as they are written to the store. There is no replay — the
 stream starts at "now", and the client only sees events the indexer
 ingests after it connects.
 
+Query parameters share the same EventFilter shape as GET /events
+(contract_id, type, topic, from_ledger, to_ledger,
+from_time, to_time), so any filter that works against the query
 Query parameters share the same `EventFilter` shape as `GET /events`
 (`contract_id`, `type`, `topic`, `from_ledger`, `to_ledger`,
 `from_time`, `to_time`), so any filter that works against the query
@@ -1078,6 +1207,30 @@ API works against the stream.
 
 Frame format:
 
+One store.Event per WebSocket text frame, JSON-encoded.
+Server-to-client only — clients do not send messages; the nhooyr.io/websocket
+library handles ping/pong internally.
+The server pings every 30s so proxies don't idle the connection.
+Behavior:
+
+Slow-consumer eviction: each subscriber gets a bounded channel
+buffer (broadcast.DefaultBufferSize = 64). A subscriber whose
+channel fills is evicted silently: its Events() channel is closed,
+the handler returns, and the WebSocket is closed from the server side.
+This protects the indexer from one stuck client back-pressuring the
+broadcaster.
+Broadcaster unwired: returns 501 Not Implemented (only happens
+if the binary was built without the broadcaster wired).
+Bad filter: returns 400 Bad Request before the WebSocket
+upgrade, with the standard {"error": "..."} JSON body.
+Example with websocat:
+
+Shell
+
+websocat 'ws://localhost:8080/events/ws?contract_id=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC&topic=mint'
+{"id":"…","contract_id":"…","topics":["mint"], …}
+{"id":"…","contract_id":"…","topics":["mint"], …}
+Data integrity
 - One `store.Event` per WebSocket text frame, JSON-encoded.
 - Server-to-client only — clients do not send messages; the `nhooyr.io/websocket`
   library handles ping/pong internally.

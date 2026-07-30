@@ -15,6 +15,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 )
 
 // ErrNotFound is returned when a lookup matches no rows.
@@ -54,8 +57,6 @@ type Postgres struct {
 var _ Store = (*Postgres)(nil)
 
 // NewPostgres wraps an existing pool. The caller owns the pool's lifecycle.
-// partitionSpan is optional; when unset or non-positive, the production
-// default is used.
 func NewPostgres(pool *pgxpool.Pool, partitionSpan ...int64) *Postgres {
 	span := int64(DefaultEventPartitionSpan)
 	if len(partitionSpan) > 0 && partitionSpan[0] > 0 {
@@ -201,236 +202,11 @@ func (p *Postgres) attemptReconnect(ctx context.Context, logger *slog.Logger) er
 	return nil
 }
 
-// bucketHour returns the UTC hour bucket for a ledger using the
-// approximation that each Stellar ledger is ~5 seconds. Exact values
-// don't matter for bucketing — the only requirement is consistency.
-// The same ledger always maps to the same bucket.
-func bucketHour(ledger int64) time.Time {
-	// Reference: Soroban Protocol 20 launch ~2024-01-30 near ledger 53M.
-	const refLedger = 53_000_000
-	const refUnix = 1706572800 // 2024-01-30 00:00:00 UTC
-	sec := refUnix + (ledger-refLedger)*5
-	return time.Unix(sec, 0).UTC().Truncate(time.Hour)
-}
-
-// bucketKey is the compound key for rollup delta accumulation.
-type bucketKey struct {
-	bucketStart time.Time
-	contractID  string
-	eventType   string
-}
-
-// volDelta accumulates token transfer volume and unique addresses for one
-// rollup bucket from newly inserted events.
-type volDelta struct {
-	volume    *big.Int
-	addresses map[string]struct{}
-}
-
-func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
+func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) ([]Event, error) {
 	if len(events) == 0 {
-		return 0, nil
+		return nil, nil
 	}
-
-	tx, err := p.pool.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("begin upsert tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	// Batch INSERT with RETURNING so only newly inserted rows (not
-	// duplicate-ID skipped rows) are visible for rollup deltas.
-	batch := &pgx.Batch{}
-	for _, e := range events {
-		batch.Queue(`
-			INSERT INTO events
-				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-				 in_successful_call, topics, value, raw_topic_xdr, raw_value_xdr)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-			ON CONFLICT (id) DO NOTHING
-			RETURNING contract_id, type, ledger, topics, value`,
-			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
-			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value,
-			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
-		)
-	}
-
-	results := tx.SendBatch(ctx, batch)
-	defer results.Close()
-
-	// Aggregate deltas from newly inserted rows.
-	eventDeltas := make(map[bucketKey]int64)
-	volumeDeltas := make(map[bucketKey]*volDelta)
-
-	var inserted int64
-	for range events {
-		var (
-			contractID, eventType string
-			ledger                int64
-			topics, value         json.RawMessage
-		)
-		err := results.QueryRow().Scan(&contractID, &eventType, &ledger, &topics, &value)
-		if errors.Is(err, pgx.ErrNoRows) {
-			continue // ON CONFLICT DO NOTHING — duplicate, not inserted
-		}
-		if err != nil {
-			return inserted, fmt.Errorf("upserting events: %w", err)
-		}
-		inserted++
-
-		key := bucketKey{
-			bucketStart: bucketHour(ledger),
-			contractID:  contractID,
-			eventType:   eventType,
-		}
-		eventDeltas[key]++
-
-		// Detect token transfer events for rollup_token_volume (#1).
-		if amt, addrs, ok := tryExtractTransfer(topics, value); ok {
-			vd, exists := volumeDeltas[key]
-			if !exists {
-				vd = &volDelta{volume: new(big.Int), addresses: make(map[string]struct{})}
-				volumeDeltas[key] = vd
-			}
-			vd.volume.Add(vd.volume, amt)
-			for _, a := range addrs {
-				vd.addresses[a] = struct{}{}
-			}
-		}
-	}
-
-	if err := results.Close(); err != nil {
-		return inserted, fmt.Errorf("closing insert batch: %w", err)
-	}
-
-	// Apply rollup_events deltas.
-	if len(eventDeltas) > 0 {
-		if err := applyEventRollups(ctx, tx, eventDeltas); err != nil {
-			return inserted, err
-		}
-	}
-
-	// Apply rollup_token_volume deltas.
-	if len(volumeDeltas) > 0 {
-		if err := applyVolumeRollups(ctx, tx, volumeDeltas); err != nil {
-			return inserted, err
-		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return inserted, fmt.Errorf("committing upsert tx: %w", err)
-	}
-
-	return inserted, nil
-}
-
-// applyEventRollups upserts rollup_events deltas from newly inserted events.
-func applyEventRollups(ctx context.Context, tx pgx.Tx, deltas map[bucketKey]int64) error {
-	batch := &pgx.Batch{}
-	for key, delta := range deltas {
-		batch.Queue(`
-			INSERT INTO rollup_events (bucket_start, contract_id, type, count)
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (bucket_start, contract_id, type)
-			DO UPDATE SET count = rollup_events.count + EXCLUDED.count`,
-			key.bucketStart, key.contractID, key.eventType, delta,
-		)
-	}
-	results := tx.SendBatch(ctx, batch)
-	defer results.Close()
-	for range deltas {
-		if _, err := results.Exec(); err != nil {
-			return fmt.Errorf("applying rollup deltas: %w", err)
-		}
-	}
-	return results.Close()
-}
-
-// applyVolumeRollups upserts rollup_token_volume deltas from newly inserted
-// transfer events.
-//
-// contributors: unique_address_count is additive per-batch (COALESCE + COALESCE)
-// rather than truly distinct across batches. Replace with a proper address-tracking
-// table (e.g. rollup_addresses keyed by (bucket_start, contract_id, address)) when
-// #1 lands so the count is an actual COUNT(DISTINCT).
-func applyVolumeRollups(ctx context.Context, tx pgx.Tx, deltas map[bucketKey]*volDelta) error {
-	batch := &pgx.Batch{}
-	for key, vd := range deltas {
-		batch.Queue(`
-			INSERT INTO rollup_token_volume
-				(bucket_start, contract_id, volume, unique_address_count)
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (bucket_start, contract_id) DO UPDATE SET
-				volume = rollup_token_volume.volume + EXCLUDED.volume,
-				unique_address_count =
-					rollup_token_volume.unique_address_count + EXCLUDED.unique_address_count`,
-			key.bucketStart, key.contractID,
-			vd.volume.String(), int64(len(vd.addresses)),
-		)
-	}
-	results := tx.SendBatch(ctx, batch)
-	defer results.Close()
-	for range deltas {
-		if _, err := results.Exec(); err != nil {
-			return fmt.Errorf("applying volume rollup deltas: %w", err)
-		}
-	}
-	return results.Close()
-}
-
-// tryExtractTransfer inspects the decoded topics/value of an event to
-// detect SEP-41-style transfer events. Returns (amount, addresses, true)
-// when the event looks like a transfer, or (nil, nil, false) otherwise.
-//
-// Transfers are recognized by topics[0] == {"symbol":"transfer"} and
-// value containing an i128 amount. Topics[1] and [2] carry address entries
-// for the sender and receiver.
-func tryExtractTransfer(topics, value json.RawMessage) (*big.Int, []string, bool) {
-	var topicList []json.RawMessage
-	if err := json.Unmarshal(topics, &topicList); err != nil || len(topicList) < 3 {
-		return nil, nil, false
-	}
-
-	// First topic must be {"symbol":"transfer"}.
-	var firstTopic map[string]string
-	if err := json.Unmarshal(topicList[0], &firstTopic); err != nil || firstTopic["symbol"] != "transfer" {
-		return nil, nil, false
-	}
-
-	// Value must carry an i128 amount.
-	var valMap map[string]json.RawMessage
-	if err := json.Unmarshal(value, &valMap); err != nil {
-		return nil, nil, false
-	}
-	amountRaw, ok := valMap["i128"]
-	if !ok {
-		return nil, nil, false
-	}
-	var amountStr string
-	if err := json.Unmarshal(amountRaw, &amountStr); err != nil {
-		return nil, nil, false
-	}
-	amt, ok := new(big.Int).SetString(amountStr, 10)
-	if !ok {
-		return nil, nil, false
-	}
-
-	// Extract addresses from topics[1] and [2] (SEP-41 transfer has
-	// exactly 3 topics: symbol, from, to). Limit to the first two
-	// positions after the symbol to avoid picking up non-address
-	// topics that happen to carry an "address" key.
-	var addrs []string
-	for _, t := range topicList[1:min(len(topicList), 3)] {
-		var m map[string]string
-		if err := json.Unmarshal(t, &m); err != nil {
-			continue
-		}
-		if a, ok := m["address"]; ok && a != "" {
-			addrs = append(addrs, a)
-		}
-	}
-
-	return amt, addrs, true
+	return p.upsertEvents(ctx, events, false)
 }
 
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
@@ -440,9 +216,14 @@ func tryExtractTransfer(topics, value json.RawMessage) (*big.Int, []string, bool
 // arrives without XDR preserves what was already stored via the coalesce()
 // clauses in the UPDATE branch (`sorotrail replay` relies on that).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
+	conflict := `ON CONFLICT (network, ledger, id) DO NOTHING`
+	batch := &pgx.Batch{}
+	conflict := "ON CONFLICT (id) DO NOTHING"
+	if onUpdate {
+		conflict = `ON CONFLICT (id) DO UPDATE SET
 	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
 	if onUpdate {
-		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
+		conflict = `ON CONFLICT (network, ledger, id) DO UPDATE SET
 			contract_id        = EXCLUDED.contract_id,
 			ledger             = EXCLUDED.ledger,
 			type               = EXCLUDED.type,
@@ -453,18 +234,34 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			topics             = EXCLUDED.topics,
 			value              = EXCLUDED.value,
 			created_at         = EXCLUDED.created_at,
+			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+			topics_xdr         = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
+			value_xdr          = coalesce(EXCLUDED.value_xdr, events.value_xdr)`
 			raw_topic_xdr      = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
 			raw_value_xdr      = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
-	stmt := `
+	batch := &pgx.Batch{}
+	sql := `
 		INSERT INTO events
-			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+			(network, id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 			 in_successful_call, topics, value, created_at,
 			 raw_topic_xdr, raw_value_xdr)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		` + conflict
-	batch := &pgx.Batch{}
 	for _, e := range events {
+		batch.Queue(sql,
+			e.Network, e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+		batch.Queue(`
+			INSERT INTO events
+				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+				 in_successful_call, topics, value, created_at,
+				 raw_topic_xdr, raw_value_xdr)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			`+conflict,
+			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
+			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
 		// into SQL NULL so the column has one representation of "absent"
 		// rather than two.
@@ -497,13 +294,9 @@ func (p *Postgres) ensureEventPartitions(ctx context.Context, events []Event) er
 	return nil
 }
 
-// upsertEvents is shared by UpsertEvents (idempotent insert) and
-// ReplaceEventsInRange (insert-or-update, so topic/value drift on the RPC
-// side is corrected). onUpdate=false → ON CONFLICT DO NOTHING;
-// onUpdate=true → ON CONFLICT DO UPDATE SET ….
 func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bool) (int64, error) {
 	if len(events) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	if err := p.ensureEventPartitions(ctx, events); err != nil {
 		return 0, err
@@ -511,29 +304,31 @@ func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bo
 	results := p.pool.SendBatch(ctx, insertEventsBatch(events, onUpdate))
 	defer results.Close()
 
-	var affected int64
-	for range events {
+	var inserted []Event
+	for i := range events {
 		tag, err := results.Exec()
 		if err != nil {
-			return affected, fmt.Errorf("upserting events: %w", err)
+			return nil, fmt.Errorf("upserting events: %w", err)
 		}
-		affected += tag.RowsAffected()
+		if tag.RowsAffected() > 0 {
+			inserted = append(inserted, events[i])
+		}
 	}
-	return affected, nil
+	return inserted, nil
 }
 
-// ReplaceEventsInRange makes [fromLedger, toLedger] match `events` exactly:
-// orphans are deleted and same-ID rows are updated (correcting topic/value
-// drift). The auditor calls this for targeted repair; ingest never does
-// because UpsertEvents is idempotent and therefore cheaper.
-//
-// Raw XDR is carried across the replace: incoming XDR wins, but an event
-// that arrives without any keeps whatever was already stored, so repairing
-// a range never makes its rows unreplayable.
 func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error {
+	if len(events) == 0 {
+		return nil
+	}
+	timer := prometheus.NewTimer(metrics.DBWriteLatency)
+	defer timer.ObserveDuration()
+
 	if err := p.ensureEventPartitions(ctx, events); err != nil {
 		return err
 	}
+	// Need a network for the delete — all events in a batch share the same network.
+	network := events[0].Network
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -544,19 +339,17 @@ func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fro
 	// have preserved raw XDR from, so snapshot it first. A repair fetch that
 	// came back without XDR must not cost surviving events their
 	// replayability (see internal/replay).
-	kept, err := rawXDRInRange(ctx, tx, fromLedger, toLedger)
+	kept, err := rawXDRInRange(ctx, tx, network, fromLedger, toLedger)
 	if err != nil {
 		return err
 	}
 
-	if _, err := tx.Exec(ctx, `DELETE FROM events WHERE ledger BETWEEN $1 AND $2`, fromLedger, toLedger); err != nil {
-		return fmt.Errorf("deleting events in ledger range [%d,%d]: %w", fromLedger, toLedger, err)
+	if _, err := tx.Exec(ctx, `DELETE FROM events WHERE network = $1 AND ledger BETWEEN $2 AND $3`, network, fromLedger, toLedger); err != nil {
+		return fmt.Errorf("deleting events in ledger range [%d,%d] for network %s: %w", fromLedger, toLedger, network, err)
 	}
 
 	if len(events) > 0 {
 		events = restoreRawXDR(events, kept)
-		// Same INSERT as upsertEvents with onUpdate=true, but routed through
-		// the in-flight transaction so the delete + insert are atomic.
 		results := tx.SendBatch(ctx, insertEventsBatch(events, true))
 		for range events {
 			if _, err := results.Exec(); err != nil {
@@ -575,7 +368,6 @@ func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fro
 	return nil
 }
 
-// rawXDR is the replayable payload kept for one event.
 type rawXDR struct {
 	topics []string
 	value  string
@@ -583,13 +375,13 @@ type rawXDR struct {
 
 // rawXDRInRange reads the raw XDR currently stored for a ledger range,
 // keyed by event ID, so a delete-and-reinsert repair can put it back.
-func rawXDRInRange(ctx context.Context, tx pgx.Tx, fromLedger, toLedger int64) (map[string]rawXDR, error) {
+func rawXDRInRange(ctx context.Context, tx pgx.Tx, network string, fromLedger, toLedger int64) (map[string]rawXDR, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT id, raw_topic_xdr, raw_value_xdr
 		FROM events
-		WHERE ledger BETWEEN $1 AND $2
+		WHERE network = $1 AND ledger BETWEEN $2 AND $3
 		  AND (raw_topic_xdr IS NOT NULL OR raw_value_xdr IS NOT NULL)`,
-		fromLedger, toLedger)
+		network, fromLedger, toLedger)
 	if err != nil {
 		return nil, fmt.Errorf("reading raw XDR in ledger range [%d,%d]: %w", fromLedger, toLedger, err)
 	}
@@ -617,9 +409,6 @@ func rawXDRInRange(ctx context.Context, tx pgx.Tx, fromLedger, toLedger int64) (
 	return kept, nil
 }
 
-// restoreRawXDR fills in raw XDR the incoming events lack from what was
-// already stored. Incoming XDR always wins — this only fills gaps, so a
-// repair can add replayability but never remove it.
 func restoreRawXDR(events []Event, kept map[string]rawXDR) []Event {
 	if len(kept) == 0 {
 		return events
@@ -826,7 +615,7 @@ func (p *Postgres) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger i
 	return out, rows.Err()
 }
 
-const eventColumns = `id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+const eventColumns = `network, id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 	in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr`
 
 // nullableText and nullableStringSlice store empty raw-XDR values as SQL NULL
@@ -997,8 +786,12 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 		where = append(where, "in_successful_call = "+arg(*f.InSuccessfulCall))
 	}
 	if len(f.Topic) > 0 {
-		// Containment on the array matches the topic at any position.
 		where = append(where, "topics @> "+arg(fmt.Sprintf("[%s]", f.Topic))+"::jsonb")
+	}
+	if len(f.TopicContains) > 0 {
+		// Direct containment — caller controls the shape (object wrapped in
+		// array for element match, multi-element arrays for subset match).
+		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
 	}
 	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
 		if len(topic) == 0 {
@@ -1257,12 +1050,15 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 		return IngestionState{}, ErrNotFound
 	}
 	if err != nil {
-		return IngestionState{}, fmt.Errorf("loading ingestion state: %w", err)
+		return IngestionState{}, fmt.Errorf("loading ingestion state for network %q: %w", network, err)
 	}
 	return s, nil
 }
 
 func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) error {
+	if s.Network == "" {
+		s.Network = "default"
+	}
 	_, err := p.pool.Exec(ctx, `
 		INSERT INTO ingestion_state (id, last_ingested_ledger, last_cursor, last_successful_poll, updated_at)
 		VALUES (1, $1, $2, $3, now())
@@ -1274,62 +1070,64 @@ func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) err
 		s.LastIngestedLedger, s.LastCursor, s.LastSuccessfulPoll,
 	)
 	if err != nil {
-		return fmt.Errorf("saving ingestion state: %w", err)
+		return fmt.Errorf("saving ingestion state for network %q: %w", s.Network, err)
 	}
 	return nil
 }
 
-func (p *Postgres) GetAuditState(ctx context.Context) (AuditState, error) {
+func (p *Postgres) GetAuditState(ctx context.Context, network string) (AuditState, error) {
 	var s AuditState
-	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx,
-			`SELECT verified_through_ledger, updated_at FROM audit_state WHERE id = 1`,
-		).Scan(&s.VerifiedThroughLedger, &s.UpdatedAt)
-	})
+	err := p.pool.QueryRow(ctx,
+		`SELECT network, verified_through_ledger, updated_at FROM audit_state WHERE network = $1`,
+		network,
+	).Scan(&s.Network, &s.VerifiedThroughLedger, &s.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuditState{}, ErrNotFound
 	}
 	if err != nil {
-		return AuditState{}, fmt.Errorf("loading audit state: %w", err)
+		return AuditState{}, fmt.Errorf("loading audit state for network %q: %w", network, err)
 	}
 	return s, nil
 }
 
 func (p *Postgres) SaveAuditState(ctx context.Context, s AuditState) error {
+	if s.Network == "" {
+		s.Network = "default"
+	}
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO audit_state (id, verified_through_ledger, updated_at)
-		VALUES (1, $1, now())
-		ON CONFLICT (id) DO UPDATE SET
+		INSERT INTO audit_state (network, verified_through_ledger, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (network) DO UPDATE SET
 			verified_through_ledger = EXCLUDED.verified_through_ledger,
 			updated_at              = now()`,
-		s.VerifiedThroughLedger,
+		s.Network, s.VerifiedThroughLedger,
 	)
 	if err != nil {
-		return fmt.Errorf("saving audit state: %w", err)
+		return fmt.Errorf("saving audit state for network %q: %w", s.Network, err)
 	}
 	return nil
 }
 
-func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (AuditState, error) {
-	// Single round trip — the WHERE on the singleton row makes the
-	// upsert no-op when the candidate is not greater than what's stored.
+func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, network string, ledger int64) (AuditState, error) {
+	if network == "" {
+		network = "default"
+	}
 	row := p.pool.QueryRow(ctx, `
-		INSERT INTO audit_state (id, verified_through_ledger, updated_at)
-		VALUES (1, $1, now())
-		ON CONFLICT (id) DO UPDATE SET
+		INSERT INTO audit_state (network, verified_through_ledger, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (network) DO UPDATE SET
 			verified_through_ledger = EXCLUDED.verified_through_ledger,
 			updated_at              = now()
 		WHERE EXCLUDED.verified_through_ledger > audit_state.verified_through_ledger
-		RETURNING verified_through_ledger, updated_at`,
-		ledger,
+		RETURNING network, verified_through_ledger, updated_at`,
+		network, ledger,
 	)
 	var s AuditState
-	if err := row.Scan(&s.VerifiedThroughLedger, &s.UpdatedAt); err != nil {
+	if err := row.Scan(&s.Network, &s.VerifiedThroughLedger, &s.UpdatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Candidate was not greater — return the existing state.
-			return p.GetAuditState(ctx)
+			return p.GetAuditState(ctx, network)
 		}
-		return AuditState{}, fmt.Errorf("saving audit state: %w", err)
+		return AuditState{}, fmt.Errorf("saving audit state for network %q: %w", network, err)
 	}
 	return s, nil
 }
@@ -1636,11 +1434,11 @@ func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID str
 func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
 	err := p.pool.QueryRow(ctx, `
 		INSERT INTO audit_findings
-			(from_ledger, to_ledger, expected_count, actual_count,
+			(network, from_ledger, to_ledger, expected_count, actual_count,
 			 missing_ids, status, attempts)
-		VALUES ($1, $2, $3, $4, $5, $6, 0)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 0)
 		RETURNING id, created_at`,
-		f.FromLedger, f.ToLedger, f.ExpectedCount, f.ActualCount,
+		f.Network, f.FromLedger, f.ToLedger, f.ExpectedCount, f.ActualCount,
 		f.MissingIDs, f.Status,
 	).Scan(&f.ID, &f.CreatedAt)
 	if err != nil {
@@ -1650,8 +1448,6 @@ func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (Audi
 }
 
 func (p *Postgres) UpdateAuditFinding(ctx context.Context, f AuditFinding) error {
-	// last_attempted_at is updated only when the auditor actually tried
-	// to repair (not when only the metadata is tweaked).
 	var lastAttempted any
 	if !f.LastAttemptedAt.IsZero() {
 		lastAttempted = f.LastAttemptedAt
@@ -1677,21 +1473,22 @@ func (p *Postgres) UpdateAuditFinding(ctx context.Context, f AuditFinding) error
 // ListOpenFindingsByRange returns the most recent finding whose range
 // overlaps [fromLedger, toLedger] and is still in a working state (open
 // or unrecoverable). ErrNotFound means no live finding spans the range.
-func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error) {
+func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, network string, fromLedger, toLedger int64) (AuditFinding, error) {
 	row := p.pool.QueryRow(ctx, `
-		SELECT id, from_ledger, to_ledger, expected_count, actual_count,
+		SELECT id, network, from_ledger, to_ledger, expected_count, actual_count,
 		       missing_ids, status, attempts, last_attempted_at, last_error, created_at
 		FROM audit_findings
-		WHERE status IN ('open', 'unrecoverable')
-		  AND from_ledger <= $2
-		  AND to_ledger   >= $1
+		WHERE network = $1
+		  AND status IN ('open', 'unrecoverable')
+		  AND from_ledger <= $3
+		  AND to_ledger   >= $2
 		ORDER BY id DESC
 		LIMIT 1`,
-		fromLedger, toLedger,
+		network, fromLedger, toLedger,
 	)
 	var f AuditFinding
 	var lastAttempted *time.Time
-	err := row.Scan(&f.ID, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
+	err := row.Scan(&f.ID, &f.Network, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
 		&f.MissingIDs, &f.Status, &f.Attempts, &lastAttempted, &f.LastError, &f.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuditFinding{}, ErrNotFound
@@ -1921,19 +1718,13 @@ func statementTimeoutFromContext(ctx context.Context) (time.Duration, bool) {
 
 func scanEvent(row pgx.Row) (Event, error) {
 	var (
-		e         Event
-		rawTopics []string
-		rawValue  *string
+		e Event
 	)
-	err := row.Scan(&e.ID, &e.ContractID, &e.Ledger, &e.Type, &e.TxHash,
+	err := row.Scan(&e.Network, &e.ID, &e.ContractID, &e.Ledger, &e.Type, &e.TxHash,
 		&e.TxIndex, &e.OpIndex, &e.InSuccessfulCall, &e.Topics, &e.Value,
-		&e.CreatedAt, &rawTopics, &rawValue)
+		&e.CreatedAt)
 	if err != nil {
 		return Event{}, err
-	}
-	e.RawTopicXDR = rawTopics
-	if rawValue != nil {
-		e.RawValueXDR = *rawValue
 	}
 	return e, nil
 }
