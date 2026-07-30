@@ -622,36 +622,6 @@ type EventDecoding struct {
 	Value  json.RawMessage
 }
 
-// AnalyticsEventBucket is one time-bucketed event count returned by the
-// analytics endpoints. BucketStart is a UTC timestamp truncated to the
-// requested granularity (hour or day).
-type AnalyticsEventBucket struct {
-	BucketStart time.Time `json:"bucket_start"`
-	ContractID  string    `json:"contract_id"`
-	Type        string    `json:"type"`
-	Count       int64     `json:"count"`
-}
-
-// AnalyticsTokenVolume is one time-bucketed transfer volume row.
-// Volume is a decimal string (i128-safe). UniqueAddressCount is the number
-// of distinct addresses appearing in transfer topics for the bucket.
-type AnalyticsTokenVolume struct {
-	BucketStart        time.Time `json:"bucket_start"`
-	ContractID         string    `json:"contract_id"`
-	Volume             string    `json:"volume"`
-	UniqueAddressCount int64     `json:"unique_address_count"`
-}
-
-// AnalyticsFilter narrows analytics queries. From/To are UTC timestamps;
-// zero means unbounded. Bucket is "hour" or "day".
-type AnalyticsFilter struct {
-	ContractID string
-	Type       string
-	From       time.Time
-	To         time.Time
-	Bucket     string // "hour" or "day"
-}
-
 // Store is the persistence boundary. The ingester, auditor, and API depend
 // on this interface, never on Postgres directly, so alternative backends can
 // be contributed by implementing it.

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // Oracle verifies that stored events match the set of fetchable chain events

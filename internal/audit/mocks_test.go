@@ -386,10 +386,6 @@ func (m *mockStore) MigrationVersion(context.Context) (int, bool, error) {
 
 func (m *mockStore) Ping(context.Context) error { return nil }
 
-func (m *mockStore) QueryAnalyticsEvents(context.Context, store.AnalyticsFilter) ([]store.AnalyticsEventBucket, error) {
-	return nil, nil
-}
-func (m *mockStore) QueryAnalyticsTokenVolume(context.Context, store.AnalyticsFilter) ([]store.AnalyticsTokenVolume, error) {
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
 }

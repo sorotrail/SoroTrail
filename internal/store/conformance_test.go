@@ -77,7 +77,7 @@ func testUpsertEventsIdempotent(t *testing.T, st Store) {
 	require.NoError(t, err)
 	assert.Zero(t, inserted, "duplicate IDs are ignored")
 
-	got, err := st.GetEvent(ctx, eventID(1))
+	got, err := st.GetEvent(ctx, eventID(1), WildcardScope())
 	require.NoError(t, err)
 	assert.Equal(t, contractA, got.ContractID)
 	assert.JSONEq(t, `[{"symbol":"transfer"},{"u64":7}]`, string(got.Topics))
@@ -85,7 +85,7 @@ func testUpsertEventsIdempotent(t *testing.T, st Store) {
 }
 
 func testGetEventNotFound(t *testing.T, st Store) {
-	_, err := st.GetEvent(context.Background(), "missing")
+	_, err := st.GetEvent(context.Background(), "missing", WildcardScope())
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -121,7 +121,7 @@ func testQueryEventsFiltersAndPagination(t *testing.T, st Store) {
 	})
 
 	t.Run("by type", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{Type: "diagnostic"})
+		got, _, err := st.QueryEvents(ctx, EventFilter{Types: []string{"diagnostic"}})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.Equal(t, eventID(3), got[0].ID)
@@ -308,7 +308,11 @@ func testWatchedContracts(t *testing.T, st Store) {
 
 	got, err := st.ListWatchedContracts(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, []string{contractA, contractB}, got)
+	ids := make([]string, 0, len(got))
+	for _, wc := range got {
+		ids = append(ids, wc.ContractID)
+	}
+	assert.Equal(t, []string{contractA, contractB}, ids)
 }
 
 func testStats(t *testing.T, st Store) {
@@ -322,7 +326,7 @@ func testStats(t *testing.T, st Store) {
 	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 101}))
 	require.NoError(t, st.AddWatchedContract(ctx, contractA))
 
-	stats, err := st.Stats(ctx)
+	stats, err := st.Stats(ctx, WildcardScope())
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), stats.TotalEvents)
 	assert.Equal(t, int64(101), stats.LastIngestedLedger)
@@ -343,12 +347,12 @@ func testRawXDRRoundTrip(t *testing.T, st Store) {
 	_, err := st.UpsertEvents(ctx, []Event{withXDR, legacy})
 	require.NoError(t, err)
 
-	got, err := st.GetEvent(ctx, withXDR.ID)
+	got, err := st.GetEvent(ctx, withXDR.ID, WildcardScope())
 	require.NoError(t, err)
 	assert.Equal(t, withXDR.RawTopicXDR, got.RawTopicXDR)
 	assert.Equal(t, withXDR.RawValueXDR, got.RawValueXDR)
 
-	gotLegacy, err := st.GetEvent(ctx, legacy.ID)
+	gotLegacy, err := st.GetEvent(ctx, legacy.ID, WildcardScope())
 	require.NoError(t, err)
 	assert.Empty(t, gotLegacy.RawTopicXDR)
 	assert.Empty(t, gotLegacy.RawValueXDR)
@@ -367,7 +371,7 @@ func testReplaceEventsInRangeKeepsRawXDR(t *testing.T, st Store) {
 	repaired.RawValueXDR = "AAAACgAAAAAAAAAC"
 	require.NoError(t, st.ReplaceEventsInRange(ctx, []Event{repaired}, 100, 100))
 
-	got, err := st.GetEvent(ctx, original.ID)
+	got, err := st.GetEvent(ctx, original.ID, WildcardScope())
 	require.NoError(t, err)
 	assert.Equal(t, "AAAACgAAAAAAAAAC", got.RawValueXDR)
 
@@ -375,7 +379,7 @@ func testReplaceEventsInRangeKeepsRawXDR(t *testing.T, st Store) {
 	noXDR.RawTopicXDR, noXDR.RawValueXDR = nil, ""
 	require.NoError(t, st.ReplaceEventsInRange(ctx, []Event{noXDR}, 100, 100))
 
-	got, err = st.GetEvent(ctx, original.ID)
+	got, err = st.GetEvent(ctx, original.ID, WildcardScope())
 	require.NoError(t, err)
 	assert.Equal(t, []string{"AAAADwAAAAh0cmFuc2Zlcg=="}, got.RawTopicXDR,
 		"a JSON-only repair must not strip stored raw XDR")

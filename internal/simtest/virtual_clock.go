@@ -43,7 +43,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/khaylebfortune/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/ingester"
 )
 
 // VirtualClock implements ingester.Clock so the ingester's timing seams
