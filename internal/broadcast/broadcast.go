@@ -205,6 +205,15 @@ func eventMatches(ev store.Event, f store.EventFilter) bool {
 			return false
 		}
 	}
+	if f.TopicCount != nil {
+		var arr []json.RawMessage
+		if err := json.Unmarshal(ev.Topics, &arr); err != nil {
+			return false
+		}
+		if len(arr) != *f.TopicCount {
+			return false
+		}
+	}
 	if f.FromLedger > 0 && ev.Ledger < f.FromLedger {
 		return false
 	}
