@@ -15,6 +15,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 )
 
 // ErrNotFound is returned when a lookup matches no rows.
@@ -219,6 +222,10 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // arrives without XDR preserves what was already stored via the coalesce()
 // clauses in the UPDATE branch (`sorotrail replay` relies on that).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
+	batch := &pgx.Batch{}
+	conflict := "ON CONFLICT (id) DO NOTHING"
+	if onUpdate {
+		conflict = `ON CONFLICT (id) DO UPDATE SET
 	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
 	if onUpdate {
 		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
@@ -232,6 +239,8 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			topics             = EXCLUDED.topics,
 			value              = EXCLUDED.value,
 			created_at         = EXCLUDED.created_at,
+			topics_xdr         = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
+			value_xdr          = coalesce(EXCLUDED.value_xdr, events.value_xdr)`
 			raw_topic_xdr      = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
 			raw_value_xdr      = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
@@ -320,6 +329,9 @@ func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bo
 // that arrives without any keeps whatever was already stored, so repairing
 // a range never makes its rows unreplayable.
 func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error {
+	timer := prometheus.NewTimer(metrics.DBWriteLatency)
+	defer timer.ObserveDuration()
+
 	if err := p.ensureEventPartitions(ctx, events); err != nil {
 		return err
 	}
@@ -788,6 +800,11 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	if len(f.Topic) > 0 {
 		// Containment on the array matches the topic at any position.
 		where = append(where, "topics @> "+arg(fmt.Sprintf("[%s]", f.Topic))+"::jsonb")
+	}
+	if len(f.TopicContains) > 0 {
+		// Direct containment — caller controls the shape (object wrapped in
+		// array for element match, multi-element arrays for subset match).
+		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
 	}
 	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
 		if len(topic) == 0 {

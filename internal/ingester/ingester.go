@@ -11,6 +11,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/khaylebfortune/sorotrail/internal/broadcast"
+	"github.com/khaylebfortune/sorotrail/internal/decode"
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
+	"github.com/khaylebfortune/sorotrail/internal/rpc"
+	"github.com/khaylebfortune/sorotrail/internal/store"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/sorotrail/sorotrail/internal/broadcast"
@@ -396,6 +403,7 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 	if err := ing.store.SaveIngestionState(ctx, state); err != nil {
 		return false, err
 	}
+	ing.setIngestionLag(int64(resp.LatestLedger), state.LastIngestedLedger)
 	return caughtUp, nil
 }
 
@@ -600,6 +608,7 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	if err != nil {
 		return false, err
 	}
+	ing.setIngestionLag(int64(health.LatestLedger), lastIngested)
 	return end >= health.LatestLedger, nil
 }
 
@@ -681,10 +690,13 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		}
 		events = append(events, ev)
 	}
+	timer := prometheus.NewTimer(metrics.DBWriteLatency)
 	inserted, err := ing.store.UpsertEvents(ctx, events)
+	timer.ObserveDuration()
 	if err != nil {
 		return err
 	}
+	metrics.EventsIngested.Add(float64(len(events)))
 
 	// Extract addresses from decoded event topics/values and persist the
 	// inverted index. Extraction operates on the decoded JSON (not XDR) and
@@ -928,6 +940,15 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 		RawTopicXDR: re.Topic,
 		RawValueXDR: re.Value,
 	}, nil
+}
+
+// setIngestionLag updates the Prometheus gauge for ingestion lag.
+// chainHead can be 0 when unknown (no-op in that case).
+func (ing *Ingester) setIngestionLag(chainHead, lastIngested int64) {
+	if chainHead <= 0 || lastIngested <= 0 {
+		return
+	}
+	metrics.IngestionLag.Set(float64(chainHead - lastIngested))
 }
 
 // sleepCtx sleeps for d or until ctx is done; it reports whether the full
