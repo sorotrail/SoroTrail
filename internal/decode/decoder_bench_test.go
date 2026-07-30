@@ -4,8 +4,9 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/stellar/go-stellar-sdk/xdr"
+
+	"github.com/sorotrail/sorotrail/internal/rpc"
 )
 
 // Helper to encode an ScVal to base64 for testing.
