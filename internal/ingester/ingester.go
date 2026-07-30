@@ -216,7 +216,7 @@ type Ingester struct {
 // New wires an Ingester.
 func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, opts Options) *Ingester {
 	opts.applyDefaults()
-	return &Ingester{client: client, store: st, decoder: dec, log: log, opts: opts}
+	return &Ingester{client: client, store: st, decoder: dec, log: log, metrics: obs, opts: opts}
 }
 
 // WithBroadcaster attaches a live event broadcaster so ingested events are

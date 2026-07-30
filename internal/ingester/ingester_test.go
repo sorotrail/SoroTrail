@@ -128,7 +128,7 @@ type mockCycle struct {
 }
 
 func newTestIngester(client rpc.Client, st store.Store, opts Options) *Ingester {
-	return New(client, st, passthroughDecoder{}, testLogger(), opts)
+	return New(client, st, passthroughDecoder{}, testLogger(), nil, opts)
 }
 
 func rpcEvent(id string, ledger uint32) rpc.Event {

@@ -430,6 +430,13 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 			"status", ww.Status(),
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
+		if s.metrics != nil {
+			path := chi.RouteContext(r.Context()).RoutePattern()
+			if path == "" {
+				path = r.URL.Path
+			}
+			s.metrics.RecordHTTPRequest(path, ww.Status(), time.Since(start).Seconds())
+		}
 	})
 }
 
