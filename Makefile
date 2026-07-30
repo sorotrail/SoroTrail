@@ -12,6 +12,7 @@ LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Versio
 .PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down simtest simtest-long clean bench bench-ci seed
 
 build:
+	go build -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/sorotrail
 	go build $(LDFLAGS) -o $(BINARY) ./cmd/sorotrail
 
 run: build
