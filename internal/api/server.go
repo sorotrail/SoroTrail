@@ -270,6 +270,7 @@ func (s *Server) Router() http.Handler {
 	// Non-list routes: health, metrics, writes — responses are always
 	// small, so compression is just overhead with no benefit.
 	r.Get("/health", s.handleHealth)
+	r.Get("/metrics", s.handleMetrics)
 	r.Get("/livez", s.handleLivez)
 	r.Get("/readyz", s.handleReadyz)
 	r.Get("/version", s.handleVersion)

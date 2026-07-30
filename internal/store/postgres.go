@@ -15,6 +15,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 )
 
 // ErrNotFound is returned when a lookup matches no rows.
@@ -218,6 +221,11 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // clauses in the UPDATE branch (`sorotrail replay` relies on that).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	conflict := `ON CONFLICT (network, ledger, id) DO NOTHING`
+	batch := &pgx.Batch{}
+	conflict := "ON CONFLICT (id) DO NOTHING"
+	if onUpdate {
+		conflict = `ON CONFLICT (id) DO UPDATE SET
+	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
 	if onUpdate {
 		conflict = `ON CONFLICT (network, ledger, id) DO UPDATE SET
 			contract_id        = EXCLUDED.contract_id,
@@ -232,6 +240,10 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			created_at         = EXCLUDED.created_at,
 			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
 			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+			topics_xdr         = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
+			value_xdr          = coalesce(EXCLUDED.value_xdr, events.value_xdr)`
+			raw_topic_xdr      = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
 	batch := &pgx.Batch{}
 	sql := `
@@ -244,6 +256,21 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	for _, e := range events {
 		batch.Queue(sql,
 			e.Network, e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+		batch.Queue(`
+			INSERT INTO events
+				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+				 in_successful_call, topics, value, created_at,
+				 raw_topic_xdr, raw_value_xdr)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			`+conflict,
+			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
+			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
+		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
+		// into SQL NULL so the column has one representation of "absent"
+		// rather than two.
+		batch.Queue(stmt,
+			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
 			nullableStringSlice(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
@@ -296,6 +323,9 @@ func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fro
 	if len(events) == 0 {
 		return nil
 	}
+	timer := prometheus.NewTimer(metrics.DBWriteLatency)
+	defer timer.ObserveDuration()
+
 	if err := p.ensureEventPartitions(ctx, events); err != nil {
 		return err
 	}
@@ -759,6 +789,11 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	}
 	if len(f.Topic) > 0 {
 		where = append(where, "topics @> "+arg(fmt.Sprintf("[%s]", f.Topic))+"::jsonb")
+	}
+	if len(f.TopicContains) > 0 {
+		// Direct containment — caller controls the shape (object wrapped in
+		// array for element match, multi-element arrays for subset match).
+		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
 	}
 	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
 		if len(topic) == 0 {
