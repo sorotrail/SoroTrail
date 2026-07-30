@@ -12,16 +12,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// ErrNotFound is returned when a lookup matches no rows.
-var ErrNotFound = errors.New("not found")
-
-// DefaultQueryLimit applies when EventFilter.Limit is unset; MaxQueryLimit
-// caps requested page sizes.
-const (
-	DefaultQueryLimit         = 50
-	MaxQueryLimit             = 200
-	DefaultEventPartitionSpan = 120960
-)
+// DefaultEventPartitionSpan is the span of ledgers per event partition.
+const DefaultEventPartitionSpan = 120960
 
 // Postgres implements Store on a pgx connection pool.
 type Postgres struct {
@@ -83,7 +75,7 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 		batch.Queue(sql,
 			e.Network, e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
-			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
+			nullableStringSlice(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
 	}
 	return batch
@@ -131,22 +123,31 @@ func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bo
 }
 
 func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error {
+	if len(events) == 0 {
+		return nil
+	}
 	if err := p.ensureEventPartitions(ctx, events); err != nil {
 		return err
 	}
+	// Need a network for the delete — all events in a batch share the same network.
+	network := events[0].Network
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	kept, err := rawXDRInRange(ctx, tx, fromLedger, toLedger)
+	// The delete below drops the rows the ON CONFLICT clause would otherwise
+	// have preserved raw XDR from, so snapshot it first. A repair fetch that
+	// came back without XDR must not cost surviving events their
+	// replayability (see internal/replay).
+	kept, err := rawXDRInRange(ctx, tx, network, fromLedger, toLedger)
 	if err != nil {
 		return err
 	}
 
-	if _, err := tx.Exec(ctx, `DELETE FROM events WHERE ledger BETWEEN $1 AND $2`, fromLedger, toLedger); err != nil {
-		return fmt.Errorf("deleting events in ledger range [%d,%d]: %w", fromLedger, toLedger, err)
+	if _, err := tx.Exec(ctx, `DELETE FROM events WHERE network = $1 AND ledger BETWEEN $2 AND $3`, network, fromLedger, toLedger); err != nil {
+		return fmt.Errorf("deleting events in ledger range [%d,%d] for network %s: %w", fromLedger, toLedger, network, err)
 	}
 
 	if len(events) > 0 {
@@ -174,13 +175,15 @@ type rawXDR struct {
 	value  string
 }
 
-func rawXDRInRange(ctx context.Context, tx pgx.Tx, fromLedger, toLedger int64) (map[string]rawXDR, error) {
+// rawXDRInRange reads the raw XDR currently stored for a ledger range,
+// keyed by event ID, so a delete-and-reinsert repair can put it back.
+func rawXDRInRange(ctx context.Context, tx pgx.Tx, network string, fromLedger, toLedger int64) (map[string]rawXDR, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT id, raw_topic_xdr, raw_value_xdr
 		FROM events
-		WHERE ledger BETWEEN $1 AND $2
+		WHERE network = $1 AND ledger BETWEEN $2 AND $3
 		  AND (raw_topic_xdr IS NOT NULL OR raw_value_xdr IS NOT NULL)`,
-		fromLedger, toLedger)
+		network, fromLedger, toLedger)
 	if err != nil {
 		return nil, fmt.Errorf("reading raw XDR in ledger range [%d,%d]: %w", fromLedger, toLedger, err)
 	}
@@ -261,6 +264,8 @@ func (p *Postgres) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger i
 const eventColumns = `network, id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 	in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr`
 
+// nullableText and nullableStringSlice store empty raw-XDR values as SQL NULL
+// so "no raw XDR" is one representation, not two.
 func nullableText(s string) any {
 	if s == "" {
 		return nil
@@ -268,7 +273,7 @@ func nullableText(s string) any {
 	return s
 }
 
-func nullableTextArray(s []string) any {
+func nullableStringSlice(s []string) any {
 	if len(s) == 0 {
 		return nil
 	}
@@ -276,9 +281,17 @@ func nullableTextArray(s []string) any {
 }
 
 func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
-	row := p.pool.QueryRow(ctx, `SELECT `+eventColumns+` FROM events WHERE id = $1`, id)
-	e, err := scanEvent(row)
-	if errors.Is(err, pgx.ErrNoRows) {
+	var e Event
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `SELECT `+eventColumns+` FROM events WHERE id = $1`, id)
+		var err error
+		e, err = scanEvent(row)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	})
+	if errors.Is(err, ErrNotFound) {
 		return Event{}, ErrNotFound
 	}
 	return e, err
@@ -286,7 +299,9 @@ func (p *Postgres) GetEvent(ctx context.Context, id string) (Event, error) {
 
 func (p *Postgres) EventExists(ctx context.Context, id string) (bool, error) {
 	var one int
-	err := p.pool.QueryRow(ctx, `SELECT 1 FROM events WHERE id = $1`, id).Scan(&one)
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT 1 FROM events WHERE id = $1`, id).Scan(&one)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -332,6 +347,11 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 		where = append(where,
 			fmt.Sprintf("topics->%d = %s::jsonb", i, arg(topic)))
 	}
+	if len(f.TopicContains) > 0 {
+		// Direct containment — caller controls the shape (object wrapped in
+		// array for element match, multi-element arrays for subset match).
+		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
+	}
 	if f.FromLedger > 0 {
 		where = append(where, "ledger >= "+arg(f.FromLedger))
 	}
@@ -360,30 +380,38 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
+	// Fetch one extra row to know whether a next page exists.
 	query += " ORDER BY id " + orderDir + " LIMIT " + arg(limit+1)
 
-	rows, err := p.pool.Query(ctx, query, args...)
-	if err != nil {
-		return nil, "", fmt.Errorf("querying events: %w", err)
-	}
-	defer rows.Close()
-
-	events := make([]Event, 0, limit)
-	for rows.Next() {
-		e, err := scanEvent(rows)
-		if err != nil {
-			return nil, "", err
-		}
-		events = append(events, e)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, "", fmt.Errorf("reading events: %w", err)
-	}
-
+	var events []Event
 	next := ""
-	if len(events) > limit {
-		events = events[:limit]
-		next = events[limit-1].ID
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("querying events: %w", err)
+		}
+		defer rows.Close()
+
+		events = make([]Event, 0, limit)
+		for rows.Next() {
+			e, err := scanEvent(rows)
+			if err != nil {
+				return err
+			}
+			events = append(events, e)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("reading events: %w", err)
+		}
+
+		if len(events) > limit {
+			events = events[:limit]
+			next = events[limit-1].ID
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
 	}
 	return events, next, nil
 }
@@ -479,23 +507,39 @@ func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, network string, 
 	return s, nil
 }
 
-func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]string, error) {
+func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT contract_id FROM watched_contracts ORDER BY contract_id`)
+		`SELECT contract_id, added_at FROM watched_contracts ORDER BY contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
 	defer rows.Close()
 
-	var ids []string
+	var out []WatchedContract
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var wc WatchedContract
+		if err := rows.Scan(&wc.ContractID, &wc.AddedAt); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		out = append(out, wc)
 	}
-	return ids, rows.Err()
+	return out, rows.Err()
+}
+
+// RemoveWatchedContract stops future ingestion for the given contract by
+// removing its row from watched_contracts. It does NOT delete any event
+// rows already in storage — those remain queryable. ErrNotFound signals a
+// typo so the API can respond 404.
+func (p *Postgres) RemoveWatchedContract(ctx context.Context, contractID string) error {
+	tag, err := p.pool.Exec(ctx,
+		`DELETE FROM watched_contracts WHERE contract_id = $1`, contractID)
+	if err != nil {
+		return fmt.Errorf("removing watched contract: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) error {
@@ -508,52 +552,22 @@ func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) er
 	return nil
 }
 
-func (p *Postgres) Stats(ctx context.Context) (Stats, error) {
+func (p *Postgres) Stats(ctx context.Context, network string) (Stats, error) {
 	var s Stats
-	err := p.pool.QueryRow(ctx, `
-		SELECT
-			(SELECT count(*) FROM events),
-			(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
-			(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
-			(SELECT count(DISTINCT contract_id) FROM events),
-			(SELECT count(*) FROM watched_contracts)`,
-	).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.ContractCount, &s.WatchedContracts)
+	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT
+				(SELECT count(*) FROM events),
+				(SELECT coalesce(max(last_ingested_ledger), 0) FROM ingestion_state),
+				(SELECT coalesce(max(verified_through_ledger), 0) FROM audit_state),
+				(SELECT coalesce(min(ledger), 0) FROM events),
+				(SELECT count(DISTINCT contract_id) FROM events),
+				(SELECT count(*) FROM watched_contracts)`,
+		).Scan(&s.TotalEvents, &s.LastIngestedLedger, &s.VerifiedThroughLedger, &s.OldestStoredLedger, &s.ContractCount, &s.WatchedContracts)
+	})
 	if err != nil {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
 	}
-
-	// Per-network stats.
-	s.PerNetwork = make(map[string]PerNetworkStats)
-	rows, err := p.pool.Query(ctx, `
-		SELECT
-			network,
-			count(*)::bigint,
-			COALESCE(i.last_ingested_ledger, 0),
-			COALESCE(a.verified_through_ledger, 0)
-		FROM events
-		JOIN LATERAL (
-			SELECT last_ingested_ledger FROM ingestion_state WHERE ingestion_state.network = events.network
-		) i ON true
-		JOIN LATERAL (
-			SELECT verified_through_ledger FROM audit_state WHERE audit_state.network = events.network
-		) a ON true
-		GROUP BY network, i.last_ingested_ledger, a.verified_through_ledger`)
-	if err != nil {
-		return Stats{}, fmt.Errorf("loading per-network stats: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var pns PerNetworkStats
-		var network string
-		if err := rows.Scan(&network, &pns.TotalEvents, &pns.LastIngestedLedger, &pns.VerifiedThroughLedger); err != nil {
-			return Stats{}, fmt.Errorf("scanning per-network stats: %w", err)
-		}
-		s.PerNetwork[network] = pns
-	}
-	if err := rows.Err(); err != nil {
-		return Stats{}, fmt.Errorf("reading per-network stats: %w", err)
-	}
-
 	return s, nil
 }
 
@@ -593,11 +607,11 @@ func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID str
 func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
 	err := p.pool.QueryRow(ctx, `
 		INSERT INTO audit_findings
-			(from_ledger, to_ledger, expected_count, actual_count,
+			(network, from_ledger, to_ledger, expected_count, actual_count,
 			 missing_ids, status, attempts)
-		VALUES ($1, $2, $3, $4, $5, $6, 0)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 0)
 		RETURNING id, created_at`,
-		f.FromLedger, f.ToLedger, f.ExpectedCount, f.ActualCount,
+		f.Network, f.FromLedger, f.ToLedger, f.ExpectedCount, f.ActualCount,
 		f.MissingIDs, f.Status,
 	).Scan(&f.ID, &f.CreatedAt)
 	if err != nil {
@@ -629,21 +643,25 @@ func (p *Postgres) UpdateAuditFinding(ctx context.Context, f AuditFinding) error
 	return nil
 }
 
-func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error) {
+// ListOpenFindingsByRange returns the most recent finding whose range
+// overlaps [fromLedger, toLedger] and is still in a working state (open
+// or unrecoverable). ErrNotFound means no live finding spans the range.
+func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, network string, fromLedger, toLedger int64) (AuditFinding, error) {
 	row := p.pool.QueryRow(ctx, `
-		SELECT id, from_ledger, to_ledger, expected_count, actual_count,
+		SELECT id, network, from_ledger, to_ledger, expected_count, actual_count,
 		       missing_ids, status, attempts, last_attempted_at, last_error, created_at
 		FROM audit_findings
-		WHERE status IN ('open', 'unrecoverable')
-		  AND from_ledger <= $2
-		  AND to_ledger   >= $1
+		WHERE network = $1
+		  AND status IN ('open', 'unrecoverable')
+		  AND from_ledger <= $3
+		  AND to_ledger   >= $2
 		ORDER BY id DESC
 		LIMIT 1`,
-		fromLedger, toLedger,
+		network, fromLedger, toLedger,
 	)
 	var f AuditFinding
 	var lastAttempted *time.Time
-	err := row.Scan(&f.ID, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
+	err := row.Scan(&f.ID, &f.Network, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
 		&f.MissingIDs, &f.Status, &f.Attempts, &lastAttempted, &f.LastError, &f.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuditFinding{}, ErrNotFound
@@ -662,6 +680,45 @@ func nullableString(s string) any {
 		return nil
 	}
 	return s
+}
+
+func (p *Postgres) withStatementTimeoutTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin guarded tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if timeout, ok := statementTimeoutFromContext(ctx); ok && timeout > 0 {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = '%dms'", timeout.Milliseconds())); err != nil {
+			return fmt.Errorf("setting statement_timeout: %w", err)
+		}
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit guarded tx: %w", err)
+	}
+	return nil
+}
+
+func statementTimeoutFromContext(ctx context.Context) (time.Duration, bool) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0, false
+	}
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		return 0, false
+	}
+	if timeout < time.Millisecond {
+		return time.Millisecond, true
+	}
+	return timeout, true
 }
 
 func scanEvent(row pgx.Row) (Event, error) {

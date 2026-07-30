@@ -18,7 +18,7 @@ var envKeys = []string{
 	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
 	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
 	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
-	"NETWORKS", "DEFAULT_NETWORK",
+	"NETWORKS", "DEFAULT_NETWORK", "CACHE_PRIVATE", "PARTITION_LEDGER_SPAN",
 }
 
 func TestLoad(t *testing.T) {
@@ -32,8 +32,6 @@ func TestLoad(t *testing.T) {
 			name: "defaults with only DATABASE_URL",
 			env:  map[string]string{"DATABASE_URL": "postgres://localhost/db"},
 			check: func(t *testing.T, c Config) {
-				// RPCURL may be empty when the env var is unset; NetworksOrDefault
-				// provides the default.
 				assert.Equal(t, 5*time.Second, c.PollInterval)
 				assert.Equal(t, ":8080", c.HTTPAddr)
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
@@ -74,8 +72,8 @@ func TestLoad(t *testing.T) {
 		{
 			name: "NETWORKS with two networks and DEFAULT_NETWORK works",
 			env: map[string]string{
-				"DATABASE_URL":   "postgres://localhost/db",
-				"NETWORKS":       `[{"name":"testnet","rpc_url":"https://testnet.stellar.org"},{"name":"mainnet","rpc_url":"https://mainnet.stellar.org"}]`,
+				"DATABASE_URL":    "postgres://localhost/db",
+				"NETWORKS":        `[{"name":"testnet","rpc_url":"https://testnet.stellar.org"},{"name":"mainnet","rpc_url":"https://mainnet.stellar.org"}]`,
 				"DEFAULT_NETWORK": "testnet",
 			},
 			check: func(t *testing.T, c Config) {
@@ -211,4 +209,21 @@ func TestParseNetworks(t *testing.T) {
 	networks, err = ParseNetworks("")
 	require.NoError(t, err)
 	assert.Nil(t, networks)
+}
+
+func TestValidCursor(t *testing.T) {
+	assert.True(t, ValidCursor("0001099511627776-0000000001"))
+	assert.True(t, ValidCursor("00000000000000000102-00000"))
+	assert.True(t, ValidCursor("e1"))
+	assert.True(t, ValidCursor("cursor-42"))
+	assert.True(t, ValidCursor("pt_1"))
+	assert.True(t, ValidCursor("abc.123:45_67-89"))
+
+	assert.False(t, ValidCursor(""), "empty string")
+	assert.False(t, ValidCursor("invalid cursor"), "contains space")
+	assert.False(t, ValidCursor("e1; DROP TABLE events;"), "contains semicolon and space")
+	assert.False(t, ValidCursor("cursor'OR'1'='1"), "contains single quotes")
+	assert.False(t, ValidCursor("<script>alert(1)</script>"), "contains angle brackets")
+	assert.False(t, ValidCursor("e1\n"), "contains newline")
+	assert.False(t, ValidCursor(string(make([]byte, 129))), "too long (>128 chars)")
 }

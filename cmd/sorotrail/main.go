@@ -1,5 +1,10 @@
 // Command sorotrail runs the SoroTrail indexer: a Stellar RPC event ingester
 // and a query API in one process.
+//
+// With no arguments it runs the indexer. Subcommands cover maintenance:
+//
+//	sorotrail replay --from-ledger N [--to-ledger M]
+//	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
 package main
 
 import (
@@ -28,6 +33,8 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/webhook"
 )
 
+var errInterrupted = errors.New("interrupted")
+
 func main() {
 	err := dispatch(os.Args[1:])
 	switch {
@@ -47,6 +54,8 @@ func dispatch(args []string) error {
 	switch args[0] {
 	case "replay":
 		return runReplay(args[1:])
+	case "backfill":
+		return runBackfill(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -64,6 +73,8 @@ With no subcommand, runs the indexer (ingester + HTTP API).
 subcommands:
   replay    re-decode stored events with the current decoder
             (sorotrail replay --help)
+  backfill  ingest historical contract events from Horizon
+            (sorotrail backfill --help)
 `)
 }
 
@@ -74,6 +85,8 @@ func run() error {
 	}
 	log := newLogger(cfg.LogLevel)
 
+	log.Info("startup configuration", cfg.LoggableFields()...)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -81,46 +94,62 @@ func run() error {
 		return err
 	}
 
-	// Tag any events that have empty network with the default network.
-	// This handles the upgrade path for single-network deployments.
-	defaultNetwork := cfg.DefaultNetworkName()
-	if defaultNetwork == "" {
-		networks := cfg.NetworksOrDefault()
-		if len(networks) > 0 {
-			defaultNetwork = networks[0].Name
-		}
-	}
-
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
-	if err != nil {
-		return fmt.Errorf("connecting to postgres: %w", err)
-	}
-	defer pool.Close()
-	if err := pool.Ping(ctx); err != nil {
-		return fmt.Errorf("pinging postgres: %w", err)
-	}
-
-	st := store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
-	for _, id := range cfg.WatchedContracts {
-		if err := st.AddWatchedContract(ctx, id); err != nil {
+	var (
+		st   store.Store
+		pool *pgxpool.Pool
+	)
+	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
+		st, err = store.NewStoreFromURL(cfg.DatabaseURL)
+		if err != nil {
 			return err
 		}
+	} else {
+		pool, err = pgxpool.New(ctx, cfg.DatabaseURL)
+		if err != nil {
+			return fmt.Errorf("connecting to postgres: %w", err)
+		}
+		defer pool.Close()
+		if err := pool.Ping(ctx); err != nil {
+			return fmt.Errorf("pinging postgres: %w", err)
+		}
+		st = store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
 	}
 
-	// Tag legacy rows with the default network.
-	if _, err := pool.Exec(ctx, `UPDATE events SET network = $1 WHERE network = '' OR network IS NULL`, defaultNetwork); err != nil {
-		log.Warn("tagging legacy events with default network", "error", err)
+	// Tag any events that have empty network with the default network.
+	// This handles the upgrade path for single-network deployments.
+	if pool != nil {
+		defaultNetwork := cfg.DefaultNetworkName()
+		if defaultNetwork == "" {
+			networks := cfg.NetworksOrDefault()
+			if len(networks) > 0 {
+				defaultNetwork = networks[0].Name
+			}
+		}
+		if defaultNetwork != "" {
+			if _, err := pool.Exec(ctx, `UPDATE events SET network = $1 WHERE network = '' OR network IS NULL`, defaultNetwork); err != nil {
+				log.Warn("tagging legacy events with default network", "error", err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO ingestion_state (network, last_ingested_ledger, last_cursor, updated_at)
+				SELECT $1, last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE network = '' OR network IS NULL
+				ON CONFLICT (network) DO NOTHING`, defaultNetwork); err != nil {
+				log.Warn("migrating ingestion state", "error", err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO audit_state (network, verified_through_ledger, updated_at)
+				SELECT $1, verified_through_ledger, updated_at FROM audit_state WHERE network = '' OR network IS NULL
+				ON CONFLICT (network) DO NOTHING`, defaultNetwork); err != nil {
+				log.Warn("migrating audit state", "error", err)
+			}
+		}
 	}
-	// Tag legacy ingestion_state and audit_state rows.
-	if _, err := pool.Exec(ctx, `INSERT INTO ingestion_state (network, last_ingested_ledger, last_cursor, updated_at)
-		SELECT $1, last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE network = '' OR network IS NULL
-		ON CONFLICT (network) DO NOTHING`, defaultNetwork); err != nil {
-		log.Warn("migrating ingestion state", "error", err)
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO audit_state (network, verified_through_ledger, updated_at)
-		SELECT $1, verified_through_ledger, updated_at FROM audit_state WHERE network = '' OR network IS NULL
-		ON CONFLICT (network) DO NOTHING`, defaultNetwork); err != nil {
-		log.Warn("migrating audit state", "error", err)
+
+	for _, id := range cfg.WatchedContracts {
+		// In multi-network mode, watched contracts apply to all networks.
+		for _, n := range cfg.NetworksOrDefault() {
+			if err := st.AddWatchedContract(ctx, id); err != nil {
+				return err
+			}
+			_ = n // preserve for per-network contract lists
+		}
 	}
 
 	// Shared broadcaster for live event streaming across all networks.
@@ -178,14 +207,23 @@ func run() error {
 	firstSpecFetcher := spec.NewFetcher(ingesters[0].rpc)
 	firstSpecEnricher := spec.NewEnricher(firstSpecFetcher, specCache, log)
 
-	// Set up the API server.
-	limiter := api.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.RateLimitTrustedProxy)
-	limiter.Start(ctx)
-	defer limiter.Stop()
+	// Guarded store for API-originated reads with timeout and slow-query logging.
+	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
+		Timeout:            cfg.APIQueryTimeout,
+		SlowQueryThreshold: cfg.APISlowQueryThreshold,
+		Logger:             log,
+	})
 
-	apiServer := api.New(st, ingesters[0].rpc, log, firstSpecEnricher).WithBroadcaster(bcast)
+	// Set up the API server.
+	apiServer := api.New(apiStore, ingesters[0].rpc, log, cfg.APIKey, firstSpecEnricher).WithBroadcaster(bcast)
+	limiter := api.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.RateLimitTrustedProxy)
+	if cfg.RateLimitRPS > 0 {
+		limiter.Start(ctx)
+		defer limiter.Stop()
+	}
 	apiServer.SetRateLimiter(limiter)
 	apiServer.SetNetworks(cfg.NetworkNames())
+	api.SetCachePrivate(cfg.CachePrivate)
 
 	// Connect notifier to all ingesters.
 	for _, ni := range ingesters {
@@ -197,9 +235,14 @@ func run() error {
 		Handler:           apiServer.Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	if cfg.APIKey == "" {
+		log.Warn("API_KEY env is unset; watched-contracts endpoints will reject every request with 503")
+	} else {
+		log.Info("watched-contracts endpoints are auth-gated")
+	}
 
 	// Error channel: one per ingester + HTTP server + webhook + auditor per network.
-	errCh := make(chan error, 4+len(ingesters))
+	errCh := make(chan error, 3+len(ingesters)*2)
 
 	// Start webhook notifier.
 	go wh.Run(ctx)
@@ -237,8 +280,7 @@ func run() error {
 		}
 	}()
 
-	// Wait for first error or shutdown signal.
-	var firstErr error
+	// Count expected goroutines that send to errCh.
 	remaining := 2 + len(ingesters) // http server + webhook + ingesters
 	for _, ni := range ingesters {
 		if ni.auditor != nil {
@@ -246,6 +288,7 @@ func run() error {
 		}
 	}
 
+	var firstErr error
 	select {
 	case <-ctx.Done():
 		log.Info("shutdown signal received")

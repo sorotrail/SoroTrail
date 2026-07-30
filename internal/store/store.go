@@ -7,6 +7,14 @@ import (
 	"time"
 )
 
+// DefaultQueryLimit is the default number of events returned when ?limit=
+// is omitted. It matches the value used in QueryEvents when Limit is <= 0.
+const DefaultQueryLimit = 50
+
+// MaxQueryLimit is the upper bound for the ?limit= parameter; values above
+// this are rejected by the API layer before the store sees them.
+const MaxQueryLimit = 200
+
 // Event is a Soroban contract event as persisted by SoroTrail.
 type Event struct {
 	ID               string          `json:"id"`
@@ -22,6 +30,11 @@ type Event struct {
 	CreatedAt        time.Time       `json:"created_at"`
 	Network          string          `json:"network"`
 
+	// RawTopicXDR and RawValueXDR keep the base64 XDR the RPC delivered, so
+	// an improved decoder can re-derive Topics/Value later without the RPC
+	// (see internal/replay). Both are empty when the RPC returned
+	// already-decoded JSON, or for rows ingested before raw XDR was stored.
+	// They are not part of the API representation.
 	RawTopicXDR []string `json:"-"`
 	RawValueXDR string   `json:"-"`
 }
@@ -76,21 +89,35 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
+	// Network scopes the query to a single network. Required when multiple
+	// networks are configured; defaults to the sole network in single-network mode.
+	Network    string
 	ContractID string
 	Type       string
-	Topic      json.RawMessage
-	Topic0     json.RawMessage
-	Topic1     json.RawMessage
-	Topic2     json.RawMessage
-	Topic3     json.RawMessage
-	FromLedger int64
-	ToLedger   int64
-	FromTime   time.Time
-	ToTime     time.Time
-	Cursor     string
-	Limit      int
-	Order      string
-	Network    string
+	// Topic matches events whose topics array contains this JSON value at any
+	// position (Postgres jsonb containment).
+	Topic json.RawMessage
+	// Topic0-Topic3 match the exact JSON value at that specific topic array
+	// position. Unspecified positions are wildcards.
+	Topic0 json.RawMessage
+	Topic1 json.RawMessage
+	Topic2 json.RawMessage
+	Topic3 json.RawMessage
+	// TopicContains matches events whose topics array jsonb-contains this
+	// value (Postgres @> operator). Unlike Topic, the value is passed
+	// directly without array-wrapping, so callers can use multi-element
+	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
+	// Uses the GIN index on events.topics.
+	TopicContains json.RawMessage
+	FromLedger    int64     // inclusive
+	ToLedger      int64     // inclusive
+	FromTime      time.Time // inclusive, zero = no constraint
+	ToTime        time.Time // inclusive, zero = no constraint
+	// Cursor is the ID of the last event from the previous page.
+	Cursor string
+	Limit  int
+	// Order is "asc" or "desc", defaults to "asc"
+	Order string
 }
 
 // IngestionState tracks how far ingestion has progressed for one network.
@@ -107,6 +134,15 @@ type AuditState struct {
 	Network               string
 	VerifiedThroughLedger int64
 	UpdatedAt             time.Time
+}
+
+// WatchedContract is one entry of the watch list: a contract ID and the
+// time it was added (either by env seeding on startup, or by a runtime
+// POST). The API uses this to render the GET response; the ingester reads
+// only ContractID for its filter batches.
+type WatchedContract struct {
+	ContractID string    `json:"contract_id"`
+	AddedAt    time.Time `json:"added_at"`
 }
 
 // LedgerCensus is one row of a per-ledger census over a contiguous range.
@@ -128,6 +164,7 @@ const (
 // store and the RPC.
 type AuditFinding struct {
 	ID              int64
+	Network         string
 	FromLedger      int64
 	ToLedger        int64
 	ExpectedCount   int
@@ -143,12 +180,13 @@ type AuditFinding struct {
 // SubscriptionFilter is a JSON-serializable filter that subscription
 // callbacks use to select which events to deliver.
 type SubscriptionFilter struct {
-	ContractID string          `json:"contract_id,omitempty"`
-	Type       string          `json:"type,omitempty"`
-	Topic      json.RawMessage `json:"topic,omitempty"`
-	FromLedger int64           `json:"from_ledger,omitempty"`
-	ToLedger   int64           `json:"to_ledger,omitempty"`
-	Network    string          `json:"network,omitempty"`
+	ContractID    string          `json:"contract_id,omitempty"`
+	Type          string          `json:"type,omitempty"`
+	Topic         json.RawMessage `json:"topic,omitempty"`
+	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
+	FromLedger    int64           `json:"from_ledger,omitempty"`
+	ToLedger      int64           `json:"to_ledger,omitempty"`
+	Network       string          `json:"network,omitempty"`
 }
 
 // MatchesEvent reports whether an event passes this filter.
@@ -184,7 +222,52 @@ func (f SubscriptionFilter) MatchesEvent(e Event) bool {
 			return false
 		}
 	}
+	if len(f.TopicContains) > 0 && len(e.Topics) > 0 {
+		var topics []json.RawMessage
+		if err := json.Unmarshal(e.Topics, &topics); err != nil {
+			return false
+		}
+		// Unwrap a single-element array so topic_contains=[{...}] works
+		// the same way in-memory as it does in Postgres @> containment.
+		needle := f.TopicContains
+		var arr []json.RawMessage
+		if err := json.Unmarshal(f.TopicContains, &arr); err == nil && len(arr) == 1 {
+			needle = arr[0]
+		}
+		matched := false
+		for _, t := range topics {
+			if jsonbContains(t, needle) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
 	return true
+}
+
+// jsonbContains reports whether the container jsonb-contains the contained
+// value. For objects it checks that every key in contained exists with the
+// same raw JSON value in container; for scalars/arrays it falls back to
+// direct byte comparison (JSON string equality). This mirrors the Postgres
+// @> operator's semantics for the topic-matching use case.
+func jsonbContains(container, contained json.RawMessage) bool {
+	// If both are objects, check key-value subset.
+	var cMap, dMap map[string]json.RawMessage
+	if json.Unmarshal(container, &cMap) == nil && json.Unmarshal(contained, &dMap) == nil {
+		for k, v := range dMap {
+			cv, ok := cMap[k]
+			if !ok || string(cv) != string(v) {
+				return false
+			}
+		}
+		return true
+	}
+	// Fallback: exact JSON string match (handles strings, numbers, and
+	// cases where unmarshalling into map failed — e.g. arrays).
+	return string(container) == string(contained)
 }
 
 // Subscription is one registered webhook callback.
@@ -211,22 +294,22 @@ type DeliveryAttempt struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-// PerNetworkStats holds stats for a single network.
-type PerNetworkStats struct {
-	TotalEvents           int64 `json:"total_events"`
-	LastIngestedLedger    int64 `json:"last_ingested_ledger"`
-	VerifiedThroughLedger int64 `json:"verified_through_ledger"`
-}
-
-// Stats summarizes what the indexer has stored so far.
+// Stats summarizes what the indexer has stored so far. VerifiedThroughLedger
+// is the inclusive highest ledger whose stored events have been confirmed
+// to match a fresh RPC fetch; 0 means no ledger has been verified yet.
+// Auditor counters are filled in by the API layer when an auditor is wired.
 type Stats struct {
-	TotalEvents           int64                      `json:"total_events"`
-	LastIngestedLedger    int64                      `json:"last_ingested_ledger"`
-	VerifiedThroughLedger int64                      `json:"verified_through_ledger"`
-	ContractCount         int64                      `json:"contract_count"`
-	WatchedContracts      int64                      `json:"watched_contracts"`
-	PerNetwork            map[string]PerNetworkStats `json:"per_network,omitempty"`
-	Auditor               AuditStats                 `json:"auditor,omitempty"`
+	TotalEvents           int64      `json:"total_events"`
+	LastIngestedLedger    int64      `json:"last_ingested_ledger"`
+	VerifiedThroughLedger int64      `json:"verified_through_ledger"`
+	OldestStoredLedger    int64      `json:"oldest_stored_ledger"`
+	ChainHeadLedger       *int64     `json:"chain_head_ledger"`
+	IngestLagLedgers      *int64     `json:"ingest_lag_ledgers"`
+	ContractCount         int64      `json:"contract_count"`
+	WatchedContracts      int64      `json:"watched_contracts"`
+	// Auditor counters are populated only when the audit package is
+	// active; omitted from JSON when the auditor is nil.
+	Auditor AuditStats `json:"auditor,omitempty"`
 }
 
 // AuditStats is a JSON-friendly view of audit.Metrics.
@@ -259,6 +342,10 @@ type Store interface {
 	ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error
 	GetEvent(ctx context.Context, id string) (Event, error)
 	EventExists(ctx context.Context, id string) (bool, error)
+	// QueryEvents returns a page of events in ascending ID order, plus a
+	// cursor for the next page ("" when there are no more results).
+	// Default order is ascending (oldest-first) for backward compatibility.
+	// The query is scoped to f.Network when set.
 	QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error)
 	LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error)
 
@@ -267,14 +354,33 @@ type Store interface {
 
 	GetAuditState(ctx context.Context, network string) (AuditState, error)
 	SaveAuditState(ctx context.Context, s AuditState) error
+	// SaveAuditStateIfGreater atomically sets verified_through_ledger
+	// only when it is strictly greater than the stored value. Returns the
+	// post-write AuditState (whether or not it was modified). It's an
+	// UPDATE ... WHERE clause, so concurrent auditors can't regress the
+	// HWM even if they race.
 	SaveAuditStateIfGreater(ctx context.Context, network string, ledger int64) (AuditState, error)
 
-	ListWatchedContracts(ctx context.Context) ([]string, error)
+	// ListWatchedContracts returns every watched contract in stable
+	// (contract_id) order, with its add timestamp. An empty result means
+	// the watch list is empty, and the ingester interprets that as
+	// "ingest all contract events" — distinct from "ingest nothing".
+	ListWatchedContracts(ctx context.Context) ([]WatchedContract, error)
 	AddWatchedContract(ctx context.Context, contractID string) error
+	// RemoveWatchedContract stops future ingestion for the given contract
+	// by removing its row from watched_contracts. It does NOT delete any
+	// (event) rows already in storage — removal is "stop watching", not
+	// "drop history", so a removed contract's events stay queryable.
+	// ErrNotFound is returned when no row matches the given ID, so the
+	// API can surface 404 for typos.
+	RemoveWatchedContract(ctx context.Context, contractID string) error
 
 	RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error)
 	UpdateAuditFinding(ctx context.Context, f AuditFinding) error
-	ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error)
+	// ListOpenFindingsByRange returns the most recent open finding whose
+	// range contains a single ledger, or ErrNotFound if none. The auditor
+	// uses this to keep working while a finding is being repaired.
+	ListOpenFindingsByRange(ctx context.Context, network string, fromLedger, toLedger int64) (AuditFinding, error)
 
 	CreateSubscription(ctx context.Context, s Subscription) (Subscription, error)
 	GetSubscription(ctx context.Context, id int64) (Subscription, error)
@@ -286,9 +392,24 @@ type Store interface {
 	ResetSubscriptionFailures(ctx context.Context, id int64) error
 	RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (DeliveryAttempt, error)
 	ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error)
+
+	// GetContractSpec returns the JSON-serialized spec for a wasm_hash,
+	// or ErrNotFound when no spec is cached for that hash.
 	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
 	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
 
-	Stats(ctx context.Context) (Stats, error)
+	Stats(ctx context.Context, network string) (Stats, error)
 	Ping(ctx context.Context) error
+}
+
+var ErrNotFound = func() error {
+	return &notFoundError{}
+}()
+
+type notFoundError struct{}
+
+func (e *notFoundError) Error() string { return "not found" }
+func (e *notFoundError) Is(target error) bool {
+	_, ok := target.(*notFoundError)
+	return ok
 }

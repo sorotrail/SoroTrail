@@ -21,24 +21,29 @@ type NetworkConfig struct {
 // Config holds all runtime configuration. Every field is settable via the
 // environment variable named in its `env` tag; see .env.example for docs.
 type Config struct {
-	RPCURL              string        `env:"RPC_URL"` // deprecated — use NETWORKS
-	DatabaseURL         string        `env:"DATABASE_URL"`
-	PollInterval        time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
-	HTTPAddr            string        `env:"HTTP_ADDR" envDefault:":8080"`
-	WatchedContracts    []string      `env:"WATCHED_CONTRACTS"`
-	StartLedger         uint32        `env:"START_LEDGER"`
-	RetentionLedgers    uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
-	PartitionLedgerSpan uint32        `env:"PARTITION_LEDGER_SPAN" envDefault:"120960"`
-	LogLevel            string        `env:"LOG_LEVEL" envDefault:"info"`
+	RPCURL                string        `env:"RPC_URL"` // deprecated — use NETWORKS
+	DatabaseURL           string        `env:"DATABASE_URL"`
+	PollInterval          time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
+	HTTPAddr              string        `env:"HTTP_ADDR" envDefault:":8080"`
+	WatchedContracts      []string      `env:"WATCHED_CONTRACTS"`
+	StartLedger           uint32        `env:"START_LEDGER"`
+	RetentionLedgers      uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
+	PartitionLedgerSpan   uint32        `env:"PARTITION_LEDGER_SPAN" envDefault:"120960"`
+	LogLevel              string        `env:"LOG_LEVEL" envDefault:"info"`
+	APIQueryTimeout       time.Duration `env:"API_QUERY_TIMEOUT" envDefault:"25s"`
+	APISlowQueryThreshold time.Duration `env:"API_SLOW_QUERY_THRESHOLD" envDefault:"2s"`
+
+	// Horizon backfill configuration.
+	HorizonURL      string  `env:"HORIZON_URL" envDefault:"https://horizon-testnet.stellar.org"`
+	BackfillRateRPS float64 `env:"BACKFILL_RATE_RPS" envDefault:"10"`
 
 	// Networks configures one or more Stellar RPC endpoints.
-	// JSON array of {name, rpc_url}. Parsed from NETWORKS env var as raw JSON string.
+	// JSON string of [{name, rpc_url}]. Parsed from NETWORKS env var.
 	Networks       []NetworkConfig `env:"-"`
 	NetworksRaw    string          `env:"NETWORKS"`
 	DefaultNetwork string          `env:"DEFAULT_NETWORK"`
 
-	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
-	// entirely; the binary behaves exactly like the pre-audit build.
+	// Audit config.
 	AuditEnabled        bool          `env:"AUDIT_ENABLED" envDefault:"false"`
 	AuditPollInterval   time.Duration `env:"AUDIT_POLL_INTERVAL" envDefault:"30s"`
 	AuditBatchLedgers   uint32        `env:"AUDIT_BATCH_LEDGERS" envDefault:"100"`
@@ -48,10 +53,9 @@ type Config struct {
 	AuditMaxRepair      int           `env:"AUDIT_MAX_REPAIR_ATTEMPTS" envDefault:"3"`
 	AuditFindingMaxLgrs uint32        `env:"AUDIT_FINDING_MAX_LEDGERS" envDefault:"100"`
 
-	// HTTP rate limiting (per client). RATE_LIMIT_RPS / RATE_LIMIT_BURST
-	// are both unset (zero) by default, which disables the limiter
-	// entirely — a no-op middleware — so deployments without this turned
-	// on keep today's behavior bit-for-bit.
+	// APIKey gates the watched-contracts management endpoints.
+	APIKey string `env:"API_KEY"`
+	// HTTP rate limiting.
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
@@ -92,6 +96,16 @@ func (c Config) DefaultNetworkName() string {
 	networks := c.NetworksOrDefault()
 	if len(networks) == 1 {
 		return networks[0].Name
+	}
+	return ""
+}
+
+// SingleNetworkName returns the sole network name when exactly one is configured,
+// or empty string when multiple are configured (caller must require explicit
+// selection). When zero networks (shouldn't happen after validation) returns "".
+func (c Config) SingleNetworkName() string {
+	if len(c.Networks) == 1 {
+		return c.Networks[0].Name
 	}
 	return ""
 }
@@ -158,6 +172,12 @@ func (c Config) Validate() error {
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("POLL_INTERVAL must be positive, got %s", c.PollInterval)
 	}
+	if c.APIQueryTimeout <= 0 {
+		return fmt.Errorf("API_QUERY_TIMEOUT must be positive, got %s", c.APIQueryTimeout)
+	}
+	if c.APISlowQueryThreshold <= 0 {
+		return fmt.Errorf("API_SLOW_QUERY_THRESHOLD must be positive, got %s", c.APISlowQueryThreshold)
+	}
 	if c.RetentionLedgers == 0 {
 		return fmt.Errorf("RETENTION_LEDGERS must be positive")
 	}
@@ -223,6 +243,24 @@ func ValidContractID(s string) bool {
 	return true
 }
 
+// ValidCursor reports whether s is a valid pagination cursor.
+// A cursor must be non-empty, at most 128 characters, and consist only of
+// alphanumeric characters, hyphens, underscores, dots, or colons.
+func ValidCursor(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	for _, r := range s {
+		if (r < 'a' || r > 'z') &&
+			(r < 'A' || r > 'Z') &&
+			(r < '0' || r > '9') &&
+			r != '-' && r != '_' && r != '.' && r != ':' {
+			return false
+		}
+	}
+	return true
+}
+
 func cleanContractList(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
@@ -243,4 +281,25 @@ func ParseNetworks(raw string) ([]NetworkConfig, error) {
 		return nil, fmt.Errorf("parsing NETWORKS JSON: %w", err)
 	}
 	return networks, nil
+}
+
+// LoggableFields returns the configuration as a flat key-value slice suitable
+// for structured logging, with credentials redacted.
+func (c Config) LoggableFields() []any {
+	dbURL := c.DatabaseURL
+	if u, err := url.Parse(c.DatabaseURL); err == nil {
+		u.User = nil
+		dbURL = u.String()
+	}
+	return []any{
+		"rpc_url", c.RPCURL,
+		"database_url", dbURL,
+		"poll_interval", c.PollInterval,
+		"http_addr", c.HTTPAddr,
+		"watched_contracts", len(c.WatchedContracts),
+		"start_ledger", c.StartLedger,
+		"retention_ledgers", c.RetentionLedgers,
+		"log_level", c.LogLevel,
+		"audit_enabled", c.AuditEnabled,
+	}
 }

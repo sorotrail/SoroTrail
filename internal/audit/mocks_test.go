@@ -70,8 +70,9 @@ type mockStore struct {
 	events   map[string]store.Event
 	ingress  store.IngestionState
 	audit    store.AuditState
-	watched  []string
+	watched  []store.WatchedContract
 	findings []store.AuditFinding
+	nextFID  int64
 }
 
 func newMockStore() *mockStore {
@@ -167,7 +168,7 @@ func (m *mockStore) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger 
 	return out, nil
 }
 
-func (m *mockStore) GetIngestionState(_ context.Context, network string) (store.IngestionState, error) {
+func (m *mockStore) GetIngestionState(_ context.Context, _ string) (store.IngestionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.ingress.LastIngestedLedger <= 0 && m.ingress.LastCursor == "" {
@@ -183,7 +184,7 @@ func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState
 	return nil
 }
 
-func (m *mockStore) GetAuditState(_ context.Context, network string) (store.AuditState, error) {
+func (m *mockStore) GetAuditState(_ context.Context, _ string) (store.AuditState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.audit, nil
@@ -196,7 +197,7 @@ func (m *mockStore) SaveAuditState(_ context.Context, s store.AuditState) error 
 	return nil
 }
 
-func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, network string, ledger int64) (store.AuditState, error) {
+func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, _ string, ledger int64) (store.AuditState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if ledger > m.audit.VerifiedThroughLedger {
@@ -205,16 +206,65 @@ func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, network string, l
 	return m.audit, nil
 }
 
-func (m *mockStore) ListWatchedContracts(context.Context) ([]string, error) {
+func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return m.watched, nil
 }
 
 func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
-	m.watched = append(m.watched, id)
+	m.watched = append(m.watched, store.WatchedContract{ContractID: id})
 	return nil
 }
 
-func (m *mockStore) Stats(context.Context) (store.Stats, error) {
+func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
+	for i, wc := range m.watched {
+		if wc.ContractID == id {
+			m.watched = append(m.watched[:i], m.watched[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+
+func (m *mockStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) (store.AuditFinding, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextFID++
+	f.ID = m.nextFID
+	if f.Status == "" {
+		f.Status = store.FindingOpen
+	}
+	m.findings = append(m.findings, f)
+	return f, nil
+}
+
+func (m *mockStore) UpdateAuditFinding(_ context.Context, f store.AuditFinding) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.findings {
+		if m.findings[i].ID == f.ID {
+			m.findings[i] = f
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+
+func (m *mockStore) ListOpenFindingsByRange(_ context.Context, _ string, from, to int64) (store.AuditFinding, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := len(m.findings) - 1; i >= 0; i-- {
+		f := m.findings[i]
+		if f.Status != store.FindingOpen && f.Status != store.FindingUnrecoverable {
+			continue
+		}
+		if f.FromLedger <= to && f.ToLedger >= from {
+			return f, nil
+		}
+	}
+	return store.AuditFinding{}, store.ErrNotFound
+}
+
+func (m *mockStore) Stats(_ context.Context, _ string) (store.Stats, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var s store.Stats
@@ -228,28 +278,6 @@ func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
 }
 func (m *mockStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
-
-func (m *mockStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) (store.AuditFinding, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	f.ID = int64(len(m.findings) + 1)
-	m.findings = append(m.findings, f)
-	return f, nil
-}
-func (m *mockStore) UpdateAuditFinding(_ context.Context, f store.AuditFinding) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for i, existing := range m.findings {
-		if existing.ID == f.ID {
-			m.findings[i] = f
-			return nil
-		}
-	}
-	return nil
-}
-func (m *mockStore) ListOpenFindingsByRange(context.Context, int64, int64) (store.AuditFinding, error) {
-	return store.AuditFinding{}, store.ErrNotFound
-}
 
 func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
 	sub.ID = 1

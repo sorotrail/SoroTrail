@@ -21,10 +21,18 @@ type Options struct {
 	PollInterval     time.Duration
 	StartLedger      uint32
 	RetentionLedgers uint32
-	PageLimit        uint
-	MaxBackoff       time.Duration
-	SweepWindow      uint32
-	Network          string
+	// PageLimit is the getEvents pagination limit per request. Default 1000.
+	PageLimit uint
+	// MaxBackoff caps the error backoff. Default 1m.
+	MaxBackoff time.Duration
+	// SweepWindow bounds the ledger range scanned per pass when the watched
+	// list needs more than one getEvents request (see buildFilterBatches).
+	// Default 1000 ledgers.
+	SweepWindow uint32
+	// Network is the logical network name this ingester is responsible for
+	// (e.g. "testnet", "mainnet"). Every stored event and state row is
+	// tagged with this value.
+	Network string
 }
 
 func (o *Options) applyDefaults() {
@@ -61,8 +69,8 @@ type Ingester struct {
 	decoder  decode.Decoder
 	log      *slog.Logger
 	opts     Options
-	notifier EventNotifier
 	bcast    *broadcast.Broadcaster
+	notifier EventNotifier // optional; nil means no notification
 }
 
 // New wires an Ingester.
@@ -71,18 +79,22 @@ func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger
 	return &Ingester{client: client, store: st, decoder: dec, log: log, opts: opts}
 }
 
-// SetNotifier attaches an optional EventNotifier.
-func (ing *Ingester) SetNotifier(n EventNotifier) {
-	ing.notifier = n
-}
-
-// WithBroadcaster attaches a live event broadcaster.
+// WithBroadcaster attaches a live event broadcaster so ingested events are
+// pushed to streaming subscribers.
 func (ing *Ingester) WithBroadcaster(b *broadcast.Broadcaster) *Ingester {
 	ing.bcast = b
 	return ing
 }
 
-// Run polls until ctx is canceled.
+// SetNotifier attaches an optional EventNotifier that is called after
+// every successful event persistence. When nil (the default) no
+// notification is sent — the ingester behaves exactly as before.
+func (ing *Ingester) SetNotifier(n EventNotifier) {
+	ing.notifier = n
+}
+
+// Run polls until ctx is canceled. Errors are logged and retried with
+// exponential backoff; the only terminal condition is context cancellation.
 func (ing *Ingester) Run(ctx context.Context) error {
 	backoff := time.Second
 	for {
@@ -156,7 +168,7 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 // ReingestRange re-fetches events for the closed range [fromLedger, toLedger].
 func (ing *Ingester) ReingestRange(ctx context.Context, client rpc.Client, fromLedger, toLedger uint32) (int, error) {
 	if fromLedger > toLedger {
-		return 0, fmt.Errorf("ReingestRange: from %d > to %d", fromLedger, toLedger)
+		return 0, fmt.Errorf("ReingestRange: from %d > %d", fromLedger, toLedger)
 	}
 	if client == nil {
 		client = ing.client
@@ -331,11 +343,13 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
 		"latest_ledger", latestLedger)
 
-	if ing.notifier != nil {
-		ing.notifier.NotifyEvents(ctx, events)
-	}
 	if ing.bcast != nil {
 		ing.bcast.Publish(ctx, events)
+	}
+	// Notify webhooks (or other listeners) after successful persistence.
+	// This is a fire-and-forget call — it must never block ingestion.
+	if ing.notifier != nil {
+		ing.notifier.NotifyEvents(ctx, events)
 	}
 	return nil
 }
@@ -375,9 +389,8 @@ func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) erro
 	if err != nil {
 		return fmt.Errorf("getHealth while re-clamping: %w", err)
 	}
-	ing.log.Warn("resume ledger fell outside RPC retention window; skipping ahead",
-		"network", ing.opts.Network,
-		"requested_ledger", requested, "oldest_retained", health.OldestLedger)
+	ing.log.Warn("resume ledger fell outside RPC retention window; skipping ahead — events in the gap are lost",
+		"network", ing.opts.Network, "requested_ledger", requested, "oldest_retained", health.OldestLedger)
 	return ing.store.SaveIngestionState(ctx, store.IngestionState{
 		Network:            ing.opts.Network,
 		LastIngestedLedger: int64(health.OldestLedger) - 1,
@@ -392,10 +405,19 @@ func (ing *Ingester) buildFilterBatches(ctx context.Context) ([][]rpc.EventFilte
 	if len(watched) == 0 {
 		return [][]rpc.EventFilter{{{Type: "contract"}}}, nil
 	}
+	// Copy IDs into a local slice: the watched list can grow between
+	// passes (a runtime POST that lands mid-process is picked up by the
+	// next runOnce without restart — see BuildFilterBatches' caller in
+	// runOnce), and we don't want to capture a slice that an inserter
+	// could mutate under us.
+	ids := make([]string, len(watched))
+	for i, wc := range watched {
+		ids[i] = wc.ContractID
+	}
 	var filters []rpc.EventFilter
-	for start := 0; start < len(watched); start += rpc.MaxContractIDsPerFilter {
-		end := min(start+rpc.MaxContractIDsPerFilter, len(watched))
-		filters = append(filters, rpc.EventFilter{Type: "contract", ContractIDs: watched[start:end]})
+	for start := 0; start < len(ids); start += rpc.MaxContractIDsPerFilter {
+		end := min(start+rpc.MaxContractIDsPerFilter, len(ids))
+		filters = append(filters, rpc.EventFilter{Type: "contract", ContractIDs: ids[start:end]})
 	}
 	var batches [][]rpc.EventFilter
 	for start := 0; start < len(filters); start += rpc.MaxFiltersPerRequest {
@@ -427,8 +449,12 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 		Value:            value,
 		CreatedAt:        createdAt,
 		Network:          ing.opts.Network,
-		RawTopicXDR:      re.Topic,
-		RawValueXDR:      re.Value,
+		// Keep the raw XDR so `sorotrail replay` can re-decode this event
+		// with a future decoder. Empty when the RPC delivered JSON directly
+		// (xdrFormat "json") — there is no XDR to keep in that case, and
+		// replay skips such rows.
+		RawTopicXDR: re.Topic,
+		RawValueXDR: re.Value,
 	}, nil
 }
 

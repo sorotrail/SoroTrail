@@ -11,7 +11,9 @@ import (
 
 	"github.com/khaylebfortune/sorotrail/internal/rpc"
 	"github.com/khaylebfortune/sorotrail/internal/store"
-) // stubReingest is a stand-in for ingester.Ingester. It records filter-batches
+)
+
+// stubReingest is a stand-in for ingester.Ingester. It records filter-batches
 // and reingest-range calls so tests can verify the auditor's path.
 type stubReingest struct {
 	mu       sync.Mutex
@@ -112,7 +114,7 @@ func TestPassOnce_CleanAdvance_HWM(t *testing.T) {
 	_, err := a.PassOnce(ctx)
 	require.NoError(t, err)
 
-	state, err := st.GetAuditState(ctx, "default")
+	state, err := st.GetAuditState(ctx, "")
 	require.NoError(t, err)
 	assert.Equal(t, int64(104), state.VerifiedThroughLedger,
 		"a clean audit pass advances HWM through the whole range")
@@ -193,7 +195,7 @@ func TestPassOnce_DetectsMissingEvent_Repairs_AndVerifies(t *testing.T) {
 	assert.Contains(t, f.MissingIDs, "00000000000000000102-00000")
 
 	// HWM should now be past the cluster.
-	state, _ := st.GetAuditState(ctx, "default")
+	state, _ := st.GetAuditState(ctx, "")
 	assert.Equal(t, int64(104), state.VerifiedThroughLedger, "post-repair HWM advanced to cluster end")
 
 	// Sanity: events count.
@@ -213,7 +215,7 @@ func TestPassOnce_LagPaused(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, worked, "lag below threshold → audit does no work")
 
-	state, _ := st.GetAuditState(ctx, "default")
+	state, _ := st.GetAuditState(ctx, "")
 	assert.Equal(t, int64(90), state.VerifiedThroughLedger, "HWM unchanged on lag pause")
 }
 
@@ -252,7 +254,7 @@ func TestPassOnce_FilterParity(t *testing.T) {
 	// No finding should be opened: the unwatched event was intentionally
 	// not ingested.
 	assert.Empty(t, st.findings, "watched-mode filter parity must hold")
-	state, _ := st.GetAuditState(ctx, "default")
+	state, _ := st.GetAuditState(ctx, "")
 	assert.Equal(t, int64(100), state.VerifiedThroughLedger, "HWM advances through the watched event")
 }
 
@@ -342,12 +344,12 @@ func TestAuditStatePersistence(t *testing.T) {
 	}
 	_, err := a.PassOnce(ctx)
 	require.NoError(t, err)
-	state1, _ := st.GetAuditState(ctx, "default")
+	state1, _ := st.GetAuditState(ctx, "")
 	assert.EqualValues(t, 5, state1.VerifiedThroughLedger)
 
 	_, err = a.PassOnce(ctx)
 	require.NoError(t, err)
-	state2, _ := st.GetAuditState(ctx, "default")
+	state2, _ := st.GetAuditState(ctx, "")
 	// Second pass should not regress even though BatchLedgers caps to 5
 	// ledgers per pass.
 	assert.GreaterOrEqual(t, state2.VerifiedThroughLedger, state1.VerifiedThroughLedger)
@@ -411,12 +413,12 @@ func TestSaveAuditStateIfGreater_RaceConditionFree(t *testing.T) {
 		wg.Add(1)
 		go func(ledger int64) {
 			defer wg.Done()
-			_, err := st.SaveAuditStateIfGreater(context.Background(), "default", ledger)
+			_, err := st.SaveAuditStateIfGreater(context.Background(), "", ledger)
 			require.NoError(t, err)
 		}(n)
 	}
 	wg.Wait()
-	final, err := st.GetAuditState(context.Background(), "default")
+	final, err := st.GetAuditState(context.Background(), "")
 	require.NoError(t, err)
 	assert.Equal(t, int64(200), final.VerifiedThroughLedger,
 		"concurrent SaveAuditStateIfGreater must converge on max(candidates)")

@@ -50,7 +50,7 @@ type mockStore struct {
 	mu       sync.Mutex
 	events   map[string]store.Event
 	state    *store.IngestionState
-	watched  []string
+	watched  []store.WatchedContract
 	upserted [][]store.Event
 }
 
@@ -111,13 +111,13 @@ func (m *mockStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]st
 	return nil, nil
 }
 
-func (m *mockStore) GetAuditState(context.Context, string) (store.AuditState, error) {
+func (m *mockStore) GetAuditState(_ context.Context, _ string) (store.AuditState, error) {
 	return store.AuditState{}, store.ErrNotFound
 }
-func (m *mockStore) SaveAuditState(context.Context, store.AuditState) error {
+func (m *mockStore) SaveAuditState(_ context.Context, _ store.AuditState) error {
 	return nil
 }
-func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, network string, ledger int64) (store.AuditState, error) {
+func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, _ string, ledger int64) (store.AuditState, error) {
 	return store.AuditState{VerifiedThroughLedger: ledger}, nil
 }
 
@@ -128,11 +128,11 @@ func (m *mockStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) 
 func (m *mockStore) UpdateAuditFinding(context.Context, store.AuditFinding) error {
 	return nil
 }
-func (m *mockStore) ListOpenFindingsByRange(context.Context, int64, int64) (store.AuditFinding, error) {
+func (m *mockStore) ListOpenFindingsByRange(_ context.Context, _ string, _, _ int64) (store.AuditFinding, error) {
 	return store.AuditFinding{}, store.ErrNotFound
 }
 
-func (m *mockStore) GetIngestionState(_ context.Context, network string) (store.IngestionState, error) {
+func (m *mockStore) GetIngestionState(_ context.Context, _ string) (store.IngestionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.state == nil {
@@ -148,16 +148,26 @@ func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState
 	return nil
 }
 
-func (m *mockStore) ListWatchedContracts(context.Context) ([]string, error) {
+func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return m.watched, nil
 }
 
 func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
-	m.watched = append(m.watched, id)
+	m.watched = append(m.watched, store.WatchedContract{ContractID: id})
 	return nil
 }
 
-func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
+func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
+	for i, wc := range m.watched {
+		if wc.ContractID == id {
+			m.watched = append(m.watched[:i], m.watched[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+
+func (m *mockStore) Stats(_ context.Context, _ string) (store.Stats, error) { return store.Stats{}, nil }
 func (m *mockStore) Ping(context.Context) error                 { return nil }
 
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
