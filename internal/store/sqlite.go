@@ -246,8 +246,13 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 	if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
-	if f.Type != "" {
-		where = append(where, "type = "+arg(f.Type))
+	if len(f.Types) > 0 {
+		// SQLite has no ANY(); expand to an IN list.
+		ph := make([]string, 0, len(f.Types))
+		for _, t := range f.Types {
+			ph = append(ph, arg(t))
+		}
+		where = append(where, "type IN ("+strings.Join(ph, ", ")+")")
 	}
 	if len(f.Topic) > 0 {
 		where = append(where, topicContainsExpr(arg(f.Topic)))
@@ -636,7 +641,7 @@ func (s *SQLite) UpdateSubscription(ctx context.Context, sub Subscription) (Subs
 	return s.GetSubscription(ctx, sub.ID)
 }
 
-func (s *SQLite) DeleteSubscription(ctx context.Context, id int64) error {
+func (s *SQLite) DeleteSubscription(ctx context.Context, id int64, _ SubscriptionOwner) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM subscriptions WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("deleting subscription %d: %w", id, err)
@@ -896,4 +901,49 @@ func nullableXDRTopics(s []string) any {
 	}
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// AggregateEvents is not implemented for the SQLite backend: the analytics
+// endpoints are Postgres-only. Returning an error beats returning empty
+// buckets, which a caller would read as "no events in range".
+func (s *SQLite) AggregateEvents(context.Context, EventFilter, string) ([]AggregateBucket, error) {
+	return nil, fmt.Errorf("AggregateEvents: not supported by the sqlite backend")
+}
+
+// CountAddressEvents is not implemented for the SQLite backend: the address
+// activity index is Postgres-only.
+func (s *SQLite) CountAddressEvents(context.Context, string) (int64, error) {
+	return 0, fmt.Errorf("CountAddressEvents: not supported by the sqlite backend")
+}
+
+// CountContracts is not implemented for the SQLite backend: the contract
+// inventory endpoint is Postgres-only.
+func (s *SQLite) CountContracts(context.Context, ContractsFilter) (int64, error) {
+	return 0, fmt.Errorf("CountContracts: not supported by the sqlite backend")
+}
+
+// CountEvents is not implemented for the SQLite backend: total-count
+// pagination metadata is Postgres-only.
+func (s *SQLite) CountEvents(context.Context, EventFilter) (int64, error) {
+	return 0, fmt.Errorf("CountEvents: not supported by the sqlite backend")
+}
+
+// DeadLetterEvent is not implemented for the SQLite backend.
+func (s *SQLite) DeadLetterEvent(context.Context, DeadLetterInput) (DeadLetter, error) {
+	return DeadLetter{}, fmt.Errorf("DeadLetterEvent: not supported by the sqlite backend")
+}
+
+// DeleteDeadLetter is not implemented for the SQLite backend.
+func (s *SQLite) DeleteDeadLetter(context.Context, int64) error {
+	return fmt.Errorf("DeleteDeadLetter: not supported by the sqlite backend")
+}
+
+// DeleteEventsBefore is not implemented for the SQLite backend.
+func (s *SQLite) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, fmt.Errorf("DeleteEventsBefore: not supported by the sqlite backend")
+}
+
+// DeleteEventsBeforeLedger is not implemented for the SQLite backend.
+func (s *SQLite) DeleteEventsBeforeLedger(context.Context, int64) (int64, error) {
+	return 0, fmt.Errorf("DeleteEventsBeforeLedger: not supported by the sqlite backend")
 }

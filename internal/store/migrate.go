@@ -5,6 +5,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -31,7 +32,7 @@ func Migrate(databaseURL string) error {
 		return fmt.Errorf("unsupported database url scheme")
 	}
 
-	src, err := iofs.New(migrationsFS, "migrations")
+	src, err := iofs.New(postgresMigrationsFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("loading embedded migrations: %w", err)
 	}
@@ -117,4 +118,15 @@ func migrateSQLite(databaseURL string) error {
 		}
 	}
 	return nil
+}
+
+// parseSQLiteDSN strips the sqlite:// scheme, leaving the file path (or
+// :memory:) that modernc.org/sqlite expects.
+func parseSQLiteDSN(databaseURL string) string {
+	for _, p := range []string{"sqlite://", "sqlite3://", "file:"} {
+		if strings.HasPrefix(databaseURL, p) {
+			return strings.TrimPrefix(databaseURL, p)
+		}
+	}
+	return databaseURL
 }

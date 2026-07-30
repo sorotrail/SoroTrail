@@ -20,7 +20,7 @@ type MigrationStatus struct {
 // GetMigrationStatus reports the database's current migration version and
 // migrations that have not yet been applied. It does not modify the database.
 func GetMigrationStatus(databaseURL string) (MigrationStatus, error) {
-	migrationSource, err := iofs.New(migrationsFS, "migrations")
+	migrationSource, err := iofs.New(postgresMigrationsFS, "migrations")
 	if err != nil {
 		return MigrationStatus{}, fmt.Errorf("opening migrations: %w", err)
 	}
