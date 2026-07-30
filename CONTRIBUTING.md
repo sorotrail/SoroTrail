@@ -102,6 +102,15 @@ known-vulnerable code paths are surfaced before they ship. Review dependency
 PRs promptly — a green check on `vulncheck` is a good signal that the bump can
 be merged without deep audit.
 
+## Verification & Automated Checks
+
+Before submitting a pull request, please run the following commands locally:
+
+```bash
+go build ./...
+make test-db   # Requires local Postgres instance
+make lint
+
 ## Pull requests
 
 - `go build ./...`, `make test` and `make lint` must pass.
