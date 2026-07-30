@@ -8,9 +8,9 @@ import (
 	"math/rand/v2"
 	"time"
 
-	"github.com/khaylebfortune/sorotrail/internal/decode"
-	"github.com/khaylebfortune/sorotrail/internal/ingester"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // Scenario describes one simulation test case: the chain setup, fault

@@ -2,6 +2,7 @@ BINARY := bin/sorotrail
 MIGRATIONS := internal/store/migrations
 DATABASE_URL ?= postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
 
+.PHONY: build run test test-db test-integration lint cover cover-html migrate-up migrate-down docker-up docker-down clean
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "unknown")
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown")
@@ -11,6 +12,7 @@ LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Versio
 .PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down simtest simtest-long clean bench bench-ci seed
 
 build:
+	go build -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/sorotrail
 	go build $(LDFLAGS) -o $(BINARY) ./cmd/sorotrail
 
 run: build
@@ -26,6 +28,19 @@ test:
 test-db:
 	TEST_DATABASE_URL=$(DATABASE_URL) go test -p 1 ./...
 
+# Integration test suite only, gated behind the `integration` build tag so
+# `go test ./...` stays fast. The suite honors TEST_DATABASE_URL when set
+# (CI's services-postgres path), and otherwise spins up an ephemeral
+# Postgres 16-alpine via testcontainers-go per `internal/testdb.Setup`
+# call. Either way, the four required coverage areas — migration-up from
+# empty, event upsert idempotency, ingestion_state save/resume across
+# ingester restarts, GET /events filter combinations against seeded
+# data — are asserted against a real PostgreSQL.
+#
+# -p 1 because the integration tests in internal/store and internal/replay
+# share one database and truncate the same tables.
+test-integration:
+	go test -tags=integration -p 1 ./... -count=1
 # Run the deterministic simulation test suite (mock store, fast).
 simtest:
 	go test ./internal/simtest/... -count=1 -timeout 120s

@@ -28,6 +28,9 @@ import (
 
 	"time"
 
+	"github.com/khaylebfortune/sorotrail/internal/config"
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
+	"github.com/khaylebfortune/sorotrail/internal/store"
 	"github.com/sorotrail/sorotrail/internal/api/queries"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
@@ -35,10 +38,25 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
+// decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
+// unknown fields so a typo like {"contractID": "..."} doesn't fall
+// through with an empty contract_id and a confusing 400 from a later
+// check.
+func decodeJSONBody(r *http.Request, dst any) error {
+	if r.Body == nil {
+		return errors.New("request body is empty")
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	return nil
+}
 
-	"github.com/coder/websocket"
+var cachePrivate atomic.Bool
 
-	"github.com/go-chi/chi/v5"
+func SetCachePrivate(v bool) { cachePrivate.Store(v) }
 
 // tenantScoped mirrors Server.multiTenant for the package-level cache
 // helpers, which are plain functions and have no server to ask.
@@ -79,42 +97,13 @@ func SetTenantScopedCaching(v bool) { tenantScoped.Store(v) }
 
 const immutableMaxAge = 365 * 24 * time.Hour
 
-
-
-// cacheability kinds a handler can ask for. The mapping to header
-
-// directives lives in writeCacheHeaders so handlers never write
-
-// Cache-Control themselves.
-
 type cacheability int
 
 
 
 const (
-
-	// cacheImmutable: long-lived, public (or private when CACHE_PRIVATE
-
-	// is on), with the `immutable` directive. Used only when the server
-
-	// can prove the response will not change.
-
 	cacheImmutable cacheability = iota
-
-	// cacheNoCache: must revalidate (Cache-Control: no-cache). Safe for
-
-	// any growing-page response — it's never optimistic, never implies
-
-	// staleness is OK.
-
 	cacheNoCache
-
-	// cacheNoStore: do not cache anywhere (Cache-Control: no-store).
-
-	// Reserved for /health and /stats — operational data, not
-
-	// shareable across users or even across requests on the same box.
-
 	cacheNoStore
 
 )
@@ -132,11 +121,7 @@ type errorResponse struct {
 type eventsResponse struct {
 
 	Events []store.Event `json:"events"`
-
-	// Cursor is non-empty when another page exists; pass it back as ?cursor=.
-
-	Cursor string `json:"cursor,omitempty"`
-
+	Cursor string        `json:"cursor,omitempty"`
 }
 
 
@@ -144,11 +129,24 @@ type eventsResponse struct {
 type enrichedEventsResponse struct {
 
 	Events []store.EnrichedEvent `json:"events"`
+	Cursor string                `json:"cursor,omitempty"`
+}
 
-	// Cursor is non-empty when another page exists.
+type eventWithXDR struct {
+	Event     store.Event `json:"-"`
+	TopicsXDR []string    `json:"topics_xdr"`
+	ValueXDR  *string     `json:"value_xdr,omitempty"`
+}
 
-	Cursor string `json:"cursor,omitempty"`
+type enrichedEventWithXDR struct {
+	eventWithXDR
+	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                          `json:"decoded"`
+}
 
+type enrichedEventsWithXDRResponse struct {
+	Events []enrichedEventWithXDR `json:"events"`
+	Cursor string                  `json:"cursor,omitempty"`
 }
 
 
@@ -156,55 +154,56 @@ type enrichedEventsResponse struct {
 type eventsWithXDRResponse struct {
 
 	Events []eventWithXDR `json:"events"`
-
-	// Cursor is non-empty when another page exists.
-
-	Cursor string `json:"cursor,omitempty"`
-
+	Cursor string         `json:"cursor,omitempty"`
 }
 
+// eventWithXDR is an event plus the raw XDR it was decoded from, returned
+// when ?include_xdr=true. ValueXDR is a pointer so an event with no value
+// serialises as null rather than an empty string.
+type eventWithXDR struct {
+	store.Event
+	TopicsXDR []string `json:"topics_xdr"`
+	ValueXDR  *string  `json:"value_xdr"`
+}
 
+// enrichedEventWithXDR combines the raw-XDR view with spec-decoded fields.
+type enrichedEventWithXDR struct {
+	eventWithXDR
+	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                        `json:"decoded"`
+}
 
 type enrichedEventsWithXDRResponse struct {
-
 	Events []enrichedEventWithXDR `json:"events"`
-
 	// Cursor is non-empty when another page exists.
 
 	Cursor string `json:"cursor,omitempty"`
 
 }
 
-
-
-type eventWithXDR struct {
-
-	store.Event
-
-	TopicsXDR []string `json:"topics_xdr"`
-
-	ValueXDR  *string  `json:"value_xdr"`
-
+// envelopeResponse is the JSON body returned when ?envelope=true is set on
+// any paginated list endpoint. It normalises the response shape across all
+// list endpoints so clients that prefer a consistent outer wrapper don't
+// have to inspect endpoint-specific field names.
+//
+// Fields:
+//
+//	data        – the page items (array, never null).
+//	next_cursor – opaque pagination cursor; empty/absent when exhausted.
+type envelopeResponse struct {
+	Data       any    `json:"data"`
+	NextCursor string `json:"next_cursor,omitempty"`
 }
 
-
-
-type enrichedEventWithXDR struct {
-
-	eventWithXDR
-
-	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
-
-	Decoded      bool                        `json:"decoded"`
-
+// wrapEnvelope builds an envelopeResponse from a page of items and the
+// next-page cursor. It is a convenience constructor so call sites stay
+// single-line.
+func wrapEnvelope(data any, cursor string) envelopeResponse {
+	return envelopeResponse{Data: data, NextCursor: cursor}
 }
-
-
 
 type healthResponse struct {
-
-	Status string            `json:"status"` // ok | degraded
-
+	Status string            `json:"status"`
 	Checks map[string]string `json:"checks"`
 
 }
@@ -224,11 +223,7 @@ type versionResponse struct {
 
 
 // eventFieldNames is the set of JSON keys on store.Event that the ?fields=
-
-// allowlist accepts. It is built from the json struct tags so the compiler
-
-// catches drift when Event gains or renames fields.
-
+// allowlist accepts.
 var eventFieldNames = map[string]bool{
 
 	"id":                 true,
@@ -260,9 +255,6 @@ var eventFieldNames = map[string]bool{
 // parseFields splits a comma-separated ?fields= value and returns the
 
 // allowlist set. Unknown field names are rejected with a 400-style error.
-
-// An empty or missing raw value returns nil (meaning "return the full object").
-
 func parseFields(raw string) (map[string]bool, error) {
 
 	if raw == "" {
@@ -323,12 +315,7 @@ func projectEvent(ev store.Event, fields map[string]bool) any {
 
 }
 
-
-
-// projectEvents applies projectEvent to a slice, returning []map[string]any
-
-// when fields is set, or the original slice when nil.
-
+// projectEvents applies projectEvent to a slice.
 func projectEvents(evs []store.Event, fields map[string]bool) any {
 
 	if fields == nil {
@@ -348,10 +335,6 @@ func projectEvents(evs []store.Event, fields map[string]bool) any {
 	return out
 
 }
-
-
-
-// eventToMap builds a map with only the requested fields.
 
 func eventToMap(ev store.Event, fields map[string]bool) map[string]any {
 
@@ -435,10 +418,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	defer cancel()
 
-
-
-	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok", "rpc": "ok"}}
-
+	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok"}}
 	status := http.StatusOK
 
 
@@ -473,6 +453,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 }
 
+// handleMetrics serves the Prometheus /metrics endpoint. The response is
+// always cacheNoStore so scrapers never see a stale snapshot.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	metrics.Handler().ServeHTTP(w, r)
 // handleDeleteEvents is the admin-only bulk delete endpoint. It deletes all
 // events whose ledger is strictly less than the ?before_ledger= query parameter.
 // The endpoint is protected by apiKeyAuth middleware (same as watched-contracts).
@@ -873,27 +858,11 @@ func writeForbiddenContract(w http.ResponseWriter, contractID string) {
 }
 
 // serveEvents is the shared body for /events and /contracts/{id}/events.
-
-// It runs the cacheability decision (frontier vs. upper bound) BEFORE the
-
-// SQL query, so an immutable page with a matching If-None-Match never
-
-// touches the events table at all — only the cheap ingestion_state row
-
-// used to read the frontier.
-
 func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter store.EventFilter, fields map[string]bool) {
 
 	policy, etag, err := s.listCachePolicy(r.Context(), filter)
 
 	if err != nil {
-
-		// "When in doubt, don't cache" is the explicit guidance: any
-
-		// failure to read the frontier falls back to no-cache rather
-
-		// than guessing the page is safe.
-
 		loggerFromContext(r.Context()).Warn("deciding list cache policy", "error", err)
 
 	} else if etag != "" && ifNoneMatch(r, etag) {
@@ -972,7 +941,7 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 
 	decoded := r.URL.Query().Get("decoded") == "true"
-
+	envelope := r.URL.Query().Get("envelope") == "true"
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
 
 	if decoded && s.enricher != nil {
@@ -983,11 +952,13 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		// shared cache could key ?decoded=true responses on URL alone.
 		writeVary(w)
 		if includeXDR {
-
+			items := enrichEventsWithXDR(enriched)
+			if envelope {
+				writeJSON(w, http.StatusOK, wrapEnvelope(items, cursor))
+				return
+			}
 			writeJSON(w, http.StatusOK, enrichedEventsWithXDRResponse{
-
-				Events: enrichEventsWithXDR(enriched),
-
+				Events: items,
 				Cursor: cursor,
 
 			})
@@ -995,7 +966,10 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 			return
 
 		}
-
+		if envelope {
+			writeJSON(w, http.StatusOK, wrapEnvelope(enriched, cursor))
+			return
+		}
 		writeJSON(w, http.StatusOK, enrichedEventsResponse{Events: enriched, Cursor: cursor})
 
 		return
@@ -1003,11 +977,13 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	}
 
 	if includeXDR {
-
+		items := eventsWithXDR(events)
+		if envelope {
+			writeJSON(w, http.StatusOK, wrapEnvelope(items, cursor))
+			return
+		}
 		writeJSON(w, http.StatusOK, eventsWithXDRResponse{
-
-			Events: eventsWithXDR(events),
-
+			Events: items,
 			Cursor: cursor,
 
 		})
@@ -1017,7 +993,10 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	}
 
 	if fields == nil {
-
+		if envelope {
+			writeJSON(w, http.StatusOK, wrapEnvelope(events, cursor))
+			return
+		}
 		writeJSON(w, http.StatusOK, eventsResponse{Events: events, Cursor: cursor})
 
 	} else {
@@ -1029,19 +1008,17 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 			m["cursor"] = cursor
 
 		}
-
+		if envelope {
+			writeJSON(w, http.StatusOK, wrapEnvelope(projectEvents(events, fields), cursor))
+			return
+		}
 		writeJSON(w, http.StatusOK, m)
 
 	}
 
 }
 
-
-
-// parseFilterAndFields parses the shared filter params plus the optional
-
-// ?fields= allowlist.
-
+// parseFilterAndFields parses the shared filter params plus the optional ?fields= allowlist.
 func parseFilterAndFields(r *http.Request) (store.EventFilter, map[string]bool, error) {
 
 	filter, err := filterFromQuery(r)
@@ -1191,31 +1168,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-
-
-	// Strong ETag: the event ID is itself a perfect validator for an
-
-	// immutable resource (each ID maps to exactly one row, that row's
-
-	// body never changes). Using the ID instead of a body hash skips a
-
-	// scan-and-hash on the cache-miss path and keeps 304s cheap.
-
 	etag := `"` + id + `"`
-
-
-
-	// 304 fast path: conditional GET with a matching validator. We
-
-	// avoid the row-serialization path entirely (GetEvent is not
-
-	// called), and instead probe presence with EventExists so retention
-
-	// /pruning (#8) can't let a deleted event masquerade as still
-
-	// present. A miss in EventExists is reported as 404, matching the
-
-	// unconditional code path.
 
 	if ifNoneMatch(r, etag) {
 		exists, err := s.store.EventExists(r.Context(), id, scope)
@@ -1230,15 +1183,6 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !exists {
-
-			// Retention/pruning (#8) deleted the row out from under cached
-
-			// clients. writeError carries Cache-Control: no-store so a CDN
-
-			// that warmed on the ETag-bearing 200 doesn't happily pool
-
-			// this 404 for the immutable max-age.
-
 			writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
 
 			return
@@ -1276,9 +1220,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	event.WithSEP41()
 
 	decoded := r.URL.Query().Get("decoded") == "true"
-
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
-
 	if decoded && s.enricher != nil {
 
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
@@ -1461,6 +1403,10 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 		items = []store.ContractSummary{}
 	}
 	writeCacheHeaders(w, cacheNoCache, 0, "")
+	if r.URL.Query().Get("envelope") == "true" {
+		writeJSON(w, http.StatusOK, wrapEnvelope(items, cursor))
+		return
+	}
 	writeJSON(w, http.StatusOK, contractListResponse{
 		Contracts: items,
 		Count:     len(items),
@@ -1507,6 +1453,13 @@ func (s *Server) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
+	if r.URL.Query().Get("envelope") == "true" {
+		if items == nil {
+			items = []store.DeadLetter{}
+		}
+		writeJSON(w, http.StatusOK, wrapEnvelope(items, cursor))
+		return
+	}
 	writeJSON(w, http.StatusOK, deadLetterListResponse{
 		DeadLetters: items,
 		Count:       len(items),
@@ -1605,25 +1558,13 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 }
 
-
-
-// addWatchedRequest is the body for POST /watched-contracts: a single
-
-// contract ID to add to the runtime watch list.
+// Watched contracts types.
 
 type addWatchedRequest struct {
 
 	ContractID string `json:"contract_id"`
 
 }
-
-
-
-// addWatchedResponse includes the current ingestion cursor so callers
-
-// know exactly where historical replay starts — events before this ledger
-
-// are not backfilled by the runtime add (a separate replay tool covers them).
 
 type addWatchedResponse struct {
 
@@ -1632,26 +1573,8 @@ type addWatchedResponse struct {
 	AddedAt           string `json:"added_at"`
 
 	HistoryFromLedger int64  `json:"history_from_ledger"`
-
-	// ModeTransition is "all_to_specific" when the list was empty before
-
-	// this add, surfacing the same semantic change the confirm guard
-
-	// guards. Useful to post-run auditors even when the caller already
-
-	// confirmed.
-
-	ModeTransition string `json:"mode_transition,omitempty"`
-
+	ModeTransition    string `json:"mode_transition,omitempty"`
 }
-
-
-
-// removeWatchedResponse explains what removal actually did: stored events
-
-// are NOT deleted; only future ingestion stops. The message is part of
-
-// the contract so callers don't have to read the README to find out.
 
 type removeWatchedResponse struct {
 
@@ -1665,12 +1588,6 @@ type removeWatchedResponse struct {
 
 }
 
-
-
-// watchedListResponse wraps the GET response in an envelope so the route
-
-// is easy to extend without breaking JSON shape.
-
 type watchedListResponse struct {
 
 	Contracts []store.WatchedContract `json:"contracts"`
@@ -1678,12 +1595,6 @@ type watchedListResponse struct {
 	Count     int                     `json:"count"`
 
 }
-
-
-
-// handleListWatchedChains returns the current watch list in stable
-
-// (contract_id) order.
 
 func (s *Server) handleListWatchedChains(w http.ResponseWriter, r *http.Request) {
 
@@ -1702,34 +1613,6 @@ func (s *Server) handleListWatchedChains(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, watchedListResponse{Contracts: contracts, Count: len(contracts)})
 
 }
-
-
-
-// handleAddWatchedChain adds a contract to the runtime watch list and
-
-// returns where historical replay for it starts (= the current cursor).
-
-//
-
-// Guarded by ?confirm=true when the add would switch the ingester from
-
-// "all contract events" (empty list) to a specific contract list, since
-
-// that silently narrows what gets stored going forward.
-
-//
-
-// TOCTOU note: the confirm check reads the list and then mutates it
-
-// without holding a row lock. Two concurrent empty→non-empty POSTs can
-
-// both pass the guard before either mutates — acceptable because
-
-// ON CONFLICT DO NOTHING makes a duplicate Add a no-op, and only the
-
-// first response carries the genuine transition; the second reports one
-
-// too, but no row state diverges.
 
 func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
@@ -1789,10 +1672,7 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-
-
-	state, err := s.store.GetIngestionState(r.Context())
-
+	state, err := s.store.GetIngestionState(r.Context(), s.defaultNetwork)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 
 		s.log.Error("loading ingestion state for add", "error", err)
@@ -1830,14 +1710,6 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	})
 
 }
-
-
-
-// handleRemoveWatchedChain stops future ingestion for the named contract
-
-// without deleting any events already stored. The same empty<->non-empty
-
-// guard fires when removing the last contract on the list (specific -> all).
 
 func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {
 
@@ -1960,6 +1832,11 @@ func (s *Server) handleAddressEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeCacheHeaders(w, cacheNoCache, 0, "")
+	envelope := r.URL.Query().Get("envelope") == "true"
+	if envelope {
+		writeJSON(w, http.StatusOK, wrapEnvelope(events, cursor))
+		return
+	}
 	writeJSON(w, http.StatusOK, addressEventsResponse{Events: events, Cursor: cursor})
 }
 
@@ -2047,48 +1924,12 @@ func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
 
 
 func ingestLagLedgers(chainHead, lastIngested int64) int64 {
-
+	if lastIngested <= 0 {
+		return 0
+	}
 	return chainHead - lastIngested
 
 }
-
-
-
-// listCachePolicy decides whether a list page is cacheable as immutable
-
-// based on the ingest frontier. The whole point of this function is
-
-// correctness against a moving frontier: a 1-ledger mistake either
-
-// way lets a stale row into a cache or strands one behind it, so the
-
-// comparison is deliberately strict and biases toward no-cache.
-
-//
-
-// Rule: a page is only safe (= can't gain rows) when to_ledger is set
-
-// AND strictly less than the last ingested ledger. Equality is folded
-
-// into the unsafe bucket: at the frontier, ingestion may still be in
-
-// progress and the boundary ledger's row count isn't guaranteed.
-
-//
-
-// Time-only filters (no ledger bound) are never cacheable: translating
-
-// created_at to ledgers would need a maintained lookup and the spec
-
-// says "when in doubt, don't cache". Time filters can still be applied
-
-// alongside ledger bounds and the policy falls through correctly
-
-// because the ledger-side comparison decides.
-
-//
-
-// On any failure to read frontier, the policy is no-cache.
 
 func (s *Server) listCachePolicy(ctx context.Context, filter store.EventFilter) (cacheability, string, error) {
 
@@ -2097,9 +1938,7 @@ func (s *Server) listCachePolicy(ctx context.Context, filter store.EventFilter) 
 		return cacheNoCache, "", nil
 
 	}
-
-	frontier, err := s.lastIngestedLedger(ctx)
-
+	frontier, err := s.lastIngestedLedger(ctx, filter.Network)
 	if err != nil {
 
 		return cacheNoCache, "", err
@@ -2107,9 +1946,6 @@ func (s *Server) listCachePolicy(ctx context.Context, filter store.EventFilter) 
 	}
 
 	if filter.ToLedger >= frontier {
-
-		// Includes the boundary case by design. See the rationale above.
-
 		return cacheNoCache, "", nil
 
 	}
@@ -2118,32 +1954,9 @@ func (s *Server) listCachePolicy(ctx context.Context, filter store.EventFilter) 
 
 }
 
-
-
-// lastIngestedLedger reads the frontier from the persisted ingestion
-
-// state. We deliberately reuse GetIngestionState (the narrow index-only
-
-// row already on the hot path) rather than Stats, whose count-aggregates
-
-// scan the events table — the spec wants the existing value via the
-
-// store, not a fancier query just for caching.
-
-//
-
-// A miss (cold start, no row yet) is treated as frontier=0 so every
-
-// to_ledger is "not strictly below" and the caller returns no-cache.
-
-// This is conservative on the safe side: nothing gets the immutable
-
-// header until at least one ledger is ingested.
-
-func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
-
-	state, err := s.store.GetIngestionState(ctx)
-
+// lastIngestedLedger reads the frontier from the persisted ingestion state.
+func (s *Server) lastIngestedLedger(ctx context.Context, network string) (int64, error) {
+	state, err := s.store.GetIngestionState(ctx, network)
 	if errors.Is(err, store.ErrNotFound) {
 
 		return 0, nil
@@ -2160,58 +1973,30 @@ func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
 
 }
 
-
-
-// listETag is the strong validator for a list call. The frontier is
-
-// deliberately NOT included in the hash: once a page is verified
-
-// cacheable immutable, its ETag stays valid as the frontier moves
-
-// forward, so a warmed cache isn't invalidated on every ingest cycle.
-
-// Distinct filters produce distinct ETags because every component is
-
-// marshaled to JSON (no separator-collision worries).
-
-//
-
-// Order and Limit are normalized to the values QueryEvents will
-
-// actually use: the SQL layer treats Order=="" as "asc" and Limit<=0
-
-// as DefaultQueryLimit. Hashing the unresolved values would give us
-
-// different ETags for requests that produce identical bodies
-
-// (e.g. ?order=asc vs no order param), which thrashes caches for no
-
-// reason.
-
-//
-
-// DefaultQueryLimit is the value the store applies; copying it here
-
-// (instead of importing `store`) keeps the cache layer unaware of the
-
-// store's pagination rules and we re-verify by test.
+// resolveNetwork returns the network to use for the current request.
+func (s *Server) resolveNetwork(r *http.Request) (string, error) {
+	q := r.URL.Query().Get("network")
+	if q == "" {
+		if s.defaultNetwork != "" {
+			return s.defaultNetwork, nil
+		}
+		if len(s.networkNames) == 0 {
+			return "", nil
+		}
+		return "", fmt.Errorf("network query parameter is required when multiple networks are configured; available: %s", strings.Join(s.networkNames, ", "))
+	}
+	if len(s.networkNames) == 0 {
+		return "", fmt.Errorf("unknown network %q; no networks configured", q)
+	}
+	for _, n := range s.networkNames {
+		if n == q {
+			return q, nil
+		}
+	}
+	return "", fmt.Errorf("unknown network %q; available: %s", q, strings.Join(s.networkNames, ", "))
+}
 
 func listETag(f store.EventFilter) string {
-
-	// contributors: every field of EventFilter that narrows the result set
-
-	// MUST appear here. A filter that is missing produces the same hash for
-
-	// two requests that return different bodies, which on an immutable page
-
-	// means a conditional request for one is answered 304 for the other, and
-
-	// a shared cache pools one filter's body under the other's key — for the
-
-	// full one-year max-age. TestListETag_CoversEveryFilterField enumerates
-
-	// the fields independently and fails when a new one is not added.
-
 	key := struct {
 
 		ContractID    string          `json:"c"`
@@ -2287,7 +2072,7 @@ func listETag(f store.EventFilter) string {
 		FromTime:      timeOrEmpty(f.FromTime),
 
 		ToTime:        timeOrEmpty(f.ToTime),
-
+		HasValue:      f.HasValue,
 		Cursor:        f.Cursor,
 
 		Limit:         resolvedLimit(f.Limit),
@@ -2303,18 +2088,6 @@ func listETag(f store.EventFilter) string {
 	return fmt.Sprintf(`"%x"`, sum)
 
 }
-
-
-
-// resolvedLimit mirrors the default applied in QueryEvents. Pulling
-
-// the constant from the store package keeps the cache layer from
-
-// drifting if the store-side default ever moves: any change shows up
-
-// immediately in the build, and the cache-stopping behavior updates
-
-// in lockstep.
 
 func resolvedLimit(n int) int {
 
@@ -2342,14 +2115,6 @@ func resolvedOrder(o string) string {
 
 }
 
-
-
-// timeOrEmpty renders a zero time as "" so two unset times don't both
-
-// serialize to "0001-01-01T00:00:00Z" (which would otherwise be a
-
-// distinct value from one caller that didn't set the field at all).
-
 func timeOrEmpty(t time.Time) string {
 
 	if t.IsZero() {
@@ -2361,16 +2126,6 @@ func timeOrEmpty(t time.Time) string {
 	return t.Format(time.RFC3339)
 
 }
-
-
-
-// ifNoneMatch reports whether the request's If-None-Match header
-
-// matches the supplied strong ETag. RFC 7232 §3.2: the comparison for
-
-// strong ETags is byte-exact after stripping the W/ weakness prefix.
-
-// `*` matches any present representation.
 
 func ifNoneMatch(r *http.Request, etag string) bool {
 
@@ -2403,30 +2158,6 @@ func ifNoneMatch(r *http.Request, etag string) bool {
 	return false
 
 }
-
-
-
-// writeCacheHeaders is the single place in the package that writes
-
-// ETag, Cache-Control, Vary. Handlers pick a cacheability kind and an
-
-// etag string; nothing else needs to know about header semantics.
-
-//
-
-// Vary: Accept-Encoding is set proactively so the future compression
-
-// middleware (#25) can plug in without re-encoding responses already
-
-// cached as gzip or vice versa; the header is the contract a shared
-
-// cache uses to keep distinct variants. If a future middleware (auth
-
-// #17, or any content-negotiating layer) has already populated Vary,
-
-// we MERGE rather than overwrite so distinct dimensions coexist in
-
-// the comma-separated value the cache uses.
 
 func writeCacheHeaders(w http.ResponseWriter, kind cacheability, maxAge time.Duration, etag string) {
 	writeVary(w)
@@ -2847,7 +2578,77 @@ func (s *Server) syncStreamScope(ctx context.Context, sub *broadcast.Subscriptio
 	}()
 }
 
+// Holders endpoint types.
 
+type holderResponse struct {
+	Address    string `json:"address"`
+	Balance    string `json:"balance"`
+	LastLedger int64  `json:"last_ledger"`
+}
+
+type holdersResponse struct {
+	ContractID     string           `json:"contract_id"`
+	EarliestLedger int64            `json:"earliest_ledger"`
+	Holders        []holderResponse `json:"holders"`
+	Cursor         string           `json:"cursor,omitempty"`
+}
+
+func (s *Server) handleContractHolders(w http.ResponseWriter, r *http.Request) {
+	contractID := chi.URLParam(r, "id")
+	if !config.ValidContractID(contractID) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid contract ID %q", contractID))
+		return
+	}
+
+	network, err := s.resolveNetwork(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	minBalance := r.URL.Query().Get("min_balance")
+	cursor := r.URL.Query().Get("cursor")
+	limit := store.DefaultQueryLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		limit = parsed
+	}
+
+	// Determine the earliest ledger for coverage indication.
+	earliestLedger, err := s.store.GetEarliestLedger(r.Context(), network, contractID)
+	if err != nil {
+		// non-fatal; surface as 0 to indicate unknown coverage
+		loggerFromContext(r.Context()).Warn("getting earliest ledger", "contract_id", contractID, "error", err)
+	}
+
+	balances, next, err := s.store.GetTokenBalances(r.Context(), contractID, network, minBalance, cursor, limit)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("querying token holders", "contract_id", contractID, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("querying token holders failed"))
+		return
+	}
+
+	holders := make([]holderResponse, len(balances))
+	for i, tb := range balances {
+		holders[i] = holderResponse{
+			Address:    tb.Address,
+			Balance:    tb.Balance,
+			LastLedger: tb.LastLedger,
+		}
+	}
+
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, holdersResponse{
+		ContractID:     contractID,
+		EarliestLedger: earliestLedger,
+		Holders:        holders,
+		Cursor:         next,
+	})
+}
 
 func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 
@@ -2859,23 +2660,12 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-
-
-	filter, fields, err := parseFilterAndFields(r)
-
+	filter, err := filterFromQuery(r)
 	if err != nil {
 		writeFilterError(w, err)
 		return
 
 	}
-
-
-
-	// InsecureSkipVerify disables WebSocket Origin checking: the WS endpoint
-
-	// is server-to-client only (no client messages are read), so a forged
-
-	// Origin header cannot influence what the client sees.
 
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 
@@ -2906,13 +2696,6 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 
 
 	ctx := r.Context()
-
-
-
-	// Use CloseRead to get a context cancelled when the client disconnects
-
-	// and to ensure the library processes control frames (ping/pong/close).
-
 	ctx = c.CloseRead(ctx)
 
 	// Attribute the connection's wall-clock duration to the tenant when it
@@ -2980,9 +2763,7 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 				return
 
 			}
-
-			data, err := json.Marshal(projectEvent(ev, fields))
-
+			data, err := json.Marshal(ev)
 			if err != nil {
 
 				log.Error("marshal event for ws", "error", err)
@@ -3070,108 +2851,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 
 func writeError(w http.ResponseWriter, status int, err error) {
-
-	// Every error response is marked no-store so neither CDNs nor
-
-	// browsers can pool a 4xx/5xx behind a success response's
-
-	// validator. The prime motivator is the 404-on-eviction path in
-
-	// handleGetEvent: a stale cache otherwise keeps returning "not
-
-	// found" for an event that briefly aged out but never came back.
-
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 
 	writeJSON(w, status, errorResponse{Error: err.Error()})
-}
-
-// handleAnalyticsEvents serves GET /analytics/events.
-// Query params: bucket (hour|day, default hour), contract_id, type,
-// from, to (ISO-8601 UTC timestamps). Returns time-bucketed event counts.
-func (s *Server) handleAnalyticsEvents(w http.ResponseWriter, r *http.Request) {
-	filter, err := analyticsFilterFromQuery(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	buckets, err := s.store.QueryAnalyticsEvents(r.Context(), filter)
-	if err != nil {
-		s.log.Error("querying analytics events", "error", err)
-		writeError(w, http.StatusInternalServerError, errors.New("querying analytics events failed"))
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"buckets": buckets})
-}
-
-// handleAnalyticsTokenVolume serves GET /analytics/token-volume.
-// Query params: bucket (hour|day, default hour), contract_id, from, to.
-// Returns time-bucketed transfer volume and unique-address counts.
-// Populated only when the ingester recognizes SEP-41 transfer-shaped
-// events (gated on #1).
-func (s *Server) handleAnalyticsTokenVolume(w http.ResponseWriter, r *http.Request) {
-	filter, err := analyticsFilterFromQuery(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	// Type filter doesn't apply to token volume.
-	filter.Type = ""
-	buckets, err := s.store.QueryAnalyticsTokenVolume(r.Context(), filter)
-	if err != nil {
-		s.log.Error("querying analytics token volume", "error", err)
-		writeError(w, http.StatusInternalServerError, errors.New("querying analytics token volume failed"))
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"buckets": buckets})
-}
-
-// analyticsFilterFromQuery parses shared analytics query params:
-// bucket, contract_id, type, from, to.
-func analyticsFilterFromQuery(r *http.Request) (store.AnalyticsFilter, error) {
-	q := r.URL.Query()
-	f := store.AnalyticsFilter{
-		ContractID: q.Get("contract_id"),
-		Type:       q.Get("type"),
-	}
-
-	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
-		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
-	}
-
-	switch t := q.Get("type"); t {
-	case "", "contract", "system", "diagnostic":
-		f.Type = t
-	default:
-		return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
-	}
-
-	bucket := q.Get("bucket")
-	switch bucket {
-	case "", "hour":
-		f.Bucket = "hour"
-	case "day":
-		f.Bucket = "day"
-	default:
-		return f, fmt.Errorf("invalid bucket %q (want hour or day)", bucket)
-	}
-
-	var err error
-	if from := q.Get("from"); from != "" {
-		f.From, err = time.Parse(time.RFC3339, from)
-		if err != nil {
-			return f, fmt.Errorf("invalid from timestamp %q (want RFC 3339)", from)
-		}
-	}
-	if to := q.Get("to"); to != "" {
-		f.To, err = time.Parse(time.RFC3339, to)
-		if err != nil {
-			return f, fmt.Errorf("invalid to timestamp %q (want RFC 3339)", to)
-		}
-	}
-	if !f.From.IsZero() && !f.To.IsZero() && !f.From.Before(f.To) {
-		return f, fmt.Errorf("from %s is not before to %s", f.From.Format(time.RFC3339), f.To.Format(time.RFC3339))
-	}
-
-	return f, nil
 }

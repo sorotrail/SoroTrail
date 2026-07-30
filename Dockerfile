@@ -5,6 +5,12 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG DATE=unknown
+RUN CGO_ENABLED=0 go build \
+    -ldflags "-X github.com/khaylebfortune/sorotrail/internal/version.Version=${VERSION} -X github.com/khaylebfortune/sorotrail/internal/version.Commit=${COMMIT} -X github.com/khaylebfortune/sorotrail/internal/version.Date=${DATE}" \
+    -o /out/sorotrail ./cmd/sorotrail
 ARG TARGETOS TARGETARCH
 ARG VERSION=unknown
 ARG COMMIT=unknown

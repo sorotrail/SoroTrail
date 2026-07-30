@@ -9,7 +9,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -37,6 +36,17 @@ import (
 	"github.com/sorotrail/sorotrail/internal/webhook"
 )
 
+// compositeNotifier fans out to multiple EventNotifiers.
+type compositeNotifier []ingester.EventNotifier
+
+func (n compositeNotifier) NotifyEvents(ctx context.Context, events []store.Event) {
+	for _, notifier := range n {
+		notifier.NotifyEvents(ctx, events)
+	}
+}
+
+var errInterrupted = errors.New("interrupted")
+
 func main() {
 	err := dispatch(os.Args[1:])
 	switch {
@@ -49,8 +59,6 @@ func main() {
 	}
 }
 
-// dispatch routes to a subcommand, defaulting to the indexer so existing
-// deployments (and the Dockerfile entrypoint) keep working unchanged.
 func dispatch(args []string) error {
 	if len(args) == 0 {
 		return run()
@@ -109,6 +117,14 @@ func run() error {
 	log.Info("startup configuration", cfg.LoggableFields()...)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	provider, shutdown, err := telemetry.Configure(ctx, log)
+	if err != nil {
+		return fmt.Errorf("configuring tracing: %w", err)
+	}
+	defer func() {
+		_ = shutdown(context.Background())
+	}()
+	_ = provider
 	defer stop()
 
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
@@ -171,19 +187,55 @@ func run() error {
 		defer pg.StopHealthCheck()
 		st = pg
 	}
-	for _, id := range cfg.WatchedContracts {
-		if err := st.AddWatchedContract(ctx, id); err != nil {
-			return err
+
+	// Tag any events that have empty network with the default network.
+	// This handles the upgrade path for single-network deployments.
+	if pool != nil {
+		defaultNetwork := cfg.DefaultNetworkName()
+		if defaultNetwork == "" {
+			networks := cfg.NetworksOrDefault()
+			if len(networks) > 0 {
+				defaultNetwork = networks[0].Name
+			}
+		}
+		if defaultNetwork != "" {
+			if _, err := pool.Exec(ctx, `UPDATE events SET network = $1 WHERE network = '' OR network IS NULL`, defaultNetwork); err != nil {
+				log.Warn("tagging legacy events with default network", "error", err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO ingestion_state (network, last_ingested_ledger, last_cursor, updated_at)
+				SELECT $1, last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE network = '' OR network IS NULL
+				ON CONFLICT (network) DO NOTHING`, defaultNetwork); err != nil {
+				log.Warn("migrating ingestion state", "error", err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO audit_state (network, verified_through_ledger, updated_at)
+				SELECT $1, verified_through_ledger, updated_at FROM audit_state WHERE network = '' OR network IS NULL
+				ON CONFLICT (network) DO NOTHING`, defaultNetwork); err != nil {
+				log.Warn("migrating audit state", "error", err)
+			}
 		}
 	}
 
-	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
-	bcast := broadcast.New(broadcast.DefaultBufferSize)
-	// Webhook delivery runs alongside ingestion — the notifier is attached
-	// to the ingester so events flow to subscriber callbacks asynchronously.
-	wh := webhook.NewNotifier(st, log)
+	for _, id := range cfg.WatchedContracts {
+		// In multi-network mode, watched contracts apply to all networks.
+		for _, n := range cfg.NetworksOrDefault() {
+			if err := st.AddWatchedContract(ctx, id); err != nil {
+				return err
+			}
+			_ = n // preserve for per-network contract lists
+		}
+	}
 
-	// Wire the spec cache and enricher for spec-decoded event views.
+	// Shared broadcaster for live event streaming across all networks.
+	bcast := broadcast.New(broadcast.DefaultBufferSize)
+
+	// Build per-network components.
+	networks := cfg.NetworksOrDefault()
+	type networkIngester struct {
+		ing     *ingester.Ingester
+		auditor *audit.Auditor
+		rpc     rpc.Client
+	}
+	ingesters := make([]networkIngester, 0, len(networks))
 	specCache := spec.NewCache(st)
 	specFetcher := spec.NewFetcher(rpcClient)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
@@ -288,6 +340,11 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
+	// Wire spec enricher for the API using the first network's fetcher.
+	firstSpecFetcher := spec.NewFetcher(ingesters[0].rpc)
+	firstSpecEnricher := spec.NewEnricher(firstSpecFetcher, specCache, log)
+
+	// Guarded store for API-originated reads with timeout and slow-query logging.
 	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
 		Timeout:            cfg.APIQueryTimeout,
 		SlowQueryThreshold: cfg.APISlowQueryThreshold,
@@ -385,19 +442,13 @@ func run() error {
 			errCh <- nil
 		}
 	}()
-	if aud != nil {
-		go func() {
-			log.Info("auditor starting",
-				"budget_share", cfg.AuditBudgetShare,
-				"batch_ledgers", cfg.AuditBatchLedgers,
-				"lag_threshold", cfg.AuditLagThreshold,
-				"max_repair_attempts", cfg.AuditMaxRepair)
-			if err := aud.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				errCh <- fmt.Errorf("auditor: %w", err)
-			} else {
-				errCh <- nil
-			}
-		}()
+
+	// Count expected goroutines that send to errCh.
+	remaining := 2 + len(ingesters) // http server + webhook + ingesters
+	for _, ni := range ingesters {
+		if ni.auditor != nil {
+			remaining++
+		}
 	}
 	go func() {
 		if cfg.RetentionEnabled() {
@@ -424,11 +475,12 @@ func run() error {
 		log.Info("shutdown signal received")
 	case firstErr = <-errCh:
 		remaining--
-		stop() // one component failed; wind down the others
+		stop()
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
+	broker.Shutdown()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Error("http shutdown", "error", err)
 	}
@@ -503,4 +555,11 @@ func newLogger(level, format string) *slog.Logger {
 // keeps the route wiring in main.go one line wide.
 func graphqlServerDeps(st store.Store, enricher api.Enricher) api.ServerDeps {
 	return api.ServerDeps{Store: st, Enricher: enricher}
+}
+
+func rpcURLsForLog(cfg config.Config) []string {
+	if len(cfg.RPCURLS) > 0 {
+		return cfg.RPCURLS
+	}
+	return []string{cfg.RPCURL}
 }

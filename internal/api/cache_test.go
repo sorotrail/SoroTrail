@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -510,6 +509,7 @@ func TestListETag_CoversEveryFilterField(t *testing.T) {
 		{"Cursor", func(f *store.EventFilter) { f.Cursor = "e1" }},
 		{"Limit", func(f *store.EventFilter) { f.Limit = 7 }},
 		{"Order", func(f *store.EventFilter) { f.Order = "desc" }},
+		{"HasValue", func(f *store.EventFilter) { v := true; f.HasValue = &v }},
 	}
 
 	seen := map[string]string{baseETag: "base"}
