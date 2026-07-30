@@ -1,0 +1,21 @@
+# Redocly configuration for SoroTrail OpenAPI validation.
+# Run: npx @redocly/cli@1 lint internal/api/openapi.json
+
+extends:
+  - recommended
+
+rules:
+  # Auth is tracked in issue #17; the API currently has no authentication.
+  security-defined: off
+
+  # The example server URL is localhost for development; production
+  # deployments configure their own server list.
+  no-server-example.com: off
+
+  # GET /health has no query parameters to validate, so a 4XX response
+  # is structurally impossible for that endpoint. Same for GET /subscriptions
+  # (no filter params). Suppress at project level since it's expected.
+  operation-4xx-response: warn
+
+  # GET /events/ws upgrades to WebSocket (101) and has no 2XX path.
+  operation-2xx-response: warn
