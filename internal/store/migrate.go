@@ -5,6 +5,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -27,11 +28,17 @@ func Migrate(databaseURL string) error {
 	if strings.HasPrefix(databaseURL, "clickhouse://") {
 		return nil
 	}
+	// Dispatch on dialect: the sqlite series lives in migrations/sqlite and
+	// is applied by migrateSQLite. Without this the sqlite backend could
+	// never be migrated, since the guard below rejects its scheme.
+	if strings.HasPrefix(databaseURL, "sqlite:") || strings.HasPrefix(databaseURL, "file:") {
+		return migrateSQLite(databaseURL)
+	}
 	if !strings.HasPrefix(databaseURL, "postgres://") && !strings.HasPrefix(databaseURL, "postgresql://") {
 		return fmt.Errorf("unsupported database url scheme")
 	}
 
-	src, err := iofs.New(migrationsFS, "migrations")
+	src, err := iofs.New(postgresMigrationsFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("loading embedded migrations: %w", err)
 	}
@@ -117,4 +124,16 @@ func migrateSQLite(databaseURL string) error {
 		}
 	}
 	return nil
+}
+
+// parseSQLiteDSN strips the URL scheme, leaving the file path (or :memory:)
+// that modernc.org/sqlite expects. Prefixes are checked longest-first so
+// "sqlite://" is not left with a stray leading slash by the "sqlite:" case.
+func parseSQLiteDSN(databaseURL string) string {
+	for _, p := range []string{"sqlite3://", "sqlite://", "sqlite3:", "sqlite:", "file:"} {
+		if strings.HasPrefix(databaseURL, p) {
+			return strings.TrimPrefix(databaseURL, p)
+		}
+	}
+	return databaseURL
 }

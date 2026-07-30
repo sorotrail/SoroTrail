@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -93,6 +94,20 @@ func (s *SQLite) upsertEvents(ctx context.Context, events []Event, onUpdate bool
 		return affected, fmt.Errorf("commit upsert: %w", err)
 	}
 	return affected, nil
+}
+
+func (s *SQLite) UpsertAddressRefs(ctx context.Context, refs []AddressRef) error {
+	for _, r := range refs {
+		_, err := s.db.ExecContext(ctx, `
+			INSERT INTO event_addresses (address, event_id, role)
+			VALUES (?, ?, ?)
+			ON CONFLICT (address, event_id, role) DO NOTHING`,
+			r.Address, r.EventID, r.Role)
+		if err != nil {
+			return fmt.Errorf("upserting address refs: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *SQLite) ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error {
@@ -205,7 +220,7 @@ func rawXDRInRangeSQLite(ctx context.Context, tx *sql.Tx, fromLedger, toLedger i
 	return kept, nil
 }
 
-func (s *SQLite) GetEvent(ctx context.Context, id string) (Event, error) {
+func (s *SQLite) GetEvent(ctx context.Context, id string, _ Scope) (Event, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+eventColumnsSQLite+` FROM events WHERE id = ?`, id)
 	e, err := scanEventSQLite(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -214,7 +229,7 @@ func (s *SQLite) GetEvent(ctx context.Context, id string) (Event, error) {
 	return e, err
 }
 
-func (s *SQLite) EventExists(ctx context.Context, id string) (bool, error) {
+func (s *SQLite) EventExists(ctx context.Context, id string, _ Scope) (bool, error) {
 	var one int
 	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM events WHERE id = ?`, id).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -224,6 +239,35 @@ func (s *SQLite) EventExists(ctx context.Context, id string) (bool, error) {
 		return false, fmt.Errorf("checking event existence: %w", err)
 	}
 	return true, nil
+}
+
+func (s *SQLite) GetEventsByTxHash(ctx context.Context, txHash, excludeID string) ([]Event, error) {
+	query := "SELECT " + eventColumnsSQLite + " FROM events WHERE tx_hash = ?"
+	args := []any{txHash}
+	if excludeID != "" {
+		query += " AND id != ?"
+		args = append(args, excludeID)
+	}
+	query += " ORDER BY id ASC"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying events by tx hash: %w", err)
+	}
+	defer rows.Close()
+
+	var events []Event
+	for rows.Next() {
+		e, err := scanEventSQLite(rows)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading events by tx hash: %w", err)
+	}
+	return events, nil
 }
 
 func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
@@ -246,8 +290,13 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 	if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
 	}
-	if f.Type != "" {
-		where = append(where, "type = "+arg(f.Type))
+	if len(f.Types) > 0 {
+		// SQLite has no ANY(); expand to an IN list.
+		ph := make([]string, 0, len(f.Types))
+		for _, t := range f.Types {
+			ph = append(ph, arg(t))
+		}
+		where = append(where, "type IN ("+strings.Join(ph, ", ")+")")
 	}
 	if len(f.Topic) > 0 {
 		where = append(where, topicContainsExpr(arg(f.Topic)))
@@ -331,6 +380,472 @@ func topicContainsExpr(placeholder string) string {
 	return fmt.Sprintf(`json_type(topics) = 'array' AND EXISTS (
 		SELECT 1 FROM json_each(topics) AS _te WHERE json(_te.value) = json(%s)
 	)`, placeholder)
+}
+
+func (s *SQLite) AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error) {
+	f.Cursor = ""
+	f.Order = ""
+	f.OrderBy = ""
+	f.Limit = 0
+
+	var (
+		where []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return "?"
+	}
+	if f.ContractID != "" {
+		where = append(where, "contract_id = "+arg(f.ContractID))
+	}
+	if len(f.Types) > 0 {
+		where = append(where, "type = ANY("+arg(f.Types)+")")
+	}
+	if len(f.Topic) > 0 {
+		where = append(where, topicContainsExpr(arg(f.Topic)))
+	}
+	if len(f.TopicContains) > 0 {
+		tc := f.TopicContains
+		var arr []json.RawMessage
+		if json.Unmarshal(tc, &arr) == nil {
+			for _, elem := range arr {
+				where = append(where, topicContainsExpr(arg(elem)))
+			}
+		} else {
+			where = append(where, "1=0")
+		}
+	}
+	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
+		if len(topic) == 0 {
+			continue
+		}
+		where = append(where, fmt.Sprintf("json_extract(topics, '$[%d]') = json(?)", i))
+		args = append(args, string(topic))
+	}
+	if f.FromLedger > 0 {
+		where = append(where, "ledger >= "+arg(f.FromLedger))
+	}
+	if f.ToLedger > 0 {
+		where = append(where, "ledger <= "+arg(f.ToLedger))
+	}
+	if !f.FromTime.IsZero() {
+		where = append(where, "created_at >= "+arg(formatTime(f.FromTime)))
+	}
+	if !f.ToTime.IsZero() {
+		where = append(where, "created_at <= "+arg(formatTime(f.ToTime)))
+	}
+
+	var groupCol, bucketCol string
+	switch bucket {
+	case "ledger":
+		groupCol = "ledger"
+		bucketCol = "ledger"
+	default:
+		dur, err := time.ParseDuration(bucket)
+		if err != nil {
+			return nil, fmt.Errorf("invalid bucket %q: %w", bucket, err)
+		}
+		if dur <= 0 {
+			return nil, fmt.Errorf("bucket duration must be positive")
+		}
+		groupCol = "strftime('%Y-%m-%dT%H:%M:%S', datetime(created_at, 'unixepoch'))"
+		bucketCol = groupCol
+	}
+
+	query := "SELECT " + bucketCol + " AS bucket, count(*) AS count FROM events"
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY " + groupCol + " ORDER BY " + groupCol
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("aggregating events: %w", err)
+	}
+	defer rows.Close()
+
+	var buckets []AggregateBucket
+	for rows.Next() {
+		var b AggregateBucket
+		if err := rows.Scan(&b.Bucket, &b.Count); err != nil {
+			return nil, err
+		}
+		buckets = append(buckets, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading aggregation: %w", err)
+	}
+	return buckets, nil
+}
+
+func (s *SQLite) CountEvents(ctx context.Context, f EventFilter) (int64, error) {
+	f.Cursor = ""
+	f.Order = ""
+	f.OrderBy = ""
+	f.Limit = 0
+
+	var (
+		where []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return "?"
+	}
+	if f.ContractID != "" {
+		where = append(where, "contract_id = "+arg(f.ContractID))
+	}
+	if len(f.Types) > 0 {
+		where = append(where, "type = ANY("+arg(f.Types)+")")
+	}
+	if len(f.Topic) > 0 {
+		where = append(where, topicContainsExpr(arg(f.Topic)))
+	}
+	if len(f.TopicContains) > 0 {
+		tc := f.TopicContains
+		var arr []json.RawMessage
+		if json.Unmarshal(tc, &arr) == nil {
+			for _, elem := range arr {
+				where = append(where, topicContainsExpr(arg(elem)))
+			}
+		} else {
+			where = append(where, "1=0")
+		}
+	}
+	for i, topic := range []json.RawMessage{f.Topic0, f.Topic1, f.Topic2, f.Topic3} {
+		if len(topic) == 0 {
+			continue
+		}
+		where = append(where, fmt.Sprintf("json_extract(topics, '$[%d]') = json(?)", i))
+		args = append(args, string(topic))
+	}
+	if f.FromLedger > 0 {
+		where = append(where, "ledger >= "+arg(f.FromLedger))
+	}
+	if f.ToLedger > 0 {
+		where = append(where, "ledger <= "+arg(f.ToLedger))
+	}
+	if !f.FromTime.IsZero() {
+		where = append(where, "created_at >= "+arg(formatTime(f.FromTime)))
+	}
+	if !f.ToTime.IsZero() {
+		where = append(where, "created_at <= "+arg(formatTime(f.ToTime)))
+	}
+
+	query := "SELECT count(*) FROM events"
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+
+	var total int64
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("counting events: %w", err)
+	}
+	return total, nil
+}
+
+func (s *SQLite) QueryAddressEvents(ctx context.Context, address string, f EventFilter) ([]Event, string, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+
+	var (
+		where []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return "?"
+	}
+
+	// Join with event_addresses to find events for this address.
+	where = append(where, "ea.address = "+arg(address))
+	where = append(where, "e.id = ea.event_id")
+
+	if f.ContractID != "" {
+		where = append(where, "e.contract_id = "+arg(f.ContractID))
+	}
+	if len(f.Types) > 0 {
+		where = append(where, "e.type = ANY("+arg(f.Types)+")")
+	}
+	if f.FromLedger > 0 {
+		where = append(where, "e.ledger >= "+arg(f.FromLedger))
+	}
+	if f.ToLedger > 0 {
+		where = append(where, "e.ledger <= "+arg(f.ToLedger))
+	}
+
+	// Cursor: event_id-based pagination (paging by event ID in chronological order).
+	orderDir := "ASC"
+	cursorOp := ">"
+	if f.Order == "desc" {
+		orderDir = "DESC"
+		cursorOp = "<"
+	}
+	orderCols := "e.id " + orderDir
+
+	if f.Cursor != "" {
+		where = append(where, "e.id "+cursorOp+" "+arg(f.Cursor))
+	}
+
+	query := `SELECT ` + eventColumnsSQLite + `
+		FROM events e
+		INNER JOIN event_addresses ea ON ea.event_id = e.id`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY " + orderCols + " LIMIT " + arg(limit+1)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("querying address events for %s: %w", address, err)
+	}
+	defer rows.Close()
+
+	events := make([]Event, 0, limit)
+	for rows.Next() {
+		e, err := scanEventSQLite(rows)
+		if err != nil {
+			return nil, "", err
+		}
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("reading address events: %w", err)
+	}
+
+	next := ""
+	if len(events) > limit {
+		events = events[:limit]
+		next = events[limit-1].ID
+	}
+	return events, next, nil
+}
+
+func (s *SQLite) CountAddressEvents(ctx context.Context, address string) (int64, error) {
+	var total int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT count(*) FROM events e
+		INNER JOIN event_addresses ea ON ea.event_id = e.id
+		WHERE ea.address = ?`, address,
+	).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("counting address events for %s: %w", address, err)
+	}
+	return total, nil
+}
+
+func (s *SQLite) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
+	var (
+		where []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return "?"
+	}
+	if f.ContractIDPrefix != "" {
+		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
+	}
+	query := "SELECT count(*) FROM (SELECT contract_id FROM events"
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY contract_id) AS sub"
+
+	var total int64
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("counting contracts: %w", err)
+	}
+	return total, nil
+}
+
+func (s *SQLite) DeadLetterEvent(ctx context.Context, in DeadLetterInput) (DeadLetter, error) {
+	errStr := ""
+	if in.Err != nil {
+		errStr = in.Err.Error()
+	}
+	var d DeadLetter
+	err := s.db.QueryRowContext(ctx, `
+		INSERT INTO dead_letters
+		    (event_id, contract_id, ledger, type, tx_hash,
+		     topic_xdr, value_xdr, error, attempts, last_attempt)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
+		ON CONFLICT (event_id) DO UPDATE SET
+		    error        = excluded.error,
+		    attempts     = dead_letters.attempts + 1,
+		    last_attempt = datetime('now'),
+		    topic_xdr    = excluded.topic_xdr,
+		    value_xdr    = excluded.value_xdr
+		RETURNING id, event_id, contract_id, ledger, type, tx_hash,
+		          topic_xdr, value_xdr, error, attempts, last_attempt, created_at`,
+		in.EventID, in.ContractID, in.Ledger, in.Type, in.TxHash,
+		in.TopicXDR, in.ValueXDR, errStr,
+	).Scan(&d.ID, &d.EventID, &d.ContractID, &d.Ledger, &d.Type, &d.TxHash,
+		&d.TopicXDR, &d.ValueXDR, &d.Error, &d.Attempts, &d.LastAttempt, &d.CreatedAt)
+	if err != nil {
+		return DeadLetter{}, fmt.Errorf("recording dead letter: %w", err)
+	}
+	return d, nil
+}
+
+func (s *SQLite) ListDeadLetters(ctx context.Context, contractID string, limit int, cursor string) ([]DeadLetter, string, error) {
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+	var (
+		where []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return "?"
+	}
+	if contractID != "" {
+		where = append(where, "contract_id = "+arg(contractID))
+	}
+	if cursor != "" {
+		sv, err := base64.RawURLEncoding.DecodeString(cursor)
+		if err != nil {
+			return nil, "", fmt.Errorf("%w: dead letter cursor", ErrInvalidContractsCursor)
+		}
+		where = append(where, "dead_letters.id < "+arg(string(sv)))
+	}
+	query := "SELECT id, event_id, contract_id, ledger, type, tx_hash, topic_xdr, value_xdr, error, attempts, last_attempt, created_at FROM dead_letters"
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY id DESC LIMIT " + arg(limit+1)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("listing dead letters: %w", err)
+	}
+	defer rows.Close()
+
+	var letters []DeadLetter
+	for rows.Next() {
+		var d DeadLetter
+		var txHash, valueXDR *string
+		if err := rows.Scan(&d.ID, &d.EventID, &d.ContractID, &d.Ledger, &d.Type, &txHash,
+			&d.TopicXDR, &valueXDR, &d.Error, &d.Attempts, &d.LastAttempt, &d.CreatedAt); err != nil {
+			return nil, "", err
+		}
+		if txHash != nil {
+			d.TxHash = *txHash
+		}
+		if valueXDR != nil {
+			d.ValueXDR = *valueXDR
+		}
+		letters = append(letters, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("reading dead letters: %w", err)
+	}
+	next := ""
+	if len(letters) > limit {
+		letters = letters[:limit]
+		next = base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d", letters[limit-1].ID)))
+	}
+	return letters, next, nil
+}
+
+func (s *SQLite) GetDeadLetter(ctx context.Context, id int64) (DeadLetter, error) {
+	var d DeadLetter
+	var txHash, valueXDR *string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, event_id, contract_id, ledger, type, tx_hash,
+		       topic_xdr, value_xdr, error, attempts, last_attempt, created_at
+		FROM dead_letters WHERE id = ?`, id,
+	).Scan(&d.ID, &d.EventID, &d.ContractID, &d.Ledger, &d.Type, &txHash,
+		&d.TopicXDR, &valueXDR, &d.Error, &d.Attempts, &d.LastAttempt, &d.CreatedAt)
+	if err == sql.ErrNoRows {
+		return DeadLetter{}, ErrNotFound
+	}
+	if err != nil {
+		return DeadLetter{}, fmt.Errorf("getting dead letter: %w", err)
+	}
+	if txHash != nil {
+		d.TxHash = *txHash
+	}
+	if valueXDR != nil {
+		d.ValueXDR = *valueXDR
+	}
+	return d, nil
+}
+
+func (s *SQLite) DeleteDeadLetter(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM dead_letters WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("deleting dead letter: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLite) DeleteEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	var (
+		where string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return "?"
+	}
+	where = "ledger < " + arg(maxLedger)
+	if !beforeTime.IsZero() {
+		where += " AND created_at < " + arg(beforeTime)
+	}
+	q := fmt.Sprintf("DELETE FROM events WHERE id IN (SELECT id FROM events WHERE %s LIMIT %d)", where, limit)
+	result, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, fmt.Errorf("deleting events before ledger %d: %w", maxLedger, err)
+	}
+	rows, _ := result.RowsAffected()
+	return rows, nil
+}
+
+func (s *SQLite) DeleteEventsBeforeLedger(ctx context.Context, beforeLedger int64) (int64, error) {
+	result, err := s.db.ExecContext(ctx, "DELETE FROM events WHERE ledger < ?", beforeLedger)
+	if err != nil {
+		return 0, fmt.Errorf("deleting events before ledger %d: %w", beforeLedger, err)
+	}
+	rows, _ := result.RowsAffected()
+	return rows, nil
+}
+
+func (s *SQLite) GetAddressSummary(ctx context.Context, address string) (AddressSummary, error) {
+	var sum AddressSummary
+	sum.Address = address
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			min(e.ledger),
+			max(e.ledger),
+			count(*),
+			group_concat(DISTINCT e.contract_id)
+		FROM events e
+		INNER JOIN event_addresses ea ON ea.event_id = e.id
+		WHERE ea.address = ?`, address,
+	).Scan(&sum.FirstSeenLedger, &sum.LastSeenLedger, &sum.EventCount, &sum.DistinctContracts)
+	if err == sql.ErrNoRows {
+		return sum, ErrNotFound
+	}
+	if err != nil {
+		return AddressSummary{}, fmt.Errorf("loading address summary for %s: %w", address, err)
+	}
+	return sum, nil
 }
 
 func (s *SQLite) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error) {
@@ -464,23 +979,21 @@ func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (Aud
 	return s.GetAuditState(ctx)
 }
 
-func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT contract_id FROM watched_contracts ORDER BY contract_id`)
+func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT contract_id FROM watched_contracts ORDER BY contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
-	defer rows.Close()
-
-	var ids []string
+	defer func() { _ = rows.Close() }()
+	var out []WatchedContract
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var wc WatchedContract
+		if err := rows.Scan(&wc.ContractID); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		out = append(out, wc)
 	}
-	return ids, rows.Err()
+	return out, rows.Err()
 }
 
 func (s *SQLite) AddWatchedContract(ctx context.Context, contractID string) error {
@@ -489,6 +1002,19 @@ func (s *SQLite) AddWatchedContract(ctx context.Context, contractID string) erro
 		ON CONFLICT (contract_id) DO NOTHING`, contractID)
 	if err != nil {
 		return fmt.Errorf("adding watched contract: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLite) RemoveWatchedContract(ctx context.Context, contractID string) error {
+	result, err := s.db.ExecContext(ctx,
+		`DELETE FROM watched_contracts WHERE contract_id = ?`, contractID)
+	if err != nil {
+		return fmt.Errorf("removing watched contract: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
@@ -599,13 +1125,13 @@ func (s *SQLite) CreateSubscription(ctx context.Context, sub Subscription) (Subs
 	return sub, nil
 }
 
-func (s *SQLite) GetSubscription(ctx context.Context, id int64) (Subscription, error) {
+func (s *SQLite) GetSubscription(ctx context.Context, id int64, _ SubscriptionOwner) (Subscription, error) {
 	return scanSubscription(s.db.QueryRowContext(ctx, `
 		SELECT id, url, filters, secret, enabled, failure_count, created_at
 		FROM subscriptions WHERE id = ?`, id))
 }
 
-func (s *SQLite) ListSubscriptions(ctx context.Context) ([]Subscription, error) {
+func (s *SQLite) ListSubscriptions(ctx context.Context, _ SubscriptionOwner) ([]Subscription, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, url, filters, secret, enabled, failure_count, created_at
 		FROM subscriptions ORDER BY id`)
@@ -616,7 +1142,7 @@ func (s *SQLite) ListSubscriptions(ctx context.Context) ([]Subscription, error) 
 	return scanSubscriptionsSQLite(rows)
 }
 
-func (s *SQLite) UpdateSubscription(ctx context.Context, sub Subscription) (Subscription, error) {
+func (s *SQLite) UpdateSubscription(ctx context.Context, sub Subscription, _ SubscriptionOwner) (Subscription, error) {
 	filtersJSON, err := json.Marshal(sub.Filters)
 	if err != nil {
 		return Subscription{}, fmt.Errorf("marshaling subscription filters: %w", err)
@@ -633,10 +1159,10 @@ func (s *SQLite) UpdateSubscription(ctx context.Context, sub Subscription) (Subs
 	if err != nil {
 		return Subscription{}, fmt.Errorf("updating subscription %d: %w", sub.ID, err)
 	}
-	return s.GetSubscription(ctx, sub.ID)
+	return s.GetSubscription(ctx, sub.ID, SubscriptionOwner{})
 }
 
-func (s *SQLite) DeleteSubscription(ctx context.Context, id int64) error {
+func (s *SQLite) DeleteSubscription(ctx context.Context, id int64, _ SubscriptionOwner) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM subscriptions WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("deleting subscription %d: %w", id, err)
@@ -703,7 +1229,7 @@ func (s *SQLite) RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (
 	return a, nil
 }
 
-func (s *SQLite) ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error) {
+func (s *SQLite) ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int, _ SubscriptionOwner) ([]DeliveryAttempt, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -773,7 +1299,7 @@ func (s *SQLite) SetContractSpec(ctx context.Context, wasmHash, contractID strin
 	return nil
 }
 
-func (s *SQLite) Stats(ctx context.Context) (Stats, error) {
+func (s *SQLite) Stats(ctx context.Context, _ Scope) (Stats, error) {
 	var st Stats
 	err := s.db.QueryRowContext(ctx, `
 		SELECT
@@ -789,6 +1315,19 @@ func (s *SQLite) Stats(ctx context.Context) (Stats, error) {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
 	}
 	return st, nil
+}
+
+func (s *SQLite) MigrationVersion(ctx context.Context) (version int, dirty bool, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT version, dirty FROM schema_migrations`,
+	).Scan(&version, &dirty)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("reading migration version: %w", err)
+	}
+	return version, dirty, nil
 }
 
 func (s *SQLite) Ping(ctx context.Context) error {
@@ -896,4 +1435,94 @@ func nullableXDRTopics(s []string) any {
 	}
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// AggregateEvents is not implemented for the SQLite backend: the analytics
+// endpoints are Postgres-only. Returning an error beats returning empty
+// buckets, which a caller would read as "no events in range".
+func (s *SQLite) AggregateEvents(context.Context, EventFilter, string) ([]AggregateBucket, error) {
+	return nil, fmt.Errorf("AggregateEvents: not supported by the sqlite backend")
+}
+
+// CountAddressEvents is not implemented for the SQLite backend: the address
+// activity index is Postgres-only.
+func (s *SQLite) CountAddressEvents(context.Context, string) (int64, error) {
+	return 0, fmt.Errorf("CountAddressEvents: not supported by the sqlite backend")
+}
+
+// CountContracts is not implemented for the SQLite backend: the contract
+// inventory endpoint is Postgres-only.
+func (s *SQLite) CountContracts(context.Context, ContractsFilter) (int64, error) {
+	return 0, fmt.Errorf("CountContracts: not supported by the sqlite backend")
+}
+
+// CountEvents is not implemented for the SQLite backend: total-count
+// pagination metadata is Postgres-only.
+func (s *SQLite) CountEvents(context.Context, EventFilter) (int64, error) {
+	return 0, fmt.Errorf("CountEvents: not supported by the sqlite backend")
+}
+
+// DeadLetterEvent is not implemented for the SQLite backend.
+func (s *SQLite) DeadLetterEvent(context.Context, DeadLetterInput) (DeadLetter, error) {
+	return DeadLetter{}, fmt.Errorf("DeadLetterEvent: not supported by the sqlite backend")
+}
+
+// DeleteDeadLetter is not implemented for the SQLite backend.
+func (s *SQLite) DeleteDeadLetter(context.Context, int64) error {
+	return fmt.Errorf("DeleteDeadLetter: not supported by the sqlite backend")
+}
+
+// DeleteEventsBefore is not implemented for the SQLite backend.
+func (s *SQLite) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, fmt.Errorf("DeleteEventsBefore: not supported by the sqlite backend")
+}
+
+// DeleteEventsBeforeLedger is not implemented for the SQLite backend.
+func (s *SQLite) DeleteEventsBeforeLedger(context.Context, int64) (int64, error) {
+	return 0, fmt.Errorf("DeleteEventsBeforeLedger: not supported by the sqlite backend")
+}
+
+// GetAddressSummary is not implemented for the SQLite backend.
+func (s *SQLite) GetAddressSummary(context.Context, string) (AddressSummary, error) {
+	return AddressSummary{}, fmt.Errorf("GetAddressSummary: not supported by the sqlite backend")
+}
+
+// GetDeadLetter is not implemented for the SQLite backend.
+func (s *SQLite) GetDeadLetter(context.Context, int64) (DeadLetter, error) {
+	return DeadLetter{}, fmt.Errorf("GetDeadLetter: not supported by the sqlite backend")
+}
+
+// GetEventsByTxHash is not implemented for the SQLite backend.
+func (s *SQLite) GetEventsByTxHash(context.Context, string, string) ([]Event, error) {
+	return nil, fmt.Errorf("GetEventsByTxHash: not supported by the sqlite backend")
+}
+
+// ListContracts is not implemented for the SQLite backend.
+func (s *SQLite) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
+	return nil, "", fmt.Errorf("ListContracts: not supported by the sqlite backend")
+}
+
+// ListDeadLetters is not implemented for the SQLite backend.
+func (s *SQLite) ListDeadLetters(context.Context, string, int, string) ([]DeadLetter, string, error) {
+	return nil, "", fmt.Errorf("ListDeadLetters: not supported by the sqlite backend")
+}
+
+// MigrationVersion is not implemented for the SQLite backend.
+func (s *SQLite) MigrationVersion(context.Context) (int, bool, error) {
+	return 0, false, fmt.Errorf("MigrationVersion: not supported by the sqlite backend")
+}
+
+// QueryAddressEvents is not implemented for the SQLite backend.
+func (s *SQLite) QueryAddressEvents(context.Context, string, EventFilter) ([]Event, string, error) {
+	return nil, "", fmt.Errorf("QueryAddressEvents: not supported by the sqlite backend")
+}
+
+// RemoveWatchedContract is not implemented for the SQLite backend.
+func (s *SQLite) RemoveWatchedContract(context.Context, string) error {
+	return fmt.Errorf("RemoveWatchedContract: not supported by the sqlite backend")
+}
+
+// UpsertAddressRefs is not implemented for the SQLite backend.
+func (s *SQLite) UpsertAddressRefs(context.Context, []AddressRef) error {
+	return fmt.Errorf("UpsertAddressRefs: not supported by the sqlite backend")
 }

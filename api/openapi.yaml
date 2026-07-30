@@ -65,6 +65,22 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/InternalError"
+    delete:
+      operationId: deleteEvents
+      summary: Prune stored events
+      description: >-
+        Deletes stored events matching the given bounds. Intended for
+        retention maintenance; gated behind the management credential.
+      tags: [Operations]
+      parameters:
+        - $ref: "#/components/parameters/ToLedger"
+      responses:
+        "200":
+          description: Number of events deleted
+        "401":
+          description: Missing or invalid API key
+        "500":
+          $ref: "#/components/responses/InternalError"
   /events/{id}:
     get:
       operationId: getEvent
@@ -133,6 +149,679 @@ paths:
                 $ref: "#/components/schemas/EventsResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /addresses/{address}/events:
+    get:
+      operationId: addressEvents
+      summary: List events involving an address
+      description: >-
+        Events where the given Stellar address appears in the event topics,
+        as either sender or recipient. Backed by the address activity index.
+      tags: [Events]
+      parameters:
+        - name: address
+          in: path
+          required: true
+          description: Stellar account (G-prefixed) or contract (C-prefixed) address
+          schema:
+            type: string
+          example: "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"
+        - $ref: "#/components/parameters/FromLedger"
+        - $ref: "#/components/parameters/ToLedger"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Order"
+      responses:
+        "200":
+          description: A page of events involving the address
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /addresses/{address}/summary:
+    get:
+      operationId: addressSummary
+      summary: Summarise an address's event history
+      description: >-
+        Aggregate view of an address's activity: first and last ledger it was
+        seen in, total event count, and the contracts it interacted with.
+      tags: [Events]
+      parameters:
+        - name: address
+          in: path
+          required: true
+          description: Stellar account (G-prefixed) or contract (C-prefixed) address
+          schema:
+            type: string
+          example: "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"
+      responses:
+        "200":
+          description: Aggregate activity for the address
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          description: The address has no recorded events
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/tenants:
+    get:
+      operationId: listTenants
+      summary: List tenants
+      description: >-
+        Administrative endpoint, available only when MULTI_TENANT is enabled
+        and gated behind the admin credential.
+      tags: [Admin]
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          description: Missing or invalid admin credential
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: createTenant
+      summary: Create a tenant
+      description: >-
+        Administrative endpoint, available only when MULTI_TENANT is enabled
+        and gated behind the admin credential.
+      tags: [Admin]
+      responses:
+        "201":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          description: Missing or invalid admin credential
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/tenants/{id}:
+    get:
+      operationId: getTenant
+      summary: Get a tenant
+      description: >-
+        Administrative endpoint, available only when MULTI_TENANT is enabled
+        and gated behind the admin credential.
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Tenant ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          description: Missing or invalid admin credential
+        "500":
+          $ref: "#/components/responses/InternalError"
+    patch:
+      operationId: updateTenant
+      summary: Update a tenant
+      description: >-
+        Administrative endpoint, available only when MULTI_TENANT is enabled
+        and gated behind the admin credential.
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Tenant ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          description: Missing or invalid admin credential
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      operationId: deleteTenant
+      summary: Delete a tenant
+      description: >-
+        Administrative endpoint, available only when MULTI_TENANT is enabled
+        and gated behind the admin credential.
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Tenant ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "204":
+          description: Deleted
+        "401":
+          description: Missing or invalid admin credential
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/tenants/{id}/usage:
+    get:
+      operationId: tenantUsage
+      summary: Get a tenant's recorded usage
+      description: >-
+        Administrative endpoint, available only when MULTI_TENANT is enabled
+        and gated behind the admin credential.
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Tenant ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          description: Missing or invalid admin credential
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/tenants/{id}/grants:
+    get:
+      operationId: listTenantGrants
+      summary: List a tenant's contract grants
+      description: >-
+        Administrative endpoint, available only when MULTI_TENANT is enabled
+        and gated behind the admin credential.
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Tenant ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          description: Missing or invalid admin credential
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: grantContract
+      summary: Grant a contract to a tenant
+      description: >-
+        Administrative endpoint, available only when MULTI_TENANT is enabled
+        and gated behind the admin credential.
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Tenant ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "201":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          description: Missing or invalid admin credential
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/tenants/{id}/grants/{contract_id}:
+    delete:
+      operationId: revokeContract
+      summary: Revoke a contract grant
+      description: >-
+        Administrative endpoint, available only when MULTI_TENANT is enabled
+        and gated behind the admin credential.
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Tenant ID
+          schema:
+            type: integer
+            format: int64
+        - name: contract_id
+          in: path
+          required: true
+          description: Stellar contract ID (C-prefixed)
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+        "401":
+          description: Missing or invalid admin credential
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/tenants/{id}/keys:
+    get:
+      operationId: listTenantKeys
+      summary: List a tenant's API keys
+      description: >-
+        Administrative endpoint, available only when MULTI_TENANT is enabled
+        and gated behind the admin credential.
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Tenant ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          description: Missing or invalid admin credential
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: createTenantKey
+      summary: Issue an API key for a tenant
+      description: >-
+        Administrative endpoint, available only when MULTI_TENANT is enabled
+        and gated behind the admin credential.
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Tenant ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "201":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          description: Missing or invalid admin credential
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/keys/{key_id}:
+    delete:
+      operationId: revokeKey
+      summary: Revoke an API key
+      description: >-
+        Administrative endpoint, available only when MULTI_TENANT is enabled
+        and gated behind the admin credential.
+      tags: [Admin]
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          description: API key ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "204":
+          description: Deleted
+        "401":
+          description: Missing or invalid admin credential
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /contracts:
+    get:
+      operationId: listContracts
+      summary: List indexed contracts
+      description: >-
+        Contracts that have at least one stored event, with per-contract event
+        counts and ledger ranges.
+      tags: [Events]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: A page of indexed contracts
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /livez:
+    get:
+      operationId: livez
+      summary: Liveness probe
+      description: >-
+        Reports only that the process is up. Never touches the database or RPC.
+      tags: [Operations]
+      responses:
+        "200":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /readyz:
+    get:
+      operationId: readyz
+      summary: Readiness probe
+      description: >-
+        Reports whether the database, RPC and schema are usable. 503 when not.
+      tags: [Operations]
+      responses:
+        "200":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /version:
+    get:
+      operationId: version
+      summary: Build version information
+      description: >-
+        Version, commit and build date embedded at build time.
+      tags: [Operations]
+      responses:
+        "200":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /metrics:
+    get:
+      operationId: metrics
+      summary: Prometheus metrics
+      description: >-
+        Prometheus text-format exposition of ingest, RPC and HTTP metrics.
+      tags: [Operations]
+      responses:
+        "200":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /events/count:
+    get:
+      operationId: countEvents
+      summary: Count matching events
+      description: >-
+        Total number of events matching the filter, ignoring pagination.
+      tags: [Operations]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /events/aggregate:
+    get:
+      operationId: aggregateEvents
+      summary: Aggregate event counts
+      description: >-
+        Event counts bucketed by ledger or by a time interval.
+      tags: [Operations]
+      responses:
+        "200":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /events.csv:
+    get:
+      operationId: eventsCSV
+      summary: Export events as CSV
+      description: >-
+        Streaming CSV export of matching events.
+      tags: [Operations]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /events/{id}/raw:
+    get:
+      operationId: rawEvent
+      summary: Get an event's raw XDR
+      description: >-
+        The base64 XDR the event was decoded from, for re-decoding.
+      tags: [Operations]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Event ID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /events/{id}/transaction:
+    get:
+      operationId: eventTransaction
+      summary: Get an event's sibling events
+      description: >-
+        Other events emitted by the same transaction.
+      tags: [Operations]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Event ID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /contracts/{id}/export:
+    get:
+      operationId: contractExport
+      summary: Export a contract's events
+      description: >-
+        Streaming export of every stored event for one contract.
+      tags: [Operations]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Stellar contract ID (C-prefixed)
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /tenant:
+    get:
+      operationId: currentTenant
+      summary: Describe the calling tenant
+      description: >-
+        The authenticated tenant's identity and grants.
+      tags: [Operations]
+      responses:
+        "200":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /tenant/usage:
+    get:
+      operationId: currentTenantUsage
+      summary: Usage for the calling tenant
+      description: >-
+        Recorded request and event-served counters for the caller.
+      tags: [Operations]
+      responses:
+        "200":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /tenant/watch:
+    get:
+      operationId: tenantWatchList
+      summary: List the tenant's watched contracts
+      description: >-
+        Contracts the calling tenant has asked the indexer to follow.
+      tags: [Operations]
+      responses:
+        "200":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: addTenantWatch
+      summary: Add a contract to the tenant's watch list
+      description: >-
+        Adds a contract to the calling tenant's watch list.
+      tags: [Operations]
+      responses:
+        "201":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /tenant/watch/{contract_id}:
+    delete:
+      operationId: removeTenantWatch
+      summary: Remove a contract from the tenant's watch list
+      description: >-
+        Removes a contract from the calling tenant's watch list.
+      tags: [Operations]
+      parameters:
+        - name: contract_id
+          in: path
+          required: true
+          description: Stellar contract ID (C-prefixed)
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /watched-contracts:
+    get:
+      operationId: listWatchedContracts
+      summary: List watched contracts
+      description: >-
+        Contracts the indexer is following.
+      tags: [Operations]
+      responses:
+        "200":
+          description: Success
+        "401":
+          description: Missing or invalid API key
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: addWatchedContract
+      summary: Add a watched contract
+      description: >-
+        Starts ingesting a contract on the next poll.
+      tags: [Operations]
+      responses:
+        "201":
+          description: Success
+        "401":
+          description: Missing or invalid API key
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /watched-contracts/{id}:
+    delete:
+      operationId: removeWatchedContract
+      summary: Stop watching a contract
+      description: >-
+        Removes a contract from the watch list.
+      tags: [Operations]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Stellar contract ID (C-prefixed)
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Success
+        "401":
+          description: Missing or invalid API key
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /dead-letters:
+    get:
+      operationId: listDeadLetters
+      summary: List dead-lettered events
+      description: >-
+        Events that failed to decode or persist and were set aside instead of stalling ingestion.
+      tags: [Operations]
+      responses:
+        "200":
+          description: Success
+        "401":
+          description: Missing or invalid API key
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /dead-letters/{id}:
+    delete:
+      operationId: deleteDeadLetter
+      summary: Discard a dead-lettered event
+      description: >-
+        Removes one dead-letter row once it has been dealt with.
+      tags: [Operations]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Dead-letter row ID
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Success
+        "401":
+          description: Missing or invalid API key
         "500":
           $ref: "#/components/responses/InternalError"
   /stats:
