@@ -297,6 +297,8 @@ func (m *mockStore) QueryAnalyticsEvents(context.Context, store.AnalyticsFilter)
 	return nil, nil
 }
 func (m *mockStore) QueryAnalyticsTokenVolume(context.Context, store.AnalyticsFilter) ([]store.AnalyticsTokenVolume, error) {
+	return nil, nil
+}
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
 }

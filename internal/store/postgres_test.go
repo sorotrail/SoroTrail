@@ -11,8 +11,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"

@@ -11,12 +11,19 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // mockStore is an in-memory store.Store for simtest harness tests.
+//
+// store.Store is embedded so the mock keeps satisfying the interface as it
+// grows; the methods the harness actually exercises are defined explicitly
+// below, and any unstubbed method panics (nil interface) if a test reaches
+// it — which none of the simtest scenarios do.
 type mockStore struct {
+	store.Store
+
 	mu       sync.Mutex
 	events   map[string]store.Event
 	state    *store.IngestionState
@@ -56,7 +63,7 @@ func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event
 	return nil
 }
 
-func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) {
+func (m *mockStore) GetEvent(_ context.Context, id string, _ store.Scope) (store.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.events[id]
@@ -123,11 +130,13 @@ func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState
 	return nil
 }
 
-func (m *mockStore) ListWatchedContracts(context.Context) ([]string, error) {
+func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]string, len(m.watched))
-	copy(out, m.watched)
+	out := make([]store.WatchedContract, len(m.watched))
+	for i, id := range m.watched {
+		out[i] = store.WatchedContract{ContractID: id}
+	}
 	return out, nil
 }
 
@@ -157,8 +166,10 @@ func (m *mockStore) UpdateAuditFinding(context.Context, store.AuditFinding) erro
 func (m *mockStore) ListOpenFindingsByRange(context.Context, int64, int64) (store.AuditFinding, error) {
 	return store.AuditFinding{}, store.ErrNotFound
 }
-func (m *mockStore) Ping(context.Context) error                 { return nil }
-func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
+func (m *mockStore) Ping(context.Context) error { return nil }
+func (m *mockStore) Stats(context.Context, store.Scope) (store.Stats, error) {
+	return store.Stats{}, nil
+}
 
 // ---------- Tests ----------
 

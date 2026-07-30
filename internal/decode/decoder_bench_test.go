@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/stellar/go/xdr"
 )
 

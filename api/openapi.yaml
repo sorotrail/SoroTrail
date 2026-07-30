@@ -65,6 +65,17 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/InternalError"
+    delete:
+      operationId: deleteEvents
+      summary: Delete events in a ledger range (retention/admin)
+      tags: [Events]
+      responses:
+        "204":
+          description: Deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /events/{id}:
     get:
       operationId: getEvent
@@ -131,6 +142,64 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/EventsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /addresses/{address}/events:
+    get:
+      operationId: addressEvents
+      summary: List events involving an address
+      description: >-
+        Events (for example SEP-41 transfers) that reference the given Stellar
+        address. Always ordered by event id.
+      tags: [Events]
+      parameters:
+        - name: address
+          in: path
+          required: true
+          description: Stellar address (G-prefixed account or C-prefixed contract)
+          schema:
+            type: string
+          example: "GDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        - $ref: "#/components/parameters/FromLedger"
+        - $ref: "#/components/parameters/ToLedger"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: A page of events involving the address
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /addresses/{address}/summary:
+    get:
+      operationId: addressSummary
+      summary: Activity summary for an address
+      description: >-
+        Aggregate activity counters for the given Stellar address (total events
+        and the ledger range over which it has been active).
+      tags: [System]
+      parameters:
+        - name: address
+          in: path
+          required: true
+          description: Stellar address (G-prefixed account or C-prefixed contract)
+          schema:
+            type: string
+          example: "GDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+      responses:
+        "200":
+          description: Address activity summary
+          content:
+            application/json:
+              schema:
+                type: object
         "400":
           $ref: "#/components/responses/BadRequest"
         "500":
@@ -332,6 +401,520 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/keys/{key_id}:
+    delete:
+      operationId: deleteAdminKeys
+      summary: DELETE /admin/keys/{key_id}
+      tags: [Admin]
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/tenants/{id}:
+    delete:
+      operationId: deleteAdminTenants
+      summary: DELETE /admin/tenants/{id}
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      operationId: getAdminTenants
+      summary: GET /admin/tenants/{id}
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    patch:
+      operationId: patchAdminTenants
+      summary: PATCH /admin/tenants/{id}
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/tenants/{id}/grants/{contract_id}:
+    delete:
+      operationId: deleteAdminTenantsGrants
+      summary: DELETE /admin/tenants/{id}/grants/{contract_id}
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: contract_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /tenant/watch/{contract_id}:
+    delete:
+      operationId: deleteTenantWatch
+      summary: DELETE /tenant/watch/{contract_id}
+      tags: [Tenant]
+      parameters:
+        - name: contract_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/tenants:
+    get:
+      operationId: getAdminTenants
+      summary: GET /admin/tenants
+      tags: [Admin]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: postAdminTenants
+      summary: POST /admin/tenants
+      tags: [Admin]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/tenants/{id}/grants:
+    get:
+      operationId: getAdminTenantsGrants
+      summary: GET /admin/tenants/{id}/grants
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: postAdminTenantsGrants
+      summary: POST /admin/tenants/{id}/grants
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/tenants/{id}/keys:
+    get:
+      operationId: getAdminTenantsKeys
+      summary: GET /admin/tenants/{id}/keys
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: postAdminTenantsKeys
+      summary: POST /admin/tenants/{id}/keys
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/tenants/{id}/usage:
+    get:
+      operationId: getAdminTenantsUsage
+      summary: GET /admin/tenants/{id}/usage
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /analytics/events:
+    get:
+      operationId: getAnalyticsEvents
+      summary: GET /analytics/events
+      tags: [Analytics]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /analytics/token-volume:
+    get:
+      operationId: getAnalyticsTokenVolume
+      summary: GET /analytics/token-volume
+      tags: [Analytics]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /contracts:
+    get:
+      operationId: getContracts
+      summary: GET /contracts
+      tags: [Events]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /contracts/{id}/export:
+    get:
+      operationId: getContractsExport
+      summary: GET /contracts/{id}/export
+      tags: [Events]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /events.csv:
+    get:
+      operationId: getEventsCsv
+      summary: GET /events.csv
+      tags: [Events]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /events/aggregate:
+    get:
+      operationId: getEventsAggregate
+      summary: GET /events/aggregate
+      tags: [Events]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /events/count:
+    get:
+      operationId: getEventsCount
+      summary: GET /events/count
+      tags: [Events]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /events/{id}/raw:
+    get:
+      operationId: getEventsRaw
+      summary: GET /events/{id}/raw
+      tags: [Events]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /events/{id}/transaction:
+    get:
+      operationId: getEventsTransaction
+      summary: GET /events/{id}/transaction
+      tags: [Events]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /livez:
+    get:
+      operationId: getLivez
+      summary: GET /livez
+      tags: [System]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /readyz:
+    get:
+      operationId: getReadyz
+      summary: GET /readyz
+      tags: [System]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /tenant:
+    get:
+      operationId: getTenant
+      summary: GET /tenant
+      tags: [Tenant]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /tenant/usage:
+    get:
+      operationId: getTenantUsage
+      summary: GET /tenant/usage
+      tags: [Tenant]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /tenant/watch:
+    get:
+      operationId: getTenantWatch
+      summary: GET /tenant/watch
+      tags: [Tenant]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: postTenantWatch
+      summary: POST /tenant/watch
+      tags: [Tenant]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /version:
+    get:
+      operationId: getVersion
+      summary: GET /version
+      tags: [System]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /dead-letters:
+    get:
+      operationId: listDeadLetters
+      summary: List dead-lettered events
+      tags: [Events]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /dead-letters/{id}:
+    delete:
+      operationId: deleteDeadLetter
+      summary: Delete a dead-letter entry
+      tags: [Events]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /watched-contracts:
+    get:
+      operationId: listWatchedContracts
+      summary: List watched contracts
+      tags: [System]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: addWatchedContract
+      summary: Add a watched contract
+      tags: [System]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /watched-contracts/{id}:
+    delete:
+      operationId: removeWatchedContract
+      summary: Remove a watched contract
+      tags: [System]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /metrics:
+    get:
+      operationId: metrics
+      summary: Prometheus metrics exposition
+      tags: [System]
+      responses:
+        "200":
+          description: OK
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/InternalError"
 components:

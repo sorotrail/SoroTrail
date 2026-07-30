@@ -703,6 +703,14 @@ type Store interface {
 	// time interval. Buckets with zero events are omitted. Filters
 	// (contract_id, type, etc.) are applied to the aggregation query.
 	AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error)
+	// QueryAnalyticsEvents returns time-bucketed event counts from the
+	// rollup_events table. Bucket="day" aggregates hourly buckets to daily.
+	// Empty buckets in the range are omitted (not zero-filled).
+	QueryAnalyticsEvents(ctx context.Context, f AnalyticsFilter) ([]AnalyticsEventBucket, error)
+	// QueryAnalyticsTokenVolume returns time-bucketed transfer volume from
+	// the rollup_token_volume table. Populated only when the ingester
+	// recognizes SEP-41 transfer-shaped events.
+	QueryAnalyticsTokenVolume(ctx context.Context, f AnalyticsFilter) ([]AnalyticsTokenVolume, error)
 	// LedgerRangeCensus returns one LedgerCensus row per ledger in the
 	// inclusive [fromLedger, toLedger] range that contains at least one
 	// event, in ascending ledger order. idsOnly=true populates LedgerCensus.IDs

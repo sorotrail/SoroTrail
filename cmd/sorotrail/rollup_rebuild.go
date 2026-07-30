@@ -11,8 +11,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/khaylebfortune/sorotrail/internal/config"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // runRollupRebuild implements `sorotrail rollup-rebuild`: reconstruct the
@@ -54,7 +54,7 @@ flags:
 	if err != nil {
 		return err
 	}
-	_ = newLogger(cfg.LogLevel) // log level validated, but rebuild is non-interactive
+	_ = newLogger(cfg.LogLevel, cfg.LogFormat) // log level validated, but rebuild is non-interactive
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

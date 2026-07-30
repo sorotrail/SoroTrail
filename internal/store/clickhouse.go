@@ -107,6 +107,14 @@ func (c *ClickHouse) AggregateEvents(ctx context.Context, f EventFilter, bucket 
 	return nil, nil
 }
 
+func (c *ClickHouse) QueryAnalyticsEvents(ctx context.Context, f AnalyticsFilter) ([]AnalyticsEventBucket, error) {
+	return nil, nil
+}
+
+func (c *ClickHouse) QueryAnalyticsTokenVolume(ctx context.Context, f AnalyticsFilter) ([]AnalyticsTokenVolume, error) {
+	return nil, nil
+}
+
 func (c *ClickHouse) GetIngestionState(ctx context.Context) (IngestionState, error) {
 	return IngestionState{}, nil
 }

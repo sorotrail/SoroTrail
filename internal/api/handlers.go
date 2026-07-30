@@ -132,6 +132,24 @@ type eventsWithXDRResponse struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
+type enrichedEventsWithXDRResponse struct {
+	Events []enrichedEventWithXDR `json:"events"`
+	// Cursor is non-empty when another page exists.
+	Cursor string `json:"cursor,omitempty"`
+}
+
+type eventWithXDR struct {
+	store.Event
+	TopicsXDR []string `json:"topics_xdr"`
+	ValueXDR  *string  `json:"value_xdr"`
+}
+
+type enrichedEventWithXDR struct {
+	eventWithXDR
+	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                        `json:"decoded"`
+}
+
 type healthResponse struct {
 	Status string            `json:"status"` // ok | degraded
 	Checks map[string]string `json:"checks"`
@@ -924,6 +942,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	event.WithSEP41()
 
 	decoded := r.URL.Query().Get("decoded") == "true"
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {

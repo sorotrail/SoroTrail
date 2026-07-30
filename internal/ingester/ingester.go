@@ -105,6 +105,14 @@ type Options struct {
 	// values mean replays-of-truth are caught faster at the cost of
 	// extra RPC requests per idle cycle.
 	ReorgRescanInterval time.Duration
+	// Clock is the time source for the poll loop's sleeps. Defaults to
+	// RealClock (wall time); simulations inject a deterministic virtual
+	// clock so backoff and poll intervals advance under test control.
+	Clock Clock
+	// Jitter produces the randomized component of the error backoff.
+	// Defaults to RealJitter (math/rand/v2); simulations inject a seeded
+	// generator for reproducible runs.
+	Jitter JitterFunc
 }
 
 // LagMetrics is the optional sink for ingest-lag signals. The Ingester
@@ -142,6 +150,12 @@ func (o *Options) applyDefaults() {
 	}
 	if o.LagMetrics == nil {
 		o.LagMetrics = noopLagMetrics{}
+	}
+	if o.Clock == nil {
+		o.Clock = RealClock{}
+	}
+	if o.Jitter == nil {
+		o.Jitter = RealJitter
 	}
 	// LagWarnLedgers intentionally NOT defaulted to 100 here: see
 	// Options.LagWarnLedgers doc comment. The env-config layer applies
@@ -339,6 +353,14 @@ func (ing *Ingester) rescanForReorg(ctx context.Context) error {
 // a single page (resumable via the persisted cursor); with more watched
 // contracts than one request allows it sweeps a bounded ledger window once
 // per filter batch.
+// RunOnceForTest runs a single ingestion pass and reports whether the loop
+// caught up to the chain head. It exists so the simulation harness can drive
+// the ingester deterministically one cycle at a time; production code uses
+// Run instead.
+func (ing *Ingester) RunOnceForTest(ctx context.Context) (caughtUp bool, err error) {
+	return ing.runOnce(ctx)
+}
+
 func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
 	startLedger, cursor, err := ing.resolvePosition(ctx)
 	if err != nil {

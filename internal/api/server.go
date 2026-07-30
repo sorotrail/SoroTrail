@@ -289,7 +289,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/livez", s.handleLivez)
 	r.Get("/readyz", s.handleReadyz)
 	r.Get("/version", s.handleVersion)
-	r.Handle("/metrics", s.metrics.Handler())
+	r.Method(http.MethodGet, "/metrics", s.metrics.Handler())
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/count", s.handleCountEvents)
 	r.Get("/events/aggregate", s.handleAggregateEvents)

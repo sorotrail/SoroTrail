@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // drive sends req through s.Router() via httptest and returns the result.
@@ -164,9 +164,9 @@ func TestRateLimit_HealthzIsExempt(t *testing.T) {
 	require.Equal(t, http.StatusTooManyRequests, r1.StatusCode, "sanity: bucket must be empty")
 
 	for i := 0; i < 10; i++ {
-		rh := drive(t, s, mkReq(http.MethodGet, "/healthz"))
+		rh := drive(t, s, mkReq(http.MethodGet, "/livez"))
 		require.Equalf(t, http.StatusOK, rh.StatusCode,
-			"/healthz call %d must be exempt", i)
+			"/livez call %d must be exempt", i)
 		rh.Body.Close()
 	}
 }

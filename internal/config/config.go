@@ -220,7 +220,7 @@ func Load() (Config, error) {
 	}
 	// env/v11 splits on "," but keeps empty entries and whitespace.
 	cfg.WatchedContracts = cleanContractList(cfg.WatchedContracts)
-	if err := cfg.ValidateAll(); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -234,7 +234,7 @@ func IsSQLite(databaseURL string) bool {
 // Validate checks the configuration for values that would fail at runtime.
 func (c Config) Validate() error {
 	if c.DatabaseURL == "" {
-		return fmt.Errorf("DATABASE_URL is required")
+		return fmt.Errorf("DATABASE_URL: required but empty")
 	}
 	if !IsSQLite(c.DatabaseURL) {
 		u, err := url.Parse(c.RPCURL)
@@ -328,7 +328,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("RPC_MAX_BACKOFF must be positive, got %s", c.RPCMaxBackoff)
 	}
 	if c.RateLimitRPS < 0 {
-		return fmt.Errorf("RATE_LIMIT_RPS must be non-negative")
+		return fmt.Errorf("RATE_LIMIT_RPS: %v must be non-negative", c.RateLimitRPS)
 	}
 	if c.RateLimitBurst < 0 {
 		return fmt.Errorf("RATE_LIMIT_BURST must be non-negative")

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"math/big"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,128 @@ var ErrNotFound = errors.New("not found")
 // ErrInvalidCursor is returned when a pagination cursor is malformed for the
 // requested ordering. It is caller error: the API maps it to 400, not 500.
 var ErrInvalidCursor = errors.New("invalid cursor")
+
+// nullableTextArray returns nil for an empty slice so a text[] column is
+// stored as SQL NULL rather than an empty array, and the slice itself
+// otherwise. Used when binding optional topic/address arrays.
+func nullableTextArray(s []string) any {
+	if len(s) == 0 {
+		return nil
+	}
+	return s
+}
+
+// QueryAnalyticsEvents returns time-bucketed event counts from the
+// rollup_events table. Bucket="day" aggregates the hourly rollups to day
+// granularity; any other value buckets by hour.
+func (p *Postgres) QueryAnalyticsEvents(ctx context.Context, f AnalyticsFilter) ([]AnalyticsEventBucket, error) {
+	trunc := "hour"
+	if f.Bucket == "day" {
+		trunc = "day"
+	}
+
+	var (
+		where []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	if f.ContractID != "" {
+		where = append(where, "contract_id = "+arg(f.ContractID))
+	}
+	if f.Type != "" {
+		where = append(where, "type = "+arg(f.Type))
+	}
+	if !f.From.IsZero() {
+		where = append(where, "bucket_start >= "+arg(f.From.UTC()))
+	}
+	if !f.To.IsZero() {
+		where = append(where, "bucket_start < "+arg(f.To.UTC()))
+	}
+
+	query := fmt.Sprintf(`
+		SELECT date_trunc('%s', bucket_start) AS bucket,
+		       contract_id, type,
+		       sum(count)::bigint AS count
+		FROM rollup_events`, trunc)
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY bucket, contract_id, type ORDER BY bucket ASC"
+
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying analytics events: %w", err)
+	}
+	defer rows.Close()
+
+	var out []AnalyticsEventBucket
+	for rows.Next() {
+		var b AnalyticsEventBucket
+		if err := rows.Scan(&b.BucketStart, &b.ContractID, &b.Type, &b.Count); err != nil {
+			return nil, fmt.Errorf("scanning analytics event bucket: %w", err)
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// QueryAnalyticsTokenVolume returns time-bucketed transfer volume from the
+// rollup_token_volume table. Populated only when the ingester recognizes
+// SEP-41 transfer-shaped events. Bucket="day" aggregates hourly.
+func (p *Postgres) QueryAnalyticsTokenVolume(ctx context.Context, f AnalyticsFilter) ([]AnalyticsTokenVolume, error) {
+	trunc := "hour"
+	if f.Bucket == "day" {
+		trunc = "day"
+	}
+
+	var (
+		where []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	if f.ContractID != "" {
+		where = append(where, "contract_id = "+arg(f.ContractID))
+	}
+	if !f.From.IsZero() {
+		where = append(where, "bucket_start >= "+arg(f.From.UTC()))
+	}
+	if !f.To.IsZero() {
+		where = append(where, "bucket_start < "+arg(f.To.UTC()))
+	}
+
+	query := fmt.Sprintf(`
+		SELECT date_trunc('%s', bucket_start) AS bucket,
+		       contract_id,
+		       sum(volume)::text AS volume,
+		       sum(unique_address_count)::bigint AS unique_address_count
+		FROM rollup_token_volume`, trunc)
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY bucket, contract_id ORDER BY bucket ASC"
+
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying analytics token volume: %w", err)
+	}
+	defer rows.Close()
+
+	var out []AnalyticsTokenVolume
+	for rows.Next() {
+		var v AnalyticsTokenVolume
+		if err := rows.Scan(&v.BucketStart, &v.ContractID, &v.Volume, &v.UniqueAddressCount); err != nil {
+			return nil, fmt.Errorf("scanning analytics token volume: %w", err)
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
 
 // DefaultQueryLimit applies when EventFilter.Limit is unset; MaxQueryLimit
 // caps requested page sizes as a server-side safety net (the API layer

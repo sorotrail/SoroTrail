@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/khaylebfortune/sorotrail/internal/decode"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/store"
 	"github.com/stellar/go/xdr"
 )
 

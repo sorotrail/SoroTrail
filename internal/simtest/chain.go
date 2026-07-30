@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/rpc"
 )
 
 // LedgerDuration is the virtual time between ledger closes in the simulation.
@@ -186,6 +186,13 @@ func (c *VirtualChain) GetHealth(_ context.Context) (rpc.Health, error) {
 		OldestLedger:          oldest,
 		LedgerRetentionWindow: c.retentionLedgers,
 	}, nil
+}
+
+// GetLedgerEntries implements rpc.Client. The virtual chain models only the
+// event stream, so ledger-entry lookups return an empty response; no simtest
+// scenario reads contract state through this path.
+func (c *VirtualChain) GetLedgerEntries(_ context.Context, _ rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+	return rpc.GetLedgerEntriesResponse{}, nil
 }
 
 // GetLatestLedger implements rpc.Client.
