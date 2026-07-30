@@ -946,6 +946,7 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	event.WithSEP41()
 
 	decoded := r.URL.Query().Get("decoded") == "true"
+	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {
