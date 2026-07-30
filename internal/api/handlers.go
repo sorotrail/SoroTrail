@@ -31,7 +31,7 @@ import (
 // decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
 // unknown fields so a typo like {"contractID": "..."} doesn't fall
 // through with an empty contract_id and a confusing 400 from a later
-// check. Returns a typed error string the handler can surface directly.
+// check.
 func decodeJSONBody(r *http.Request, dst any) error {
 	if r.Body == nil {
 		return errors.New("request body is empty")
@@ -44,20 +44,8 @@ func decodeJSONBody(r *http.Request, dst any) error {
 	return nil
 }
 
-// cachePrivate is the package-wide override that flips Cache-Control
-// directives from `public` to `private`. Production code sets it once at
-// startup via SetCachePrivate (mirrors SetAuditor's "set before serve"
-// pattern). Tests use the same entry point with t.Cleanup to reset.
-//
-// Why this exists: when auth (#17) lands, a single deployment can serve
-// per-user data behind authentication. `private` keeps the response in
-// the user's own browser cache while preventing CDNs/proxies from
-// sharing it across accounts — the bug the spec calls out as "must
-// never leak across keys".
 var cachePrivate atomic.Bool
 
-// SetCachePrivate flips the public→private override for all cacheable
-// endpoints. Call once at startup before serving requests.
 func SetCachePrivate(v bool) { cachePrivate.Store(v) }
 
 // tenantScoped mirrors Server.multiTenant for the package-level cache
@@ -93,23 +81,11 @@ func SetTenantScopedCaching(v bool) { tenantScoped.Store(v) }
 // revalidation for the cached lifetime.
 const immutableMaxAge = 365 * 24 * time.Hour
 
-// cacheability kinds a handler can ask for. The mapping to header
-// directives lives in writeCacheHeaders so handlers never write
-// Cache-Control themselves.
 type cacheability int
 
 const (
-	// cacheImmutable: long-lived, public (or private when CACHE_PRIVATE
-	// is on), with the `immutable` directive. Used only when the server
-	// can prove the response will not change.
 	cacheImmutable cacheability = iota
-	// cacheNoCache: must revalidate (Cache-Control: no-cache). Safe for
-	// any growing-page response — it's never optimistic, never implies
-	// staleness is OK.
 	cacheNoCache
-	// cacheNoStore: do not cache anywhere (Cache-Control: no-store).
-	// Reserved for /health and /stats — operational data, not
-	// shareable across users or even across requests on the same box.
 	cacheNoStore
 )
 
@@ -119,20 +95,17 @@ type errorResponse struct {
 
 type eventsResponse struct {
 	Events []store.Event `json:"events"`
-	// Cursor is non-empty when another page exists; pass it back as ?cursor=.
-	Cursor string `json:"cursor,omitempty"`
+	Cursor string        `json:"cursor,omitempty"`
 }
 
 type enrichedEventsResponse struct {
 	Events []store.EnrichedEvent `json:"events"`
-	// Cursor is non-empty when another page exists.
-	Cursor string `json:"cursor,omitempty"`
+	Cursor string                `json:"cursor,omitempty"`
 }
 
 type eventsWithXDRResponse struct {
 	Events []eventWithXDR `json:"events"`
-	// Cursor is non-empty when another page exists.
-	Cursor string `json:"cursor,omitempty"`
+	Cursor string         `json:"cursor,omitempty"`
 }
 
 // eventWithXDR is an event plus the raw XDR it was decoded from, returned
@@ -158,7 +131,7 @@ type enrichedEventsWithXDRResponse struct {
 }
 
 type healthResponse struct {
-	Status string            `json:"status"` // ok | degraded
+	Status string            `json:"status"`
 	Checks map[string]string `json:"checks"`
 }
 
@@ -169,8 +142,7 @@ type versionResponse struct {
 }
 
 // eventFieldNames is the set of JSON keys on store.Event that the ?fields=
-// allowlist accepts. It is built from the json struct tags so the compiler
-// catches drift when Event gains or renames fields.
+// allowlist accepts.
 var eventFieldNames = map[string]bool{
 	"id":                 true,
 	"contract_id":        true,
@@ -187,7 +159,6 @@ var eventFieldNames = map[string]bool{
 
 // parseFields splits a comma-separated ?fields= value and returns the
 // allowlist set. Unknown field names are rejected with a 400-style error.
-// An empty or missing raw value returns nil (meaning "return the full object").
 func parseFields(raw string) (map[string]bool, error) {
 	if raw == "" {
 		return nil, nil
@@ -219,8 +190,7 @@ func projectEvent(ev store.Event, fields map[string]bool) any {
 	return eventToMap(ev, fields)
 }
 
-// projectEvents applies projectEvent to a slice, returning []map[string]any
-// when fields is set, or the original slice when nil.
+// projectEvents applies projectEvent to a slice.
 func projectEvents(evs []store.Event, fields map[string]bool) any {
 	if fields == nil {
 		return evs
@@ -232,7 +202,6 @@ func projectEvents(evs []store.Event, fields map[string]bool) any {
 	return out
 }
 
-// eventToMap builds a map with only the requested fields.
 func eventToMap(ev store.Event, fields map[string]bool) map[string]any {
 	m := make(map[string]any, len(fields))
 	if fields["id"] {
@@ -275,7 +244,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok", "rpc": "ok"}}
+	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok"}}
 	status := http.StatusOK
 
 	// DB connectivity check: Ping the store to verify the database is reachable.
@@ -660,16 +629,9 @@ func writeForbiddenContract(w http.ResponseWriter, contractID string) {
 }
 
 // serveEvents is the shared body for /events and /contracts/{id}/events.
-// It runs the cacheability decision (frontier vs. upper bound) BEFORE the
-// SQL query, so an immutable page with a matching If-None-Match never
-// touches the events table at all — only the cheap ingestion_state row
-// used to read the frontier.
 func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter store.EventFilter, fields map[string]bool) {
 	policy, etag, err := s.listCachePolicy(r.Context(), filter)
 	if err != nil {
-		// "When in doubt, don't cache" is the explicit guidance: any
-		// failure to read the frontier falls back to no-cache rather
-		// than guessing the page is safe.
 		loggerFromContext(r.Context()).Warn("deciding list cache policy", "error", err)
 	} else if etag != "" && ifNoneMatch(r, etag) {
 		writeNotModified(w, etag, policy)
@@ -750,8 +712,7 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	}
 }
 
-// parseFilterAndFields parses the shared filter params plus the optional
-// ?fields= allowlist.
+// parseFilterAndFields parses the shared filter params plus the optional ?fields= allowlist.
 func parseFilterAndFields(r *http.Request) (store.EventFilter, map[string]bool, error) {
 	filter, err := filterFromQuery(r)
 	if err != nil {
@@ -906,18 +867,8 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Strong ETag: the event ID is itself a perfect validator for an
-	// immutable resource (each ID maps to exactly one row, that row's
-	// body never changes). Using the ID instead of a body hash skips a
-	// scan-and-hash on the cache-miss path and keeps 304s cheap.
 	etag := `"` + id + `"`
 
-	// 304 fast path: conditional GET with a matching validator. We
-	// avoid the row-serialization path entirely (GetEvent is not
-	// called), and instead probe presence with EventExists so retention
-	// /pruning (#8) can't let a deleted event masquerade as still
-	// present. A miss in EventExists is reported as 404, matching the
-	// unconditional code path.
 	if ifNoneMatch(r, etag) {
 		exists, err := s.store.EventExists(r.Context(), id, scope)
 		if err != nil {
@@ -926,10 +877,6 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !exists {
-			// Retention/pruning (#8) deleted the row out from under cached
-			// clients. writeError carries Cache-Control: no-store so a CDN
-			// that warmed on the ETag-bearing 200 doesn't happily pool
-			// this 404 for the immutable max-age.
 			writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
 			return
 		}
@@ -1192,29 +1139,19 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
-// addWatchedRequest is the body for POST /watched-contracts: a single
-// contract ID to add to the runtime watch list.
+// Watched contracts types.
+
 type addWatchedRequest struct {
 	ContractID string `json:"contract_id"`
 }
 
-// addWatchedResponse includes the current ingestion cursor so callers
-// know exactly where historical replay starts — events before this ledger
-// are not backfilled by the runtime add (a separate replay tool covers them).
 type addWatchedResponse struct {
 	ContractID        string `json:"contract_id"`
 	AddedAt           string `json:"added_at"`
 	HistoryFromLedger int64  `json:"history_from_ledger"`
-	// ModeTransition is "all_to_specific" when the list was empty before
-	// this add, surfacing the same semantic change the confirm guard
-	// guards. Useful to post-run auditors even when the caller already
-	// confirmed.
-	ModeTransition string `json:"mode_transition,omitempty"`
+	ModeTransition    string `json:"mode_transition,omitempty"`
 }
 
-// removeWatchedResponse explains what removal actually did: stored events
-// are NOT deleted; only future ingestion stops. The message is part of
-// the contract so callers don't have to read the README to find out.
 type removeWatchedResponse struct {
 	ContractID       string `json:"contract_id"`
 	RemovedAt        string `json:"removed_at"`
@@ -1222,15 +1159,11 @@ type removeWatchedResponse struct {
 	ModeTransition   string `json:"mode_transition,omitempty"`
 }
 
-// watchedListResponse wraps the GET response in an envelope so the route
-// is easy to extend without breaking JSON shape.
 type watchedListResponse struct {
 	Contracts []store.WatchedContract `json:"contracts"`
 	Count     int                     `json:"count"`
 }
 
-// handleListWatchedChains returns the current watch list in stable
-// (contract_id) order.
 func (s *Server) handleListWatchedChains(w http.ResponseWriter, r *http.Request) {
 	contracts, err := s.store.ListWatchedContracts(r.Context())
 	if err != nil {
@@ -1241,19 +1174,6 @@ func (s *Server) handleListWatchedChains(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, watchedListResponse{Contracts: contracts, Count: len(contracts)})
 }
 
-// handleAddWatchedChain adds a contract to the runtime watch list and
-// returns where historical replay for it starts (= the current cursor).
-//
-// Guarded by ?confirm=true when the add would switch the ingester from
-// "all contract events" (empty list) to a specific contract list, since
-// that silently narrows what gets stored going forward.
-//
-// TOCTOU note: the confirm check reads the list and then mutates it
-// without holding a row lock. Two concurrent empty→non-empty POSTs can
-// both pass the guard before either mutates — acceptable because
-// ON CONFLICT DO NOTHING makes a duplicate Add a no-op, and only the
-// first response carries the genuine transition; the second reports one
-// too, but no row state diverges.
 func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	var req addWatchedRequest
 	if err := decodeJSONBody(r, &req); err != nil {
@@ -1283,7 +1203,7 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 		modeTransition = "all_to_specific"
 	}
 
-	state, err := s.store.GetIngestionState(r.Context())
+	state, err := s.store.GetIngestionState(r.Context(), s.defaultNetwork)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		s.log.Error("loading ingestion state for add", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading ingestion state failed"))
@@ -1304,9 +1224,6 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRemoveWatchedChain stops future ingestion for the named contract
-// without deleting any events already stored. The same empty<->non-empty
-// guard fires when removing the last contract on the list (specific -> all).
 func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if !config.ValidContractID(id) {
@@ -1455,54 +1372,29 @@ func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
 }
 
 func ingestLagLedgers(chainHead, lastIngested int64) int64 {
+	if lastIngested <= 0 {
+		return 0
+	}
 	return chainHead - lastIngested
 }
 
-// listCachePolicy decides whether a list page is cacheable as immutable
-// based on the ingest frontier. The whole point of this function is
-// correctness against a moving frontier: a 1-ledger mistake either
-// way lets a stale row into a cache or strands one behind it, so the
-// comparison is deliberately strict and biases toward no-cache.
-//
-// Rule: a page is only safe (= can't gain rows) when to_ledger is set
-// AND strictly less than the last ingested ledger. Equality is folded
-// into the unsafe bucket: at the frontier, ingestion may still be in
-// progress and the boundary ledger's row count isn't guaranteed.
-//
-// Time-only filters (no ledger bound) are never cacheable: translating
-// created_at to ledgers would need a maintained lookup and the spec
-// says "when in doubt, don't cache". Time filters can still be applied
-// alongside ledger bounds and the policy falls through correctly
-// because the ledger-side comparison decides.
-//
-// On any failure to read frontier, the policy is no-cache.
 func (s *Server) listCachePolicy(ctx context.Context, filter store.EventFilter) (cacheability, string, error) {
 	if filter.ToLedger <= 0 {
 		return cacheNoCache, "", nil
 	}
-	frontier, err := s.lastIngestedLedger(ctx)
+	frontier, err := s.lastIngestedLedger(ctx, filter.Network)
 	if err != nil {
 		return cacheNoCache, "", err
 	}
 	if filter.ToLedger >= frontier {
-		// Includes the boundary case by design. See the rationale above.
 		return cacheNoCache, "", nil
 	}
 	return cacheImmutable, listETag(filter), nil
 }
 
-// lastIngestedLedger reads the frontier from the persisted ingestion
-// state. We deliberately reuse GetIngestionState (the narrow index-only
-// row already on the hot path) rather than Stats, whose count-aggregates
-// scan the events table — the spec wants the existing value via the
-// store, not a fancier query just for caching.
-//
-// A miss (cold start, no row yet) is treated as frontier=0 so every
-// to_ledger is "not strictly below" and the caller returns no-cache.
-// This is conservative on the safe side: nothing gets the immutable
-// header until at least one ledger is ingested.
-func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
-	state, err := s.store.GetIngestionState(ctx)
+// lastIngestedLedger reads the frontier from the persisted ingestion state.
+func (s *Server) lastIngestedLedger(ctx context.Context, network string) (int64, error) {
+	state, err := s.store.GetIngestionState(ctx, network)
 	if errors.Is(err, store.ErrNotFound) {
 		return 0, nil
 	}
@@ -1512,31 +1404,30 @@ func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
 	return state.LastIngestedLedger, nil
 }
 
-// listETag is the strong validator for a list call. The frontier is
-// deliberately NOT included in the hash: once a page is verified
-// cacheable immutable, its ETag stays valid as the frontier moves
-// forward, so a warmed cache isn't invalidated on every ingest cycle.
-// Distinct filters produce distinct ETags because every component is
-// marshaled to JSON (no separator-collision worries).
-//
-// Order and Limit are normalized to the values QueryEvents will
-// actually use: the SQL layer treats Order=="" as "asc" and Limit<=0
-// as DefaultQueryLimit. Hashing the unresolved values would give us
-// different ETags for requests that produce identical bodies
-// (e.g. ?order=asc vs no order param), which thrashes caches for no
-// reason.
-//
-// DefaultQueryLimit is the value the store applies; copying it here
-// (instead of importing `store`) keeps the cache layer unaware of the
-// store's pagination rules and we re-verify by test.
+// resolveNetwork returns the network to use for the current request.
+func (s *Server) resolveNetwork(r *http.Request) (string, error) {
+	q := r.URL.Query().Get("network")
+	if q == "" {
+		if s.defaultNetwork != "" {
+			return s.defaultNetwork, nil
+		}
+		if len(s.networkNames) == 0 {
+			return "", nil
+		}
+		return "", fmt.Errorf("network query parameter is required when multiple networks are configured; available: %s", strings.Join(s.networkNames, ", "))
+	}
+	if len(s.networkNames) == 0 {
+		return "", fmt.Errorf("unknown network %q; no networks configured", q)
+	}
+	for _, n := range s.networkNames {
+		if n == q {
+			return q, nil
+		}
+	}
+	return "", fmt.Errorf("unknown network %q; available: %s", q, strings.Join(s.networkNames, ", "))
+}
+
 func listETag(f store.EventFilter) string {
-	// contributors: every field of EventFilter that narrows the result set
-	// MUST appear here. A filter that is missing produces the same hash for
-	// two requests that return different bodies, which on an immutable page
-	// means a conditional request for one is answered 304 for the other, and
-	// a shared cache pools one filter's body under the other's key — for the
-	// full one-year max-age. TestListETag_CoversEveryFilterField enumerates
-	// the fields independently and fails when a new one is not added.
 	key := struct {
 		ContractID       string          `json:"c"`
 		ContractIDPrefix string          `json:"cp,omitempty"`
@@ -1596,11 +1487,6 @@ func listETag(f store.EventFilter) string {
 	return fmt.Sprintf(`"%x"`, sum)
 }
 
-// resolvedLimit mirrors the default applied in QueryEvents. Pulling
-// the constant from the store package keeps the cache layer from
-// drifting if the store-side default ever moves: any change shows up
-// immediately in the build, and the cache-stopping behavior updates
-// in lockstep.
 func resolvedLimit(n int) int {
 	if n <= 0 {
 		return store.DefaultQueryLimit
@@ -1615,9 +1501,6 @@ func resolvedOrder(o string) string {
 	return o
 }
 
-// timeOrEmpty renders a zero time as "" so two unset times don't both
-// serialize to "0001-01-01T00:00:00Z" (which would otherwise be a
-// distinct value from one caller that didn't set the field at all).
 func timeOrEmpty(t time.Time) string {
 	if t.IsZero() {
 		return ""
@@ -1625,10 +1508,6 @@ func timeOrEmpty(t time.Time) string {
 	return t.Format(time.RFC3339)
 }
 
-// ifNoneMatch reports whether the request's If-None-Match header
-// matches the supplied strong ETag. RFC 7232 §3.2: the comparison for
-// strong ETags is byte-exact after stripping the W/ weakness prefix.
-// `*` matches any present representation.
 func ifNoneMatch(r *http.Request, etag string) bool {
 	raw := r.Header.Get("If-None-Match")
 	if raw == "" || etag == "" {
@@ -1646,17 +1525,6 @@ func ifNoneMatch(r *http.Request, etag string) bool {
 	return false
 }
 
-// writeCacheHeaders is the single place in the package that writes
-// ETag, Cache-Control, Vary. Handlers pick a cacheability kind and an
-// etag string; nothing else needs to know about header semantics.
-//
-// Vary: Accept-Encoding is set proactively so the future compression
-// middleware (#25) can plug in without re-encoding responses already
-// cached as gzip or vice versa; the header is the contract a shared
-// cache uses to keep distinct variants. If a future middleware (auth
-// #17, or any content-negotiating layer) has already populated Vary,
-// we MERGE rather than overwrite so distinct dimensions coexist in
-// the comma-separated value the cache uses.
 func writeCacheHeaders(w http.ResponseWriter, kind cacheability, maxAge time.Duration, etag string) {
 	writeVary(w)
 	if etag != "" {
@@ -2038,21 +1906,90 @@ func (s *Server) syncStreamScope(ctx context.Context, sub *broadcast.Subscriptio
 	}()
 }
 
+// Holders endpoint types.
+
+type holderResponse struct {
+	Address    string `json:"address"`
+	Balance    string `json:"balance"`
+	LastLedger int64  `json:"last_ledger"`
+}
+
+type holdersResponse struct {
+	ContractID     string           `json:"contract_id"`
+	EarliestLedger int64            `json:"earliest_ledger"`
+	Holders        []holderResponse `json:"holders"`
+	Cursor         string           `json:"cursor,omitempty"`
+}
+
+func (s *Server) handleContractHolders(w http.ResponseWriter, r *http.Request) {
+	contractID := chi.URLParam(r, "id")
+	if !config.ValidContractID(contractID) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid contract ID %q", contractID))
+		return
+	}
+
+	network, err := s.resolveNetwork(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	minBalance := r.URL.Query().Get("min_balance")
+	cursor := r.URL.Query().Get("cursor")
+	limit := store.DefaultQueryLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		limit = parsed
+	}
+
+	// Determine the earliest ledger for coverage indication.
+	earliestLedger, err := s.store.GetEarliestLedger(r.Context(), network, contractID)
+	if err != nil {
+		// non-fatal; surface as 0 to indicate unknown coverage
+		loggerFromContext(r.Context()).Warn("getting earliest ledger", "contract_id", contractID, "error", err)
+	}
+
+	balances, next, err := s.store.GetTokenBalances(r.Context(), contractID, network, minBalance, cursor, limit)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("querying token holders", "contract_id", contractID, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("querying token holders failed"))
+		return
+	}
+
+	holders := make([]holderResponse, len(balances))
+	for i, tb := range balances {
+		holders[i] = holderResponse{
+			Address:    tb.Address,
+			Balance:    tb.Balance,
+			LastLedger: tb.LastLedger,
+		}
+	}
+
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, holdersResponse{
+		ContractID:     contractID,
+		EarliestLedger: earliestLedger,
+		Holders:        holders,
+		Cursor:         next,
+	})
+}
+
 func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	if s.bcast == nil {
 		http.Error(w, "streaming not configured", http.StatusNotImplemented)
 		return
 	}
 
-	filter, fields, err := parseFilterAndFields(r)
+	filter, err := filterFromQuery(r)
 	if err != nil {
 		writeFilterError(w, err)
 		return
 	}
 
-	// InsecureSkipVerify disables WebSocket Origin checking: the WS endpoint
-	// is server-to-client only (no client messages are read), so a forged
-	// Origin header cannot influence what the client sees.
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true,
 	})
@@ -2068,9 +2005,6 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	defer sub.Close()
 
 	ctx := r.Context()
-
-	// Use CloseRead to get a context cancelled when the client disconnects
-	// and to ensure the library processes control frames (ping/pong/close).
 	ctx = c.CloseRead(ctx)
 
 	// Attribute the connection's wall-clock duration to the tenant when it
@@ -2110,7 +2044,7 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			data, err := json.Marshal(projectEvent(ev, fields))
+			data, err := json.Marshal(ev)
 			if err != nil {
 				log.Error("marshal event for ws", "error", err)
 				continue
@@ -2180,11 +2114,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {
-	// Every error response is marked no-store so neither CDNs nor
-	// browsers can pool a 4xx/5xx behind a success response's
-	// validator. The prime motivator is the 404-on-eviction path in
-	// handleGetEvent: a stale cache otherwise keeps returning "not
-	// found" for an event that briefly aged out but never came back.
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, status, errorResponse{Error: err.Error()})
 }

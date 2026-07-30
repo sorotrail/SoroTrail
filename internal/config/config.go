@@ -3,6 +3,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -11,10 +12,16 @@ import (
 	"github.com/caarlos0/env/v11"
 )
 
+// NetworkConfig describes one Stellar network to index.
+type NetworkConfig struct {
+	Name   string `json:"name"`
+	RPCURL string `json:"rpc_url"`
+}
+
 // Config holds all runtime configuration. Every field is settable via the
 // environment variable named in its `env` tag; see .env.example for docs.
 type Config struct {
-	RPCURL                string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
+	RPCURL                string        `env:"RPC_URL"` // deprecated — use NETWORKS
 	DatabaseURL           string        `env:"DATABASE_URL"`
 	PollInterval          time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
 	HTTPAddr              string        `env:"HTTP_ADDR" envDefault:":8080"`
@@ -91,15 +98,7 @@ type Config struct {
 	// request gets a 503 with a "no API_KEY configured" message), so
 	// writes are never open even when other auth would be off.
 	APIKey string `env:"API_KEY"`
-	// HTTP rate limiting (per client). RATE_LIMIT_RPS / RATE_LIMIT_BURST
-	// are both unset (zero) by default, which disables the limiter
-	// entirely — a no-op middleware — so deployments without this turned
-	// on keep today's behavior bit-for-bit.
-	//
-	// RATE_LIMIT_TRUSTED_PROXY defaults to false because X-Forwarded-For
-	// is set by the client itself; enabling it without an upstream proxy
-	// that strips/rewrites the header would let any caller pick their own
-	// rate-limit key and bypass arbitrary per-IP throttling.
+	// HTTP rate limiting.
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
@@ -218,7 +217,6 @@ func Load() (Config, error) {
 	if err := env.Parse(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parsing environment: %w", err)
 	}
-	// env/v11 splits on "," but keeps empty entries and whitespace.
 	cfg.WatchedContracts = cleanContractList(cfg.WatchedContracts)
 	if err := cfg.ValidateAll(); err != nil {
 		return Config{}, err
@@ -264,6 +262,7 @@ func (c Config) Validate() error {
 	if u, err := url.Parse(c.HorizonURL); c.HorizonURL != "" && (err != nil || u.Scheme == "" || u.Host == "") {
 		return fmt.Errorf("HORIZON_URL %q is not a valid URL", c.HorizonURL)
 	}
+
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("POLL_INTERVAL must be positive, got %s", c.PollInterval)
 	}
@@ -408,7 +407,6 @@ func (c Config) RetentionEnabled() bool {
 }
 
 // ValidContractID reports whether s looks like a Soroban contract strkey.
-// It checks shape only (C prefix, 56 base32 chars), not the checksum.
 func ValidContractID(s string) bool {
 	if len(s) != 56 || s[0] != 'C' {
 		return false
@@ -482,7 +480,6 @@ func (c Config) LoggableFields() []any {
 		u.User = nil
 		dbURL = u.String()
 	}
-
 	return []any{
 		"rpc_url", c.RPCURL,
 		"rpc_max_attempts", c.RPCMaxAttempts,

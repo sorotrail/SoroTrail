@@ -24,16 +24,6 @@ type ctxKey string
 
 const loggerCtxKey ctxKey = "logger"
 
-// SetAuditor registers the binary's Auditor so /stats can surface its
-// Metrics counters. There is exactly one Auditor per process; its
-// lifetime is the lifetime of main(). SetAuditor must be called BEFORE
-// ListenAndServe so the first /stats request observes a stable value.
-// The setter is guarded by a RWMutex so concurrent reader goroutines in
-// /stats handlers can never observe a torn pointer.
-//
-// When AUDIT_ENABLED=false the function is never called and /stats
-// returns Stats with the embedded AuditStats struct zero-valued (and
-// omitted from JSON, courtesy of its `omitempty` tag).
 var (
 	auditorMu sync.RWMutex
 	auditor   *audit.Auditor
@@ -104,7 +94,6 @@ func getRPCCounter() *rpc.CountingClient {
 }
 
 // Enricher is the spec-based event enrichment interface used by the API.
-// Defined here so the API package doesn't import internal/spec directly.
 type Enricher interface {
 	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
 }
@@ -174,8 +163,6 @@ func SetMaxLimit(n int) {
 // New builds the API server. rpcClient is used by /health, /readyz, and /stats.
 // apiKey gates the watched-contracts management endpoints; pass "" to
 // fail closed (every request gets a 503 with "API_KEY not configured").
-// See apiKeyAuth for the exact contract. The trailing enricher is optional —
-// pass nil to disable spec decoding, or one Enricher to enable it.
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
 	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New()}
 	if len(enricher) > 0 {
@@ -226,7 +213,7 @@ func (s *Server) SetRateLimiter(l *RateLimiter) {
 }
 
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
-// (SSE, WebSocket) can deliver events as they arrive.
+// can deliver events as they arrive.
 func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 	s.bcast = b
 	return s
@@ -262,9 +249,6 @@ func (s *Server) Router() http.Handler {
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 	if s.limiter != nil {
-		// Limiter sits inside Timeout and Recoverer so its instant 429
-		// response always makes it back through the deadline cleanly, and
-		// a panic inside the limiter can't take down the server.
 		r.Use(s.limiter.Middleware)
 	}
 	// authenticate must run before any handler that reads events: it is what
