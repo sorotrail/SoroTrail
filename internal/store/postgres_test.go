@@ -1,12 +1,15 @@
+//go:build integration
+
 package store
 
-// Integration tests for the Postgres store. They need a real database and
-// are skipped unless TEST_DATABASE_URL is set, e.g.:
+// Integration tests for the Postgres store. Gated behind the `integration`
+// build tag so `go test ./...` stays fast; run via `make test-integration`
+// or with `go test -tags=integration ./...`. The runner must provide a
+// Postgres reachable via TEST_DATABASE_URL (or testcontainers-go will start
+// one — see CONTRIBUTING.md).
 //
-//	docker compose up -d postgres
-//	make test-db
-//
-// Each run migrates the schema and truncates the tables it touches.
+// Each run migrates the schema via store.Migrate and truncates the
+// tables it touches. -p 1 keeps packages from racing on the same DB.
 
 import (
 	"context"
@@ -879,13 +882,13 @@ func TestIngestionStateRoundTrip(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 
-	_, err := st.GetIngestionState(ctx)
+	_, err := st.GetIngestionState(ctx, defaultNetwork)
 	assert.ErrorIs(t, err, ErrNotFound, "fresh database has no state")
 
-	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 42, LastCursor: "c1"}))
-	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 43}))
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{Network: defaultNetwork, LastIngestedLedger: 42, LastCursor: "c1"}))
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{Network: defaultNetwork, LastIngestedLedger: 43}))
 
-	got, err := st.GetIngestionState(ctx)
+	got, err := st.GetIngestionState(ctx, defaultNetwork)
 	require.NoError(t, err)
 	assert.Equal(t, int64(43), got.LastIngestedLedger)
 	assert.Empty(t, got.LastCursor, "state is a single row, fully replaced")
