@@ -258,6 +258,48 @@ func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState
 	return nil
 }
 
+func (m *mockStore) GetContractCursor(_ context.Context, contractID string) (store.ContractCursor, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, cc := range m.contractCursors {
+		if cc.ContractID == contractID {
+			return cc, nil
+		}
+	}
+	return store.ContractCursor{}, store.ErrNotFound
+}
+
+func (m *mockStore) SaveContractCursor(_ context.Context, cc store.ContractCursor) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, existing := range m.contractCursors {
+		if existing.ContractID == cc.ContractID {
+			m.contractCursors[i] = cc
+			return nil
+		}
+	}
+	m.contractCursors = append(m.contractCursors, cc)
+	return nil
+}
+
+func (m *mockStore) DeleteContractCursor(_ context.Context, contractID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, cc := range m.contractCursors {
+		if cc.ContractID == contractID {
+			m.contractCursors = append(m.contractCursors[:i], m.contractCursors[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+
+func (m *mockStore) ListContractCursors(context.Context) ([]store.ContractCursor, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]store.ContractCursor(nil), m.contractCursors...), nil
+}
+
 func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return m.watched, nil
 }

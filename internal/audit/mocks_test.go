@@ -255,6 +255,22 @@ func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
 	return store.ErrNotFound
 }
 
+func (m *mockStore) GetContractCursor(_ context.Context, _ string) (store.ContractCursor, error) {
+	return store.ContractCursor{}, store.ErrNotFound
+}
+
+func (m *mockStore) SaveContractCursor(_ context.Context, _ store.ContractCursor) error {
+	return nil
+}
+
+func (m *mockStore) DeleteContractCursor(_ context.Context, _ string) error {
+	return nil
+}
+
+func (m *mockStore) ListContractCursors(context.Context) ([]store.ContractCursor, error) {
+	return nil, nil
+}
+
 func (m *mockStore) RecordAuditFinding(_ context.Context, f store.AuditFinding) (store.AuditFinding, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

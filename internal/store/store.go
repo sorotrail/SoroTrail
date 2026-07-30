@@ -237,6 +237,17 @@ type IngestionState struct {
 	UpdatedAt          time.Time
 }
 
+// ContractCursor tracks a single watched contract's resume position.
+// The ingester persists one cursor per contract so a lagging contract
+// never delays the others, and a contract added after ingestion has
+// already started automatically backfills from the retention window.
+type ContractCursor struct {
+	ContractID         string
+	LastIngestedLedger int64
+	LastCursor         string
+	UpdatedAt          time.Time
+}
+
 // AuditState tracks how far the background auditor has verified stored
 // ranges against the RPC for one network.
 type AuditState struct {

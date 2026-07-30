@@ -139,6 +139,22 @@ func (c *ClickHouse) AddWatchedContract(ctx context.Context, contractID string) 
 	return nil
 }
 
+func (c *ClickHouse) GetContractCursor(context.Context, string) (ContractCursor, error) {
+	return ContractCursor{}, ErrNotFound
+}
+
+func (c *ClickHouse) SaveContractCursor(context.Context, ContractCursor) error {
+	return nil
+}
+
+func (c *ClickHouse) DeleteContractCursor(context.Context, string) error {
+	return nil
+}
+
+func (c *ClickHouse) ListContractCursors(context.Context) ([]ContractCursor, error) {
+	return nil, nil
+}
+
 func (c *ClickHouse) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
 	return f, nil
 }

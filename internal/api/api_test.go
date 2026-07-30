@@ -346,15 +346,15 @@ func (s *stubRPC) GetHealth(context.Context) (rpc.Health, error) {
 	return s.health, s.healthErr
 }
 
-func newTestServer(st *stubStore, rc *stubRPC) *Server {
-	return newTestServerWithKey(st, rc, "test-key")
-}
-
 func newTestServerWithKey(st *stubStore, rc *stubRPC, apiKey string) *Server {
 	if rc == nil {
 		rc = &stubRPC{health: rpc.Health{Status: "healthy"}}
 	}
-	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), apiKey)
+	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), apiKey, 17280)
+}
+
+func newTestServer(st *stubStore, rc *stubRPC) *Server {
+	return newTestServerWithKey(st, rc, "test-key")
 }
 
 // doGet performs a GET request against the test server.
@@ -1635,7 +1635,7 @@ func TestRequestID(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-			s := New(&stubStore{}, nil, log, "test-key")
+			s := New(&stubStore{}, nil, log, "test-key", 17280)
 			srv := httptest.NewServer(s.Router())
 			defer srv.Close()
 

@@ -590,7 +590,7 @@ func TestListEvents_TopicFilterCannotReuseAnothersValidator(t *testing.T) {
 func TestGetEvent_Decoded_Immutable(t *testing.T) {
 	const id = "0001099511627776-0000000001"
 	st := &stubStore{event: store.Event{ID: id, Ledger: 100}}
-	s := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key", &stubEnricher{})
+	s := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key", 17280, &stubEnricher{})
 
 	resp, _ := doGet(t, s, "/events/"+id+"?decoded=true")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -602,7 +602,7 @@ func TestGetEvent_Decoded_Immutable(t *testing.T) {
 func TestGetEvent_DecodedWithXDR_Immutable(t *testing.T) {
 	const id = "0001099511627776-0000000002"
 	st := &stubStore{event: store.Event{ID: id, Ledger: 100}}
-	s := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key", &stubEnricher{})
+	s := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key", 17280, &stubEnricher{})
 
 	resp, _ := doGet(t, s, "/events/"+id+"?decoded=true&include_xdr=true")
 	require.Equal(t, http.StatusOK, resp.StatusCode)

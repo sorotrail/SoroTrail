@@ -139,7 +139,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `DATABASE_URL` | — (required) | Postgres connection string. |
 | `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. |
 | `HTTP_ADDR` | `:8080` | API listen address. |
-| `WATCHED_CONTRACTS` | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. |
+| `WATCHED_CONTRACTS` | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract automatically triggers a backfill from `latest − RETENTION_LEDGERS` (clamped to RPC retention), independent of other contracts. |
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
@@ -292,6 +292,39 @@ notably: Horizon must retain historical meta for the target network,
 only Soroban V3/V4 transactions carry events, and the public Stellar
 testnet Horizon retains everything from protocol 17 onward while
 mainnet varies.
+
+## Watched ingestion (per-contract cursors)
+
+When `WATCHED_CONTRACTS` is set (non-empty), SoroTrail switches from the
+single global cursor to a **per-contract cursor model** backed by the
+`contract_cursors` table.
+
+### How it works
+
+- Each watched contract has its own resume position (last ingested ledger +
+  pagination cursor). A contract that falls behind does **not** hold back the
+  others.
+- The live ingester issues one `getEvents` call per filter batch (the existing
+  batching logic: ≤5 contract IDs per filter, ≤5 filters per request).
+  Contracts at different positions within the same batch share the RPC call;
+  each contract's cursor advances independently based on the events it
+  received.
+- Adding a contract to the watch list triggers an automatic backfill for it
+  from `latest − RETENTION_LEDGERS`, clamped to the RPC's oldest retained
+  ledger and ledger 2. This uses the same cold-start rules as an initial
+  deployment.
+- Contracts that are removed from the watch list keep their cursor row. If
+  the contract is added back later and its cursor fell outside RPC retention,
+  the indexer skips ahead with a warning (just like a cold start).
+- Unwatched mode (empty `WATCHED_CONTRACTS`) keeps the single global
+  `ingestion_state` row exactly as before.
+
+### How to check who is behind
+
+`GET /stats` now includes a `contract_cursors` field — the number of
+per-contract cursor rows tracked. Each contract's position can be queried
+via the store (e.g. `SELECT * FROM contract_cursors`) to see which contracts
+are lagging.
 
 ## Decoder replay
 
