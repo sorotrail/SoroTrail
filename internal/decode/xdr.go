@@ -4,10 +4,23 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math/big"
+	"sync/atomic"
 
-	"github.com/stellar/go/xdr"
+	"github.com/stellar/go-stellar-sdk/xdr"
 )
+
+// decodeErrors counts ScVal decode failures. Incremented by DecodeScVal
+// when unmarshaling or conversion fails. Reset only on process restart.
+// Exposed via DecodeErrorCount for monitoring / stats aggregation.
+var decodeErrors atomic.Uint64
+
+// DecodeErrorCount returns the number of ScVal XDR decode failures since
+// process start. A non-zero value indicates events whose raw XDR could not
+// be decoded — they are stored in a lossless fallback form so ingestion
+// never stalls.
+func DecodeErrorCount() uint64 { return decodeErrors.Load() }
 
 // XDRDecoder decodes base64 XDR ScVals into a typed-object JSON shape,
 // e.g. {"symbol": "transfer"}, {"u64": 123}, {"address": "C..."}.
@@ -22,17 +35,40 @@ var _ Decoder = XDRDecoder{}
 func (XDRDecoder) DecodeScVal(base64XDR string) (json.RawMessage, error) {
 	var val xdr.ScVal
 	if err := xdr.SafeUnmarshalBase64(base64XDR, &val); err != nil {
-		return nil, fmt.Errorf("unmarshaling ScVal XDR: %w", err)
+		decodeErrors.Add(1)
+		slog.Warn("decode: unmarshaling ScVal XDR", "error", err, "base64_len", len(base64XDR))
+		// Preserve the raw value in a lossless fallback so ingestion
+		// never stalls on a single un-decodable value.
+		return fallbackDecode(base64XDR, err), nil
 	}
 	v, err := scValToGo(val)
 	if err != nil {
-		return nil, err
+		decodeErrors.Add(1)
+		slog.Warn("decode: converting ScVal", "type", val.Type.String(), "error", err)
+		return fallbackDecode(base64XDR, err), nil
 	}
 	out, err := json.Marshal(v)
 	if err != nil {
-		return nil, fmt.Errorf("marshaling decoded ScVal: %w", err)
+		decodeErrors.Add(1)
+		slog.Warn("decode: marshaling ScVal", "error", err)
+		return fallbackDecode(base64XDR, err), nil
 	}
 	return out, nil
+}
+
+// fallbackDecode returns a lossless {"unknown": ...} wrapper for a value
+// that could not be decoded, preserving the raw base64 XDR so a future
+// decoder version can reprocess it. The error is embedded in the metadata
+// so the operator can inspect what went wrong.
+func fallbackDecode(base64XDR string, decodeErr error) json.RawMessage {
+	fallback, _ := json.Marshal(map[string]any{
+		"unknown": map[string]any{
+			"type":   "decode_error",
+			"base64": base64XDR,
+			"error":  decodeErr.Error(),
+		},
+	})
+	return fallback
 }
 
 // scValToGo maps one ScVal onto plain Go values that marshal to the JSON
