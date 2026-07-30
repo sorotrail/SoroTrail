@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ClickHouse implements Store with clickhouse-go/v2.
@@ -78,11 +79,15 @@ func (c *ClickHouse) ReplaceEventsInRange(ctx context.Context, events []Event, f
 	return nil
 }
 
-func (c *ClickHouse) GetEvent(ctx context.Context, id string) (Event, error) {
+func (c *ClickHouse) GetEvent(ctx context.Context, id string, sc Scope) (Event, error) {
 	return Event{}, ErrNotFound
 }
 
-func (c *ClickHouse) EventExists(ctx context.Context, id string) (bool, error) {
+func (c *ClickHouse) GetEventsByTxHash(ctx context.Context, txHash, excludeID string) ([]Event, error) {
+	return nil, nil
+}
+
+func (c *ClickHouse) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
 	return false, nil
 }
 
@@ -98,6 +103,10 @@ func (c *ClickHouse) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger
 	return nil, nil
 }
 
+func (c *ClickHouse) AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error) {
+	return nil, nil
+}
+
 func (c *ClickHouse) GetIngestionState(ctx context.Context) (IngestionState, error) {
 	return IngestionState{}, nil
 }
@@ -106,7 +115,7 @@ func (c *ClickHouse) SaveIngestionState(ctx context.Context, s IngestionState) e
 	return nil
 }
 
-func (c *ClickHouse) GetAuditState(ctx context.Context) (AuditState, error) {
+func (c *ClickHouse) GetAuditState(ctx context.Context, network string) (AuditState, error) {
 	return AuditState{}, nil
 }
 
@@ -114,7 +123,7 @@ func (c *ClickHouse) SaveAuditState(ctx context.Context, s AuditState) error {
 	return nil
 }
 
-func (c *ClickHouse) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (AuditState, error) {
+func (c *ClickHouse) SaveAuditStateIfGreater(ctx context.Context, network string, ledger int64) (AuditState, error) {
 	return AuditState{}, nil
 }
 
@@ -154,7 +163,7 @@ func (c *ClickHouse) UpdateAuditFinding(ctx context.Context, f AuditFinding) err
 	return nil
 }
 
-func (c *ClickHouse) ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error) {
+func (c *ClickHouse) ListOpenFindingsByRange(ctx context.Context, network string, fromLedger, toLedger int64) (AuditFinding, error) {
 	return AuditFinding{}, ErrNotFound
 }
 
@@ -162,19 +171,19 @@ func (c *ClickHouse) CreateSubscription(ctx context.Context, s Subscription) (Su
 	return s, nil
 }
 
-func (c *ClickHouse) GetSubscription(ctx context.Context, id int64) (Subscription, error) {
+func (c *ClickHouse) GetSubscription(ctx context.Context, id int64, owner SubscriptionOwner) (Subscription, error) {
 	return Subscription{}, ErrNotFound
 }
 
-func (c *ClickHouse) ListSubscriptions(ctx context.Context) ([]Subscription, error) {
+func (c *ClickHouse) ListSubscriptions(ctx context.Context, owner SubscriptionOwner) ([]Subscription, error) {
 	return nil, nil
 }
 
-func (c *ClickHouse) UpdateSubscription(ctx context.Context, s Subscription) (Subscription, error) {
+func (c *ClickHouse) UpdateSubscription(ctx context.Context, s Subscription, owner SubscriptionOwner) (Subscription, error) {
 	return s, nil
 }
 
-func (c *ClickHouse) DeleteSubscription(ctx context.Context, id int64) error {
+func (c *ClickHouse) DeleteSubscription(ctx context.Context, id int64, owner SubscriptionOwner) error {
 	return nil
 }
 
@@ -194,7 +203,7 @@ func (c *ClickHouse) RecordDeliveryAttempt(ctx context.Context, a DeliveryAttemp
 	return a, nil
 }
 
-func (c *ClickHouse) ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int) ([]DeliveryAttempt, error) {
+func (c *ClickHouse) ListDeliveryAttempts(ctx context.Context, subscriptionID int64, limit int, owner SubscriptionOwner) ([]DeliveryAttempt, error) {
 	return nil, nil
 }
 
@@ -206,10 +215,64 @@ func (c *ClickHouse) SetContractSpec(ctx context.Context, wasmHash, contractID s
 	return nil
 }
 
-func (c *ClickHouse) Stats(ctx context.Context) (Stats, error) {
+func (c *ClickHouse) DeleteEventsBeforeLedger(ctx context.Context, beforeLedger int64) (int64, error) {
+	return 0, nil
+}
+
+func (c *ClickHouse) MigrationVersion(ctx context.Context) (int, bool, error) {
+	return 0, false, nil
+}
+
+func (c *ClickHouse) Stats(ctx context.Context, sc Scope) (Stats, error) {
 	return Stats{}, nil
+}
+
+func (c *ClickHouse) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
+	return nil, "", nil
+}
+
+func (c *ClickHouse) CountContracts(context.Context, ContractsFilter) (int64, error) {
+	return 0, nil
+}
+
+// DeleteEventsBefore is a stub: retention pruning is not implemented for
+// the ClickHouse backend yet.
+func (c *ClickHouse) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}
+
+func (c *ClickHouse) DeadLetterEvent(context.Context, DeadLetterInput) (DeadLetter, error) {
+	return DeadLetter{}, nil
+}
+
+func (c *ClickHouse) ListDeadLetters(context.Context, string, int, string) ([]DeadLetter, string, error) {
+	return nil, "", nil
+}
+
+func (c *ClickHouse) GetDeadLetter(context.Context, int64) (DeadLetter, error) {
+	return DeadLetter{}, ErrNotFound
+}
+
+func (c *ClickHouse) DeleteDeadLetter(context.Context, int64) error {
+	return nil
 }
 
 func (c *ClickHouse) Ping(ctx context.Context) error {
 	return nil
+}
+
+func (c *ClickHouse) UpsertAddressRefs(ctx context.Context, refs []AddressRef) error {
+	return nil
+}
+
+func (c *ClickHouse) QueryAddressEvents(ctx context.Context, address string, f EventFilter) ([]Event, string, error) {
+	return nil, "", nil
+}
+
+func (c *ClickHouse) CountAddressEvents(ctx context.Context, address string) (int64, error) {
+	return 0, nil
+}
+
+func (c *ClickHouse) GetAddressSummary(ctx context.Context, address string) (AddressSummary, error) {
+	return AddressSummary{}, nil
 }

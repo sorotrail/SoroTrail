@@ -7,7 +7,7 @@ package store
 //
 // Run:
 //
-//	go test -run 'TestMigrate_' ./internal/store/
+//	go test -run 'TestMigrat' ./internal/store/
 
 import (
 	"regexp"
@@ -15,17 +15,38 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/stretchr/testify/require"
 )
 
 // migrationRe matches migration file names like "0001_init.up.sql".
 var migrationRe = regexp.MustCompile(`^(\d{4})_(\w+)\.(up|down)\.sql$`)
 
+// TestMigrationsLoad checks the embedded migration set the way Migrate does,
+// without a database.
+//
+// Two migrations claiming the same version number is rejected by
+// golang-migrate at source-load time, before any connection is opened — so
+// every single integration test in this package fails at once, all of them
+// reporting a migration error rather than anything about themselves. That is
+// a lot of noise for one renumbering, and none of it reproduces locally,
+// because the tests that would surface it skip without TEST_DATABASE_URL.
+//
+// The filename checks below catch the same class of mistake by inspection;
+// this one catches it through the loader itself, so it stays honest if
+// golang-migrate ever tightens what it accepts. Two branches adding a
+// migration concurrently is the normal way to hit this, and it is invisible
+// in either diff alone.
+func TestMigrationsLoad(t *testing.T) {
+	_, err := iofs.New(postgresMigrationsFS, "migrations")
+	require.NoError(t, err, "embedded migrations must load; a duplicate version number fails every integration test in this package at once")
+}
+
 // TestMigrate_FilesAreWellFormed checks that every embedded migration file
 // has a compliant name, that every up file has a matching down file (and
 // vice versa), and that at least one migration exists.
 func TestMigrate_FilesAreWellFormed(t *testing.T) {
-	entries, err := migrationsFS.ReadDir("migrations")
+	entries, err := postgresMigrationsFS.ReadDir("migrations")
 	if err != nil {
 		t.Fatalf("reading embedded migrations directory: %v", err)
 	}
@@ -130,7 +151,7 @@ func TestMigrate_ONConflictUsesLedgerID(t *testing.T) {
 // breakage (e.g. half a conflict resolution spliced into the file) that
 // gofmt cannot surface on .sql files.
 func TestMigrate_FilesAreParseableSQL(t *testing.T) {
-	entries, err := migrationsFS.ReadDir("migrations")
+	entries, err := postgresMigrationsFS.ReadDir("migrations")
 	if err != nil {
 		t.Fatalf("reading embedded migrations directory: %v", err)
 	}
@@ -139,7 +160,7 @@ func TestMigrate_FilesAreParseableSQL(t *testing.T) {
 		if e.IsDir() {
 			continue
 		}
-		data, err := migrationsFS.ReadFile("migrations/" + e.Name())
+		data, err := postgresMigrationsFS.ReadFile("migrations/" + e.Name())
 		if err != nil {
 			t.Errorf("reading %s: %v", e.Name(), err)
 			continue
@@ -182,7 +203,7 @@ func TestMigrate_FilesAreParseableSQL(t *testing.T) {
 // single migration step. The bug described in issue #193 was multiple up
 // files (or multiple down files) with the same version.
 func TestMigrate_VersionNumbersAreUnique(t *testing.T) {
-	entries, err := migrationsFS.ReadDir("migrations")
+	entries, err := postgresMigrationsFS.ReadDir("migrations")
 	if err != nil {
 		t.Fatalf("reading embedded migrations directory: %v", err)
 	}

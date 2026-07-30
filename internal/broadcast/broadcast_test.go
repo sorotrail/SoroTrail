@@ -27,7 +27,7 @@ func mkEvent(id, contractID string, ledger int64) store.Event {
 
 func TestBroadcaster_DeliversMatchingEvents(t *testing.T) {
 	b := New(10)
-	sub := b.Subscribe(store.EventFilter{ContractID: "CA"})
+	sub := b.Subscribe(store.EventFilter{ContractID: "CA", Scope: store.WildcardScope()})
 	defer sub.Close()
 
 	b.Publish(context.Background(), []store.Event{
@@ -51,7 +51,7 @@ func TestBroadcaster_DeliversMatchingEvents(t *testing.T) {
 
 func TestBroadcaster_FilterByType(t *testing.T) {
 	b := New(10)
-	sub := b.Subscribe(store.EventFilter{Types: []string{"system"}})
+	sub := b.Subscribe(store.EventFilter{Types: []string{"system"}, Scope: store.WildcardScope()})
 	defer sub.Close()
 
 	b.Publish(context.Background(), []store.Event{
@@ -71,7 +71,7 @@ func TestBroadcaster_FilterByType(t *testing.T) {
 
 func TestBroadcaster_FilterByLedgerRange(t *testing.T) {
 	b := New(10)
-	sub := b.Subscribe(store.EventFilter{FromLedger: 5, ToLedger: 10})
+	sub := b.Subscribe(store.EventFilter{FromLedger: 5, ToLedger: 10, Scope: store.WildcardScope()})
 	defer sub.Close()
 
 	b.Publish(context.Background(), []store.Event{
@@ -95,7 +95,7 @@ func TestBroadcaster_FilterByLedgerRange(t *testing.T) {
 
 func TestBroadcaster_SlowConsumerEviction(t *testing.T) {
 	b := New(1) // tiny buffer
-	sub := b.Subscribe(store.EventFilter{})
+	sub := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
 	defer sub.Close()
 
 	// Fill the buffer (size 1) and then send another event to trigger eviction.
@@ -113,7 +113,7 @@ func TestBroadcaster_SlowConsumerEviction(t *testing.T) {
 
 func TestBroadcaster_NoMatch(t *testing.T) {
 	b := New(10)
-	sub := b.Subscribe(store.EventFilter{ContractID: "CB"})
+	sub := b.Subscribe(store.EventFilter{ContractID: "CB", Scope: store.WildcardScope()})
 	defer sub.Close()
 
 	b.Publish(context.Background(), []store.Event{
@@ -129,7 +129,7 @@ func TestBroadcaster_NoMatch(t *testing.T) {
 
 func TestBroadcaster_CloseUnsubscribes(t *testing.T) {
 	b := New(10)
-	sub := b.Subscribe(store.EventFilter{})
+	sub := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
 	sub.Close()
 
 	// Should not panic; the subscriber should be removed.
@@ -138,7 +138,7 @@ func TestBroadcaster_CloseUnsubscribes(t *testing.T) {
 
 func TestBroadcaster_ConcurrentPublish(t *testing.T) {
 	b := New(64)
-	sub := b.Subscribe(store.EventFilter{})
+	sub := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
 	defer sub.Close()
 
 	var wg sync.WaitGroup
