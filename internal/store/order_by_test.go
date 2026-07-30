@@ -77,7 +77,7 @@ func TestQueryEvents_OrderByPagination(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				// Page size 2 against runs of 3 equal values, so page
 				// boundaries land inside a tie.
-				got := walkPages(t, p, EventFilter{OrderBy: orderBy, Order: order, Limit: 2})
+				got := walkPages(t, p, EventFilter{OrderBy: orderBy, Order: order, Limit: 2, Scope: WildcardScope()})
 
 				gotIDs := make([]string, 0, len(got))
 				for _, e := range got {
@@ -141,7 +141,7 @@ func assertIDOrder(t *testing.T, prev, cur string, desc bool) {
 // typo must not quietly return default-ordered results.
 func TestQueryEvents_RejectsUnsupportedOrderBy(t *testing.T) {
 	p := testStore(t)
-	_, _, err := p.QueryEvents(context.Background(), EventFilter{OrderBy: "tx_hash"})
+	_, _, err := p.QueryEvents(context.Background(), EventFilter{OrderBy: "tx_hash", Scope: WildcardScope()})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported order_by")
 }
@@ -154,11 +154,11 @@ func TestQueryEvents_RejectsMismatchedCursor(t *testing.T) {
 	seedOrderingEvents(t, p)
 	ctx := context.Background()
 
-	_, idCursor, err := p.QueryEvents(ctx, EventFilter{Limit: 2})
+	_, idCursor, err := p.QueryEvents(ctx, EventFilter{Limit: 2, Scope: WildcardScope()})
 	require.NoError(t, err)
 	require.NotEmpty(t, idCursor)
 
-	_, _, err = p.QueryEvents(ctx, EventFilter{OrderBy: OrderByLedger, Limit: 2, Cursor: idCursor})
+	_, _, err = p.QueryEvents(ctx, EventFilter{OrderBy: OrderByLedger, Limit: 2, Cursor: idCursor, Scope: WildcardScope()})
 	assert.ErrorIs(t, err, ErrInvalidCursor)
 }
 
@@ -169,13 +169,13 @@ func TestQueryEvents_DefaultCursorStaysPlainID(t *testing.T) {
 	seeded := seedOrderingEvents(t, p)
 	ctx := context.Background()
 
-	page, cursor, err := p.QueryEvents(ctx, EventFilter{Limit: 2})
+	page, cursor, err := p.QueryEvents(ctx, EventFilter{Limit: 2, Scope: WildcardScope()})
 	require.NoError(t, err)
 	require.Len(t, page, 2)
 	assert.Equal(t, page[1].ID, cursor, "default cursor is the last event ID verbatim")
 
 	// And that bare cursor resumes correctly.
-	next, _, err := p.QueryEvents(ctx, EventFilter{Limit: 2, Cursor: cursor})
+	next, _, err := p.QueryEvents(ctx, EventFilter{Limit: 2, Cursor: cursor, Scope: WildcardScope()})
 	require.NoError(t, err)
 	require.NotEmpty(t, next)
 	assert.Equal(t, seeded[2].ID, next[0].ID)
