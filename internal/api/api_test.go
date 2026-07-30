@@ -73,6 +73,16 @@ type stubStore struct {
 	listContractsErr     error
 	countContractsResult int64
 	countContractsErr    error
+
+	addressEvents    []store.Event
+	addressCursor    string
+	addressEventsErr error
+	addressCount     int64
+	addressCountErr  error
+
+	deadLettersResult  []store.DeadLetter
+	deadLettersCursor  string
+	deadLettersErr     error
 }
 
 	// Watched contract fields
@@ -290,6 +300,15 @@ func (s *stubStore) RecordDeliveryAttempt(ctx context.Context, a store.DeliveryA
 }
 func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int, store.SubscriptionOwner) ([]store.DeliveryAttempt, error) {
 	return nil, nil
+}
+func (s *stubStore) QueryAddressEvents(_ context.Context, address string, f store.EventFilter) ([]store.Event, string, error) {
+	s.lastFilter = f
+	_ = address
+	return s.addressEvents, s.addressCursor, s.addressEventsErr
+}
+func (s *stubStore) CountAddressEvents(_ context.Context, address string) (int64, error) {
+	_ = address
+	return s.addressCount, s.addressCountErr
 }
 
 func (s *stubStore) UpsertTokenBalances(ctx context.Context, network string, state store.TokenBalanceState, updates []store.TokenBalanceUpdate) error {
@@ -1357,6 +1376,146 @@ func TestListEvents_InvalidCursorIsBadRequest(t *testing.T) {
 	assert.Contains(t, e["error"], "invalid cursor")
 }
 
+func TestEnvelope(t *testing.T) {
+	t.Run("events returns envelope with data and next_cursor", func(t *testing.T) {
+		st := &stubStore{
+			events:     []store.Event{{ID: "e1"}, {ID: "e2"}},
+			nextCursor: "e2",
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/events?envelope=true")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out envelopeResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.NotNil(t, out.Data)
+		assert.Equal(t, "e2", out.NextCursor)
+	})
+
+	t.Run("events without envelope returns original shape", func(t *testing.T) {
+		st := &stubStore{
+			events:     []store.Event{{ID: "e1"}, {ID: "e2"}},
+			nextCursor: "e2",
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/events")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out eventsResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.Len(t, out.Events, 2)
+		assert.Equal(t, "e2", out.Cursor)
+	})
+
+	t.Run("contracts returns envelope with data and next_cursor", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{
+				{ContractID: testContract, EventCount: 10},
+			},
+			listContractsCursor: "cursor1",
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/contracts?envelope=true")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out envelopeResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.NotNil(t, out.Data)
+		assert.Equal(t, "cursor1", out.NextCursor)
+	})
+
+	t.Run("contracts without envelope returns original shape", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{
+				{ContractID: testContract, EventCount: 10},
+			},
+			listContractsCursor: "cursor1",
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out contractListResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.Len(t, out.Contracts, 1)
+		assert.Equal(t, "cursor1", out.Cursor)
+	})
+
+	t.Run("dead-letters returns envelope with data and next_cursor", func(t *testing.T) {
+		st := &stubStore{
+			deadLettersResult: []store.DeadLetter{{ID: 1}},
+			deadLettersCursor: "dl-cursor",
+		}
+		resp, body := doGetWithAuth(t, newTestServer(st, nil), "/dead-letters?envelope=true", "test-key")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out envelopeResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.NotNil(t, out.Data)
+		assert.Equal(t, "dl-cursor", out.NextCursor)
+	})
+
+	t.Run("dead-letters without envelope returns original shape", func(t *testing.T) {
+		st := &stubStore{
+			deadLettersResult: []store.DeadLetter{{ID: 1}},
+			deadLettersCursor: "dl-cursor",
+		}
+		resp, body := doGetWithAuth(t, newTestServer(st, nil), "/dead-letters", "test-key")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out deadLetterListResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.Len(t, out.DeadLetters, 1)
+		assert.Equal(t, "dl-cursor", out.Cursor)
+	})
+
+	t.Run("address events returns envelope with data and next_cursor", func(t *testing.T) {
+		st := &stubStore{
+			addressEvents:    []store.Event{{ID: "e1"}},
+			addressCursor:    "addr-cursor",
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/addresses/GABC/events?envelope=true")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out envelopeResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.NotNil(t, out.Data)
+		assert.Equal(t, "addr-cursor", out.NextCursor)
+	})
+
+	t.Run("address events without envelope returns original shape", func(t *testing.T) {
+		st := &stubStore{
+			addressEvents: []store.Event{{ID: "e1"}},
+			addressCursor: "addr-cursor",
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/addresses/GABC/events")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out addressEventsResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.Len(t, out.Events, 1)
+		assert.Equal(t, "addr-cursor", out.Cursor)
+	})
+
+	t.Run("envelope data is never null even with empty results", func(t *testing.T) {
+		st := &stubStore{}
+		resp, body := doGet(t, newTestServer(st, nil), "/events?envelope=true")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out envelopeResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.NotNil(t, out.Data)
+		assert.Empty(t, out.NextCursor)
+	})
+
+	t.Run("envelope includes cursor only when present", func(t *testing.T) {
+		st := &stubStore{events: []store.Event{{ID: "e1"}}}
+		resp, body := doGet(t, newTestServer(st, nil), "/events?envelope=true")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var out envelopeResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.NotNil(t, out.Data)
+		assert.Empty(t, out.NextCursor)
+	})
+}
+
 func TestVersion(t *testing.T) {
 	t.Run("returns default values", func(t *testing.T) {
 		resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/version")
@@ -2182,7 +2341,7 @@ func (m *stubStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (sto
 	return store.DeadLetter{}, nil
 }
 func (m *stubStore) ListDeadLetters(context.Context, string, int, string) ([]store.DeadLetter, string, error) {
-	return nil, "", nil
+	return m.deadLettersResult, m.deadLettersCursor, m.deadLettersErr
 }
 func (m *stubStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, error) {
 	return store.DeadLetter{}, store.ErrNotFound

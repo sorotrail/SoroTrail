@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"math/big"
 	"strings"
 	"sync"
 	"sync/atomic"
