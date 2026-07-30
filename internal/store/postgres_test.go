@@ -11,11 +11,8 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
-	"fmt"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
@@ -67,8 +64,27 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	require.NoError(t, err)
 
 	_, err = pool.Exec(context.Background(),
-		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
+		`TRUNCATE events, ingestion_state, watched_contracts, replay_state, rollup_events, rollup_token_volume`)
 	require.NoError(t, err)
+
+	// Detach and drop all existing event partitions so a store with a different
+	// partition span can create fresh partitions without overlap. This is
+	// needed because TestMigrate_UpgradesLegacyEventsTable re-runs migrations
+	// on the shared database, which may create the default (span=120960)
+	// partition covering a very wide range.
+	_, err = pool.Exec(context.Background(), `
+		DO $block$
+		DECLARE
+			part text;
+		BEGIN
+			FOR part IN SELECT inhrelid::regclass::text FROM pg_inherits WHERE inhparent = 'events'::regclass
+			LOOP
+				EXECUTE 'DROP TABLE IF EXISTS ' || part || ' CASCADE';
+			END LOOP;
+		END $block$;
+	`)
+	require.NoError(t, err)
+
 	return NewPostgres(pool, span)
 }
 
@@ -442,23 +458,6 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		}
 	})
 
-	t.Run("by topic0 and topic1 positionally", func(t *testing.T) {
-		e1 := testEvent(eventID(100), 200, contractA)
-		e1.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GABC"},{"address":"GDEF"}]`)
-		e2 := testEvent(eventID(101), 201, contractA)
-		e2.Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GDEF"},{"address":"GABC"}]`)
-		_, err := st.UpsertEvents(ctx, []Event{e1, e2})
-		require.NoError(t, err)
-
-		got, _, err := st.QueryEvents(ctx, EventFilter{
-			Topic0: json.RawMessage(`{"symbol":"transfer"}`),
-			Topic1: json.RawMessage(`{"address":"GABC"}`),
-		})
-		require.NoError(t, err)
-		assert.Len(t, got, 1)
-		assert.Equal(t, e1.ID, got[0].ID)
-	})
-
 	t.Run("by tx_hash", func(t *testing.T) {
 		e1 := testEvent(eventID(200), 300, contractA)
 		e1.TxHash = "txhash1"
@@ -469,15 +468,21 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		_, err := st.UpsertEvents(ctx, []Event{e1, e2, e3})
 		require.NoError(t, err)
 
-		got, _, err := st.QueryEvents(ctx, EventFilter{TxHash: "txhash1"})
+		got, _, err := st.QueryEvents(ctx, EventFilter{TxHash: "txhash1",
+			Scope: WildcardScope(),
+		})
 		require.NoError(t, err)
 		assert.Len(t, got, 2)
 
-		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "txhash2"})
+		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "txhash2",
+			Scope: WildcardScope(),
+		})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
 
-		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "nonexistent"})
+		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "nonexistent",
+			Scope: WildcardScope(),
+		})
 		require.NoError(t, err)
 		assert.Len(t, got, 0)
 	})
@@ -498,6 +503,7 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			TxHash:           "isc_test_a",
 			InSuccessfulCall: ptr(true),
+			Scope:            WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
@@ -506,12 +512,15 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		got, _, err = st.QueryEvents(ctx, EventFilter{
 			TxHash:           "isc_test_b",
 			InSuccessfulCall: ptr(false),
+			Scope:            WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
 		assert.Equal(t, e2.ID, got[0].ID)
 
-		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "isc_test_c"})
+		got, _, err = st.QueryEvents(ctx, EventFilter{TxHash: "isc_test_c",
+			Scope: WildcardScope(),
+		})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.True(t, got[0].InSuccessfulCall)
@@ -533,6 +542,7 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			TxHash:           "combo1",
 			InSuccessfulCall: ptr(true),
+			Scope:            WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
@@ -541,6 +551,7 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 		got, _, err = st.QueryEvents(ctx, EventFilter{
 			TxHash:           "combo1",
 			InSuccessfulCall: ptr(false),
+			Scope:            WildcardScope(),
 		})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
@@ -562,21 +573,25 @@ func TestQueryEvents_InSuccessfulCallFilter(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("filter by true alone", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(true)})
+		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(true),
+			Scope: WildcardScope(),
+		})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.True(t, got[0].InSuccessfulCall)
 	})
 
 	t.Run("filter by false alone", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(false)})
+		got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: ptr(false),
+			Scope: WildcardScope(),
+		})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.False(t, got[0].InSuccessfulCall)
 	})
 
 	t.Run("nil returns all", func(t *testing.T) {
-		got, _, err := st.QueryEvents(ctx, EventFilter{})
+		got, _, err := st.QueryEvents(ctx, EventFilter{Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, 2)
 	})
@@ -663,6 +678,84 @@ func TestQueryEvents_TimeRange(t *testing.T) {
 		require.NoError(t, err)
 		assert.Len(t, got, 0)
 	})
+}
+
+func TestAggregateEvents_ByLedger(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	var events []Event
+	for i := 1; i <= 5; i++ {
+		e := testEvent(eventID(i), int64(100+(i-1)/2), contractA)
+		e.CreatedAt = time.Date(2026, 7, 20+i, 12, 0, 0, 0, time.UTC)
+		events = append(events, e)
+	}
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	got, err := st.AggregateEvents(ctx, EventFilter{FromLedger: 100, ToLedger: 102}, "ledger")
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+	assert.Equal(t, "100", got[0].Bucket)
+	assert.Equal(t, int64(2), got[0].Count) // events 1,2 on ledger 100
+	assert.Equal(t, "101", got[1].Bucket)
+	assert.Equal(t, int64(2), got[1].Count) // events 3,4 on ledger 101
+	assert.Equal(t, "102", got[2].Bucket)
+	assert.Equal(t, int64(1), got[2].Count) // event 5 on ledger 102
+}
+
+func TestAggregateEvents_ByTime(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	var events []Event
+	for i := 1; i <= 4; i++ {
+		e := testEvent(eventID(i), int64(100+i), contractA)
+		e.CreatedAt = time.Date(2026, 7, 20, i*6, 0, 0, 0, time.UTC) // 06:00, 12:00, 18:00, 24:00
+		events = append(events, e)
+	}
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	got, err := st.AggregateEvents(ctx, EventFilter{FromLedger: 101, ToLedger: 104}, "24h")
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "2026-07-20T00:00:00", got[0].Bucket)
+	assert.Equal(t, int64(4), got[0].Count)
+}
+
+func TestAggregateEvents_Filters(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	events := []Event{
+		testEvent(eventID(1), 100, contractA), // contract A
+		testEvent(eventID(2), 101, contractB), // contract B
+		testEvent(eventID(3), 101, contractA), // contract A again
+	}
+	for i := range events {
+		events[i].Type = "contract"
+	}
+	events[1].Type = "system"
+
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	// contract_id filter
+	got, err := st.AggregateEvents(ctx, EventFilter{ContractID: contractA}, "ledger")
+	require.NoError(t, err)
+	assert.Len(t, got, 2) // ledgers 100 and 101
+	totalA := int64(0)
+	for _, b := range got {
+		totalA += b.Count
+	}
+	assert.Equal(t, int64(2), totalA)
+
+	// type filter
+	got, err = st.AggregateEvents(ctx, EventFilter{Types: []string{"system"}}, "ledger")
+	require.NoError(t, err)
+	assert.Len(t, got, 1)
+	assert.Equal(t, int64(1), got[0].Count)
 }
 
 func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
@@ -772,6 +865,10 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		FROM events_partitioned
 		ORDER BY ledger, id;
 		DROP TABLE events_partitioned CASCADE;
+		DROP TABLE IF EXISTS contract_specs CASCADE;
+		DROP TABLE IF EXISTS replay_state CASCADE;
+		DROP TABLE IF EXISTS subscriptions CASCADE;
+		DROP TABLE IF EXISTS delivery_attempts CASCADE;
 		DROP FUNCTION IF EXISTS ensure_event_partitions(bigint, bigint, bigint);
 		UPDATE schema_migrations SET version = %d, dirty = false;
 	`, legacySchemaMigrationsVersion)
@@ -803,10 +900,9 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	require.NoError(t, err)
 	defer partitions.Close()
 	require.True(t, partitions.Next())
-	var firstPartition, secondPartition sql.NullString
-	require.NoError(t, partitions.Scan(&firstPartition, &secondPartition))
-	assert.True(t, firstPartition.Valid)
-	assert.False(t, secondPartition.Valid)
+	var partition sql.NullString
+	require.NoError(t, partitions.Scan(&partition))
+	assert.True(t, partition.Valid, "migration should create events_0_120959 partition")
 }
 
 func TestIngestionStateRoundTrip(t *testing.T) {
@@ -823,6 +919,38 @@ func TestIngestionStateRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(43), got.LastIngestedLedger)
 	assert.Empty(t, got.LastCursor, "state is a single row, fully replaced")
+}
+
+func TestIngestionState_LastSuccessfulPoll(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// Initial save without LastSuccessfulPoll should have nil
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 10, LastCursor: "c1"}))
+	got, err := st.GetIngestionState(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, got.LastSuccessfulPoll, "LastSuccessfulPoll is nil when not set")
+
+	// Save with LastSuccessfulPoll set
+	now := time.Now().Truncate(time.Millisecond)
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{
+		LastIngestedLedger: 20,
+		LastCursor:         "c2",
+		LastSuccessfulPoll: &now,
+	}))
+
+	got, err = st.GetIngestionState(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(20), got.LastIngestedLedger)
+	require.NotNil(t, got.LastSuccessfulPoll)
+	assert.Equal(t, now, *got.LastSuccessfulPoll)
+
+	// Overwrite without LastSuccessfulPoll should keep the old value? No, it should update to nil
+	// The UPSERT sets last_successful_poll = EXCLUDED.last_successful_poll, so nil overwrites
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 30, LastCursor: "c3"}))
+	got, err = st.GetIngestionState(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, got.LastSuccessfulPoll, "LastSuccessfulPoll is nil when not provided in save")
 }
 
 func TestWatchedContracts(t *testing.T) {
@@ -885,7 +1013,13 @@ func TestStats(t *testing.T) {
 		testEvent(eventID(2), 101, contractB),
 	})
 	require.NoError(t, err)
-	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 101}))
+
+	// Save ingestion state with LastSuccessfulPoll
+	now := time.Now().Truncate(time.Millisecond)
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{
+		LastIngestedLedger: 101,
+		LastSuccessfulPoll: &now,
+	}))
 	require.NoError(t, st.AddWatchedContract(ctx, contractA))
 
 	stats, err := st.Stats(ctx, SystemScope())

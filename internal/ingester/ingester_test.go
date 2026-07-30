@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -89,7 +88,7 @@ func makeIngester(t *testing.T, opts Options) (*Ingester, *bytes.Buffer, *record
 
 // setLagAlarmClientHealth updates the chain head seen by whatever RPC is
 // wired into ing. Both supported test RPCs let the test author set the
-// latest directly (mockRPC via its health field; flakyRPC via its
+// latest directly (mockRPC via its health field; other clients via
 // wrapped base mockRPC's health field). Centralizing this in one
 // helper avoids repeating a type switch at every call site.
 func setLagAlarmClientHealth(t *testing.T, client rpc.Client, latest uint32) {
@@ -97,8 +96,6 @@ func setLagAlarmClientHealth(t *testing.T, client rpc.Client, latest uint32) {
 	switch r := client.(type) {
 	case *mockRPC:
 		r.health = rpc.Health{LatestLedger: latest}
-	case *flakyRPC:
-		r.base.health = rpc.Health{LatestLedger: latest}
 	default:
 		t.Fatalf("setLagAlarmClientHealth: unhandled RPC type %T", client)
 	}
@@ -987,4 +984,90 @@ func TestIngester_PicksUpRuntimeWatchListRemoval(t *testing.T) {
 	assert.Empty(t, req2.Filters[0].ContractIDs,
 		"empty watch list means ingest-all: contractIds must be empty")
 	assert.Equal(t, "contract", req2.Filters[0].Type)
+}
+
+// The lag-alarm tests below exercise checkLag's hysteresis contract:
+// the gauge is published every cycle, but a log line is emitted only on
+// a transition, so a persistently lagging indexer does not spam.
+
+func TestLagAlarm_DisabledWhenThresholdZero(t *testing.T) {
+	ing, buf, metrics := makeIngester(t, Options{LagWarnLedgers: 0})
+
+	driveLagCycles(t, ing, []mockCycle{{latest: 10_000, ingested: 1}})
+
+	assert.Empty(t, metrics.history(), "disabled alarm must not publish a gauge")
+	assert.Empty(t, logRecords(t, buf, nil), "disabled alarm must not log")
+}
+
+func TestLagAlarm_WarnsOnceOnTransition(t *testing.T) {
+	ing, buf, metrics := makeIngester(t, Options{LagWarnLedgers: 100})
+
+	// Two consecutive lagging cycles: the gauge is published on both,
+	// but only the first crosses the edge and logs.
+	driveLagCycles(t, ing, []mockCycle{
+		{latest: 1_000, ingested: 500},
+		{latest: 1_000, ingested: 400},
+	})
+
+	assert.Equal(t, []bool{true, true}, metrics.history())
+	warns := logRecords(t, buf, func(l string) bool { return l == "WARN" })
+	require.Len(t, warns, 1, "a sustained lag must warn once, not every cycle")
+	assert.Equal(t, "ingest lag exceeded threshold", warns[0]["msg"])
+	assert.EqualValues(t, 500, warns[0]["lag_ledgers"])
+}
+
+func TestLagAlarm_RecoversAndRearms(t *testing.T) {
+	ing, buf, metrics := makeIngester(t, Options{LagWarnLedgers: 100})
+
+	driveLagCycles(t, ing, []mockCycle{
+		{latest: 1_000, ingested: 500},   // lagging  → warn
+		{latest: 1_000, ingested: 950},   // caught up → recovered
+		{latest: 2_000, ingested: 1_000}, // lagging again → warn
+	})
+
+	assert.Equal(t, []bool{true, false, true}, metrics.history())
+	assert.Len(t, logRecords(t, buf, func(l string) bool { return l == "WARN" }), 2)
+
+	infos := logRecords(t, buf, func(l string) bool { return l == "INFO" })
+	require.Len(t, infos, 1)
+	assert.Equal(t, "ingest lag recovered", infos[0]["msg"])
+}
+
+func TestLagAlarm_StaysQuietBelowThreshold(t *testing.T) {
+	ing, buf, metrics := makeIngester(t, Options{LagWarnLedgers: 100})
+
+	// Exactly at the threshold is not over it.
+	driveLagCycles(t, ing, []mockCycle{{latest: 1_000, ingested: 900}})
+
+	assert.Equal(t, []bool{false}, metrics.history())
+	assert.Empty(t, logRecords(t, buf, nil))
+}
+
+func TestLagAlarm_NegativeLagPreservesHysteresis(t *testing.T) {
+	ing, buf, metrics := makeIngester(t, Options{LagWarnLedgers: 100})
+
+	// Drive into the lagging state, then feed a chain head *behind* the
+	// stored ledger (reorg or a stale RPC cache). That evidence is not
+	// trustworthy, so the alarm must republish the current state rather
+	// than reporting a spurious recovery.
+	driveLagCycles(t, ing, []mockCycle{
+		{latest: 1_000, ingested: 500},
+		{latest: 400, ingested: 500},
+	})
+
+	assert.Equal(t, []bool{true, true}, metrics.history())
+	assert.Empty(t, logRecords(t, buf, func(l string) bool { return l == "INFO" }),
+		"a backwards chain head must not be reported as recovery")
+}
+
+func TestLagAlarm_ColdStartPublishesFalseWithoutLogging(t *testing.T) {
+	ing, buf, metrics := makeIngester(t, Options{LagWarnLedgers: 100})
+
+	// ingested == -1 removes the state row entirely.
+	driveLagCycles(t, ing, []mockCycle{{latest: 10_000, ingested: -1}})
+
+	assert.Equal(t, []bool{false}, metrics.history(),
+		"cold start still publishes so the gauge is never unknown")
+	assert.Empty(t, logRecords(t, buf, nil),
+		"a fresh deploy must not warn about a chain head that is merely large")
 }

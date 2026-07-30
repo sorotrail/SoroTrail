@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/sorotrail/sorotrail/internal/sep41"
 )
 
 // Event is a Soroban contract event as persisted by SoroTrail.
@@ -32,6 +34,34 @@ type Event struct {
 	// They are not part of the API representation.
 	RawTopicXDR []string `json:"-"`
 	RawValueXDR string   `json:"-"`
+
+	// SEP41Event carries the SEP-41 normalized envelope when the event's
+	// topics and value match the SEP-41 / CAP-46-6 shapes (transfer, mint,
+	// burn, clawback, approve). It is computed at render time by
+	// internal/sep41 and is nil for non-matching events, so the field is
+	// omitted entirely from the JSON.
+	SEP41Event *json.RawMessage `json:"sep41_event,omitempty"`
+}
+
+// WithSEP41 populates SEP41Event from the SEP-41 normalizer when the
+// event matches any of the SEP-41 / CAP-46-6 token event shapes
+// (transfer, mint, burn, clawback, approve). Non-matches leave the
+// field nil and the JSON output without the slot, which keeps the
+// augmentation additive and never destructive.
+//
+// Both delivery points (API render, webhook signing) call this before
+// JSON serialization so the same envelope surfaces in both
+// representations.
+func (e *Event) WithSEP41() {
+	if e == nil {
+		return
+	}
+	// sep41.Normalize returns a json.RawMessage ([]byte) value; nil on no
+	// match. We need to take its address so the field's pointer stays
+	// nil when nothing matched (omitempty drops the slot in JSON).
+	if n := sep41.Normalize(e.Topics, e.Value); n != nil {
+		e.SEP41Event = &n
+	}
 }
 
 // EnrichedEvent wraps an Event with decoded field information derived from
@@ -88,7 +118,19 @@ func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 
 // EventFilter narrows a QueryEvents call. Zero values mean "no constraint".
 type EventFilter struct {
+	// ContractID is a single contract ID to filter by. For backward
+	// compatibility with callers that set a single ID (e.g.
+	// handleContractEvents). When set alongside ContractIDs, the two are
+	// merged — an event matching either is returned.
 	ContractID string
+	// ContractIDs is a list of contract IDs to filter by (SQL IN / ANY).
+	// When non-empty, the store generates `contract_id = ANY($N)` instead
+	// of `contract_id = $N`. Together with ContractID the union is
+	// matched — an event for any of these contracts qualifies.
+	ContractIDs []string
+	// ContractIDPrefix matches events whose contract_id starts with this
+	// prefix via a LIKE query. Mutually exclusive with ContractID.
+	ContractIDPrefix string
 	// Types filters by event type. Multiple values are accepted (ANDed
 	// together at the SQL level via type = ANY(...)). An empty or nil
 	// slice means "no constraint".
@@ -114,14 +156,19 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	// TxHash filters events emitted by a specific transaction hash.
-	TxHash string // hex-encoded transaction hash
 	// HasValue filters events by whether they carry a value payload.
 	// nil means no constraint; true means value IS NOT NULL;
 	// false means value IS NULL.
-	HasValue   *bool
+	HasValue *bool
+	// TxIndex is an exact-match filter on the transaction index within a
+	// ledger. A nil pointer means "no constraint". Use TxIndexToPtr for
+	// inline construction of a non-nil pointer from a literal.
+	TxIndex *int32 // exact match on tx index, nil = unset
+	// OpIndex is an exact-match filter on the operation index within a
+	// transaction. A nil pointer means "no constraint".
+	OpIndex    *int32    // exact match on op index, nil = unset
 	FromLedger int64     // inclusive
-	ToLedger   int64     // inclusive
+	ToLedger   int64     // inclusive, zero = no constraint
 	FromTime   time.Time // inclusive, zero = no constraint
 	ToTime     time.Time // inclusive, zero = no constraint
 	// Cursor is the ID of the last event from the previous page.
@@ -166,10 +213,18 @@ func ValidOrderBy(s string) bool {
 	}
 }
 
+// AggregateBucket is one entry in an AggregateEvents result:
+// a bucket label and the number of events in that bucket.
+type AggregateBucket struct {
+	Bucket string `json:"bucket"`
+	Count  int64  `json:"count"`
+}
+
 // IngestionState tracks how far ingestion has progressed.
 type IngestionState struct {
 	LastIngestedLedger int64
 	LastCursor         string
+	LastSuccessfulPoll *time.Time
 	UpdatedAt          time.Time
 }
 
@@ -450,6 +505,23 @@ type DeliveryAttempt struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
+// AddressRef records one address→event mapping. Populated during ingestion
+// from decoded event topics and value JSON.
+type AddressRef struct {
+	Address string `json:"address"`
+	EventID string `json:"event_id"`
+	Role    string `json:"role"`
+}
+
+// AddressSummary is the aggregate view returned by GetAddressSummary.
+type AddressSummary struct {
+	Address           string   `json:"address"`
+	FirstSeenLedger   int64    `json:"first_seen_ledger"`
+	LastSeenLedger    int64    `json:"last_seen_ledger"`
+	EventCount        int64    `json:"event_count"`
+	DistinctContracts []string `json:"distinct_contracts"`
+}
+
 // Stats summarizes what the indexer has stored so far. VerifiedThroughLedger
 // is the inclusive highest ledger whose stored events have been confirmed
 // to match a fresh RPC fetch; 0 means no ledger has been verified yet.
@@ -544,6 +616,36 @@ type EventDecoding struct {
 	Value  json.RawMessage
 }
 
+// AnalyticsEventBucket is one time-bucketed event count returned by the
+// analytics endpoints. BucketStart is a UTC timestamp truncated to the
+// requested granularity (hour or day).
+type AnalyticsEventBucket struct {
+	BucketStart time.Time `json:"bucket_start"`
+	ContractID  string    `json:"contract_id"`
+	Type        string    `json:"type"`
+	Count       int64     `json:"count"`
+}
+
+// AnalyticsTokenVolume is one time-bucketed transfer volume row.
+// Volume is a decimal string (i128-safe). UniqueAddressCount is the number
+// of distinct addresses appearing in transfer topics for the bucket.
+type AnalyticsTokenVolume struct {
+	BucketStart        time.Time `json:"bucket_start"`
+	ContractID         string    `json:"contract_id"`
+	Volume             string    `json:"volume"`
+	UniqueAddressCount int64     `json:"unique_address_count"`
+}
+
+// AnalyticsFilter narrows analytics queries. From/To are UTC timestamps;
+// zero means unbounded. Bucket is "hour" or "day".
+type AnalyticsFilter struct {
+	ContractID string
+	Type       string
+	From       time.Time
+	To         time.Time
+	Bucket     string // "hour" or "day"
+}
+
 // Store is the persistence boundary. The ingester, auditor, and API depend
 // on this interface, never on Postgres directly, so alternative backends can
 // be contributed by implementing it.
@@ -575,7 +677,6 @@ type Store interface {
 	// the caller already supplied the contract ID and learns nothing from
 	// being told they lack access to it.
 	GetEvent(ctx context.Context, id string, sc Scope) (Event, error)
-	GetEvent(ctx context.Context, id string) (Event, error)
 	// GetEventsByTxHash returns all events emitted by the transaction
 	// identified by txHash, excluding the event with id excludeID (when
 	// non-empty). Returns an empty slice when no other events exist.
@@ -598,6 +699,10 @@ type Store interface {
 	// CountEvents returns the total number of events matching the filter
 	// (ignoring pagination: cursor, order, and limit are not applied).
 	CountEvents(ctx context.Context, f EventFilter) (int64, error)
+	// AggregateEvents returns event counts grouped by ledger or by a
+	// time interval. Buckets with zero events are omitted. Filters
+	// (contract_id, type, etc.) are applied to the aggregation query.
+	AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error)
 	// LedgerRangeCensus returns one LedgerCensus row per ledger in the
 	// inclusive [fromLedger, toLedger] range that contains at least one
 	// event, in ascending ledger order. idsOnly=true populates LedgerCensus.IDs
@@ -710,13 +815,30 @@ type Store interface {
 	// the given ledger number. It returns the number of rows deleted.
 	// This is an admin operation and should be auth-gated at the API layer.
 	DeleteEventsBeforeLedger(ctx context.Context, beforeLedger int64) (int64, error)
+	// DeleteEventsBefore deletes up to limit events strictly below maxLedger
+	// and (when beforeTime is non-zero) older than beforeTime. The limit
+	// keeps a single DELETE from holding a long lock; the pruner loops.
+	DeleteEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error)
+
+	// UpsertAddressRefs inserts address→event index rows idempotently.
+	// Duplicate (address, event_id, role) combinations are silently ignored.
+	UpsertAddressRefs(ctx context.Context, refs []AddressRef) error
+	// QueryAddressEvents returns events involving the given address, in
+	// chronological order (by event_id), cursor-paginated.
+	QueryAddressEvents(ctx context.Context, address string, f EventFilter) ([]Event, string, error)
+	// CountAddressEvents returns the total number of events involving the
+	// given address (ignoring pagination).
+	CountAddressEvents(ctx context.Context, address string) (int64, error)
+	// GetAddressSummary returns aggregate information about an address's
+	// event history: first/last seen ledger, total event count, and
+	// distinct contracts interacted with.
+	GetAddressSummary(ctx context.Context, address string) (AddressSummary, error)
 
 	// MigrationVersion returns the currently applied migration version and
 	// whether the schema_migrations table reports a dirty state. When the
 	// migration table does not exist or returns no rows, it returns (0, false, nil).
 	MigrationVersion(ctx context.Context) (version int, dirty bool, err error)
 
-	Stats(ctx context.Context) (Stats, error)
 	// Stats summarizes the store within sc. Aggregates are scoped because
 	// counts are an information leak in their own right: an unscoped
 	// total_events or contract_count tells a tenant how much data exists

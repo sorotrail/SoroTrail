@@ -85,7 +85,6 @@ func (s *guardedStore) GetEvent(ctx context.Context, id string, sc Scope) (Event
 	return e, err
 }
 
-func (s *guardedStore) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
 func (s *guardedStore) GetEventsByTxHash(ctx context.Context, txHash, excludeID string) ([]Event, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.GetEventsByTxHash")
 	defer cancel()
@@ -95,7 +94,7 @@ func (s *guardedStore) GetEventsByTxHash(ctx context.Context, txHash, excludeID 
 	return events, err
 }
 
-func (s *guardedStore) EventExists(ctx context.Context, id string) (bool, error) {
+func (s *guardedStore) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.EventExists")
 	defer cancel()
 	start := time.Now()
@@ -129,6 +128,15 @@ func (s *guardedStore) LedgerRangeCensus(ctx context.Context, fromLedger, toLedg
 	census, err := s.Store.LedgerRangeCensus(ctx, fromLedger, toLedger, idsOnly)
 	s.logSlowQuery("store.LedgerRangeCensus", start, err)
 	return census, err
+}
+
+func (s *guardedStore) AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.AggregateEvents")
+	defer cancel()
+	start := time.Now()
+	buckets, err := s.Store.AggregateEvents(ctx, f, bucket)
+	s.logSlowQuery("store.AggregateEvents", start, err)
+	return buckets, err
 }
 
 func (s *guardedStore) GetIngestionState(ctx context.Context) (IngestionState, error) {
@@ -174,6 +182,24 @@ func (s *guardedStore) SaveAuditStateIfGreater(ctx context.Context, ledger int64
 	state, err := s.Store.SaveAuditStateIfGreater(ctx, ledger)
 	s.logSlowQuery("store.SaveAuditStateIfGreater", start, err)
 	return state, err
+}
+
+func (s *guardedStore) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.ListContracts")
+	defer cancel()
+	start := time.Now()
+	summaries, cursor, err := s.Store.ListContracts(ctx, f)
+	s.logSlowQuery("store.ListContracts", start, err)
+	return summaries, cursor, err
+}
+
+func (s *guardedStore) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.CountContracts")
+	defer cancel()
+	start := time.Now()
+	total, err := s.Store.CountContracts(ctx, f)
+	s.logSlowQuery("store.CountContracts", start, err)
+	return total, err
 }
 
 func (s *guardedStore) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
@@ -352,7 +378,6 @@ func (s *guardedStore) MigrationVersion(ctx context.Context) (int, bool, error) 
 	return s.Store.MigrationVersion(ctx)
 }
 
-func (s *guardedStore) Stats(ctx context.Context) (Stats, error) {
 func (s *guardedStore) Stats(ctx context.Context, sc Scope) (Stats, error) {
 	ctx, cancel := s.wrapContext(ctx, "store.Stats")
 	defer cancel()
@@ -370,4 +395,40 @@ func (s *guardedStore) Ping(ctx context.Context) error {
 	err := s.Store.Ping(ctx)
 	s.logSlowQuery("store.Ping", start, err)
 	return err
+}
+
+func (s *guardedStore) UpsertAddressRefs(ctx context.Context, refs []AddressRef) error {
+	ctx, cancel := s.wrapContext(ctx, "store.UpsertAddressRefs")
+	defer cancel()
+	start := time.Now()
+	err := s.Store.UpsertAddressRefs(ctx, refs)
+	s.logSlowQuery("store.UpsertAddressRefs", start, err)
+	return err
+}
+
+func (s *guardedStore) QueryAddressEvents(ctx context.Context, address string, f EventFilter) ([]Event, string, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.QueryAddressEvents")
+	defer cancel()
+	start := time.Now()
+	events, cursor, err := s.Store.QueryAddressEvents(ctx, address, f)
+	s.logSlowQuery("store.QueryAddressEvents", start, err)
+	return events, cursor, err
+}
+
+func (s *guardedStore) CountAddressEvents(ctx context.Context, address string) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.CountAddressEvents")
+	defer cancel()
+	start := time.Now()
+	total, err := s.Store.CountAddressEvents(ctx, address)
+	s.logSlowQuery("store.CountAddressEvents", start, err)
+	return total, err
+}
+
+func (s *guardedStore) GetAddressSummary(ctx context.Context, address string) (AddressSummary, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.GetAddressSummary")
+	defer cancel()
+	start := time.Now()
+	summary, err := s.Store.GetAddressSummary(ctx, address)
+	s.logSlowQuery("store.GetAddressSummary", start, err)
+	return summary, err
 }

@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	_ "modernc.org/sqlite"
 
 	"github.com/sorotrail/sorotrail/internal/api"
 	"github.com/sorotrail/sorotrail/internal/api/graphql"
@@ -28,6 +30,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/config"
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/pruner"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/spec"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -57,6 +60,8 @@ func dispatch(args []string) error {
 		return runReplay(args[1:])
 	case "backfill":
 		return runBackfill(args[1:])
+	case "index-addresses":
+		return runIndexAddresses(args[1:])
 	case "healthcheck":
 		// The healthcheck subcommand manages its own exit codes
 		// (0 healthy, 1 unhealthy, 2 usage error) — the docker
@@ -87,6 +92,8 @@ subcommands:
                (sorotrail replay --help)
   backfill     ingest historical contract events from Horizon
                (sorotrail backfill --help)
+  index-addresses  rebuild the address→event inverted index from stored events
+               (sorotrail index-addresses --help)
   healthcheck  probe /health and exit (used by docker HEALTHCHECK)
                (sorotrail healthcheck --help)
 `)
@@ -111,6 +118,7 @@ func run() error {
 	var (
 		st   store.Store
 		pool *pgxpool.Pool
+		pg   *store.Postgres
 	)
 	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
 		st, err = store.NewStoreFromURL(cfg.DatabaseURL)
@@ -128,9 +136,9 @@ func run() error {
 		// startup races (database container still initialising, network
 		// not yet ready) don't crash the process before it can serve.
 		const (
-			maxRetries     = 5
-			baseBackoff    = 500 * time.Millisecond
-			maxBackoff     = 5 * time.Second
+			maxRetries  = 5
+			baseBackoff = 500 * time.Millisecond
+			maxBackoff  = 5 * time.Second
 		)
 		var pingErr error
 		for attempt := 1; attempt <= maxRetries; attempt++ {
@@ -159,7 +167,9 @@ func run() error {
 			return fmt.Errorf("pinging postgres after %d retries: %w", maxRetries, pingErr)
 		}
 		log.Info("postgres connection established")
-		st = store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
+		pg = store.NewPostgresWithHealthCheck(ctx, pool, cfg.DatabaseURL, int64(cfg.PartitionLedgerSpan))
+		defer pg.StopHealthCheck()
+		st = pg
 	}
 	for _, id := range cfg.WatchedContracts {
 		if err := st.AddWatchedContract(ctx, id); err != nil {
@@ -178,26 +188,45 @@ func run() error {
 	specFetcher := spec.NewFetcher(rpcClient)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
-	ing := ingester.New(rpcClient, st, decode.XDRDecoder{}, log, ingester.Options{
-		PollInterval:     cfg.PollInterval,
-		StartLedger:      cfg.StartLedger,
-		RetentionLedgers: cfg.RetentionLedgers,
-		LagWarnLedgers:   cfg.LagWarnLedgers,
-		// LagMetrics is nil here on purpose: no /metrics endpoint is
-		// wired up yet, so the ingester's applyDefaults installs a
-		// no-op. When a Prometheus endpoint lands, main.go is the
-		// seam to pass a real LagMetrics implementation.
-	})
 	// Wrap the raw RPC client so per-method error totals are tracked and
 	// surfaced via /stats. specFetcher already holds a reference to the
 	// unwrapped client (spec lookups are not counted as ingestion errors).
 	countingClient := rpc.NewCountingClient(rpcClient)
 	api.SetRPCCounter(countingClient)
 
+	// Advisory lock: when enabled (opt-in), acquire a Postgres advisory
+	// lock keyed by the RPC URL so a second instance targeting the same
+	// network yields ingestion to the lock holder. The API server still
+	// runs so the passive instance can serve reads.
+	ingesterEnabled := true
+	if cfg.IngestionLockEnabled {
+		lockKey := store.AdvisoryLockKey(cfg.RPCURL)
+		// Only Postgres-backed stores support advisory locks; ClickHouse
+		// and other backends skip silently.
+		if pg, ok := st.(*store.Postgres); ok {
+			lockConn, acquired, err := pg.TryAdvisoryLock(ctx, lockKey)
+			if err != nil {
+				return fmt.Errorf("advisory lock: %w", err)
+			}
+			if acquired {
+				defer lockConn.Release() // releases lock + connection on shutdown
+				log.Info("acquired ingestion advisory lock",
+					"key", lockKey, "rpc_url", cfg.RPCURL)
+			} else {
+				log.Warn("ingestion advisory lock held by another instance; skipping ingestion",
+					"key", lockKey, "rpc_url", cfg.RPCURL)
+				ingesterEnabled = false
+			}
+		} else {
+			log.Warn("INGESTION_LOCK_ENABLED is set but the store is not Postgres; skipping advisory lock")
+		}
+	}
+
 	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:            cfg.PollInterval,
 		StartLedger:             cfg.StartLedger,
 		RetentionLedgers:        cfg.RetentionLedgers,
+		LagWarnLedgers:          cfg.LagWarnLedgers,
 		SweepConcurrency:        cfg.SweepConcurrency,
 		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
@@ -331,14 +360,22 @@ func run() error {
 	go func() {
 		go wh.Run(ctx)
 	}()
-	go func() {
-		log.Info("ingester starting", "rpc_url", cfg.RPCURL, "poll_interval", cfg.PollInterval)
-		if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			errCh <- fmt.Errorf("ingester: %w", err)
-		} else {
-			errCh <- nil
-		}
-	}()
+
+	// Start the ingester only when the advisory lock was acquired (or
+	// when lock enforcement is disabled). The goroutine is skipped
+	// when another instance holds the lock.
+	remaining := 2 // http server + webhook
+	if ingesterEnabled {
+		remaining++ // + ingester
+		go func() {
+			log.Info("ingester starting", "rpc_url", cfg.RPCURL, "poll_interval", cfg.PollInterval)
+			if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("ingester: %w", err)
+			} else {
+				errCh <- nil
+			}
+		}()
+	}
 	go func() {
 		log.Info("http api listening", "addr", cfg.HTTPAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -378,9 +415,8 @@ func run() error {
 	}()
 
 	var firstErr error
-	remaining := 3 // ingester + http server + webhook
 	if aud != nil {
-		remaining = 4
+		remaining++
 	}
 	select {
 	case <-ctx.Done():

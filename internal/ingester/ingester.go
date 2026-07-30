@@ -19,6 +19,38 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
+// Clock abstracts time operations so tests and simulations can supply a
+// deterministic virtual clock instead of wall time.
+type Clock interface {
+	// Now returns the current time.
+	Now() time.Time
+	// SleepCtx sleeps for d or until ctx is done; it reports whether the
+	// full sleep completed. This is the only sleep seam in the ingester.
+	SleepCtx(ctx context.Context, d time.Duration) bool
+}
+
+// RealClock is the wall-clock implementation of Clock.
+type RealClock struct{}
+
+func (RealClock) Now() time.Time { return time.Now() }
+func (RealClock) SleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// JitterFunc returns a random duration in [0, max). The default uses
+// math/rand/v2; simulations inject a seeded generator for determinism.
+type JitterFunc func(max time.Duration) time.Duration
+
+// RealJitter is the wall-clock jitter function.
+func RealJitter(max time.Duration) time.Duration { return rand.N(max) }
+
 // Options configure an Ingester.
 type Options struct {
 	// PollInterval is how long to sleep once caught up. Default 5s.
@@ -151,13 +183,9 @@ type Ingester struct {
 	// threaded relative to Run().
 	lagging bool
 	bcast   *broadcast.Broadcaster
-	client   rpc.Client
-	store    store.Store
-	decoder  decode.Decoder
-	log      *slog.Logger
-	opts     Options
-	bcast    *broadcast.Broadcaster
-	notifier EventNotifier // optional; nil means no notification
+	// notifier fans ingested events out to subscribers; optional, nil
+	// means no notification.
+	notifier EventNotifier
 	// deadLetterStore receives events that fail to decode or persist so
 	// a poison event no longer stalls the loop. nil means no
 	// dead-lettering — the cycle aborts on the first error as before.
@@ -229,12 +257,9 @@ func (ing *Ingester) Run(ctx context.Context) error {
 			ing.checkLag(ctx)
 			// Jittered exponential backoff so restarts don't thundering-herd
 			// a shared endpoint.
-			sleep := backoff/2 + rand.N(backoff/2)
-			if errors.Is(err, rpc.ErrCircuitOpen) {
-				sleep = backoff
-			}
+			sleep := backoff/2 + ing.opts.Jitter(backoff/2)
 			ing.log.Error("ingestion pass failed", "error", err, "retry_in", sleep)
-			if !sleepCtx(ctx, sleep) {
+			if !ing.opts.Clock.SleepCtx(ctx, sleep) {
 				return ctx.Err()
 			}
 			if backoff *= 2; backoff > ing.opts.MaxBackoff {
@@ -247,7 +272,7 @@ func (ing *Ingester) Run(ctx context.Context) error {
 			ing.checkLag(ctx)
 			backoff = time.Second
 			if caughtUp {
-				if !sleepCtx(ctx, ing.opts.PollInterval) {
+				if !ing.opts.Clock.SleepCtx(ctx, ing.opts.PollInterval) {
 					return ctx.Err()
 				}
 			}
@@ -483,10 +508,11 @@ func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState
 		lastLedger = int64(resp.Events[len(resp.Events)-1].Ledger)
 	}
 
+	now := time.Now().UTC()
 	if cursor != "" {
-		return store.IngestionState{LastIngestedLedger: lastLedger, LastCursor: cursor}, caughtUp
+		return store.IngestionState{LastIngestedLedger: lastLedger, LastCursor: cursor, LastSuccessfulPoll: &now}, caughtUp
 	}
-	return store.IngestionState{LastIngestedLedger: int64(resp.LatestLedger) - 1}, caughtUp
+	return store.IngestionState{LastIngestedLedger: int64(resp.LatestLedger) - 1, LastSuccessfulPoll: &now}, caughtUp
 }
 
 // windowSweep ingests the ledger window [start, end] by paging each filter
@@ -555,7 +581,8 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	if end >= health.LatestLedger {
 		lastIngested = int64(end) - 1
 	}
-	err = ing.store.SaveIngestionState(ctx, store.IngestionState{LastIngestedLedger: lastIngested})
+	now := time.Now().UTC()
+	err = ing.store.SaveIngestionState(ctx, store.IngestionState{LastIngestedLedger: lastIngested, LastSuccessfulPoll: &now})
 	if err != nil {
 		return false, err
 	}
@@ -644,6 +671,18 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	if err != nil {
 		return err
 	}
+
+	// Extract addresses from decoded event topics/values and persist the
+	// inverted index. Extraction operates on the decoded JSON (not XDR) and
+	// runs after UpsertEvents so a failed address extraction does not lose
+	// events — the events themselves are already committed.
+	if err := ing.indexEventAddresses(ctx, events); err != nil {
+		// Log the error but do not fail the ingest pass: address indexing
+		// is a derived index and can be rebuilt via the index-addresses
+		// backfill command if it falls behind.
+		ing.log.Error("indexing event addresses", "error", err)
+	}
+
 	ing.log.Info("ingested events",
 		"count", len(events), "new", inserted,
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
@@ -879,6 +918,32 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 
 // sleepCtx sleeps for d or until ctx is done; it reports whether the full
 // sleep completed.
+// indexEventAddresses extracts G.../C... addresses from each event's
+// decoded topics and value JSON, then persists them to the event_addresses
+// inverted index. Extraction is a best-effort derived index: errors are
+// logged but do not fail the ingest pass, because the index can be rebuilt
+// from stored events via the index-addresses backfill command.
+func (ing *Ingester) indexEventAddresses(ctx context.Context, events []store.Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+	var refs []store.AddressRef
+	for _, ev := range events {
+		decoded := decode.ExtractAddresses(ev.Topics, ev.Value)
+		for _, r := range decoded {
+			refs = append(refs, store.AddressRef{
+				Address: r.Address,
+				EventID: ev.ID,
+				Role:    r.Role,
+			})
+		}
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	return ing.store.UpsertAddressRefs(ctx, refs)
+}
+
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()

@@ -19,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/sorotrail/sorotrail/internal/api/queries"
+	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
 	"github.com/sorotrail/sorotrail/internal/config"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -129,24 +130,6 @@ type eventsWithXDRResponse struct {
 	Events []eventWithXDR `json:"events"`
 	// Cursor is non-empty when another page exists.
 	Cursor string `json:"cursor,omitempty"`
-}
-
-type enrichedEventsWithXDRResponse struct {
-	Events []enrichedEventWithXDR `json:"events"`
-	// Cursor is non-empty when another page exists.
-	Cursor string `json:"cursor,omitempty"`
-}
-
-type eventWithXDR struct {
-	store.Event
-	TopicsXDR []string `json:"topics_xdr"`
-	ValueXDR  *string  `json:"value_xdr"`
-}
-
-type enrichedEventWithXDR struct {
-	eventWithXDR
-	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
-	Decoded      bool                        `json:"decoded"`
 }
 
 type healthResponse struct {
@@ -291,11 +274,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // The endpoint is protected by apiKeyAuth middleware (same as watched-contracts).
 //
 // Query params:
-//   before_ledger (required) — delete all events with ledger < this value
+//
+//	before_ledger (required) — delete all events with ledger < this value
 //
 // Response:
-//   200 { "deleted": <count> } on success
-//   400 when before_ledger is missing or not a positive integer
+//
+//	200 { "deleted": <count> } on success
+//	400 when before_ledger is missing or not a positive integer
 func (s *Server) handleDeleteEvents(w http.ResponseWriter, r *http.Request) {
 	raw := r.URL.Query().Get("before_ledger")
 	if raw == "" {
@@ -335,9 +320,9 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	resp := healthResponse{Status: "ok", Checks: map[string]string{
-		"database":        "ok",
-		"rpc":             "ok",
-		"schema_version":  "ok",
+		"database":       "ok",
+		"rpc":            "ok",
+		"schema_version": "ok",
 	}}
 	status := http.StatusOK
 
@@ -432,6 +417,55 @@ func (s *Server) handleCountEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	writeCacheHeaders(w, cacheNoCache, 0, "")
 	writeJSON(w, http.StatusOK, countResponse{Count: total})
+}
+
+// bucketResponse is the JSON body for GET /events/aggregate.
+type bucketResponse struct {
+	Buckets []AggregateBucket `json:"buckets"`
+}
+
+// AggregateBucket is one bucket in an aggregation result.
+type AggregateBucket = store.AggregateBucket
+
+// handleAggregateEvents returns event counts grouped by ledger or
+// by a time interval. The ?bucket parameter controls the grouping
+// and accepts "ledger" or a Go duration string (e.g. "1h", "1d").
+// All other event filter params (contract_id, type, from_ledger,
+// to_ledger, from_time, to_time, topic, topic0..topic3,
+// topic_contains, tx_hash) are accepted and applied to the
+// aggregation. Pagination params (cursor, limit, order, order_by)
+// are accepted in the URL but ignored.
+func (s *Server) handleAggregateEvents(w http.ResponseWriter, r *http.Request) {
+	filter, _, err := parseFilterAndFields(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	filter.Cursor = ""
+	filter.Order = ""
+	filter.OrderBy = ""
+	filter.Limit = 0
+
+	bucket := r.URL.Query().Get("bucket")
+	if bucket == "" {
+		writeError(w, http.StatusBadRequest, errors.New("bucket parameter is required"))
+		return
+	}
+	if bucket != "ledger" {
+		if _, err := time.ParseDuration(bucket); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid bucket %q: must be \"ledger\" or a duration", bucket))
+			return
+		}
+	}
+
+	buckets, err := s.store.AggregateEvents(r.Context(), filter, bucket)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("aggregating events", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("aggregating events failed"))
+		return
+	}
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, bucketResponse{Buckets: buckets})
 }
 
 // streamBatchSize is the number of events fetched per internal query when
@@ -628,6 +662,13 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	}
 	s.recordEventsServed(r.Context(), len(events))
 
+	// Tag every event with its SEP-41 normalized envelope (if any) before
+	// rendering — the layer is additive and never destructive, so events
+	// that do not match keep exactly the same shape they had before.
+	for i := range events {
+		events[i].WithSEP41()
+	}
+
 	// Total matching count (ignoring pagination) as a response header.
 	// Failure to count is non-fatal: we log a warning and proceed without
 	// the header rather than dropping a successful page.
@@ -768,7 +809,7 @@ func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	event, err := s.store.GetEvent(r.Context(), id)
+	event, err := s.store.GetEvent(r.Context(), id, scopeFrom(r.Context()))
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
 		return
@@ -877,8 +918,12 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.recordEventsServed(r.Context(), 1)
+
+	// Additive SEP-41 normalization on the single-event path; non-matches
+	// simply omit the field.
+	event.WithSEP41()
+
 	decoded := r.URL.Query().Get("decoded") == "true"
-	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {
@@ -934,9 +979,6 @@ func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
 	}
 	return out
 }
-
-// Stats summarizes what the indexer has stored plus, when the auditor is
-// running, the post-processing counters it has accumulated.
 
 // contractListResponse is the JSON body for GET /contracts.
 type contractListResponse struct {
@@ -999,6 +1041,9 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 		loggerFromContext(r.Context()).Warn("counting contracts for X-Total-Count", "error", cerr)
 	} else if total > 0 {
 		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+	if items == nil {
+		items = []store.ContractSummary{}
 	}
 	writeCacheHeaders(w, cacheNoCache, 0, "")
 	writeJSON(w, http.StatusOK, contractListResponse{
@@ -1101,6 +1146,8 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		stats.Pruner = store.PrunerStats{
 			RunsCompleted:   m.RunsCompleted,
 			TotalRowsPurged: m.TotalRowsPurged,
+		}
+	}
 	if c := getRPCCounter(); c != nil {
 		snap := c.Errors().Snapshot()
 		stats.RPCErrors = store.RPCErrorStats{
@@ -1194,7 +1241,6 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading watched contracts failed"))
 		return
 	}
-
 	modeTransition := ""
 	if len(current) == 0 {
 		if r.URL.Query().Get("confirm") != "true" {
@@ -1273,6 +1319,92 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 		ModeTransition:   modeTransition,
 	})
 }
+
+// handleAddressEvents returns events involving the given address,
+// chronologically ordered, cursor-paginated.
+func (s *Server) handleAddressEvents(w http.ResponseWriter, r *http.Request) {
+	address := chi.URLParam(r, "address")
+	if !isValidAddress(address) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid address %q (want G... or C... strkey)", address))
+		return
+	}
+
+	filter, _, err := parseFilterAndFields(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	// Address events are always ordered by event_id.
+	if filter.OrderBy != "" && filter.OrderBy != store.OrderByID {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("address events only support order_by=id (the default)"))
+		return
+	}
+
+	events, cursor, qerr := s.store.QueryAddressEvents(r.Context(), address, filter)
+	if qerr != nil {
+		loggerFromContext(r.Context()).Error("querying address events", "address", address, "error", qerr)
+		writeError(w, http.StatusInternalServerError, errors.New("querying address events failed"))
+		return
+	}
+
+	// Total matching count header.
+	if total, cerr := s.store.CountAddressEvents(r.Context(), address); cerr != nil {
+		loggerFromContext(r.Context()).Warn("counting address events", "error", cerr)
+	} else {
+		w.Header().Set("X-Total-Count", fmt.Sprintf("%d", total))
+	}
+
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, addressEventsResponse{Events: events, Cursor: cursor})
+}
+
+// handleAddressSummary returns aggregate information about an address's
+// event history.
+func (s *Server) handleAddressSummary(w http.ResponseWriter, r *http.Request) {
+	address := chi.URLParam(r, "address")
+	if !isValidAddress(address) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid address %q (want G... or C... strkey)", address))
+		return
+	}
+
+	summary, err := s.store.GetAddressSummary(r.Context(), address)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("address %q not found", address))
+		return
+	}
+	if err != nil {
+		loggerFromContext(r.Context()).Error("loading address summary", "address", address, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading address summary failed"))
+		return
+	}
+
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, summary)
+}
+
+// isValidAddress checks if the string looks like a Stellar strkey (G... or C..., 56 chars).
+func isValidAddress(s string) bool {
+	if len(s) != 56 {
+		return false
+	}
+	prefix := s[0]
+	if prefix != 'G' && prefix != 'C' {
+		return false
+	}
+	for _, r := range s[1:] {
+		if (r < 'A' || r > 'Z') && (r < '2' || r > '7') {
+			return false
+		}
+	}
+	return true
+}
+
+// addressEventsResponse is the response shape for GET /addresses/{address}/events.
+type addressEventsResponse struct {
+	Events []store.Event `json:"events"`
+	Cursor string        `json:"cursor,omitempty"`
+}
+
 func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
 	if s.rpc == nil {
 		return
@@ -1375,23 +1507,26 @@ func listETag(f store.EventFilter) string {
 	// full one-year max-age. TestListETag_CoversEveryFilterField enumerates
 	// the fields independently and fails when a new one is not added.
 	key := struct {
-		ContractID    string          `json:"c"`
-		Types         []string        `json:"t"`
-		Topic         json.RawMessage `json:"p,omitempty"`
-		Topic0        json.RawMessage `json:"p0,omitempty"`
-		Topic1        json.RawMessage `json:"p1,omitempty"`
-		Topic2        json.RawMessage `json:"p2,omitempty"`
-		Topic3        json.RawMessage `json:"p3,omitempty"`
-		TopicContains json.RawMessage `json:"pc,omitempty"`
-		TxHash        string          `json:"th,omitempty"`
-		HasValue      *bool           `json:"hv,omitempty"`
-		FromLedger    int64           `json:"fl"`
-		ToLedger      int64           `json:"tl"`
-		FromTime      string          `json:"ft,omitempty"`
-		ToTime        string          `json:"tt,omitempty"`
-		Cursor        string          `json:"cu,omitempty"`
-		Limit         int             `json:"l"`
-		Order         string          `json:"o,omitempty"`
+		ContractID       string          `json:"c"`
+		ContractIDPrefix string          `json:"cp,omitempty"`
+		Types            []string        `json:"t"`
+		Topic            json.RawMessage `json:"p,omitempty"`
+		Topic0           json.RawMessage `json:"p0,omitempty"`
+		Topic1           json.RawMessage `json:"p1,omitempty"`
+		Topic2           json.RawMessage `json:"p2,omitempty"`
+		Topic3           json.RawMessage `json:"p3,omitempty"`
+		TopicContains    json.RawMessage `json:"pc,omitempty"`
+		TxHash           string          `json:"th,omitempty"`
+		HasValue         *bool           `json:"hv,omitempty"`
+		TxIndex          *int32          `json:"txi,omitempty"`
+		OpIndex          *int32          `json:"opi,omitempty"`
+		FromLedger       int64           `json:"fl"`
+		ToLedger         int64           `json:"tl"`
+		FromTime         string          `json:"ft,omitempty"`
+		ToTime           string          `json:"tt,omitempty"`
+		Cursor           string          `json:"cu,omitempty"`
+		Limit            int             `json:"l"`
+		Order            string          `json:"o,omitempty"`
 		// Scope makes the validator tenant-specific. Two tenants issuing
 		// the same request are asking for different representations of
 		// this URL, and without this component the second one's
@@ -1400,9 +1535,10 @@ func listETag(f store.EventFilter) string {
 		// server, with no CDN involved.
 		Scope string `json:"s"`
 	}{
-		ContractID: f.ContractID,
-		Types:      f.Types,
-		Topic:      f.Topic,
+		ContractID:       f.ContractID,
+		ContractIDPrefix: f.ContractIDPrefix,
+		Types:            f.Types,
+		Topic:            f.Topic,
 		// Each positional filter gets its own distinctly named key, so
 		// topic0={x} and topic1={x} — which select different events — cannot
 		// serialize identically.
@@ -1413,6 +1549,8 @@ func listETag(f store.EventFilter) string {
 		TopicContains: f.TopicContains,
 		TxHash:        f.TxHash,
 		HasValue:      f.HasValue,
+		TxIndex:       f.TxIndex,
+		OpIndex:       f.OpIndex,
 		FromLedger:    f.FromLedger,
 		ToLedger:      f.ToLedger,
 		FromTime:      timeOrEmpty(f.FromTime),
@@ -1560,6 +1698,10 @@ func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 	w.WriteHeader(http.StatusNotModified)
 }
 
+// ptr returns a pointer to v. Used for the tri-state query params
+// (nil = unset) where a bare &true is not valid Go.
+func ptr[T any](v T) *T { return &v }
+
 // filterFromQuery parses the shared event-filter query params:
 // contract_id, type, topic, from_ledger, to_ledger, from_time, to_time, cursor, limit.
 //
@@ -1569,42 +1711,6 @@ func writeNotModified(w http.ResponseWriter, etag string, kind cacheability) {
 // remembering to attach it. A handler that hand-rolled an EventFilter
 // instead would get the zero Scope and return nothing — see store.Scope for
 // why that is the failure mode we chose.
-func filterFromQuery(r *http.Request) (store.EventFilter, error) {
-	q := r.URL.Query()
-	f := store.EventFilter{
-		ContractID: q.Get("contract_id"),
-		Cursor:     q.Get("cursor"),
-		TxHash:     q.Get("tx_hash"),
-		Scope:      scopeFrom(r.Context()),
-	}
-
-	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
-		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
-	}
-	// An explicitly named contract the tenant lacks is refused rather than
-	// quietly filtered to nothing, so a missing grant is distinguishable
-	// from a contract with no events. The store still ANDs the scope into
-	// the query regardless, so this check being wrong or removed downgrades
-	// the error message without opening a leak.
-	if f.ContractID != "" && !f.Scope.Allows(f.ContractID) {
-		return f, errForbiddenContract{contractID: f.ContractID}
-	}
-
-	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
-		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
-	}
-
-	if raw := q.Get("type"); raw != "" {
-		for _, t := range strings.Split(raw, ",") {
-			t = strings.TrimSpace(t)
-			switch t {
-			case "contract", "system", "diagnostic":
-			default:
-				return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
-			}
-			f.Types = append(f.Types, t)
-		}
-	}
 // The parsing rules and validation live in the shared queries package so
 // the GraphQL resolvers in internal/api/graphql can reuse them — there is
 // exactly one source of truth for which topic positions are valid, what
@@ -1662,23 +1768,57 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return store.EventFilter{}, err
 	}
 
+	// contract_ids is a comma-separated list of contract IDs. When present,
+	// each element must be a valid contract strkey. The empty string (no
+	// parameter) or a single value without commas behave identically to the
+	// original ?contract_id= — no breaking change to existing callers.
+	var contractIDs []string
+	if raw := q.Get("contract_id"); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			// The doc comment above promises each element is a valid
+			// contract strkey; enforce it rather than passing a typo
+			// through to a query that silently matches nothing.
+			if !config.ValidContractID(part) {
+				return store.EventFilter{}, fmt.Errorf("invalid contract_id %q", part)
+			}
+			contractIDs = append(contractIDs, part)
+		}
+	}
+	// Backward compatibility: a single contract_id without commas still
+	// sets ContractID so existing callers (handleContractEvents, GraphQL)
+	// are unaffected. When multiple IDs are given, ContractID is left empty
+	// and ContractIDs carries the full list.
+	var singleID string
+	if len(contractIDs) == 1 {
+		singleID = contractIDs[0]
+		contractIDs = nil
+	}
+
 	args := queries.EventFilterArgs{
-		ContractID:    q.Get("contract_id"),
-		Types:         types,
-		Topic:         topic,
-		T0:            t0,
-		T1:            t1,
-		T2:            t2,
-		T3:            t3,
-		TopicContains: tc,
-		TxHash:        q.Get("tx_hash"),
-		FromLedger:    fromLedger,
-		ToLedger:      toLedger,
-		FromTime:      fromTime,
-		ToTime:        toTime,
-		Order:         q.Get("order"),
-		OrderBy:       q.Get("order_by"),
-		Cursor:        q.Get("cursor"),
+		// singleID, not the raw param: a lone contract_id keeps the
+		// historical single-ID behaviour, while a comma-separated list is
+		// carried by ContractIDs below.
+		ContractID:       singleID,
+		ContractIDPrefix: q.Get("contract_id_prefix"),
+		Types:            types,
+		Topic:            topic,
+		T0:               t0,
+		T1:               t1,
+		T2:               t2,
+		T3:               t3,
+		TopicContains:    tc,
+		TxHash:           q.Get("tx_hash"),
+		FromLedger:       fromLedger,
+		ToLedger:         toLedger,
+		FromTime:         fromTime,
+		ToTime:           toTime,
+		Order:            q.Get("order"),
+		OrderBy:          q.Get("order_by"),
+		Cursor:           q.Get("cursor"),
 	}
 
 	// ?limit=N: explicit validation here so an explicit `?limit=0` (or
@@ -1698,12 +1838,43 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	if err != nil {
 		return f, err
 	}
-	if !f.FromTime.IsZero() && !f.ToTime.IsZero() && f.FromTime.After(f.ToTime) {
-		return f, fmt.Errorf("from_time %s is after to_time %s",
-			f.FromTime.Format(time.RFC3339), f.ToTime.Format(time.RFC3339))
+	// ContractIDs is set outside EventFilterArgs because the shared queries
+	// package (used by GraphQL) has no multi-ID concept yet; the store
+	// turns a non-empty list into `contract_id = ANY($N)`.
+	f.ContractIDs = contractIDs
+
+	// Scope is attached here, the single place REST list filters are built:
+	// queries.BuildEventFilter is shared with the GraphQL resolvers and
+	// deliberately knows nothing about HTTP authentication.
+	f.Scope = scopeFrom(r.Context())
+
+	// An explicitly named contract the tenant lacks is refused rather than
+	// quietly filtered to nothing, so a missing grant is distinguishable
+	// from a contract with no events. The store still ANDs the scope into
+	// the query regardless, so this check being wrong or removed downgrades
+	// the error message without opening a leak.
+	if f.ContractID != "" && !f.Scope.Allows(f.ContractID) {
+		return f, errForbiddenContract{contractID: f.ContractID}
 	}
 
-	f.TxHash = q.Get("tx_hash")
+	if f.Cursor != "" && !config.ValidCursor(f.Cursor) {
+		return f, fmt.Errorf("invalid cursor %q", f.Cursor)
+	}
+
+	if rawTx := q.Get("tx_index"); rawTx != "" {
+		txIdx, err := strconv.Atoi(rawTx)
+		if err != nil || txIdx < 0 {
+			return f, fmt.Errorf("invalid tx_index %q (want a non-negative integer)", rawTx)
+		}
+		f.TxIndex = ptr(int32(txIdx))
+	}
+	if rawOp := q.Get("op_index"); rawOp != "" {
+		opIdx, err := strconv.Atoi(rawOp)
+		if err != nil || opIdx < 0 {
+			return f, fmt.Errorf("invalid op_index %q (want a non-negative integer)", rawOp)
+		}
+		f.OpIndex = ptr(int32(opIdx))
+	}
 
 	switch raw := q.Get("in_successful_call"); raw {
 	case "":
@@ -1985,4 +2156,94 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	// found" for an event that briefly aged out but never came back.
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, status, errorResponse{Error: err.Error()})
+}
+
+// handleAnalyticsEvents serves GET /analytics/events.
+// Query params: bucket (hour|day, default hour), contract_id, type,
+// from, to (ISO-8601 UTC timestamps). Returns time-bucketed event counts.
+func (s *Server) handleAnalyticsEvents(w http.ResponseWriter, r *http.Request) {
+	filter, err := analyticsFilterFromQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	buckets, err := s.store.QueryAnalyticsEvents(r.Context(), filter)
+	if err != nil {
+		s.log.Error("querying analytics events", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("querying analytics events failed"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"buckets": buckets})
+}
+
+// handleAnalyticsTokenVolume serves GET /analytics/token-volume.
+// Query params: bucket (hour|day, default hour), contract_id, from, to.
+// Returns time-bucketed transfer volume and unique-address counts.
+// Populated only when the ingester recognizes SEP-41 transfer-shaped
+// events (gated on #1).
+func (s *Server) handleAnalyticsTokenVolume(w http.ResponseWriter, r *http.Request) {
+	filter, err := analyticsFilterFromQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	// Type filter doesn't apply to token volume.
+	filter.Type = ""
+	buckets, err := s.store.QueryAnalyticsTokenVolume(r.Context(), filter)
+	if err != nil {
+		s.log.Error("querying analytics token volume", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("querying analytics token volume failed"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"buckets": buckets})
+}
+
+// analyticsFilterFromQuery parses shared analytics query params:
+// bucket, contract_id, type, from, to.
+func analyticsFilterFromQuery(r *http.Request) (store.AnalyticsFilter, error) {
+	q := r.URL.Query()
+	f := store.AnalyticsFilter{
+		ContractID: q.Get("contract_id"),
+		Type:       q.Get("type"),
+	}
+
+	if f.ContractID != "" && !config.ValidContractID(f.ContractID) {
+		return f, fmt.Errorf("invalid contract_id %q", f.ContractID)
+	}
+
+	switch t := q.Get("type"); t {
+	case "", "contract", "system", "diagnostic":
+		f.Type = t
+	default:
+		return f, fmt.Errorf("invalid type %q (want contract|system|diagnostic)", t)
+	}
+
+	bucket := q.Get("bucket")
+	switch bucket {
+	case "", "hour":
+		f.Bucket = "hour"
+	case "day":
+		f.Bucket = "day"
+	default:
+		return f, fmt.Errorf("invalid bucket %q (want hour or day)", bucket)
+	}
+
+	var err error
+	if from := q.Get("from"); from != "" {
+		f.From, err = time.Parse(time.RFC3339, from)
+		if err != nil {
+			return f, fmt.Errorf("invalid from timestamp %q (want RFC 3339)", from)
+		}
+	}
+	if to := q.Get("to"); to != "" {
+		f.To, err = time.Parse(time.RFC3339, to)
+		if err != nil {
+			return f, fmt.Errorf("invalid to timestamp %q (want RFC 3339)", to)
+		}
+	}
+	if !f.From.IsZero() && !f.To.IsZero() && !f.From.Before(f.To) {
+		return f, fmt.Errorf("from %s is not before to %s", f.From.Format(time.RFC3339), f.To.Format(time.RFC3339))
+	}
+
+	return f, nil
 }

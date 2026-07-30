@@ -122,12 +122,19 @@ func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest)
 
 // mockStore is an in-memory Store.
 type mockStore struct {
+	// Embedded so the mock keeps satisfying store.Store as the
+	// interface grows; unstubbed methods panic if a test calls them.
+	store.Store
+
 	mu          sync.Mutex
 	events      map[string]store.Event
 	state       *store.IngestionState
 	watched     []store.WatchedContract
 	upserted    [][]store.Event
 	deadLetters []store.DeadLetterInput
+	// ingestErr, when set, is returned by GetIngestionState so tests can
+	// exercise the ingester's error path.
+	ingestErr error
 }
 
 func newMockStore() *mockStore {
@@ -200,6 +207,10 @@ func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Eve
 
 func (m *mockStore) CountEvents(context.Context, store.EventFilter) (int64, error) {
 	return 0, nil
+}
+
+func (m *mockStore) AggregateEvents(context.Context, store.EventFilter, string) ([]store.AggregateBucket, error) {
+	return nil, nil
 }
 
 // LedgerRangeCensus is unused by ingester tests but needed to satisfy
@@ -277,13 +288,15 @@ func (m *mockStore) MigrationVersion(context.Context) (int, bool, error) {
 	return 9, false, nil
 }
 
-func (m *mockStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
-func (m *mockStore) Ping(context.Context) error                 { return nil }
 func (m *mockStore) Stats(context.Context, store.Scope) (store.Stats, error) {
 	return store.Stats{}, nil
 }
 func (m *mockStore) Ping(context.Context) error { return nil }
 
+func (m *mockStore) QueryAnalyticsEvents(context.Context, store.AnalyticsFilter) ([]store.AnalyticsEventBucket, error) {
+	return nil, nil
+}
+func (m *mockStore) QueryAnalyticsTokenVolume(context.Context, store.AnalyticsFilter) ([]store.AnalyticsTokenVolume, error) {
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
 }
@@ -346,4 +359,18 @@ type passthroughDecoder struct{}
 
 func (passthroughDecoder) DecodeScVal(string) (json.RawMessage, error) {
 	return json.RawMessage(`"decoded"`), nil
+}
+
+// DeleteEventsBefore satisfies store.Store; this mock never prunes.
+func (m *mockStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}
+
+func (m *mockStore) UpsertAddressRefs(context.Context, []store.AddressRef) error { return nil }
+func (m *mockStore) QueryAddressEvents(context.Context, string, store.EventFilter) ([]store.Event, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) CountAddressEvents(context.Context, string) (int64, error) { return 0, nil }
+func (m *mockStore) GetAddressSummary(context.Context, string) (store.AddressSummary, error) {
+	return store.AddressSummary{}, nil
 }

@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -118,6 +117,10 @@ func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest)
 // for the auditor. It mirrors and extends the ingester test mock so we
 // don't import the ingester test package.
 type mockStore struct {
+	// Embedded so the mock keeps satisfying store.Store as the
+	// interface grows; unstubbed methods panic if a test calls them.
+	store.Store
+
 	mu sync.Mutex
 
 	events map[string]store.Event
@@ -215,6 +218,10 @@ func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Eve
 
 func (m *mockStore) CountEvents(context.Context, store.EventFilter) (int64, error) {
 	return 0, nil
+}
+
+func (m *mockStore) AggregateEvents(context.Context, store.EventFilter, string) ([]store.AggregateBucket, error) {
+	return nil, nil
 }
 
 func (m *mockStore) LedgerRangeCensus(_ context.Context, from, to int64, idsOnly bool) ([]store.LedgerCensus, error) {
@@ -379,6 +386,10 @@ func (m *mockStore) MigrationVersion(context.Context) (int, bool, error) {
 
 func (m *mockStore) Ping(context.Context) error { return nil }
 
+func (m *mockStore) QueryAnalyticsEvents(context.Context, store.AnalyticsFilter) ([]store.AnalyticsEventBucket, error) {
+	return nil, nil
+}
+func (m *mockStore) QueryAnalyticsTokenVolume(context.Context, store.AnalyticsFilter) ([]store.AnalyticsTokenVolume, error) {
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
 }
@@ -468,3 +479,12 @@ func (m *mockStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, err
 	return store.DeadLetter{}, store.ErrNotFound
 }
 func (m *mockStore) DeleteDeadLetter(context.Context, int64) error { return nil }
+
+func (m *mockStore) UpsertAddressRefs(context.Context, []store.AddressRef) error { return nil }
+func (m *mockStore) QueryAddressEvents(context.Context, string, store.EventFilter) ([]store.Event, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) CountAddressEvents(context.Context, string) (int64, error) { return 0, nil }
+func (m *mockStore) GetAddressSummary(context.Context, string) (store.AddressSummary, error) {
+	return store.AddressSummary{}, nil
+}
