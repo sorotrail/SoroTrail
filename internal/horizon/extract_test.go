@@ -5,11 +5,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stellar/go/xdr"
+	"github.com/stellar/go-stellar-sdk/xdr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/khaylebfortune/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/decode"
 )
 
 // scSymbol / scAddress / scU64 / scVec / buildContractEvent produce

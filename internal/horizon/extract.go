@@ -27,10 +27,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/stellar/go/xdr"
+	"github.com/stellar/go-stellar-sdk/xdr"
 
-	"github.com/khaylebfortune/sorotrail/internal/decode"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // Extracted is one transaction's slice of events plus a small audit
