@@ -8,8 +8,8 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 func testLogger() *slog.Logger {
@@ -66,11 +66,17 @@ func (m *mockRPC) GetLedgerEntries(_ context.Context, _ rpc.GetLedgerEntriesRequ
 }
 
 type mockStore struct {
-	mu       sync.Mutex
-	events   map[string]store.Event
-	ingress  store.IngestionState
-	audit    store.AuditState
-	watched  []store.WatchedContract
+	// Embedded so the mock keeps satisfying store.Store as the
+	// interface grows; unstubbed methods panic if a test calls them.
+	store.Store
+
+	mu sync.Mutex
+
+	events map[string]store.Event
+
+	ingestionState *store.IngestionState
+	auditState     *store.AuditState
+
 	findings []store.AuditFinding
 	nextFID  int64
 }
@@ -123,7 +129,18 @@ func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event
 	return nil
 }
 
-func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) {
+// EventExists mirrors GetEvent but stops at presence — the auditor's
+// interface compliance is enough for the cache layer's needs.
+func (m *mockStore) EventExists(_ context.Context, id string, _ store.Scope) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.events[id]; !ok {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (m *mockStore) GetEvent(_ context.Context, id string, _ store.Scope) (store.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.events[id]
@@ -133,18 +150,31 @@ func (m *mockStore) GetEvent(_ context.Context, id string) (store.Event, error) 
 	return e, nil
 }
 
-func (m *mockStore) EventExists(_ context.Context, id string) (bool, error) {
+func (m *mockStore) GetEventsByTxHash(_ context.Context, txHash, excludeID string) ([]store.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_, ok := m.events[id]
-	return ok, nil
+	var out []store.Event
+	for _, e := range m.events {
+		if e.TxHash == txHash && e.ID != excludeID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 func (m *mockStore) QueryEvents(context.Context, store.EventFilter) ([]store.Event, string, error) {
 	return nil, "", nil
 }
 
-func (m *mockStore) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]store.LedgerCensus, error) {
+func (m *mockStore) CountEvents(context.Context, store.EventFilter) (int64, error) {
+	return 0, nil
+}
+
+func (m *mockStore) AggregateEvents(context.Context, store.EventFilter, string) ([]store.AggregateBucket, error) {
+	return nil, nil
+}
+
+func (m *mockStore) LedgerRangeCensus(_ context.Context, from, to int64, idsOnly bool) ([]store.LedgerCensus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	byLedger := map[int64][]string{}
@@ -264,12 +294,20 @@ func (m *mockStore) ListOpenFindingsByRange(_ context.Context, _ string, from, t
 	return store.AuditFinding{}, store.ErrNotFound
 }
 
-func (m *mockStore) Stats(_ context.Context, _ string) (store.Stats, error) {
+func (m *mockStore) Stats(context.Context, store.Scope) (store.Stats, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var s store.Stats
 	s.TotalEvents = int64(len(m.events))
 	return s, nil
+}
+
+func (m *mockStore) DeleteEventsBeforeLedger(context.Context, int64) (int64, error) {
+	return 0, nil
+}
+
+func (m *mockStore) MigrationVersion(context.Context) (int, bool, error) {
+	return 9, false, nil
 }
 
 func (m *mockStore) Ping(context.Context) error { return nil }
@@ -283,16 +321,18 @@ func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription
 	sub.ID = 1
 	return sub, nil
 }
-func (m *mockStore) GetSubscription(context.Context, int64) (store.Subscription, error) {
+func (m *mockStore) GetSubscription(_ context.Context, id int64, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return store.Subscription{}, store.ErrNotFound
 }
-func (m *mockStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
+func (m *mockStore) ListSubscriptions(context.Context, store.SubscriptionOwner) ([]store.Subscription, error) {
 	return nil, nil
 }
-func (m *mockStore) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+func (m *mockStore) UpdateSubscription(_ context.Context, sub store.Subscription, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return sub, nil
 }
-func (m *mockStore) DeleteSubscription(context.Context, int64) error { return nil }
+func (m *mockStore) DeleteSubscription(context.Context, int64, store.SubscriptionOwner) error {
+	return nil
+}
 func (m *mockStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
 	return nil, nil
 }
@@ -304,7 +344,7 @@ func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 	a.ID = 1
 	return a, nil
 }
-func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
+func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int, store.SubscriptionOwner) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
 
@@ -326,4 +366,30 @@ func (m *mockStore) UpsertTokenBalanceState(ctx context.Context, state store.Tok
 
 func (m *mockStore) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {
 	return 0, nil
+}
+
+func (m *mockStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
+	return 0, nil
+}
+func (m *mockStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
+	return store.DeadLetter{}, nil
+}
+func (m *mockStore) ListDeadLetters(context.Context, string, int, string) ([]store.DeadLetter, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, error) {
+	return store.DeadLetter{}, store.ErrNotFound
+}
+func (m *mockStore) DeleteDeadLetter(context.Context, int64) error { return nil }
+
+func (m *mockStore) UpsertAddressRefs(context.Context, []store.AddressRef) error { return nil }
+func (m *mockStore) QueryAddressEvents(context.Context, string, store.EventFilter) ([]store.Event, string, error) {
+	return nil, "", nil
+}
+func (m *mockStore) CountAddressEvents(context.Context, string) (int64, error) { return 0, nil }
+func (m *mockStore) GetAddressSummary(context.Context, string) (store.AddressSummary, error) {
+	return store.AddressSummary{}, nil
 }

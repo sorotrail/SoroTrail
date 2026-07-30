@@ -11,10 +11,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/khaylebfortune/sorotrail/internal/config"
-	"github.com/khaylebfortune/sorotrail/internal/decode"
-	"github.com/khaylebfortune/sorotrail/internal/replay"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/replay"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // runReplay implements `sorotrail replay`: re-run the current decoder over
@@ -64,7 +64,7 @@ flags:
 	if err != nil {
 		return err
 	}
-	log := newLogger(cfg.LogLevel)
+	log := newLogger(cfg.LogLevel, cfg.LogFormat)
 
 	// Ctrl-C stops between batches rather than killing the process, so the
 	// in-flight transaction rolls back cleanly and progress stays consistent.
