@@ -348,40 +348,24 @@ func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int, store.Subs
 	return nil, nil
 }
 
-// seedLedgers records pre-existing events in m.events so tests can set up
-// "stored state that diverges from the RPC" without a database. IDs use
-// the same %020d-%05d format as mkEvents, so seeded events and RPC
-// events are comparable by id.
-func (m *mockStore) seedLedgers(ledgers []int, contractID string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, l := range ledgers {
-		id := fmt.Sprintf("%020d-00000", l)
-		m.events[id] = store.Event{
-			ID:         id,
-			ContractID: contractID,
-			Ledger:     int64(l),
-			Type:       "contract",
-		}
-	}
+func (m *mockStore) UpsertTokenBalances(ctx context.Context, network string, state store.TokenBalanceState, updates []store.TokenBalanceUpdate) error {
+	return nil
 }
 
-// mkEvents constructs `count` rpc.Event objects with stable IDs for ledger.
-// IDs use the same %020d-%05d format the auditor compares against, so seeded
-// events and RPC events align.
-func mkEvents(ledger uint32, count int, contractID string) []rpc.Event {
-	out := make([]rpc.Event, count)
-	for i := 0; i < count; i++ {
-		id := fmt.Sprintf("%020d-%05d", ledger, i)
-		out[i] = rpc.Event{
-			ID:         id,
-			ContractID: contractID,
-			TxHash:     "deadbeef",
-			Type:       "contract",
-			Ledger:     ledger,
-		}
-	}
-	return out
+func (m *mockStore) GetTokenBalances(ctx context.Context, contractID, network, minBalance string, cursor string, limit int) ([]store.TokenBalance, string, error) {
+	return nil, "", nil
+}
+
+func (m *mockStore) GetTokenBalanceState(ctx context.Context, network, contractID string) (store.TokenBalanceState, error) {
+	return store.TokenBalanceState{}, store.ErrNotFound
+}
+
+func (m *mockStore) UpsertTokenBalanceState(ctx context.Context, state store.TokenBalanceState) error {
+	return nil
+}
+
+func (m *mockStore) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {
+	return 0, nil
 }
 
 func (m *mockStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {

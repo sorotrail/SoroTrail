@@ -36,6 +36,15 @@ import (
 	"github.com/sorotrail/sorotrail/internal/webhook"
 )
 
+// compositeNotifier fans out to multiple EventNotifiers.
+type compositeNotifier []ingester.EventNotifier
+
+func (n compositeNotifier) NotifyEvents(ctx context.Context, events []store.Event) {
+	for _, notifier := range n {
+		notifier.NotifyEvents(ctx, events)
+	}
+}
+
 var errInterrupted = errors.New("interrupted")
 
 func main() {
@@ -323,6 +332,10 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
+	// Wire spec enricher for the API using the first network's fetcher.
+	firstSpecFetcher := spec.NewFetcher(ingesters[0].rpc)
+	firstSpecEnricher := spec.NewEnricher(firstSpecFetcher, specCache, log)
+
 	// Guarded store for API-originated reads with timeout and slow-query logging.
 	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
 		Timeout:            cfg.APIQueryTimeout,
@@ -532,4 +545,11 @@ func newLogger(level, format string) *slog.Logger {
 // keeps the route wiring in main.go one line wide.
 func graphqlServerDeps(st store.Store, enricher api.Enricher) api.ServerDeps {
 	return api.ServerDeps{Store: st, Enricher: enricher}
+}
+
+func rpcURLsForLog(cfg config.Config) []string {
+	if len(cfg.RPCURLS) > 0 {
+		return cfg.RPCURLS
+	}
+	return []string{cfg.RPCURL}
 }

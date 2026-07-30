@@ -412,7 +412,40 @@ func ValidContractID(s string) bool {
 		return false
 	}
 	for _, r := range s[1:] {
-		if (r < 'A' || r > 'Z') && (r < '2' || r > '7') {
+		if !strings.ContainsRune("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", r) {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidCursor reports whether s is a valid pagination cursor.
+// A cursor must be non-empty, at most 128 characters, and consist only of
+// alphanumeric characters, hyphens, underscores, dots, or colons.
+func ValidCursor(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	for _, r := range s {
+		if !strings.ContainsRune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:", r) {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidCursor reports whether s is a valid pagination cursor.
+// A cursor must be non-empty, at most 128 characters, and consist only of
+// alphanumeric characters, hyphens, underscores, dots, or colons.
+func ValidCursor(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	for _, r := range s {
+		if (r < 'a' || r > 'z') &&
+			(r < 'A' || r > 'Z') &&
+			(r < '0' || r > '9') &&
+			r != '-' && r != '_' && r != '.' && r != ':' {
 			return false
 		}
 	}

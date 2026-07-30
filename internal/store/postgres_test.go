@@ -1,12 +1,15 @@
+//go:build integration
+
 package store
 
-// Integration tests for the Postgres store. They need a real database and
-// are skipped unless TEST_DATABASE_URL is set, e.g.:
+// Integration tests for the Postgres store. Gated behind the `integration`
+// build tag so `go test ./...` stays fast; run via `make test-integration`
+// or with `go test -tags=integration ./...`. The runner must provide a
+// Postgres reachable via TEST_DATABASE_URL (or testcontainers-go will start
+// one — see CONTRIBUTING.md).
 //
-//	docker compose up -d postgres
-//	make test-db
-//
-// Each run migrates the schema and truncates the tables it touches.
+// Each run migrates the schema via store.Migrate and truncates the
+// tables it touches. -p 1 keeps packages from racing on the same DB.
 
 import (
 	"context"

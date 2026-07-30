@@ -236,6 +236,13 @@ func (s *Server) SetCORSConfig(cfg CORSConfig) { s.cors = cfg }
 
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
+	return s.router()
+}
+
+// router builds the chi router with middleware and all routes. Returned
+// as chi.Router (not http.Handler) so tests can walk the route tree with
+// chi.Walk to verify spec coverage.
+func (s *Server) router() chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
@@ -270,6 +277,7 @@ func (s *Server) Router() http.Handler {
 	// Non-list routes: health, metrics, writes — responses are always
 	// small, so compression is just overhead with no benefit.
 	r.Get("/health", s.handleHealth)
+	r.Get("/metrics", s.handleMetrics)
 	r.Get("/livez", s.handleLivez)
 	r.Get("/readyz", s.handleReadyz)
 	r.Get("/version", s.handleVersion)
@@ -391,6 +399,22 @@ func (s *Server) Router() http.Handler {
 	r.Get("/addresses/{address}/summary", s.handleAddressSummary)
 
 	return r
+}
+
+// handleOpenAPI serves the embedded OpenAPI 3.1 specification.
+func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(openapiSpec)
+}
+
+// handleDocs serves the Swagger UI page that renders /openapi.json.
+func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(swaggerUI))
 }
 
 func (s *Server) requestLogger(next http.Handler) http.Handler {

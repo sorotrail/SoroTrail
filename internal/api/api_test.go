@@ -30,10 +30,6 @@ type stubStore struct {
 	lastFilter store.EventFilter
 	nextCursor string
 
-	stats      store.Stats
-	ingState   store.IngestionState
-	stateErr   error
-
 	totalCount      int64
 	countEventsErr  error
 	lastCountFilter store.EventFilter
@@ -199,6 +195,13 @@ func (s *stubStore) EventExists(_ context.Context, id string, _ store.Scope) (bo
 	return s.exists, s.existsErr
 }
 
+func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
+	return nil, store.ErrNotFound
+}
+func (s *stubStore) SetContractSpec(context.Context, string, string, []byte) error {
+	return nil
+}
+
 // GetIngestionState backs the list-cache frontier lookup. Tests stage
 // LastIngestedLedger to drive the boundary decisions (just-below, at,
 // and above the frontier).
@@ -287,6 +290,26 @@ func (s *stubStore) RecordDeliveryAttempt(ctx context.Context, a store.DeliveryA
 }
 func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int, store.SubscriptionOwner) ([]store.DeliveryAttempt, error) {
 	return nil, nil
+}
+
+func (s *stubStore) UpsertTokenBalances(ctx context.Context, network string, state store.TokenBalanceState, updates []store.TokenBalanceUpdate) error {
+	return nil
+}
+
+func (s *stubStore) GetTokenBalances(ctx context.Context, contractID, network, minBalance string, cursor string, limit int) ([]store.TokenBalance, string, error) {
+	return nil, "", nil
+}
+
+func (s *stubStore) GetTokenBalanceState(ctx context.Context, network, contractID string) (store.TokenBalanceState, error) {
+	return store.TokenBalanceState{}, store.ErrNotFound
+}
+
+func (s *stubStore) UpsertTokenBalanceState(ctx context.Context, state store.TokenBalanceState) error {
+	return nil
+}
+
+func (s *stubStore) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {
+	return 0, nil
 }
 
 type stubRPC struct {
@@ -455,6 +478,7 @@ func TestListEvents_BadParams(t *testing.T) {
 		"/events?from_time=2026-07-21T00:00:00",
 		"/events?from_time=2026-07-21T00:00:00.123Z",
 		"/events?from_time=2026-07-22T00:00:00Z&to_time=2026-07-21T00:00:00Z",
+		// #223: limit must be a positive integer <= MaxQueryLimit.
 		"/events?limit=0",
 		"/events?limit=-1",
 		"/events?limit=99999",

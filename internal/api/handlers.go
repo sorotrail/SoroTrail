@@ -18,6 +18,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 
+	"github.com/khaylebfortune/sorotrail/internal/config"
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
+	"github.com/khaylebfortune/sorotrail/internal/store"
 	"github.com/sorotrail/sorotrail/internal/api/queries"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
@@ -260,6 +263,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, resp)
 }
 
+// handleMetrics serves the Prometheus /metrics endpoint. The response is
+// always cacheNoStore so scrapers never see a stale snapshot.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	metrics.Handler().ServeHTTP(w, r)
 // handleDeleteEvents is the admin-only bulk delete endpoint. It deletes all
 // events whose ledger is strictly less than the ?before_ledger= query parameter.
 // The endpoint is protected by apiKeyAuth middleware (same as watched-contracts).
@@ -893,7 +901,6 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	event.WithSEP41()
 
 	decoded := r.URL.Query().Get("decoded") == "true"
-	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 	if decoded && s.enricher != nil {
 		enriched := s.enricher.EnrichEvents(r.Context(), []store.Event{event})
 		if len(enriched) > 0 {
@@ -1896,6 +1903,78 @@ func (s *Server) syncStreamScope(ctx context.Context, sub *broadcast.Subscriptio
 			}
 		}
 	}()
+}
+
+// Holders endpoint types.
+
+type holderResponse struct {
+	Address    string `json:"address"`
+	Balance    string `json:"balance"`
+	LastLedger int64  `json:"last_ledger"`
+}
+
+type holdersResponse struct {
+	ContractID     string           `json:"contract_id"`
+	EarliestLedger int64            `json:"earliest_ledger"`
+	Holders        []holderResponse `json:"holders"`
+	Cursor         string           `json:"cursor,omitempty"`
+}
+
+func (s *Server) handleContractHolders(w http.ResponseWriter, r *http.Request) {
+	contractID := chi.URLParam(r, "id")
+	if !config.ValidContractID(contractID) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid contract ID %q", contractID))
+		return
+	}
+
+	network, err := s.resolveNetwork(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	minBalance := r.URL.Query().Get("min_balance")
+	cursor := r.URL.Query().Get("cursor")
+	limit := store.DefaultQueryLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > store.MaxQueryLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
+			return
+		}
+		limit = parsed
+	}
+
+	// Determine the earliest ledger for coverage indication.
+	earliestLedger, err := s.store.GetEarliestLedger(r.Context(), network, contractID)
+	if err != nil {
+		// non-fatal; surface as 0 to indicate unknown coverage
+		loggerFromContext(r.Context()).Warn("getting earliest ledger", "contract_id", contractID, "error", err)
+	}
+
+	balances, next, err := s.store.GetTokenBalances(r.Context(), contractID, network, minBalance, cursor, limit)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("querying token holders", "contract_id", contractID, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("querying token holders failed"))
+		return
+	}
+
+	holders := make([]holderResponse, len(balances))
+	for i, tb := range balances {
+		holders[i] = holderResponse{
+			Address:    tb.Address,
+			Balance:    tb.Balance,
+			LastLedger: tb.LastLedger,
+		}
+	}
+
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, holdersResponse{
+		ContractID:     contractID,
+		EarliestLedger: earliestLedger,
+		Holders:        holders,
+		Cursor:         next,
+	})
 }
 
 func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
