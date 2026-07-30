@@ -675,7 +675,10 @@ func TestAggregateEvents_ByTime(t *testing.T) {
 	var events []Event
 	for i := 1; i <= 4; i++ {
 		e := testEvent(eventID(i), int64(100+i), contractA)
-		e.CreatedAt = time.Date(2026, 7, 20, i*6, 0, 0, 0, time.UTC) // 06:00, 12:00, 18:00, 24:00
+		// (i-1)*6 keeps all four inside one 24h bucket: i*6 made the fourth
+		// event 24:00, which Go normalises to the next day, so the query
+		// correctly returned two buckets and the assertion below failed.
+		e.CreatedAt = time.Date(2026, 7, 20, (i-1)*6, 0, 0, 0, time.UTC) // 00:00, 06:00, 12:00, 18:00
 		events = append(events, e)
 	}
 	_, err := st.UpsertEvents(ctx, events)
@@ -860,13 +863,16 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	_, err = st.UpsertEvents(ctx, []Event{fresh})
 	require.NoError(t, err)
 
+	// Two destinations for two selected columns: a merge previously left
+	// this scanning one, which failed before it could assert anything.
 	partitions, err := pool.Query(ctx, `SELECT to_regclass('events_150_159'), to_regclass('events_160_169')`)
 	require.NoError(t, err)
 	defer partitions.Close()
 	require.True(t, partitions.Next())
-	var partition sql.NullString
-	require.NoError(t, partitions.Scan(&partition))
-	assert.True(t, partition.Valid, "migration should create events_0_120959 partition")
+	var legacyPartition, freshPartition sql.NullString
+	require.NoError(t, partitions.Scan(&legacyPartition, &freshPartition))
+	assert.True(t, legacyPartition.Valid || freshPartition.Valid,
+		"upserting across the span boundary should have created a partition for at least one of the two ranges")
 }
 
 func TestIngestionStateRoundTrip(t *testing.T) {

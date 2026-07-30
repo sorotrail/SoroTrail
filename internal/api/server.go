@@ -289,7 +289,10 @@ func (s *Server) Router() http.Handler {
 	r.Get("/livez", s.handleLivez)
 	r.Get("/readyz", s.handleReadyz)
 	r.Get("/version", s.handleVersion)
-	r.Handle("/metrics", s.metrics.Handler())
+	// Registered as GET, not Handle: Handle advertises every method (the
+	// route-drift test then demands CONNECT/TRACE entries in the OpenAPI
+	// spec), and scraping is a GET.
+	r.Get("/metrics", s.metrics.Handler().ServeHTTP)
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/count", s.handleCountEvents)
 	r.Get("/events/aggregate", s.handleAggregateEvents)

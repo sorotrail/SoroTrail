@@ -308,7 +308,11 @@ func testWatchedContracts(t *testing.T, st Store) {
 
 	got, err := st.ListWatchedContracts(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, []string{contractA, contractB}, got)
+	ids := make([]string, 0, len(got))
+	for _, wc := range got {
+		ids = append(ids, wc.ContractID)
+	}
+	assert.Equal(t, []string{contractA, contractB}, ids)
 }
 
 func testStats(t *testing.T, st Store) {
