@@ -3,7 +3,6 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -108,7 +107,6 @@ type Config struct {
 	// responses are gzip/deflate encoded for clients that advertise support.
 	// Negative disables compression entirely; 0 uses api.CompressMinSize.
 	CompressMinSize int `env:"COMPRESS_MIN_SIZE" envDefault:"0"`
-
 
 	// EnableMetrics exposes the Prometheus /metrics endpoint.
 	EnableMetrics bool `env:"ENABLE_METRICS" envDefault:"false"`
@@ -432,42 +430,6 @@ func ValidCursor(s string) bool {
 	}
 	for _, r := range s {
 		if !strings.ContainsRune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:", r) {
-			return false
-		}
-	}
-	return true
-}
-
-// ValidCursor reports whether s is a valid pagination cursor.
-// A cursor must be non-empty, at most 128 characters, and consist only of
-// alphanumeric characters, hyphens, underscores, dots, or colons.
-func ValidCursor(s string) bool {
-	if len(s) == 0 || len(s) > 128 {
-		return false
-	}
-	for _, r := range s {
-		if (r < 'a' || r > 'z') &&
-			(r < 'A' || r > 'Z') &&
-			(r < '0' || r > '9') &&
-			r != '-' && r != '_' && r != '.' && r != ':' {
-			return false
-		}
-	}
-	return true
-}
-
-// ValidCursor reports whether s is a valid pagination cursor.
-// A cursor must be non-empty, at most 128 characters, and consist only of
-// alphanumeric characters, hyphens, underscores, dots, or colons.
-func ValidCursor(s string) bool {
-	if len(s) == 0 || len(s) > 128 {
-		return false
-	}
-	for _, r := range s {
-		if (r < 'a' || r > 'z') &&
-			(r < 'A' || r > 'Z') &&
-			(r < '0' || r > '9') &&
-			r != '-' && r != '_' && r != '.' && r != ':' {
 			return false
 		}
 	}

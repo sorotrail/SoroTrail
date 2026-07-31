@@ -8,6 +8,7 @@
 //	metrics.EventsIngested.Add(float64(len(events)))
 //	timer := prometheus.NewTimer(metrics.DBWriteLatency)
 //	defer timer.ObserveDuration()
+//
 // Package metrics exposes Prometheus metrics for the HTTP API, notably a
 // per-route request-duration histogram served at GET /metrics.
 package metrics
@@ -49,6 +50,16 @@ var (
 		Buckets: prometheus.DefBuckets,
 	})
 
+	// RPCCallDuration is the same measurement broken down by JSON-RPC
+	// method, so a slow getEvents is distinguishable from a slow
+	// getLatestLedger. Two collectors rather than one because the
+	// unlabeled histogram above is what NewTimer wraps.
+	RPCCallDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "sorotrail_rpc_call_duration_by_method_seconds",
+		Help:    "RPC call latency in seconds, labeled by JSON-RPC method.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"method"})
+
 	// DBWriteLatency records the wall-clock duration of a database write
 	// operation (batch upsert, replace-in-range, etc.).
 	DBWriteLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -71,6 +82,7 @@ func init() {
 		EventsIngested,
 		IngestErrors,
 		RPCCallLatency,
+		RPCCallDuration,
 		DBWriteLatency,
 		IngestionLag,
 	)
@@ -80,6 +92,8 @@ func init() {
 // Prometheus exposition format.
 func Handler() http.Handler {
 	return promhttp.Handler()
+}
+
 // unmatchedRoute labels requests that never reached a registered chi route
 // (404s from a totally unknown path). Falling back to r.URL.Path there
 // would let clients probing random paths grow the histogram's cardinality

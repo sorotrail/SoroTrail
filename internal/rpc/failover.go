@@ -452,23 +452,6 @@ func (fc *FailoverClient) GetLedgerEntries(ctx context.Context, req GetLedgerEnt
 	return resp, nil
 }
 
-func (fc *FailoverClient) SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error) {
-	p, idx, err := fc.pickProvider(ctx)
-	if err != nil {
-		return SimulateTransactionResponse{}, err
-	}
-	if err := p.waitLimiter(ctx); err != nil {
-		return SimulateTransactionResponse{}, err
-	}
-	resp, err := p.client.SimulateTransaction(ctx, req)
-	if err != nil {
-		fc.recordError(idx, err)
-		return resp, err
-	}
-	fc.recordSuccess(idx)
-	return resp, nil
-}
-
 // Compile-time check.
 var _ Client = (*FailoverClient)(nil)
 
