@@ -203,9 +203,9 @@ func (p *Postgres) attemptReconnect(ctx context.Context, logger *slog.Logger) er
 	return nil
 }
 
-func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) ([]Event, error) {
+func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
 	if len(events) == 0 {
-		return nil, nil
+		return 0, nil
 	}
 	return p.upsertEvents(ctx, events, false)
 }
@@ -278,7 +278,7 @@ func (p *Postgres) ensureEventPartitions(ctx context.Context, events []Event) er
 
 func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bool) (int64, error) {
 	if len(events) == 0 {
-		return nil, nil
+		return 0, nil
 	}
 	if err := p.ensureEventPartitions(ctx, events); err != nil {
 		return 0, err
