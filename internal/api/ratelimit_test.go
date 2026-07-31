@@ -12,6 +12,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // drive sends req through s.Router() via httptest and returns the result.
@@ -143,6 +145,51 @@ func TestRateLimit_HealthIsExempt(t *testing.T) {
 		rh := drive(t, s, mkReq(http.MethodGet, "/health"))
 		require.Equalf(t, http.StatusOK, rh.StatusCode,
 			"/health call %d must be exempt", i)
+		rh.Body.Close()
+	}
+}
+
+func TestRateLimit_HealthzIsExempt(t *testing.T) {
+	lim := NewRateLimiter(0.001, 1, false)
+	stop := startLimiter(t, lim)
+	t.Cleanup(stop)
+
+	s := newTestServer(&stubStore{}, nil)
+	s.SetRateLimiter(lim)
+
+	r0 := drive(t, s, mkReq(http.MethodGet, "/events"))
+	r0.Body.Close()
+	r1 := drive(t, s, mkReq(http.MethodGet, "/events"))
+	r1.Body.Close()
+	require.Equal(t, http.StatusTooManyRequests, r1.StatusCode, "sanity: bucket must be empty")
+
+	for i := 0; i < 10; i++ {
+		rh := drive(t, s, mkReq(http.MethodGet, "/livez"))
+		require.Equalf(t, http.StatusOK, rh.StatusCode,
+			"/healthz call %d must be exempt", i)
+		rh.Body.Close()
+	}
+}
+
+func TestRateLimit_ReadyzIsExempt(t *testing.T) {
+	lim := NewRateLimiter(0.001, 1, false)
+	stop := startLimiter(t, lim)
+	t.Cleanup(stop)
+
+	// /readyz checks DB + recent ingest, so provide a valid ingestion state.
+	s := newTestServer(&stubStore{ingestion: store.IngestionState{LastIngestedLedger: 1000}}, nil)
+	s.SetRateLimiter(lim)
+
+	r0 := drive(t, s, mkReq(http.MethodGet, "/events"))
+	r0.Body.Close()
+	r1 := drive(t, s, mkReq(http.MethodGet, "/events"))
+	r1.Body.Close()
+	require.Equal(t, http.StatusTooManyRequests, r1.StatusCode, "sanity: bucket must be empty")
+
+	for i := 0; i < 10; i++ {
+		rh := drive(t, s, mkReq(http.MethodGet, "/readyz"))
+		require.Equalf(t, http.StatusOK, rh.StatusCode,
+			"/readyz call %d must be exempt", i)
 		rh.Body.Close()
 	}
 }
