@@ -84,6 +84,11 @@ config:
   # Log verbosity: debug | info | warn | error
   logLevel: "info"
 
+  # Optional: comma-separated browser origins allowed to call the API.
+  # "*" allows any origin; otherwise list explicit origins (scheme + host).
+  # Empty = CORS disabled (no CORS headers emitted).
+  corsAllowedOrigins: ""
+
   # Per-client-IP rate limiting. Both rps and burst must be set to enable;
   # leaving either empty disables the middleware entirely.
   rateLimitRps: ""

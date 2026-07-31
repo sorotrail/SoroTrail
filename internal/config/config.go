@@ -61,6 +61,12 @@ type Config struct {
 	// intermediaries cannot. Defaults to false (the deployment does not
 	// need request-scoped caching).
 	CachePrivate bool `env:"CACHE_PRIVATE" envDefault:"false"`
+	// CORSAllowedOrigins lists the browser origins allowed to call the HTTP
+	// API. Comma-separated in CORS_ALLOWED_ORIGINS; "*" allows any origin,
+	// otherwise each entry must be an explicit scheme+host origin (e.g.
+	// https://app.example.com). Empty (the default) disables CORS entirely —
+	// the API emits no CORS headers, so existing deployments are unaffected.
+	CORSAllowedOrigins []string `env:"CORS_ALLOWED_ORIGINS"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -71,6 +77,7 @@ func Load() (Config, error) {
 	}
 	// env/v11 splits on "," but keeps empty entries and whitespace.
 	cfg.WatchedContracts = cleanContractList(cfg.WatchedContracts)
+	cfg.CORSAllowedOrigins = cleanOriginList(cfg.CORSAllowedOrigins)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -139,6 +146,11 @@ func (c Config) Validate() error {
 	if (c.RateLimitRPS > 0) != (c.RateLimitBurst > 0) {
 		return fmt.Errorf("RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
 	}
+	for _, origin := range c.CORSAllowedOrigins {
+		if !ValidOrigin(origin) {
+			return fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q is not a valid origin (want * or http(s)://host)", origin)
+		}
+	}
 	return nil
 }
 
@@ -152,6 +164,27 @@ func ValidContractID(s string) bool {
 		if (r < 'A' || r > 'Z') && (r < '2' || r > '7') {
 			return false
 		}
+	}
+	return true
+}
+
+// ValidOrigin reports whether s is a valid CORS origin: either the "*"
+// wildcard (allow any origin) or an absolute http/https URL whose host is
+// present and which carries no path, query, or fragment (browsers never
+// send those in the Origin header).
+func ValidOrigin(s string) bool {
+	if s == "*" {
+		return true
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return false
 	}
 	return true
 }
@@ -178,6 +211,19 @@ func cleanContractList(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
 		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// cleanOriginList trims whitespace, drops empties, and strips trailing
+// slashes so "https://example.com/" matches the Origin header browsers send
+// (which never carries a trailing slash).
+func cleanOriginList(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s = strings.TrimRight(strings.TrimSpace(s), "/"); s != "" {
 			out = append(out, s)
 		}
 	}

@@ -57,13 +57,14 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store    store.Store
-	rpc      rpc.Client
-	enricher Enricher
-	log      *slog.Logger
-	apiKey   string
-	limiter  *RateLimiter
-	bcast    *broadcast.Broadcaster
+	store       store.Store
+	rpc         rpc.Client
+	enricher    Enricher
+	log         *slog.Logger
+	apiKey      string
+	limiter     *RateLimiter
+	corsOrigins []string
+	bcast       *broadcast.Broadcaster
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -86,6 +87,13 @@ func (s *Server) SetRateLimiter(l *RateLimiter) {
 	s.limiter = l
 }
 
+// SetCORS configures the cross-origin allow-list (CORS_ALLOWED_ORIGINS).
+// Pass nil or an empty slice to leave CORS disabled (the default — the
+// router emits no CORS headers, so existing deployments are unaffected).
+func (s *Server) SetCORS(allowedOrigins []string) {
+	s.corsOrigins = allowedOrigins
+}
+
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
 // (SSE, WebSocket) can deliver events as they arrive.
 func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
@@ -98,6 +106,10 @@ func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
+	// CORS sits inside the request logger (so preflights are logged with
+	// their request ID) but outside Recoverer/Timeout (so its headers are
+	// set on the ResponseWriter before any of those can write a response).
+	r.Use(corsMiddleware(s.corsOrigins))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
 	if s.limiter != nil {

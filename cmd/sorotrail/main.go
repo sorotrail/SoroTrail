@@ -153,6 +153,7 @@ func run() error {
 
 	apiServer := api.New(st, rpcClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
+	apiServer.SetCORS(cfg.CORSAllowedOrigins)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -163,6 +164,9 @@ func run() error {
 		log.Warn("API_KEY env is unset; watched-contracts endpoints will reject every request with 503")
 	} else {
 		log.Info("watched-contracts endpoints are auth-gated")
+	}
+	if len(cfg.CORSAllowedOrigins) > 0 {
+		log.Info("cors enabled", "origins", strings.Join(cfg.CORSAllowedOrigins, ","))
 	}
 
 	errCh := make(chan error, 4)
