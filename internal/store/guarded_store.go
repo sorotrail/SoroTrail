@@ -143,7 +143,7 @@ func (s *guardedStore) GetIngestionState(ctx context.Context) (IngestionState, e
 	ctx, cancel := s.wrapContext(ctx, "store.GetIngestionState")
 	defer cancel()
 	start := time.Now()
-	state, err := s.Store.GetIngestionState(ctx)
+	state, err := s.Store.GetIngestionState(ctx, network)
 	s.logSlowQuery("store.GetIngestionState", start, err)
 	return state, err
 }
@@ -386,6 +386,51 @@ func (s *guardedStore) Stats(ctx context.Context, sc Scope) (Stats, error) {
 	s.logSlowQuery("store.Stats", start, err)
 	stats.QueryErrors = s.queryErrors.Load()
 	return stats, err
+}
+
+func (s *guardedStore) UpsertTokenBalances(ctx context.Context, network string, state TokenBalanceState, updates []TokenBalanceUpdate) error {
+	ctx, cancel := s.wrapContext(ctx, "store.UpsertTokenBalances")
+	defer cancel()
+	start := time.Now()
+	err := s.Store.UpsertTokenBalances(ctx, network, state, updates)
+	s.logSlowQuery("store.UpsertTokenBalances", start, err)
+	return err
+}
+
+func (s *guardedStore) GetTokenBalances(ctx context.Context, contractID, network, minBalance string, cursor string, limit int) ([]TokenBalance, string, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.GetTokenBalances")
+	defer cancel()
+	start := time.Now()
+	balances, next, err := s.Store.GetTokenBalances(ctx, contractID, network, minBalance, cursor, limit)
+	s.logSlowQuery("store.GetTokenBalances", start, err)
+	return balances, next, err
+}
+
+func (s *guardedStore) GetTokenBalanceState(ctx context.Context, network, contractID string) (TokenBalanceState, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.GetTokenBalanceState")
+	defer cancel()
+	start := time.Now()
+	state, err := s.Store.GetTokenBalanceState(ctx, network, contractID)
+	s.logSlowQuery("store.GetTokenBalanceState", start, err)
+	return state, err
+}
+
+func (s *guardedStore) UpsertTokenBalanceState(ctx context.Context, state TokenBalanceState) error {
+	ctx, cancel := s.wrapContext(ctx, "store.UpsertTokenBalanceState")
+	defer cancel()
+	start := time.Now()
+	err := s.Store.UpsertTokenBalanceState(ctx, state)
+	s.logSlowQuery("store.UpsertTokenBalanceState", start, err)
+	return err
+}
+
+func (s *guardedStore) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.GetEarliestLedger")
+	defer cancel()
+	start := time.Now()
+	earliest, err := s.Store.GetEarliestLedger(ctx, network, contractID)
+	s.logSlowQuery("store.GetEarliestLedger", start, err)
+	return earliest, err
 }
 
 func (s *guardedStore) Ping(ctx context.Context) error {

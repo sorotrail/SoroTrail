@@ -9,9 +9,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/sorotrail/sorotrail/internal/rpc"
-	"github.com/sorotrail/sorotrail/internal/store"
-	"github.com/sorotrail/sorotrail/internal/testdb"
+	"github.com/khaylebfortune/sorotrail/internal/rpc"
+	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/khaylebfortune/sorotrail/internal/testdb"
 )
 
 // TestIntegration_CursorResumeAcrossRestart proves that the persisted

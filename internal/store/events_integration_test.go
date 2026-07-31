@@ -16,7 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/sorotrail/sorotrail/internal/testdb"
+	"github.com/khaylebfortune/sorotrail/internal/testdb"
 )
 
 // TestUpsertEvents_SameTOIDTwiceYieldsOneRow is the headline

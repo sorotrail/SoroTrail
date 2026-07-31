@@ -10,6 +10,14 @@ import (
 	"github.com/sorotrail/sorotrail/internal/sep41"
 )
 
+// DefaultQueryLimit is the default number of events returned when ?limit=
+// is omitted. It matches the value used in QueryEvents when Limit is <= 0.
+const DefaultQueryLimit = 50
+
+// MaxQueryLimit is the upper bound for the ?limit= parameter; values above
+// this are rejected by the API layer before the store sees them.
+const MaxQueryLimit = 200
+
 // Event is a Soroban contract event as persisted by SoroTrail.
 type Event struct {
 	ID               string          `json:"id"`
@@ -150,6 +158,12 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
+	// Topic0-Topic3 match the exact JSON value at that specific topic array
+	// position. Unspecified positions are wildcards.
+	Topic0     json.RawMessage
+	Topic1     json.RawMessage
+	Topic2     json.RawMessage
+	Topic3     json.RawMessage
 	// HasValue filters events by whether they carry a value payload.
 	// nil means no constraint; true means value IS NOT NULL;
 	// false means value IS NULL.

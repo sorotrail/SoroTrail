@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"sync"
 
-	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/khaylebfortune/sorotrail/internal/store"
 )
 
 // subscriberBufferSize bounds the event channel per subscriber. When a

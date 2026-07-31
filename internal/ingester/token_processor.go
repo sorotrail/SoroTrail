@@ -8,8 +8,8 @@ import (
 	"math/big"
 	"sort"
 
-	"github.com/sorotrail/sorotrail/internal/decode"
-	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/khaylebfortune/sorotrail/internal/decode"
+	"github.com/khaylebfortune/sorotrail/internal/store"
 )
 
 // TokenBalanceProcessor derives per-address token balances from SEP-41 token

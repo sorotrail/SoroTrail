@@ -17,7 +17,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/sorotrail/sorotrail/internal/metrics"
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 )
 
 // Client is the RPC boundary. The ingester and API depend on this interface

@@ -1,16 +1,20 @@
 // Package metrics exports Prometheus instrumentation for SoroTrail's
-// ingestion pipeline and HTTP API. Every counter, histogram, and gauge is
-// registered so promhttp.Handler() picks it up automatically.
+// ingestion pipeline. Every counter, histogram, and gauge is registered with
+// the default Prometheus registry so promhttp.Handler() picks it up
+// automatically.
 //
 // Usage (one-time registration done in init):
 //
 //	metrics.EventsIngested.Add(float64(len(events)))
 //	timer := prometheus.NewTimer(metrics.DBWriteLatency)
 //	defer timer.ObserveDuration()
+// Package metrics exposes Prometheus metrics for the HTTP API, notably a
+// per-route request-duration histogram served at GET /metrics.
 package metrics
 
 import (
 	"net/http"
+
 	"strconv"
 	"time"
 
@@ -74,11 +78,8 @@ func init() {
 
 // Handler returns an http.Handler that serves the /metrics endpoint in
 // Prometheus exposition format.
-// Handler serves the global ingestion/metrics endpoint.
 func Handler() http.Handler {
 	return promhttp.Handler()
-}
-
 // unmatchedRoute labels requests that never reached a registered chi route
 // (404s from a totally unknown path). Falling back to r.URL.Path there
 // would let clients probing random paths grow the histogram's cardinality

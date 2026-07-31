@@ -22,7 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/sorotrail/sorotrail/internal/testdb"
+	"github.com/khaylebfortune/sorotrail/internal/testdb"
 )
 
 // TestMigrations_ApplyFromEmptyLand asserts that every embedded

@@ -28,9 +28,9 @@ import (
 
 	"time"
 
-	"github.com/sorotrail/sorotrail/internal/config"
-	"github.com/sorotrail/sorotrail/internal/metrics"
-	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/khaylebfortune/sorotrail/internal/config"
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
+	"github.com/khaylebfortune/sorotrail/internal/store"
 	"github.com/sorotrail/sorotrail/internal/api/queries"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/buildinfo"

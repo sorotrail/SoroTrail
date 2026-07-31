@@ -13,11 +13,11 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/sorotrail/sorotrail/internal/broadcast"
-	"github.com/sorotrail/sorotrail/internal/decode"
-	"github.com/sorotrail/sorotrail/internal/metrics"
-	"github.com/sorotrail/sorotrail/internal/rpc"
-	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/khaylebfortune/sorotrail/internal/broadcast"
+	"github.com/khaylebfortune/sorotrail/internal/decode"
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
+	"github.com/khaylebfortune/sorotrail/internal/rpc"
+	"github.com/khaylebfortune/sorotrail/internal/store"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/sorotrail/sorotrail/internal/broadcast"

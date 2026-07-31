@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"math/big"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,7 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/sorotrail/sorotrail/internal/metrics"
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 )
 
 // ErrNotFound is returned when a lookup matches no rows.
@@ -202,9 +203,9 @@ func (p *Postgres) attemptReconnect(ctx context.Context, logger *slog.Logger) er
 	return nil
 }
 
-func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
+func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) ([]Event, error) {
 	if len(events) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	return p.upsertEvents(ctx, events, false)
 }
@@ -216,9 +217,14 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // arrives without XDR preserves what was already stored via the coalesce()
 // clauses in the UPDATE branch (`sorotrail replay` relies on that).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
+	conflict := `ON CONFLICT (network, ledger, id) DO NOTHING`
+	batch := &pgx.Batch{}
+	conflict := "ON CONFLICT (id) DO NOTHING"
+	if onUpdate {
+		conflict = `ON CONFLICT (id) DO UPDATE SET
 	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
 	if onUpdate {
-		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
+		conflict = `ON CONFLICT (network, ledger, id) DO UPDATE SET
 			contract_id        = EXCLUDED.contract_id,
 			type               = EXCLUDED.type,
 			tx_hash            = EXCLUDED.tx_hash,
@@ -230,23 +236,39 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			decoded_payload    = EXCLUDED.decoded_payload,
 			decoded_by         = EXCLUDED.decoded_by,
 			created_at         = EXCLUDED.created_at,
+			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 			topics_xdr         = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
 			value_xdr          = coalesce(EXCLUDED.value_xdr, events.value_xdr)`
+			raw_topic_xdr      = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
+			raw_value_xdr      = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
 	batch := &pgx.Batch{}
-	stmt := `
+	sql := `
 		INSERT INTO events
-			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-			 in_successful_call, topics, value, decoded_payload, decoded_by,
-			 created_at, topics_xdr, value_xdr)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+			(network, id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+			 in_successful_call, topics, value, created_at,
+			 raw_topic_xdr, raw_value_xdr)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		` + conflict
 	for _, e := range events {
-		// decoded_payload and decoded_by are written NULL when the plugin
-		// step didn't claim the event; ON CONFLICT DO NOTHING means a
-		// re-ingest that picked up a plugin will not retroactively fill
-		// historical rows — that's expected for v1 (operators run a
-		// backfill script when upgrading).
+		batch.Queue(sql,
+			e.Network, e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+		batch.Queue(`
+			INSERT INTO events
+				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+				 in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) `+conflict,
+				 in_successful_call, topics, value, created_at,
+				 raw_topic_xdr, raw_value_xdr)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			`+conflict,
+			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
+			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
+		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
+		// into SQL NULL so the column has one representation of "absent"
+		// rather than two.
 		batch.Queue(stmt,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value,
@@ -282,7 +304,7 @@ func (p *Postgres) ensureEventPartitions(ctx context.Context, events []Event) er
 
 func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bool) (int64, error) {
 	if len(events) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	if err := p.ensureEventPartitions(ctx, events); err != nil {
 		return 0, err
@@ -290,13 +312,15 @@ func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bo
 	results := p.pool.SendBatch(ctx, insertEventsBatch(events, onUpdate))
 	defer results.Close()
 
-	var inserted int64
-	for range events {
+	var inserted []Event
+	for i := range events {
 		tag, err := results.Exec()
 		if err != nil {
-			return 0, fmt.Errorf("upserting events: %w", err)
+			return nil, fmt.Errorf("upserting events: %w", err)
 		}
-		inserted += tag.RowsAffected()
+		if tag.RowsAffected() > 0 {
+			inserted = append(inserted, events[i])
+		}
 	}
 	return inserted, nil
 }
@@ -349,6 +373,7 @@ func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fro
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("committing repair tx: %w", err)
 	}
+	metrics.DBWriteDuration.Observe(time.Since(start).Seconds())
 	return nil
 }
 
@@ -789,6 +814,9 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 		// array for element match, multi-element arrays for subset match).
 		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
 	}
+	if f.TopicCount != nil {
+		where = append(where, "jsonb_array_length(topics) = "+arg(*f.TopicCount))
+	}
 	if f.TxHash != "" {
 		where = append(where, "tx_hash = "+arg(f.TxHash))
 	}
@@ -1034,7 +1062,7 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 		return IngestionState{}, ErrNotFound
 	}
 	if err != nil {
-		return IngestionState{}, fmt.Errorf("loading ingestion state: %w", err)
+		return IngestionState{}, fmt.Errorf("loading ingestion state for network %q: %w", network, err)
 	}
 	return s, nil
 }
@@ -1701,10 +1729,12 @@ func statementTimeoutFromContext(ctx context.Context) (time.Duration, bool) {
 }
 
 func scanEvent(row pgx.Row) (Event, error) {
-	var e Event
+	var (
+		e Event
+	)
 	err := row.Scan(&e.Network, &e.ID, &e.ContractID, &e.Ledger, &e.Type, &e.TxHash,
 		&e.TxIndex, &e.OpIndex, &e.InSuccessfulCall, &e.Topics, &e.Value,
-		&e.CreatedAt, &e.RawTopicXDR, &e.RawValueXDR)
+		&e.CreatedAt)
 	if err != nil {
 		return Event{}, err
 	}

@@ -50,11 +50,11 @@ func (s *TracingStore) ReplaceEventsInRange(ctx context.Context, events []Event,
 	return err
 }
 
-func (s *TracingStore) GetEvent(ctx context.Context, id string, sc Scope) (Event, error) {
+func (s *TracingStore) GetEvent(ctx context.Context, id string) (Event, error) {
 	ctx, span := s.tracer.Start(ctx, "store.GetEvent")
 	defer span.End()
 	span.SetAttributes(attribute.String("store.event_id", id))
-	event, err := s.Store.GetEvent(ctx, id, sc)
+	event, err := s.Store.GetEvent(ctx, id)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -62,11 +62,11 @@ func (s *TracingStore) GetEvent(ctx context.Context, id string, sc Scope) (Event
 	return event, err
 }
 
-func (s *TracingStore) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
+func (s *TracingStore) EventExists(ctx context.Context, id string) (bool, error) {
 	ctx, span := s.tracer.Start(ctx, "store.EventExists")
 	defer span.End()
 	span.SetAttributes(attribute.String("store.event_id", id))
-	exists, err := s.Store.EventExists(ctx, id, sc)
+	exists, err := s.Store.EventExists(ctx, id)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -77,7 +77,7 @@ func (s *TracingStore) EventExists(ctx context.Context, id string, sc Scope) (bo
 func (s *TracingStore) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
 	ctx, span := s.tracer.Start(ctx, "store.QueryEvents")
 	defer span.End()
-	span.SetAttributes(attribute.String("store.contract_id", f.ContractID))
+	span.SetAttributes(attribute.String("store.contract_id", f.ContractID), attribute.String("store.type", f.Type))
 	events, cursor, err := s.Store.QueryEvents(ctx, f)
 	if err != nil {
 		span.RecordError(err)
