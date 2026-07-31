@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
-	"math/big"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -286,20 +285,22 @@ func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bo
 	results := p.pool.SendBatch(ctx, insertEventsBatch(events, onUpdate))
 	defer results.Close()
 
-	var inserted []Event
-	for i := range events {
+	// Count rows the batch actually wrote. ON CONFLICT DO NOTHING makes a
+	// re-ingest report 0, which is how callers distinguish new events from
+	// replayed ones.
+	var inserted int64
+	for range events {
 		tag, err := results.Exec()
 		if err != nil {
-			return nil, fmt.Errorf("upserting events: %w", err)
+			return inserted, fmt.Errorf("upserting events: %w", err)
 		}
-		if tag.RowsAffected() > 0 {
-			inserted = append(inserted, events[i])
-		}
+		inserted += tag.RowsAffected()
 	}
 	return inserted, nil
 }
 
 func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error {
+	start := time.Now()
 	if len(events) == 0 {
 		return nil
 	}
@@ -347,7 +348,7 @@ func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fro
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("committing repair tx: %w", err)
 	}
-	metrics.DBWriteDuration.Observe(time.Since(start).Seconds())
+	metrics.DBWriteLatency.Observe(time.Since(start).Seconds())
 	return nil
 }
 
@@ -1036,7 +1037,7 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 		return IngestionState{}, ErrNotFound
 	}
 	if err != nil {
-		return IngestionState{}, fmt.Errorf("loading ingestion state for network %q: %w", network, err)
+		return IngestionState{}, fmt.Errorf("loading ingestion state : %w", err)
 	}
 	return s, nil
 }

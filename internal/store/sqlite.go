@@ -916,7 +916,7 @@ func (s *SQLite) SaveIngestionState(ctx context.Context, st IngestionState) erro
 	return nil
 }
 
-func (s *SQLite) GetAuditState(ctx context.Context) (AuditState, error) {
+func (s *SQLite) GetAuditState(ctx context.Context, _ string) (AuditState, error) {
 	var (
 		st AuditState
 		ts string
@@ -950,7 +950,7 @@ func (s *SQLite) SaveAuditState(ctx context.Context, st AuditState) error {
 	return nil
 }
 
-func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (AuditState, error) {
+func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, _ string, ledger int64) (AuditState, error) {
 	now := formatTime(time.Now().UTC())
 
 	// First INSERT will succeed when the table is empty.
@@ -973,10 +973,10 @@ func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (Aud
 	}
 	n, _ := res.RowsAffected()
 	if n > 0 {
-		return s.GetAuditState(ctx)
+		return s.GetAuditState(ctx, "")
 	}
 	// Candidate was not greater — return the current stored state.
-	return s.GetAuditState(ctx)
+	return s.GetAuditState(ctx, "")
 }
 
 func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
@@ -1066,7 +1066,7 @@ func (s *SQLite) UpdateAuditFinding(ctx context.Context, f AuditFinding) error {
 	return nil
 }
 
-func (s *SQLite) ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error) {
+func (s *SQLite) ListOpenFindingsByRange(ctx context.Context, _ string, fromLedger, toLedger int64) (AuditFinding, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, from_ledger, to_ledger, expected_count, actual_count,
 		       missing_ids, status, attempts, last_attempted_at, last_error, created_at
