@@ -60,7 +60,7 @@ func newSubErrorStub() *subErrorStub {
 	return &subErrorStub{stubStore: &stubStore{}}
 }
 
-func (s *subErrorStub) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
+func (s *subErrorStub) GetSubscription(_ context.Context, id int64, _ store.SubscriptionOwner) (store.Subscription, error) {
 	if s.getErr != nil {
 		return store.Subscription{}, s.getErr
 	}
@@ -78,25 +78,25 @@ func (s *subErrorStub) CreateSubscription(_ context.Context, sub store.Subscript
 	return s.stubStore.CreateSubscription(context.Background(), sub)
 }
 
-func (s *subErrorStub) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+func (s *subErrorStub) UpdateSubscription(_ context.Context, sub store.Subscription, owner store.SubscriptionOwner) (store.Subscription, error) {
 	if s.updateErr != nil {
 		return store.Subscription{}, s.updateErr
 	}
-	return s.stubStore.UpdateSubscription(context.Background(), sub)
+	return s.stubStore.UpdateSubscription(context.Background(), sub, owner)
 }
 
-func (s *subErrorStub) DeleteSubscription(_ context.Context, id int64) error {
+func (s *subErrorStub) DeleteSubscription(_ context.Context, id int64, owner store.SubscriptionOwner) error {
 	if s.deleteErr != nil {
 		return s.deleteErr
 	}
-	return s.stubStore.DeleteSubscription(context.Background(), id)
+	return s.stubStore.DeleteSubscription(context.Background(), id, owner)
 }
 
-func (s *subErrorStub) ListDeliveryAttempts(_ context.Context, id int64, limit int) ([]store.DeliveryAttempt, error) {
+func (s *subErrorStub) ListDeliveryAttempts(_ context.Context, id int64, limit int, owner store.SubscriptionOwner) ([]store.DeliveryAttempt, error) {
 	if s.deliveriesErr != nil {
 		return nil, s.deliveriesErr
 	}
-	return s.stubStore.ListDeliveryAttempts(context.Background(), id, limit)
+	return s.stubStore.ListDeliveryAttempts(context.Background(), id, limit, owner)
 }
 
 // doAPIRequest issues one HTTP request against a freshly-spun-up
@@ -139,7 +139,7 @@ func errorEnvelope(t *testing.T, body []byte) string {
 // slog construction on every line.
 func newServerFromStub(st store.Store) *Server {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(st, nil, log, "test-key")
+	return New(st, nil, log, "test-key", 0)
 }
 
 // TestSubscriptions_ErrorPaths covers every 400/404 branch of the
