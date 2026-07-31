@@ -1878,3 +1878,37 @@ func (p *Postgres) GetAddressSummary(ctx context.Context, address string) (Addre
 	}
 	return s, nil
 }
+
+// GetContractCursor returns one contract's ingestion cursor. Callers treat
+// ErrNotFound as "never ingested" and cold-start that contract.
+func (p *Postgres) GetContractCursor(ctx context.Context, contractID string) (ContractCursor, error) {
+	var c ContractCursor
+	err := p.pool.QueryRow(ctx, `
+		SELECT contract_id, last_ingested_ledger, last_cursor, updated_at
+		FROM contract_cursors WHERE contract_id = $1`, contractID,
+	).Scan(&c.ContractID, &c.LastIngestedLedger, &c.LastCursor, &c.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ContractCursor{}, ErrNotFound
+	}
+	if err != nil {
+		return ContractCursor{}, fmt.Errorf("loading contract cursor for %s: %w", contractID, err)
+	}
+	return c, nil
+}
+
+// SaveContractCursor upserts one contract's cursor.
+func (p *Postgres) SaveContractCursor(ctx context.Context, c ContractCursor) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO contract_cursors (contract_id, last_ingested_ledger, last_cursor, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (contract_id) DO UPDATE SET
+			last_ingested_ledger = EXCLUDED.last_ingested_ledger,
+			last_cursor          = EXCLUDED.last_cursor,
+			updated_at           = now()`,
+		c.ContractID, c.LastIngestedLedger, c.LastCursor,
+	)
+	if err != nil {
+		return fmt.Errorf("saving contract cursor for %s: %w", c.ContractID, err)
+	}
+	return nil
+}

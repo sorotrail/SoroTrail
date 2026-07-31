@@ -1441,3 +1441,14 @@ func nullableXDRTopics(s []string) any {
 func (s *SQLite) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
 	return nil, "", fmt.Errorf("ListContracts: not supported by the sqlite backend")
 }
+
+// GetContractCursor is not implemented for the SQLite backend: per-contract
+// cursors are Postgres-only.
+func (s *SQLite) GetContractCursor(context.Context, string) (ContractCursor, error) {
+	return ContractCursor{}, ErrNotFound
+}
+
+// SaveContractCursor is not implemented for the SQLite backend.
+func (s *SQLite) SaveContractCursor(context.Context, ContractCursor) error {
+	return fmt.Errorf("SaveContractCursor: not supported by the sqlite backend")
+}

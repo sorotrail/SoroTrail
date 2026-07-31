@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
@@ -58,6 +58,10 @@ func RealJitter(max time.Duration) time.Duration { return rand.N(max) }
 
 // Options configure an Ingester.
 type Options struct {
+	// Network labels rows written by this ingester. Migration
+	// 0005_multi_network made it part of the events primary key, so a
+	// deployment indexing two networks keeps them separate.
+	Network string
 	// Clock supplies time and sleeping. Defaults to RealClock; simulations
 	// inject a virtual clock so a test can cover hours of ingestion without
 	// waiting for them.
@@ -383,9 +387,9 @@ func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
 		return false, err
 	}
 	if len(batches) == 1 {
-		return ing.singlePageUnwatched(ctx, startLedger, cursor, batches[0])
+		return ing.singlePage(ctx, startLedger, cursor, batches[0])
 	}
-	return ing.windowSweepUnwatched(ctx, startLedger, batches)
+	return ing.windowSweep(ctx, startLedger, batches)
 }
 
 func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor string, filters []rpc.EventFilter) (bool, error) {
@@ -809,7 +813,7 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 }
 
 func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, cursor string, err error) {
-	state, err := ing.store.GetIngestionState(ctx, ing.opts.Network)
+	state, err := ing.store.GetIngestionState(ctx)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return 0, "", err
 	}
@@ -838,17 +842,33 @@ func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, c
 	return uint32(start), "", nil
 }
 
-func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) error {
+// contractIDs, when non-empty, are the watched contracts whose per-contract
+// cursors must be re-clamped alongside the global ingestion state.
+func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32, contractIDs ...string) error {
 	health, err := ing.client.GetHealth(ctx)
 	if err != nil {
 		return fmt.Errorf("getHealth while re-clamping: %w", err)
 	}
 	ing.log.Warn("resume ledger fell outside RPC retention window; skipping ahead — events in the gap are lost",
 		"network", ing.opts.Network, "requested_ledger", requested, "oldest_retained", health.OldestLedger)
-	return ing.store.SaveIngestionState(ctx, store.IngestionState{
+	if err := ing.store.SaveIngestionState(ctx, store.IngestionState{
 		Network:            ing.opts.Network,
 		LastIngestedLedger: int64(health.OldestLedger) - 1,
-	})
+	}); err != nil {
+		return err
+	}
+	// Watched mode tracks a cursor per contract; leaving those pointing into
+	// the dropped window would make the next cycle ask for ledgers the RPC
+	// has already forgotten.
+	for _, id := range contractIDs {
+		if err := ing.store.SaveContractCursor(ctx, store.ContractCursor{
+			ContractID:         id,
+			LastIngestedLedger: int64(health.OldestLedger) - 1,
+		}); err != nil {
+			return fmt.Errorf("re-clamping cursor for %s: %w", id, err)
+		}
+	}
+	return nil
 }
 
 // checkLag evaluates the ingest-lag alarm against the chain head and
@@ -1212,4 +1232,23 @@ func maxInt64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+// discardCursor clears the persisted getEvents cursor so the next cycle
+// re-scans from last_ingested_ledger instead. A cursor is only meaningful
+// to the provider that issued it, so after a failover re-anchor keeping it
+// would ask the new provider to resume from a token it never minted.
+func (ing *Ingester) discardCursor(ctx context.Context) {
+	state, err := ing.store.GetIngestionState(ctx)
+	if err != nil {
+		ing.log.Error("discarding cursor: loading ingestion state", "error", err)
+		return
+	}
+	if state.LastCursor == "" {
+		return
+	}
+	state.LastCursor = ""
+	if err := ing.store.SaveIngestionState(ctx, state); err != nil {
+		ing.log.Error("discarding cursor: saving ingestion state", "error", err)
+	}
 }

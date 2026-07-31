@@ -2013,7 +2013,7 @@ func (s *Server) listCachePolicy(ctx context.Context, filter store.EventFilter) 
 
 // lastIngestedLedger reads the frontier from the persisted ingestion state.
 func (s *Server) lastIngestedLedger(ctx context.Context, network string) (int64, error) {
-	state, err := s.store.GetIngestionState(ctx, network)
+	state, err := s.store.GetIngestionState(ctx)
 	if errors.Is(err, store.ErrNotFound) {
 
 		return 0, nil

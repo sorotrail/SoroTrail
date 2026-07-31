@@ -684,6 +684,11 @@ type Store interface {
 
 	// Ping(ctx context.Context) error
 
+	// GetContractCursor returns the per-contract ingestion cursor, or
+	// ErrNotFound when that contract has never been ingested.
+	GetContractCursor(ctx context.Context, contractID string) (ContractCursor, error)
+	// SaveContractCursor upserts one contract's cursor.
+	SaveContractCursor(ctx context.Context, c ContractCursor) error
 	GetIngestionState(ctx context.Context) (IngestionState, error)
 	SaveIngestionState(ctx context.Context, s IngestionState) error
 
