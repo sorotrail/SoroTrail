@@ -257,6 +257,13 @@ func (s *Server) SetRateLimiter(l *RateLimiter) {
 	s.limiter = l
 }
 
+// SetCORS configures the cross-origin allow-list (CORS_ALLOWED_ORIGINS).
+// Pass nil or an empty slice to leave CORS disabled (the default — the
+// router emits no CORS headers, so existing deployments are unaffected).
+func (s *Server) SetCORS(allowedOrigins []string) {
+	s.corsOrigins = allowedOrigins
+}
+
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
 // can deliver events as they arrive.
 func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {

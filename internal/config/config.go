@@ -456,6 +456,27 @@ func ValidCursor(s string) bool {
 	return true
 }
 
+// ValidOrigin reports whether s is a valid CORS origin: either the "*"
+// wildcard (allow any origin) or an absolute http/https URL whose host is
+// present and which carries no path, query, or fragment (browsers never
+// send those in the Origin header).
+func ValidOrigin(s string) bool {
+	if s == "*" {
+		return true
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	return true
+}
+
 // ValidCursor reports whether s is a valid pagination cursor.
 // A cursor must be non-empty, at most 128 characters, and consist only of
 // alphanumeric characters, hyphens, underscores, dots, or colons.

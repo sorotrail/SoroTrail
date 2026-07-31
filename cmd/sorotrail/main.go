@@ -413,6 +413,9 @@ func run() error {
 	} else {
 		log.Info("watched-contracts endpoints are auth-gated")
 	}
+	if len(cfg.CORSAllowedOrigins) > 0 {
+		log.Info("cors enabled", "origins", strings.Join(cfg.CORSAllowedOrigins, ","))
+	}
 
 	errCh := make(chan error, 4)
 	go func() {

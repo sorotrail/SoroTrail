@@ -365,6 +365,54 @@ func TestLoad(t *testing.T) {
 			},
 			wantErr: "RATE_LIMIT_RPS: -1 must be non-negative",
 		},
+		{
+			name: "cors origins parsed, trimmed, and normalized",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "https://app.example.com, https://dashboard.example.com/ , *",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{
+					"https://app.example.com",
+					"https://dashboard.example.com",
+					"*",
+				}, c.CORSAllowedOrigins)
+			},
+		},
+		{
+			name: "cors wildcard accepted",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "*",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{"*"}, c.CORSAllowedOrigins)
+			},
+		},
+		{
+			name: "cors origin missing scheme rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "app.example.com",
+			},
+			wantErr: "CORS_ALLOWED_ORIGINS entry \"app.example.com\" is not a valid origin",
+		},
+		{
+			name: "cors origin with non-http scheme rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "ftp://example.com",
+			},
+			wantErr: "CORS_ALLOWED_ORIGINS entry",
+		},
+		{
+			name: "cors javascript scheme rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "javascript:alert(1)",
+			},
+			wantErr: "CORS_ALLOWED_ORIGINS entry",
+		},
 	}
 
 	for _, tt := range tests {
@@ -388,6 +436,20 @@ func TestLoad(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidOrigin(t *testing.T) {
+	assert.True(t, ValidOrigin("*"))
+	assert.True(t, ValidOrigin("https://app.example.com"))
+	assert.True(t, ValidOrigin("http://localhost:5173"))
+	assert.True(t, ValidOrigin("https://a.example.com:8443"))
+
+	assert.False(t, ValidOrigin(""), "empty string")
+	assert.False(t, ValidOrigin("app.example.com"), "missing scheme")
+	assert.False(t, ValidOrigin("ftp://example.com"), "non-http scheme")
+	assert.False(t, ValidOrigin("javascript:alert(1)"), "javascript scheme")
+	assert.False(t, ValidOrigin("https://"), "missing host")
+	assert.False(t, ValidOrigin("https://example.com/path"), "origins cannot carry a path")
 }
 
 func TestValidContractID(t *testing.T) {
