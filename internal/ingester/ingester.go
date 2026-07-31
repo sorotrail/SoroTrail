@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/decode"
@@ -19,11 +22,6 @@ import (
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 	"golang.org/x/sync/errgroup"
-
-	"github.com/sorotrail/sorotrail/internal/broadcast"
-	"github.com/sorotrail/sorotrail/internal/decode"
-	"github.com/sorotrail/sorotrail/internal/rpc"
-	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // Clock abstracts time operations so tests and simulations can supply a
@@ -191,6 +189,9 @@ type Ingester struct {
 	decoder decode.Decoder
 	log     *slog.Logger
 	opts    Options
+	// tracer records a span per poll cycle. Defaults to the global
+	// provider, which is a no-op unless the process installs an exporter.
+	tracer trace.Tracer
 
 	// lagging is the hysteresis state for the ingest-lag alarm. It is
 	// mutated only from the Run goroutine. Crossing the threshold flips
@@ -216,7 +217,7 @@ type Ingester struct {
 // New wires an Ingester.
 func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, opts Options) *Ingester {
 	opts.applyDefaults()
-	return &Ingester{client: client, store: st, decoder: dec, log: log, metrics: obs, opts: opts}
+	return &Ingester{client: client, store: st, decoder: dec, log: log, opts: opts}
 }
 
 // WithBroadcaster attaches a live event broadcaster so ingested events are
