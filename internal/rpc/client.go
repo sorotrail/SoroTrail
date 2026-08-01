@@ -56,6 +56,7 @@ func IsLedgerOutOfRange(err error) bool {
 // HTTPClient talks JSON-RPC 2.0 over HTTP POST, with a request-rate cap for
 // public endpoints and automatic fallback for servers that don't support
 // xdrFormat: "json".
+
 type HTTPClient struct {
 	url        string
 	httpClient *http.Client
@@ -66,6 +67,7 @@ type HTTPClient struct {
 	// param, so we stop sending it and callers decode raw XDR instead.
 	xdrJSONUnsupported atomic.Bool
 }
+
 
 var _ Client = (*HTTPClient)(nil)
 
@@ -125,11 +127,13 @@ func (c *HTTPClient) GetEvents(ctx context.Context, req GetEventsRequest) (GetEv
 	return resp, err
 }
 
+
 func (c *HTTPClient) GetLatestLedger(ctx context.Context) (LatestLedger, error) {
 	var resp LatestLedger
 	err := c.call(ctx, "getLatestLedger", nil, &resp)
 	return resp, err
 }
+
 
 func (c *HTTPClient) GetHealth(ctx context.Context) (Health, error) {
 	var resp Health
