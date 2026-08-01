@@ -16,7 +16,9 @@ import (
 	"time"
 )
 
+
 // Client is the RPC boundary. The ingester and API depend on this interface
+
 // so tests can substitute a mock.
 type Client interface {
 	GetEvents(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error)
@@ -54,7 +56,9 @@ func IsLedgerOutOfRange(err error) bool {
 }
 
 // HTTPClient talks JSON-RPC 2.0 over HTTP POST, with a request-rate cap for
+
 // public endpoints and automatic fallback for servers that don't support
+
 // xdrFormat: "json".
 
 type HTTPClient struct {
@@ -70,6 +74,7 @@ type HTTPClient struct {
 
 
 var _ Client = (*HTTPClient)(nil)
+
 
 
 // Option customizes an HTTPClient.
