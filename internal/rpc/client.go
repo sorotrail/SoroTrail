@@ -69,19 +69,23 @@ type HTTPClient struct {
 
 var _ Client = (*HTTPClient)(nil)
 
+
 // Option customizes an HTTPClient.
 type Option func(*HTTPClient)
+
 
 // WithHTTPClient replaces the underlying HTTP client (e.g. for tests).
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *HTTPClient) { c.httpClient = hc }
 }
 
+
 // WithMinRequestInterval sets the minimum spacing between requests.
 // Zero disables rate limiting.
 func WithMinRequestInterval(d time.Duration) Option {
 	return func(c *HTTPClient) { c.limiter = newIntervalLimiter(d) }
 }
+
 
 // NewHTTPClient creates a client for the RPC server at url. By default
 // requests are spaced ≥100ms apart (~10 req/s, the public endpoint limit).
