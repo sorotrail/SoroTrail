@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -103,6 +104,55 @@ func TestLoad(t *testing.T) {
 				"LOG_LEVEL":    "loud",
 			},
 			wantErr: "LOG_LEVEL",
+		},
+		{
+			name: "log level debug",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "debug",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "debug", c.LogLevel)
+			},
+		},
+		{
+			name: "log level info",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "info",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "info", c.LogLevel)
+			},
+		},
+		{
+			name: "log level warn",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "warn",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "warn", c.LogLevel)
+			},
+		},
+		{
+			name: "log level error",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "error",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "error", c.LogLevel)
+			},
+		},
+		{
+			name: "log level defaults to info",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "info", c.LogLevel)
+			},
 		},
 		{
 			name: "log format text",
@@ -302,6 +352,29 @@ func TestLoad(t *testing.T) {
 			if tt.check != nil {
 				tt.check(t, cfg)
 			}
+		})
+	}
+}
+
+func TestParseLogLevel(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  slog.Level
+	}{
+		{name: "debug", input: "debug", want: slog.LevelDebug},
+		{name: "info", input: "info", want: slog.LevelInfo},
+		{name: "warn", input: "warn", want: slog.LevelWarn},
+		{name: "error", input: "error", want: slog.LevelError},
+		{name: "mixed case", input: "DeBuG", want: slog.LevelDebug},
+		{name: "leading and trailing whitespace", input: "  warn  ", want: slog.LevelWarn},
+		{name: "empty defaults to info", input: "", want: slog.LevelInfo},
+		{name: "invalid defaults to info", input: "loud", want: slog.LevelInfo},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, ParseLogLevel(tt.input))
 		})
 	}
 }

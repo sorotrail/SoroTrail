@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"time"
@@ -290,6 +291,26 @@ func cleanContractList(in []string) []string {
 		}
 	}
 	return out
+}
+
+// ParseLogLevel normalizes the configured LOG_LEVEL string into a slog.Level.
+// Matching is case-insensitive; empty, unknown, or unparseable values fall
+// back to slog.LevelInfo so a bad value degrades to today's behavior instead
+// of silently silencing logs. Values other than debug|info|warn|error are
+// rejected earlier by Validate.
+func ParseLogLevel(raw string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	case "", "info":
+		return slog.LevelInfo
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // LoggableFields returns the configuration as a map of fields suitable for logging,
