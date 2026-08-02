@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -159,6 +160,55 @@ func TestLoad(t *testing.T) {
 				"LOG_LEVEL":    "loud",
 			},
 			wantErr: "LOG_LEVEL",
+		},
+		{
+			name: "log level debug",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "debug",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "debug", c.LogLevel)
+			},
+		},
+		{
+			name: "log level info",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "info",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "info", c.LogLevel)
+			},
+		},
+		{
+			name: "log level warn",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "warn",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "warn", c.LogLevel)
+			},
+		},
+		{
+			name: "log level error",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "error",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "error", c.LogLevel)
+			},
+		},
+		{
+			name: "log level defaults to info",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "info", c.LogLevel)
+			},
 		},
 		{
 			name: "log format text",
