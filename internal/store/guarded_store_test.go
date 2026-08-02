@@ -55,9 +55,13 @@ func (s *errorStore) Ping(ctx context.Context) error { return s.err }
 func (s *errorStore) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
 	return nil, "", s.err
 }
-func (s *errorStore) GetEvent(ctx context.Context, id string) (Event, error)   { return Event{}, s.err }
-func (s *errorStore) EventExists(ctx context.Context, id string) (bool, error) { return false, s.err }
-func (s *errorStore) Stats(ctx context.Context) (Stats, error)                 { return Stats{}, s.err }
+func (s *errorStore) GetEvent(ctx context.Context, id string, sc Scope) (Event, error) {
+	return Event{}, s.err
+}
+func (s *errorStore) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
+	return false, s.err
+}
+func (s *errorStore) Stats(ctx context.Context, sc Scope) (Stats, error) { return Stats{}, s.err }
 
 func TestGuardedStore_CountsQueryErrors(t *testing.T) {
 	tests := []struct {
@@ -81,8 +85,8 @@ func TestGuardedStore_CountsQueryErrors(t *testing.T) {
 			name: "errors from multiple methods accumulate",
 			setup: func(s Store) {
 				_, _, _ = s.QueryEvents(context.Background(), EventFilter{})
-				_, _ = s.GetEvent(context.Background(), "e1")
-				_, _ = s.EventExists(context.Background(), "e2")
+				_, _ = s.GetEvent(context.Background(), "e1", WildcardScope())
+				_, _ = s.EventExists(context.Background(), "e2", WildcardScope())
 				_ = s.Ping(context.Background())
 			},
 			expect: 4,
@@ -90,7 +94,7 @@ func TestGuardedStore_CountsQueryErrors(t *testing.T) {
 		{
 			name: "Stats call error counted once via logSlowQuery",
 			setup: func(s Store) {
-				_, _ = s.Stats(context.Background())
+				_, _ = s.Stats(context.Background(), WildcardScope())
 			},
 			expect: 1,
 		},
@@ -110,9 +114,24 @@ func TestGuardedStore_CountsQueryErrors(t *testing.T) {
 			// Now read back the counter through Stats().  The underlying
 			// errorStore.Stats() also returns an error so this call itself
 			// will increment the counter by one — account for it.
-			stats, err := guarded.Stats(context.Background())
+			stats, err := guarded.Stats(context.Background(), WildcardScope())
 			require.Error(t, err)
 			assert.Equal(t, tt.expect+1, stats.QueryErrors)
 		})
 	}
 }
+
+func (m *errorStore) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
+	return nil, "", nil
+}
+func (m *errorStore) CountContracts(context.Context, ContractsFilter) (int64, error) { return 0, nil }
+func (m *errorStore) DeadLetterEvent(context.Context, DeadLetterInput) (DeadLetter, error) {
+	return DeadLetter{}, nil
+}
+func (m *errorStore) ListDeadLetters(context.Context, string, int, string) ([]DeadLetter, string, error) {
+	return nil, "", nil
+}
+func (m *errorStore) GetDeadLetter(context.Context, int64) (DeadLetter, error) {
+	return DeadLetter{}, ErrNotFound
+}
+func (m *errorStore) DeleteDeadLetter(context.Context, int64) error { return nil }

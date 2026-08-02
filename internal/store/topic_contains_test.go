@@ -58,6 +58,7 @@ func TestQueryEvents_TopicContains(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got, _, err := st.QueryEvents(ctx, EventFilter{
 				TopicContains: json.RawMessage(tt.topicContains),
+				Scope:         WildcardScope(),
 			})
 			require.NoError(t, err)
 

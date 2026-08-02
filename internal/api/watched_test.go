@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
@@ -116,10 +117,11 @@ func TestWatchedContracts_PostValidation(t *testing.T) {
 	})
 
 	t.Run("empty to non-empty with confirm=true succeeds", func(t *testing.T) {
-		st := &stubStore{
-			ingestionState: &store.IngestionState{LastIngestedLedger: 999},
-		}
-		ts := newTestServerWithKey(st, nil, watchedTestKey)
+		// New contract gets its backfill position from the cold-
+		// start retention window, not from the global cursor.
+		rc := &stubRPC{health: rpc.Health{Status: "healthy", LatestLedger: 100_000, OldestLedger: 100}}
+		st := &stubStore{}
+		ts := newTestServerWithKey(st, rc, watchedTestKey)
 
 		resp, body := watchedRoute(t, ts, http.MethodPost, "?confirm=true", true,
 			map[string]string{"contract_id": testContract})
@@ -128,8 +130,9 @@ func TestWatchedContracts_PostValidation(t *testing.T) {
 		var got addWatchedResponse
 		require.NoError(t, json.Unmarshal(body, &got))
 		assert.Equal(t, testContract, got.ContractID)
-		assert.Equal(t, int64(999), got.HistoryFromLedger,
-			"new contract history starts at the current cursor — operators should see this")
+		// coldStartLedger = LatestLedger - RetentionLedgers clamped to oldest:
+		// 100_000 - 17280 = 82720, oldest = 100 → 82720
+		assert.Equal(t, int64(82720), got.HistoryFromLedger)
 		assert.Equal(t, "all_to_specific", got.ModeTransition)
 
 		require.Equal(t, []string{testContract}, st.added)
@@ -154,9 +157,55 @@ func TestWatchedContracts_PostValidation(t *testing.T) {
 }
 
 func TestWatchedContracts_PostIncludesHistoryFromLedger(t *testing.T) {
+	// New contract gets its backfill position from the cold-start
+	// retention window, not from the global ingestion state.
 	st := &stubStore{
-		watchedList:    []store.WatchedContract{{ContractID: watchedOtherContract}},
-		ingestionState: &store.IngestionState{LastIngestedLedger: 50_000},
+		watchedList: []store.WatchedContract{{ContractID: watchedOtherContract}},
+	}
+	rc := &stubRPC{health: rpc.Health{Status: "healthy", LatestLedger: 100_000, OldestLedger: 100}}
+	ts := newTestServerWithKey(st, rc, watchedTestKey)
+
+	resp, body := watchedRoute(t, ts, http.MethodPost, "", true,
+		map[string]string{"contract_id": testContract})
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	var got addWatchedResponse
+	require.NoError(t, json.Unmarshal(body, &got))
+	assert.Equal(t, int64(82720), got.HistoryFromLedger,
+		"new contract backfill starts at the retention window, never the global cursor")
+}
+
+func TestWatchedContracts_PostColdStartBackfillPosition(t *testing.T) {
+	// A contract added when no ingestion state exists still gets a
+	// valid backfill position derived from RPC health + RETENTION_LEDGERS.
+	st := &stubStore{
+		watchedList:      []store.WatchedContract{{ContractID: watchedOtherContract}},
+		ingestionState:   nil,
+		ingestionStateEr: store.ErrNotFound, // explicit: production path
+	}
+	rc := &stubRPC{health: rpc.Health{Status: "healthy", LatestLedger: 50_000, OldestLedger: 10}}
+	ts := newTestServerWithKey(st, rc, watchedTestKey)
+
+	resp, body := watchedRoute(t, ts, http.MethodPost, "", true,
+		map[string]string{"contract_id": testContract})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var got addWatchedResponse
+	require.NoError(t, json.Unmarshal(body, &got))
+	// 50_000 - 17280 = 32720, clamped to oldest (10) → 32720
+	assert.Equal(t, int64(32720), got.HistoryFromLedger,
+		"cold-start backfill uses RPC health + retention, not a stored cursor")
+}
+
+// Re-adding a watched contract that already has a cursor should
+// resume from that cursor, not re-backfill from the retention window.
+func TestWatchedContracts_PostReAddUsesExistingCursor(t *testing.T) {
+	contractCursors := map[string]store.ContractCursor{
+		testContract: {ContractID: testContract, LastIngestedLedger: 2_000, LastCursor: "cursor-2000"},
+	}
+	st := &stubStore{
+		watchedList:     []store.WatchedContract{{ContractID: testContract}},
+		contractCursors: contractCursors,
 	}
 	ts := newTestServerWithKey(st, nil, watchedTestKey)
 
@@ -166,26 +215,8 @@ func TestWatchedContracts_PostIncludesHistoryFromLedger(t *testing.T) {
 
 	var got addWatchedResponse
 	require.NoError(t, json.Unmarshal(body, &got))
-	assert.Equal(t, int64(50_000), got.HistoryFromLedger,
-		"the response MUST surface where historical replay starts so callers don't discover the gap later")
-}
-
-func TestWatchedContracts_PostColdStartHistoryIsZero(t *testing.T) {
-	st := &stubStore{
-		watchedList:      []store.WatchedContract{{ContractID: watchedOtherContract}},
-		ingestionState:   nil,
-		ingestionStateEr: store.ErrNotFound, // explicit: production path
-	}
-	ts := newTestServerWithKey(st, nil, watchedTestKey)
-
-	resp, body := watchedRoute(t, ts, http.MethodPost, "", true,
-		map[string]string{"contract_id": testContract})
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var got addWatchedResponse
-	require.NoError(t, json.Unmarshal(body, &got))
-	assert.Equal(t, int64(0), got.HistoryFromLedger,
-		"with no ingestion state yet, history_from_ledger is 0")
+	assert.Equal(t, int64(2_000), got.HistoryFromLedger,
+		"re-adding a watched contract resumes from its existing cursor, not a cold start")
 }
 
 func TestWatchedContracts_DeleteValidation(t *testing.T) {
