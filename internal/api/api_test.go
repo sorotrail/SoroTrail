@@ -503,6 +503,9 @@ func TestListEvents_BadParams(t *testing.T) {
 		"/events?from_time=2026-07-22T00:00:00Z&to_time=2026-07-21T00:00:00Z",
 		// #223: limit must be a positive integer <= MaxQueryLimit.
 		"/events?limit=0",
+		"/events?limit=abc",
+		"/events?limit=99999",
+		"/events?order=bogus",
 		"/events?limit=-1",
 		"/events?limit=99999",
 		"/events?limit=abc",

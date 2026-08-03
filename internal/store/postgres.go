@@ -212,7 +212,7 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) ([]Event, e
 
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
 // ingest, DO NOTHING) and ReplaceEventsInRange (auditor repair, DO UPDATE).
-// Both paths write all 13 columns of the events table so topics_xdr /
+// Both paths write all 15 columns of the events table so topics_xdr /
 // value_xdr are never silently dropped on the way in; a repair that
 // arrives without XDR preserves what was already stored via the coalesce()
 // clauses in the UPDATE branch (`sorotrail replay` relies on that).
@@ -226,7 +226,6 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	if onUpdate {
 		conflict = `ON CONFLICT (network, ledger, id) DO UPDATE SET
 			contract_id        = EXCLUDED.contract_id,
-			ledger             = EXCLUDED.ledger,
 			type               = EXCLUDED.type,
 			tx_hash            = EXCLUDED.tx_hash,
 			tx_index           = EXCLUDED.tx_index,
@@ -234,6 +233,8 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			in_successful_call = EXCLUDED.in_successful_call,
 			topics             = EXCLUDED.topics,
 			value              = EXCLUDED.value,
+			decoded_payload    = EXCLUDED.decoded_payload,
+			decoded_by         = EXCLUDED.decoded_by,
 			created_at         = EXCLUDED.created_at,
 			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
 			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
@@ -256,6 +257,8 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 		batch.Queue(`
 			INSERT INTO events
 				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+				 in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) `+conflict,
 				 in_successful_call, topics, value, created_at,
 				 raw_topic_xdr, raw_value_xdr)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -268,8 +271,12 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 		// rather than two.
 		batch.Queue(stmt,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
-			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
-			nullableStringSlice(e.RawTopicXDR), nullableText(e.RawValueXDR),
+			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value,
+			nil, /* decoded_payload */
+			nil, /* decoded_by */
+			e.CreatedAt,
+			nullableStringSlice(e.RawTopicXDR),
+			nullableText(e.RawValueXDR),
 		)
 	}
 	return batch
