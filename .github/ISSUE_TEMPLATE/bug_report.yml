@@ -1,0 +1,100 @@
+name: Bug report
+description: Report a reproducible bug in SoroTrail.
+title: "[bug]: "
+labels: ["bug"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. The fields below mirror
+        what the maintainers need to reproduce and fix the issue. **Please
+        redact any secrets** from your config before pasting.
+
+  - type: input
+    id: version
+    attributes:
+      label: SoroTrail version
+      description: |
+        Output of `sorotrail --version` (or `docker compose exec sorotrail --version`).
+        If you built from source, include the commit SHA (`git rev-parse HEAD`).
+      placeholder: "v0.x.y (commit abc1234)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration (redacted)
+      description: |
+        Paste the environment variables that affect this code path (DB
+        connection, RPC URL, retention window, sweep window, etc.).
+        **Redact credentials** — the RPC URL's basic-auth password and
+        `API_KEY` in particular.
+      placeholder: |
+        DATABASE_URL=postgres://user:redacted@db:5432/sorotrail
+        RPC_URL=https://soroban-testnet.stellar.org
+        RETENTION_LEDGERS=17280
+        SWEEP_WINDOW=1000
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected the system to do.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened. Include the exact error message.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Minimum sequence of commands or API calls. Numbered list, please.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        Paste the `sorotrail` logs around the failure. Use a fenced code
+        block; redact any secret-looking strings before pasting.
+      render: shell
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: |
+        How bad is this for you? The maintainers re-prioritize here; pick
+        the closest fit.
+      options:
+        - Low — cosmetic, workaround exists
+        - Medium — functional impact, workaround is painful
+        - High — indexer is degraded or stuck
+        - Critical — data loss, ingestion halted, security issue
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I searched [existing issues](../../issues) and didn't find a duplicate.
+          required: true
+        - label: I redacted secrets from the configuration and logs above.
+          required: true
+        - label: I can reproduce this on the latest `main`.
+          required: false

@@ -14,14 +14,31 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/khaylebfortune/sorotrail/internal/metrics"
 )
 
+
 // Client is the RPC boundary. The ingester and API depend on this interface
+
 // so tests can substitute a mock.
 type Client interface {
 	GetEvents(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error)
 	GetLatestLedger(ctx context.Context) (LatestLedger, error)
 	GetHealth(ctx context.Context) (Health, error)
+	// GetLedgerEntries returns the current state of one or more ledger entries.
+	// Keys are base64-encoded LedgerKey XDR, returned entries include the
+	// base64-encoded LedgerEntry XDR.
+	GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error)
+}
+
+// RequestObserver is called after each RPC call completes so callers can
+// instrument request counts by method and outcome without the rpc package
+// importing a metrics library.
+type RequestObserver interface {
+	ObserveRPCRequest(method string, err error)
 }
 
 // Error is a JSON-RPC 2.0 error object returned by the server.
@@ -50,8 +67,11 @@ func IsLedgerOutOfRange(err error) bool {
 }
 
 // HTTPClient talks JSON-RPC 2.0 over HTTP POST, with a request-rate cap for
+
 // public endpoints and automatic fallback for servers that don't support
+
 // xdrFormat: "json".
+
 type HTTPClient struct {
 	url        string
 	httpClient *http.Client
@@ -61,22 +81,36 @@ type HTTPClient struct {
 	// xdrJSONUnsupported flips to true once the server rejects the xdrFormat
 	// param, so we stop sending it and callers decode raw XDR instead.
 	xdrJSONUnsupported atomic.Bool
+
+	// requestObserver, when non-nil, is called after every call() completes.
+	requestObserver RequestObserver
 }
+
 
 var _ Client = (*HTTPClient)(nil)
 
+
+
 // Option customizes an HTTPClient.
 type Option func(*HTTPClient)
+
 
 // WithHTTPClient replaces the underlying HTTP client (e.g. for tests).
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *HTTPClient) { c.httpClient = hc }
 }
 
+
 // WithMinRequestInterval sets the minimum spacing between requests.
 // Zero disables rate limiting.
 func WithMinRequestInterval(d time.Duration) Option {
 	return func(c *HTTPClient) { c.limiter = newIntervalLimiter(d) }
+}
+
+// WithRequestObserver sets an observer that is called after every RPC call
+// with the JSON-RPC method name and any error that occurred.
+func WithRequestObserver(obs RequestObserver) Option {
+	return func(c *HTTPClient) { c.requestObserver = obs }
 }
 
 // NewHTTPClient creates a client for the RPC server at url. By default
@@ -107,25 +141,43 @@ func (c *HTTPClient) GetEvents(ctx context.Context, req GetEventsRequest) (GetEv
 	}
 
 	var resp GetEventsResponse
+	start := time.Now()
 	err := c.call(ctx, "getEvents", req, &resp)
+	metrics.RPCCallDuration.WithLabelValues("getEvents").Observe(time.Since(start).Seconds())
 	if err != nil && isXDRFormatRejected(err) {
 		// Older server: remember and retry once without the param.
 		c.xdrJSONUnsupported.Store(true)
 		req.XDRFormat = ""
+		start = time.Now()
 		err = c.call(ctx, "getEvents", req, &resp)
+		metrics.RPCCallDuration.WithLabelValues("getEvents").Observe(time.Since(start).Seconds())
 	}
 	return resp, err
 }
 
+
 func (c *HTTPClient) GetLatestLedger(ctx context.Context) (LatestLedger, error) {
 	var resp LatestLedger
+	start := time.Now()
 	err := c.call(ctx, "getLatestLedger", nil, &resp)
+	metrics.RPCCallDuration.WithLabelValues("getLatestLedger").Observe(time.Since(start).Seconds())
 	return resp, err
 }
 
+
 func (c *HTTPClient) GetHealth(ctx context.Context) (Health, error) {
 	var resp Health
+	start := time.Now()
 	err := c.call(ctx, "getHealth", nil, &resp)
+	metrics.RPCCallDuration.WithLabelValues("getHealth").Observe(time.Since(start).Seconds())
+	return resp, err
+}
+
+func (c *HTTPClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
+	var resp GetLedgerEntriesResponse
+	start := time.Now()
+	err := c.call(ctx, "getLedgerEntries", req, &resp)
+	metrics.RPCCallDuration.WithLabelValues("getLedgerEntries").Observe(time.Since(start).Seconds())
 	return resp, err
 }
 
@@ -151,6 +203,9 @@ type response struct {
 }
 
 func (c *HTTPClient) call(ctx context.Context, method string, params, result any) error {
+	timer := prometheus.NewTimer(metrics.RPCCallLatency)
+	defer timer.ObserveDuration()
+
 	if err := c.limiter.Wait(ctx); err != nil {
 		return err
 	}
