@@ -87,6 +87,35 @@ func TestHandler_ServesPrometheusExposition(t *testing.T) {
 	assert.Contains(t, w.Header().Get("Content-Type"), "text/plain")
 }
 
+// TestIngestionLagGauge_ExportedAtMetrics verifies the ingestion-lag gauge
+// (#237) is registered on the global registry and exposed at /metrics with
+// the exact chain-head-minus-last-ingested value.
+func TestIngestionLagGauge_ExportedAtMetrics(t *testing.T) {
+	tests := []struct {
+		name         string
+		chainHead    int64
+		lastIngested int64
+		want         string
+	}{
+		{name: "caught up", chainHead: 100, lastIngested: 100, want: "sorotrail_ingestion_lag_ledgers 0"},
+		{name: "five ledgers behind", chainHead: 100, lastIngested: 95, want: "sorotrail_ingestion_lag_ledgers 5"},
+		{name: "deep lag", chainHead: 1_000_000, lastIngested: 123_456, want: "sorotrail_ingestion_lag_ledgers 876544"},
+		{name: "nothing ingested yet", chainHead: 100, lastIngested: 0, want: "sorotrail_ingestion_lag_ledgers 100"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			IngestionLag.Set(float64(tt.chainHead - tt.lastIngested))
+			defer IngestionLag.Set(0)
+
+			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			w := httptest.NewRecorder()
+			Handler().ServeHTTP(w, req)
+			require.Equal(t, http.StatusOK, w.Code)
+			assert.Contains(t, w.Body.String(), tt.want)
+		})
+	}
+}
+
 func scrapeBody(t *testing.T, m *HTTPMetrics) string {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
