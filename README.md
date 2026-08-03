@@ -501,8 +501,9 @@ Shell
 
 | Param | Example | Meaning |
 | --- | --- | --- |
-| `contract_id` | `CDLZ...CYSC` | Only events from this contract. Accepts multiple values as a comma-separated list (`contract_id=C1,C2`) or as repeated parameters (`contract_id=C1&contract_id=C2`) — but not both styles at once, and at most 20 values. One query then returns the union in ascending event-ID order with a single cursor. |
-| `type` | `contract` | `contract` \| `system` \| `diagnostic`. Accepts multiple values the same way, e.g. `type=contract,system`. |
+| `contract_id` | `CDLZ...CYSC` | Only events from this contract. |
+| `type` | `contract` | `contract` \| `system` \| `diagnostic`. |
+| `in_successful_call` | `true` | `true` \| `false`. Only events that ran inside a successful call (`true`), or only diagnostic events from failed calls (`false`). |
 | `topic` | `{"symbol":"transfer"}` | Exact match against any topic position. A bare word is treated as a JSON string. |
 | `topic0` | `{"symbol":"transfer"}` | Exact match against topic position 0. |
 | `topic1` | `{"address":"G..."}` | Exact match against topic position 1. |
