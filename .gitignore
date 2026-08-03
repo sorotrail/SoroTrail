@@ -6,3 +6,4 @@ coverage.out
 .idea/
 .vscode/
 .claude/settings.local.json
+/sorotrail
