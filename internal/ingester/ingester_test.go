@@ -12,11 +12,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -33,6 +35,32 @@ func TestEventsIngestedTotal_SingleSuccess(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint64(3), ing.EventsIngestedTotal(),
 		"counter must equal the number of events persisted in one successful write")
+}
+
+// TestSetIngestionLag covers the #237 gauge: it must be the difference
+// between the RPC chain head and the last ingested ledger, and a no-op
+// whenever either side is unknown (≤ 0).
+func TestSetIngestionLag(t *testing.T) {
+	ing := &Ingester{}
+	tests := []struct {
+		name         string
+		chainHead    int64
+		lastIngested int64
+		want         float64
+	}{
+		{name: "caught up", chainHead: 100, lastIngested: 100, want: 0},
+		{name: "three ledgers behind", chainHead: 100, lastIngested: 97, want: 3},
+		{name: "unknown chain head is a no-op", chainHead: 0, lastIngested: 97, want: 0},
+		{name: "nothing ingested yet is a no-op", chainHead: 100, lastIngested: 0, want: 0},
+		{name: "replay can run ahead of the reported head", chainHead: 100, lastIngested: 105, want: -5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metrics.IngestionLag.Set(0)
+			ing.setIngestionLag(tt.chainHead, tt.lastIngested)
+			assert.Equal(t, tt.want, testutil.ToFloat64(metrics.IngestionLag))
+		})
+	}
 }
 
 func TestEventsIngestedTotal_CumulativeMultipleWrites(t *testing.T) {
@@ -198,7 +226,7 @@ type mockCycle struct {
 }
 
 func newTestIngester(client rpc.Client, st store.Store, opts Options) *Ingester {
-	return New(client, st, passthroughDecoder{}, testLogger(), nil, opts)
+	return New(client, st, passthroughDecoder{}, testLogger(), opts)
 }
 
 func rpcEvent(id string, ledger uint32) rpc.Event {
@@ -303,7 +331,7 @@ func TestPagination_FullPageKeepsCursorAndContinues(t *testing.T) {
 	caughtUp, err := ing.runOnce(context.Background())
 	require.NoError(t, err)
 	assert.False(t, caughtUp)
-	state, err := st.GetIngestionState(context.Background(), "")
+	state, err := st.GetIngestionState(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, "cursor-e2", state.LastCursor)
 	assert.Equal(t, int64(101), state.LastIngestedLedger)
@@ -314,7 +342,7 @@ func TestPagination_FullPageKeepsCursorAndContinues(t *testing.T) {
 	assert.Equal(t, "cursor-e2", client.eventsRequests[1].Pagination.Cursor)
 	assert.Len(t, st.events, 3)
 
-	state, err = st.GetIngestionState(context.Background(), "")
+	state, err = st.GetIngestionState(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, "cursor-e3", state.LastCursor, "caught-up resume prefers the cursor")
 }
@@ -466,7 +494,7 @@ func TestPagination_LegacyPagingTokenFallback(t *testing.T) {
 	caughtUp, err := ing.runOnce(context.Background())
 	require.NoError(t, err)
 	assert.False(t, caughtUp)
-	state, _ := st.GetIngestionState(context.Background(), "")
+	state, _ := st.GetIngestionState(context.Background())
 	assert.Equal(t, "pt-2", state.LastCursor)
 }
 
@@ -586,7 +614,7 @@ func TestWindowSweep_MultiBatch(t *testing.T) {
 	}
 	assert.Len(t, st.events, 2)
 
-	state, _ := st.GetIngestionState(context.Background(), "")
+	state, _ := st.GetIngestionState(context.Background())
 	assert.Equal(t, int64(1_099), state.LastIngestedLedger)
 	assert.Empty(t, state.LastCursor)
 }
@@ -604,7 +632,7 @@ func TestReclamp_WhenResumePointAgedOut(t *testing.T) {
 	_, err := ing.runOnce(context.Background())
 	require.NoError(t, err, "aged-out resume point is handled, not fatal")
 
-	state, _ := st.GetIngestionState(context.Background(), "")
+	state, _ := st.GetIngestionState(context.Background())
 	assert.Equal(t, int64(39_999), state.LastIngestedLedger,
 		"next pass resumes from the oldest retained ledger")
 	assert.Empty(t, state.LastCursor)

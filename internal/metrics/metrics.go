@@ -1,15 +1,9 @@
-// Package metrics exports Prometheus instrumentation for SoroTrail's
-// ingestion pipeline. Every counter, histogram, and gauge is registered with
-// the default Prometheus registry so promhttp.Handler() picks it up
-// automatically.
+// Package metrics exports Prometheus instrumentation for SoroTrail.
 //
-// Usage (one-time registration done in init):
-//
-//	metrics.EventsIngested.Add(float64(len(events)))
-//	timer := prometheus.NewTimer(metrics.DBWriteLatency)
-//	defer timer.ObserveDuration()
-// Package metrics exposes Prometheus metrics for the HTTP API, notably a
-// per-route request-duration histogram served at GET /metrics.
+// Pipeline counters, histograms, and gauges (sorotrail_*) are registered with
+// the default Prometheus registry so promhttp.Handler() picks them up
+// automatically; HTTPMetrics owns a per-server request-duration histogram
+// served at GET /metrics alongside the global metrics.
 package metrics
 
 import (
@@ -80,6 +74,8 @@ func init() {
 // Prometheus exposition format.
 func Handler() http.Handler {
 	return promhttp.Handler()
+}
+
 // unmatchedRoute labels requests that never reached a registered chi route
 // (404s from a totally unknown path). Falling back to r.URL.Path there
 // would let clients probing random paths grow the histogram's cardinality
@@ -133,6 +129,12 @@ func (m *HTTPMetrics) Middleware(next http.Handler) http.Handler {
 }
 
 // Handler serves the registered metrics in the Prometheus exposition format.
+// It combines the per-server HTTP histogram with the global pipeline metrics
+// (counters, latencies, and gauges such as sorotrail_ingestion_lag_ledgers)
+// so a single /metrics scrape sees the whole picture.
 func (m *HTTPMetrics) Handler() http.Handler {
-	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{Registry: m.registry})
+	return promhttp.HandlerFor(
+		prometheus.Gatherers{prometheus.DefaultGatherer, m.registry},
+		promhttp.HandlerOpts{Registry: m.registry},
+	)
 }

@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/metrics"
 )
 
 func TestMetrics_ServesRequestDurationHistogram(t *testing.T) {
@@ -26,4 +28,16 @@ func TestMetrics_ServesRequestDurationHistogram(t *testing.T) {
 
 func TestMetrics_ExemptFromRateLimit(t *testing.T) {
 	assert.True(t, exemptPaths["/metrics"], "/metrics must stay exempt from the rate limiter")
+}
+
+// TestMetrics_ExposesIngestionLagGauge asserts the /metrics endpoint serves
+// the ingestion-lag gauge (#237): latest RPC ledger minus last ingested.
+func TestMetrics_ExposesIngestionLagGauge(t *testing.T) {
+	metrics.IngestionLag.Set(21)
+	defer metrics.IngestionLag.Set(0)
+
+	s := newTestServer(&stubStore{}, nil)
+	resp, body := doGet(t, s, "/metrics")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, string(body), "sorotrail_ingestion_lag_ledgers 21")
 }
