@@ -20,7 +20,9 @@ import (
 	"github.com/khaylebfortune/sorotrail/internal/metrics"
 )
 
+
 // Client is the RPC boundary. The ingester and API depend on this interface
+
 // so tests can substitute a mock.
 type Client interface {
 	GetEvents(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error)
@@ -65,8 +67,11 @@ func IsLedgerOutOfRange(err error) bool {
 }
 
 // HTTPClient talks JSON-RPC 2.0 over HTTP POST, with a request-rate cap for
+
 // public endpoints and automatic fallback for servers that don't support
+
 // xdrFormat: "json".
+
 type HTTPClient struct {
 	url        string
 	httpClient *http.Client
@@ -81,15 +86,20 @@ type HTTPClient struct {
 	requestObserver RequestObserver
 }
 
+
 var _ Client = (*HTTPClient)(nil)
+
+
 
 // Option customizes an HTTPClient.
 type Option func(*HTTPClient)
+
 
 // WithHTTPClient replaces the underlying HTTP client (e.g. for tests).
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *HTTPClient) { c.httpClient = hc }
 }
+
 
 // WithMinRequestInterval sets the minimum spacing between requests.
 // Zero disables rate limiting.
@@ -145,6 +155,7 @@ func (c *HTTPClient) GetEvents(ctx context.Context, req GetEventsRequest) (GetEv
 	return resp, err
 }
 
+
 func (c *HTTPClient) GetLatestLedger(ctx context.Context) (LatestLedger, error) {
 	var resp LatestLedger
 	start := time.Now()
@@ -152,6 +163,7 @@ func (c *HTTPClient) GetLatestLedger(ctx context.Context) (LatestLedger, error) 
 	metrics.RPCCallDuration.WithLabelValues("getLatestLedger").Observe(time.Since(start).Seconds())
 	return resp, err
 }
+
 
 func (c *HTTPClient) GetHealth(ctx context.Context) (Health, error) {
 	var resp Health
