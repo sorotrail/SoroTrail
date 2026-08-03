@@ -503,6 +503,7 @@ Shell
 | --- | --- | --- |
 | `contract_id` | `CDLZ...CYSC` | Only events from this contract. |
 | `type` | `contract` | `contract` \| `system` \| `diagnostic`. |
+| `in_successful_call` | `true` | `true` \| `false`. Only events that ran inside a successful call (`true`), or only diagnostic events from failed calls (`false`). |
 | `topic` | `{"symbol":"transfer"}` | Exact match against any topic position. A bare word is treated as a JSON string. |
 | `topic0` | `{"symbol":"transfer"}` | Exact match against topic position 0. |
 | `topic1` | `{"address":"G..."}` | Exact match against topic position 1. |

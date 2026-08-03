@@ -878,6 +878,45 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		"upserting across the span boundary should have created a partition for at least one of the two ranges")
 }
 
+func TestQueryEvents_InSuccessfulCallFilter(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// testEvent sets InSuccessfulCall: true; build one failed-call event.
+	events := []Event{
+		testEvent(eventID(1), 100, contractA),
+		testEvent(eventID(2), 101, contractB),
+	}
+	failed := testEvent(eventID(3), 102, contractA)
+	failed.InSuccessfulCall = false
+	events = append(events, failed)
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name string
+		want bool
+		n    int
+	}{
+		{"successful calls only", true, 2},
+		{"failed calls only", false, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: &tc.want})
+			require.NoError(t, err)
+			require.Len(t, got, tc.n)
+			for _, e := range got {
+				assert.Equal(t, tc.want, e.InSuccessfulCall)
+			}
+		})
+	}
+
+	// nil means "no constraint" — the filter must not narrow the results.
+	all, _, err := st.QueryEvents(ctx, EventFilter{})
+	require.NoError(t, err)
+	assert.Len(t, all, 3)
+}
+
 func TestIngestionStateRoundTrip(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
