@@ -24,7 +24,7 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/khaylebfortune/sorotrail
+        - github.com/sorotrail/sorotrail
   exclusions:
     generated: lax
     paths:
