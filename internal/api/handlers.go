@@ -458,7 +458,11 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok", "rpc": "ok"}}
+	resp := healthResponse{Status: "ok", Checks: map[string]string{
+		"database":      "ok",
+		"rpc":           "ok",
+		"ingestion_lag": "ok",
+	}}
 	status := http.StatusOK
 
 	if err := s.store.Ping(ctx); err != nil {
@@ -475,6 +479,26 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		resp.Checks["rpc"] = fmt.Sprintf("rpc reports %q", health.Status)
 		status = http.StatusServiceUnavailable
 	}
+
+	// Check ingestion lag: if we're more than 100 ledgers behind the chain
+	// head, mark the instance as not ready (it should be pulled from the
+	// load balancer until it catches up).
+	if state, err := s.store.GetIngestionState(ctx); err == nil {
+		// Only check lag if we have an ingestion state and an RPC client.
+		if s.rpc != nil {
+			if health, err := s.rpc.GetHealth(ctx); err == nil {
+				lag := health.LatestLedger - state.LastIngestedLedger
+				if lag > 100 && state.LastIngestedLedger > 0 {
+					resp.Status = "degraded"
+					resp.Checks["ingestion_lag"] = fmt.Sprintf(
+						"%d ledgers behind (last ingested: %d, chain head: %d)",
+						lag, state.LastIngestedLedger, health.LatestLedger)
+					status = http.StatusServiceUnavailable
+				}
+			}
+		}
+	}
+
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, status, resp)
 }
