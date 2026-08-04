@@ -7,23 +7,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/khaylebfortune/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/config"
 )
-
-// contractMetaResponse is the JSON shape for a single contract's metadata.
-// All fields except contract_id are omitempty so null/missing metadata is
-// cleanly absent from the response rather than showing as "name": null.
-type contractMetaResponse struct {
-	ContractID string  `json:"contract_id"`
-	Name       *string `json:"name,omitempty"`
-	Symbol     *string `json:"symbol,omitempty"`
-	Decimals   *int    `json:"decimals,omitempty"`
-}
-
-// contractsResponse is the JSON shape for GET /contracts.
-type contractsResponse struct {
-	Contracts []contractMetaResponse `json:"contracts"`
-}
 
 // contractStatsResponse is the JSON shape for GET /contracts/{id}/stats.
 type contractStatsResponse struct {
@@ -32,31 +17,6 @@ type contractStatsResponse struct {
 	Symbol     *string `json:"symbol,omitempty"`
 	Decimals   *int    `json:"decimals,omitempty"`
 	EventCount int64   `json:"event_count"`
-}
-
-// handleListContracts returns all contracts seen by the indexer with their
-// cached metadata (null when unknown).
-func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
-	contractIDs, err := s.store.ListContractIDs(r.Context())
-	if err != nil {
-		s.log.Error("listing contract IDs", "error", err)
-		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
-		return
-	}
-
-	contracts := make([]contractMetaResponse, 0, len(contractIDs))
-	for _, cid := range contractIDs {
-		cr := contractMetaResponse{ContractID: cid}
-		if meta, err := s.store.GetContractMeta(r.Context(), cid); err == nil && meta.HasMetadata() {
-			cr.Name = meta.Name
-			cr.Symbol = meta.Symbol
-			cr.Decimals = meta.Decimals
-		}
-		contracts = append(contracts, cr)
-	}
-
-	writeCacheHeaders(w, cacheNoCache, 0, "")
-	writeJSON(w, http.StatusOK, contractsResponse{Contracts: contracts})
 }
 
 // handleContractStats returns per-contract statistics with cached metadata.

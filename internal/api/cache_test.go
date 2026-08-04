@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -29,26 +28,6 @@ func (e *stubEnricher) EnrichEvents(_ context.Context, events []store.Event) []s
 		Event:   events[0],
 		Decoded: true,
 	}}
-}
-
-// doGetWithHeader is doGet plus a header for conditional requests. The
-// 304 tests use this so the If-None-Match setup reads naturally without
-// the caller constructing http.Request by hand.
-func doGetWithHeader(t *testing.T, s *Server, path, header, value string) (*http.Response, []byte) {
-	t.Helper()
-	srv := httptest.NewServer(s.Router())
-	defer srv.Close()
-	req, err := http.NewRequest(http.MethodGet, srv.URL+path, nil)
-	require.NoError(t, err)
-	if header != "" {
-		req.Header.Set(header, value)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	resp.Body.Close()
-	return resp, body
 }
 
 // assertImmutable asserts that a response carries the immutable-cache
@@ -490,6 +469,7 @@ func TestListETag_CoversEveryFilterField(t *testing.T) {
 		mutate func(f *store.EventFilter)
 	}{
 		{"ContractID", func(f *store.EventFilter) { f.ContractID = testContract }},
+		{"ContractIDPrefix", func(f *store.EventFilter) { f.ContractIDPrefix = "CABC" }},
 		{"Type", func(f *store.EventFilter) { f.Types = []string{"diagnostic"} }},
 		{"Topic", func(f *store.EventFilter) { f.Topic = json.RawMessage(`{"symbol":"transfer"}`) }},
 		{"Topic0", func(f *store.EventFilter) { f.Topic0 = json.RawMessage(`{"symbol":"transfer"}`) }},
@@ -497,6 +477,11 @@ func TestListETag_CoversEveryFilterField(t *testing.T) {
 		{"Topic2", func(f *store.EventFilter) { f.Topic2 = json.RawMessage(`{"symbol":"transfer"}`) }},
 		{"Topic3", func(f *store.EventFilter) { f.Topic3 = json.RawMessage(`{"symbol":"transfer"}`) }},
 		{"TopicContains", func(f *store.EventFilter) { f.TopicContains = json.RawMessage(`[{"u64":7}]`) }},
+		{"TxHash", func(f *store.EventFilter) { f.TxHash = "abc123def" }},
+		{"HasValueTrue", func(f *store.EventFilter) { t := true; f.HasValue = &t }},
+		{"HasValueFalse", func(f *store.EventFilter) { v := false; f.HasValue = &v }},
+		{"TxIndex", func(f *store.EventFilter) { v := int32(1); f.TxIndex = &v }},
+		{"OpIndex", func(f *store.EventFilter) { v := int32(0); f.OpIndex = &v }},
 		{"FromLedger", func(f *store.EventFilter) { f.FromLedger = 501 }},
 		{"ToLedger", func(f *store.EventFilter) { f.ToLedger = 998 }},
 		{"FromTime", func(f *store.EventFilter) { f.FromTime = time.Unix(1_000_000, 0).UTC() }},
@@ -504,6 +489,7 @@ func TestListETag_CoversEveryFilterField(t *testing.T) {
 		{"Cursor", func(f *store.EventFilter) { f.Cursor = "e1" }},
 		{"Limit", func(f *store.EventFilter) { f.Limit = 7 }},
 		{"Order", func(f *store.EventFilter) { f.Order = "desc" }},
+		{"HasValue", func(f *store.EventFilter) { v := true; f.HasValue = &v }},
 	}
 
 	seen := map[string]string{baseETag: "base"}

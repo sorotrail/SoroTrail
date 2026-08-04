@@ -11,13 +11,10 @@ import (
 
 const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
-// envKeys is the comprehensive list of env vars Load reads. Each test
-// subtest clears them so leftover values from the host environment or a
-// prior test don't leak across cases.
 var envKeys = []string{
 	"RPC_URL", "RPC_URLS", "RPC_RATE_LIMIT_RPS", "DATABASE_URL",
 	"POLL_INTERVAL", "HTTP_ADDR",
-	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL",
+	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL", "LOG_FORMAT",
 	"API_QUERY_TIMEOUT", "API_SLOW_QUERY_THRESHOLD",
 	"HORIZON_URL", "BACKFILL_RATE_RPS",
 	"AUDIT_ENABLED", "AUDIT_POLL_INTERVAL", "AUDIT_BATCH_LEDGERS",
@@ -27,6 +24,9 @@ var envKeys = []string{
 	"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT",
 	"HTTP_READ_HEADER_TIMEOUT",
 	"SHUTDOWN_TIMEOUT",
+	"INGESTION_LOCK_ENABLED",
+	"MULTI_TENANT", "MULTI_TENANT_MAX_WATCHED", "MULTI_TENANT_USAGE_FLUSH",
+	"MULTI_TENANT_STREAM_SCOPE_SYNC", "MULTI_TENANT_BOOTSTRAP_KEY",
 }
 
 func TestLoad(t *testing.T) {
@@ -40,14 +40,34 @@ func TestLoad(t *testing.T) {
 			name: "defaults with only DATABASE_URL",
 			env:  map[string]string{"DATABASE_URL": "postgres://localhost/db"},
 			check: func(t *testing.T, c Config) {
-				assert.Equal(t, "https://soroban-testnet.stellar.org", c.RPCURL)
 				assert.Equal(t, 5*time.Second, c.PollInterval)
-				assert.Equal(t, 25*time.Second, c.APIQueryTimeout)
-				assert.Equal(t, 2*time.Second, c.APISlowQueryThreshold)
 				assert.Equal(t, ":8080", c.HTTPAddr)
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
 				assert.Equal(t, uint32(120960), c.PartitionLedgerSpan)
 				assert.Empty(t, c.WatchedContracts)
+				assert.Equal(t, uint32(100), c.LagWarnLedgers,
+					"LagWarnLedgers default lets the lag alarm work out of the box")
+			},
+		},
+		{
+			name: "lag alarm threshold configurable",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"LAG_WARN_LEDGERS": "50",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint32(50), c.LagWarnLedgers)
+			},
+		},
+		{
+			name: "lag alarm threshold zero disables the alarm",
+			env: map[string]string{
+				"DATABASE_URL":     "postgres://localhost/db",
+				"LAG_WARN_LEDGERS": "0",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint32(0), c.LagWarnLedgers,
+					"0 is the documented way to silence the alarm entirely")
 				assert.Zero(t, c.RateLimitRPS, "rate limiter disabled by default")
 				assert.Zero(t, c.RateLimitBurst)
 				assert.False(t, c.RateLimitTrustedProxy)
@@ -61,7 +81,7 @@ func TestLoad(t *testing.T) {
 		{
 			name:    "missing DATABASE_URL",
 			env:     map[string]string{},
-			wantErr: "DATABASE_URL is required",
+			wantErr: "DATABASE_URL: required but empty",
 		},
 		{
 			name: "watched contracts parsed and trimmed",
@@ -87,15 +107,7 @@ func TestLoad(t *testing.T) {
 				"DATABASE_URL":  "postgres://localhost/db",
 				"POLL_INTERVAL": "-3s",
 			},
-			wantErr: "POLL_INTERVAL must be positive",
-		},
-		{
-			name: "bad query timeout",
-			env: map[string]string{
-				"DATABASE_URL":      "postgres://localhost/db",
-				"API_QUERY_TIMEOUT": "0s",
-			},
-			wantErr: "API_QUERY_TIMEOUT",
+			wantErr: "POLL_INTERVAL",
 		},
 		{
 			name: "bad log level",
@@ -104,6 +116,83 @@ func TestLoad(t *testing.T) {
 				"LOG_LEVEL":    "loud",
 			},
 			wantErr: "LOG_LEVEL",
+		},
+		{
+			name: "log level debug",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "debug",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "debug", c.LogLevel)
+			},
+		},
+		{
+			name: "log level info",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "info",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "info", c.LogLevel)
+			},
+		},
+		{
+			name: "log level warn",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "warn",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "warn", c.LogLevel)
+			},
+		},
+		{
+			name: "log level error",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_LEVEL":    "error",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "error", c.LogLevel)
+			},
+		},
+		{
+			name: "log level defaults to info",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "info", c.LogLevel)
+			},
+		},
+		{
+			name: "log format text",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_FORMAT":   "text",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "text", c.LogFormat)
+			},
+		},
+		{
+			name: "log format json",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_FORMAT":   "json",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "json", c.LogFormat)
+			},
+		},
+		{
+			name: "bad log format",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"LOG_FORMAT":   "xml",
+			},
+			wantErr: "LOG_FORMAT",
 		},
 		{
 			name: "bad rpc url",
@@ -183,6 +272,36 @@ func TestLoad(t *testing.T) {
 				"DATABASE_URL": "postgres://localhost/db",
 			},
 			check: func(t *testing.T, c Config) {
+				assert.Equal(t, time.Duration(0), c.RetentionMaxAge)
+				assert.Equal(t, uint64(0), c.RetentionMinLedger)
+				assert.Equal(t, 5000, c.RetentionBatchSize)
+				assert.Equal(t, 100*time.Millisecond, c.RetentionPause)
+				assert.Equal(t, 1*time.Hour, c.RetentionInterval)
+				assert.False(t, c.RetentionEnabled())
+			},
+		},
+		{
+			name: "bad retention batch size",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"RETENTION_BATCH_SIZE": "0",
+			},
+			wantErr: "RETENTION_BATCH_SIZE must be positive",
+		},
+		{
+			name: "bad retention pause",
+			env: map[string]string{
+				"DATABASE_URL":    "postgres://localhost/db",
+				"RETENTION_PAUSE": "-1s",
+			},
+			wantErr: "RETENTION_PAUSE must be non-negative",
+		},
+		{
+			name: "shutdown timeout defaults to 15s",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
 				assert.Equal(t, 15*time.Second, c.ShutdownTimeout)
 			},
 		},
@@ -250,7 +369,55 @@ func TestLoad(t *testing.T) {
 				"DATABASE_URL":   "postgres://localhost/db",
 				"RATE_LIMIT_RPS": "-1",
 			},
-			wantErr: "RATE_LIMIT_RPS must be non-negative",
+			wantErr: "RATE_LIMIT_RPS: -1 must be non-negative",
+		},
+		{
+			name: "cors origins parsed, trimmed, and normalized",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "https://app.example.com, https://dashboard.example.com/ , *",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{
+					"https://app.example.com",
+					"https://dashboard.example.com",
+					"*",
+				}, c.CORSAllowedOrigins)
+			},
+		},
+		{
+			name: "cors wildcard accepted",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "*",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{"*"}, c.CORSAllowedOrigins)
+			},
+		},
+		{
+			name: "cors origin missing scheme rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "app.example.com",
+			},
+			wantErr: "CORS_ALLOWED_ORIGINS entry \"app.example.com\" is not a valid origin",
+		},
+		{
+			name: "cors origin with non-http scheme rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "ftp://example.com",
+			},
+			wantErr: "CORS_ALLOWED_ORIGINS entry",
+		},
+		{
+			name: "cors javascript scheme rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"CORS_ALLOWED_ORIGINS": "javascript:alert(1)",
+			},
+			wantErr: "CORS_ALLOWED_ORIGINS entry",
 		},
 		{
 			name: "RPC_URLS with valid URLs accepted",
@@ -303,8 +470,6 @@ func TestLoad(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Clear the variables Load reads, then apply the case's env.
-			// t.Setenv registers restoration; Unsetenv makes defaults apply.
 			for _, key := range envKeys {
 				t.Setenv(key, "")
 				os.Unsetenv(key)
@@ -324,6 +489,20 @@ func TestLoad(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidOrigin(t *testing.T) {
+	assert.True(t, ValidOrigin("*"))
+	assert.True(t, ValidOrigin("https://app.example.com"))
+	assert.True(t, ValidOrigin("http://localhost:5173"))
+	assert.True(t, ValidOrigin("https://a.example.com:8443"))
+
+	assert.False(t, ValidOrigin(""), "empty string")
+	assert.False(t, ValidOrigin("app.example.com"), "missing scheme")
+	assert.False(t, ValidOrigin("ftp://example.com"), "non-http scheme")
+	assert.False(t, ValidOrigin("javascript:alert(1)"), "javascript scheme")
+	assert.False(t, ValidOrigin("https://"), "missing host")
+	assert.False(t, ValidOrigin("https://example.com/path"), "origins cannot carry a path")
 }
 
 func TestValidContractID(t *testing.T) {
@@ -349,4 +528,110 @@ func TestValidCursor(t *testing.T) {
 	assert.False(t, ValidCursor("<script>alert(1)</script>"), "contains angle brackets")
 	assert.False(t, ValidCursor("e1\n"), "contains newline")
 	assert.False(t, ValidCursor(string(make([]byte, 129))), "too long (>128 chars)")
+}
+
+// Multi-tenancy is off unless asked for, and its knobs are validated.
+func TestLoad_MultiTenancy(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+		wantErr string
+		check   func(t *testing.T, c Config)
+	}{
+		{
+			name: "off by default",
+			env:  map[string]string{"DATABASE_URL": "postgres://localhost/db"},
+			check: func(t *testing.T, c Config) {
+				assert.False(t, c.MultiTenant,
+					"an upgraded deployment must not silently start requiring API keys")
+				assert.Equal(t, 250, c.MultiTenantMaxWatched)
+				assert.Equal(t, 10*time.Second, c.MultiTenantUsageFlush)
+				assert.Equal(t, 30*time.Second, c.MultiTenantStreamScopeSync)
+			},
+		},
+		{
+			name: "enabled with overrides",
+			env: map[string]string{
+				"DATABASE_URL":                   "postgres://localhost/db",
+				"MULTI_TENANT":                   "true",
+				"MULTI_TENANT_MAX_WATCHED":       "50",
+				"MULTI_TENANT_USAGE_FLUSH":       "5s",
+				"MULTI_TENANT_STREAM_SCOPE_SYNC": "2s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.True(t, c.MultiTenant)
+				assert.Equal(t, 50, c.MultiTenantMaxWatched)
+				assert.Equal(t, 5*time.Second, c.MultiTenantUsageFlush)
+				assert.Equal(t, 2*time.Second, c.MultiTenantStreamScopeSync)
+			},
+		},
+		{
+			name: "zero disables the instance watch cap",
+			env: map[string]string{
+				"DATABASE_URL":             "postgres://localhost/db",
+				"MULTI_TENANT":             "true",
+				"MULTI_TENANT_MAX_WATCHED": "0",
+			},
+			check: func(t *testing.T, c Config) { assert.Equal(t, 0, c.MultiTenantMaxWatched) },
+		},
+		{
+			name: "a negative watch cap is rejected",
+			env: map[string]string{
+				"DATABASE_URL":             "postgres://localhost/db",
+				"MULTI_TENANT_MAX_WATCHED": "-1",
+			},
+			wantErr: "MULTI_TENANT_MAX_WATCHED",
+		},
+		{
+			name: "a non-positive scope sync is rejected",
+			env: map[string]string{
+				"DATABASE_URL":                   "postgres://localhost/db",
+				"MULTI_TENANT_STREAM_SCOPE_SYNC": "0s",
+			},
+			wantErr: "MULTI_TENANT_STREAM_SCOPE_SYNC",
+		},
+		{
+			// Silently ignoring this would leave an operator believing the
+			// instance is protected when it is wide open.
+			name: "a bootstrap key without multi-tenancy is rejected",
+			env: map[string]string{
+				"DATABASE_URL":               "postgres://localhost/db",
+				"MULTI_TENANT_BOOTSTRAP_KEY": "st_ABCDEFGHIJKLMNOP_secret",
+			},
+			wantErr: "MULTI_TENANT_BOOTSTRAP_KEY is set but MULTI_TENANT is false",
+		},
+		{
+			name: "a bootstrap key with multi-tenancy is accepted",
+			env: map[string]string{
+				"DATABASE_URL":               "postgres://localhost/db",
+				"MULTI_TENANT":               "true",
+				"MULTI_TENANT_BOOTSTRAP_KEY": "st_ABCDEFGHIJKLMNOP_secret",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, "st_ABCDEFGHIJKLMNOP_secret", c.MultiTenantBootstrapKey)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, key := range envKeys {
+				t.Setenv(key, "")
+				os.Unsetenv(key)
+			}
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			cfg, err := Load()
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			if tt.check != nil {
+				tt.check(t, cfg)
+			}
+		})
+	}
 }

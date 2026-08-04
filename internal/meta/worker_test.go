@@ -14,8 +14,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 func testLogger() *slog.Logger {
@@ -74,38 +74,72 @@ func (s *stubStore) UpsertEvents(context.Context, []store.Event) (int64, error) 
 func (s *stubStore) ReplaceEventsInRange(context.Context, []store.Event, int64, int64) error {
 	return nil
 }
-func (s *stubStore) GetEvent(context.Context, string) (store.Event, error) {
+func (s *stubStore) GetEvent(context.Context, string, store.Scope) (store.Event, error) {
 	return store.Event{}, store.ErrNotFound
 }
-func (s *stubStore) EventExists(context.Context, string) (bool, error) { return false, nil }
+func (s *stubStore) GetEventsByTxHash(context.Context, string, string) ([]store.Event, error) {
+	return nil, nil
+}
+func (s *stubStore) EventExists(context.Context, string, store.Scope) (bool, error) { return false, nil }
 func (s *stubStore) QueryEvents(context.Context, store.EventFilter) ([]store.Event, string, error) {
 	return nil, "", nil
+}
+func (s *stubStore) CountEvents(context.Context, store.EventFilter) (int64, error) { return 0, nil }
+func (s *stubStore) AggregateEvents(context.Context, store.EventFilter, string) ([]store.AggregateBucket, error) {
+	return nil, nil
 }
 func (s *stubStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]store.LedgerCensus, error) {
 	return nil, nil
 }
+func (s *stubStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	return nil, "", nil
+}
+func (s *stubStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
+	return 0, nil
+}
+func (s *stubStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
+	return store.DeadLetter{}, nil
+}
+func (s *stubStore) ListDeadLetters(context.Context, string, int, string) ([]store.DeadLetter, string, error) {
+	return nil, "", nil
+}
+func (s *stubStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, error) {
+	return store.DeadLetter{}, store.ErrNotFound
+}
+func (s *stubStore) DeleteDeadLetter(context.Context, int64) error { return nil }
 func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, error) {
 	return store.IngestionState{}, store.ErrNotFound
 }
 func (s *stubStore) SaveIngestionState(context.Context, store.IngestionState) error { return nil }
-func (s *stubStore) GetAuditState(context.Context) (store.AuditState, error) {
+func (s *stubStore) GetAuditState(context.Context, string) (store.AuditState, error) {
 	return store.AuditState{}, store.ErrNotFound
 }
 func (s *stubStore) SaveAuditState(context.Context, store.AuditState) error { return nil }
-func (s *stubStore) SaveAuditStateIfGreater(context.Context, int64) (store.AuditState, error) {
+func (s *stubStore) SaveAuditStateIfGreater(context.Context, string, int64) (store.AuditState, error) {
 	return store.AuditState{}, nil
 }
-func (s *stubStore) ListWatchedContracts(context.Context) ([]string, error) { return nil, nil }
-func (s *stubStore) AddWatchedContract(context.Context, string) error       { return nil }
+func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
+	return nil, nil
+}
+func (s *stubStore) AddWatchedContract(context.Context, string) error             { return nil }
+func (s *stubStore) RemoveWatchedContract(context.Context, string) error          { return nil }
+func (s *stubStore) GetContractCursor(context.Context, string) (store.ContractCursor, error) {
+	return store.ContractCursor{}, store.ErrNotFound
+}
+func (s *stubStore) SaveContractCursor(context.Context, store.ContractCursor) error { return nil }
+func (s *stubStore) DeleteContractCursor(context.Context, string) error             { return nil }
+func (s *stubStore) ListContractCursors(context.Context) ([]store.ContractCursor, error) {
+	return nil, nil
+}
 func (s *stubStore) RecordAuditFinding(context.Context, store.AuditFinding) (store.AuditFinding, error) {
 	return store.AuditFinding{}, nil
 }
 func (s *stubStore) UpdateAuditFinding(context.Context, store.AuditFinding) error { return nil }
-func (s *stubStore) ListOpenFindingsByRange(context.Context, int64, int64) (store.AuditFinding, error) {
+func (s *stubStore) ListOpenFindingsByRange(context.Context, string, int64, int64) (store.AuditFinding, error) {
 	return store.AuditFinding{}, store.ErrNotFound
 }
-func (s *stubStore) Stats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
-func (s *stubStore) Ping(context.Context) error                 { return nil }
+func (s *stubStore) Stats(context.Context, store.Scope) (store.Stats, error) { return store.Stats{}, nil }
+func (s *stubStore) Ping(context.Context) error                              { return nil }
 func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
 }
@@ -116,16 +150,18 @@ func (s *stubStore) CreateSubscription(_ context.Context, sub store.Subscription
 	sub.ID = 1
 	return sub, nil
 }
-func (s *stubStore) GetSubscription(_ context.Context, id int64) (store.Subscription, error) {
+func (s *stubStore) GetSubscription(_ context.Context, id int64, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return store.Subscription{}, store.ErrNotFound
 }
-func (s *stubStore) ListSubscriptions(context.Context) ([]store.Subscription, error) {
+func (s *stubStore) ListSubscriptions(context.Context, store.SubscriptionOwner) ([]store.Subscription, error) {
 	return nil, nil
 }
-func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
+func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription, _ store.SubscriptionOwner) (store.Subscription, error) {
 	return sub, nil
 }
-func (s *stubStore) DeleteSubscription(context.Context, int64) error { return nil }
+func (s *stubStore) DeleteSubscription(context.Context, int64, store.SubscriptionOwner) error {
+	return nil
+}
 func (s *stubStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
 	return nil, nil
 }
@@ -137,9 +173,22 @@ func (s *stubStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 	a.ID = 1
 	return a, nil
 }
-func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.DeliveryAttempt, error) {
+func (s *stubStore) ListDeliveryAttempts(context.Context, int64, int, store.SubscriptionOwner) ([]store.DeliveryAttempt, error) {
 	return nil, nil
 }
+func (s *stubStore) DeleteEventsBeforeLedger(context.Context, int64) (int64, error) { return 0, nil }
+func (s *stubStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}
+func (s *stubStore) UpsertAddressRefs(context.Context, []store.AddressRef) error { return nil }
+func (s *stubStore) QueryAddressEvents(context.Context, string, store.EventFilter) ([]store.Event, string, error) {
+	return nil, "", nil
+}
+func (s *stubStore) CountAddressEvents(context.Context, string) (int64, error) { return 0, nil }
+func (s *stubStore) GetAddressSummary(context.Context, string) (store.AddressSummary, error) {
+	return store.AddressSummary{}, nil
+}
+func (s *stubStore) MigrationVersion(context.Context) (int, bool, error) { return 0, false, nil }
 func (s *stubStore) GetContractMeta(_ context.Context, contractID string) (store.ContractMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

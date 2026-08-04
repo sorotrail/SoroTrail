@@ -89,7 +89,7 @@ flags:
 	if err != nil {
 		return err
 	}
-	log := newLogger(cfg.LogLevel)
+	log := newLogger(cfg.LogLevel, cfg.LogFormat)
 
 	// Ctrl-C stops between pages rather than killing the process, so
 	// the in-flight upsert commits cleanly and progress stays consistent.
