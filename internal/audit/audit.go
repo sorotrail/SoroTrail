@@ -135,7 +135,7 @@ func (a *Auditor) PassOnce(ctx context.Context) (worked bool, err error) {
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return false, fmt.Errorf("loading audit state: %w", err)
 	}
-	ing, err := a.store.GetIngestionState(ctx, a.opts.Network)
+	ing, err := a.store.GetIngestionState(ctx)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return false, fmt.Errorf("loading ingestion state: %w", err)
 	}

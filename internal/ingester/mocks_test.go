@@ -69,6 +69,10 @@ func (m *scriptedRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequ
 	return rpc.GetLedgerEntriesResponse{}, nil
 }
 
+func (m *scriptedRPC) SimulateTransaction(context.Context, rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error) {
+	return rpc.SimulateTransactionResponse{}, nil
+}
+
 // mockRPC scripts getEvents responses in order and records the requests it
 // received.
 type mockRPC struct {
@@ -120,6 +124,11 @@ func (m *mockRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest)
 	return rpc.GetLedgerEntriesResponse{}, nil
 }
 
+func (m *mockRPC) SimulateTransaction(context.Context, rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error) {
+	return rpc.SimulateTransactionResponse{}, nil
+}
+
+// mockStore is an in-memory Store.
 type mockStore struct {
 	// Embedded so the mock keeps satisfying store.Store as the
 	// interface grows; unstubbed methods panic if a test calls them.
@@ -134,24 +143,28 @@ type mockStore struct {
 	// ingestErr, when set, is returned by GetIngestionState so tests can
 	// exercise the ingester's error path.
 	ingestErr error
+	// upsertErr, when set, is returned by UpsertEvents.
+	upsertErr error
+	// contractCursors backs the per-contract cursor methods.
+	contractCursors []store.ContractCursor
 }
 
 func newMockStore() *mockStore {
 	return &mockStore{events: map[string]store.Event{}}
 }
 
-func (m *mockStore) UpsertEvents(_ context.Context, events []store.Event) ([]store.Event, error) {
+func (m *mockStore) UpsertEvents(_ context.Context, events []store.Event) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.upsertErr != nil {
 		return 0, m.upsertErr
 	}
 	m.upserted = append(m.upserted, events)
-	var inserted []store.Event
+	var inserted int64
 	for _, e := range events {
 		if _, dup := m.events[e.ID]; !dup {
 			m.events[e.ID] = e
-			inserted = append(inserted, e)
+			inserted++
 		}
 	}
 	return inserted, nil
@@ -242,7 +255,7 @@ func (m *mockStore) ListOpenFindingsByRange(_ context.Context, _ string, _, _ in
 	return store.AuditFinding{}, store.ErrNotFound
 }
 
-func (m *mockStore) GetIngestionState(_ context.Context, _ string) (store.IngestionState, error) {
+func (m *mockStore) GetIngestionState(_ context.Context) (store.IngestionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.ingestErr != nil {
@@ -338,7 +351,21 @@ func (m *mockStore) Ping(context.Context) error { return nil }
 func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
 }
-func (m *mockStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
+func (m *mockStore) ListContractIDs(context.Context) ([]string, error) {
+	return nil, nil
+}
+func (m *mockStore) GetContractMeta(context.Context, string) (store.ContractMeta, error) {
+	return store.ContractMeta{}, store.ErrNotFound
+}
+func (m *mockStore) UpsertContractMeta(context.Context, store.ContractMeta) error {
+	return nil
+}
+func (m *mockStore) CountContractEvents(context.Context, string) (int64, error) {
+	return 0, nil
+}
+func (m *mockStore) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
+	return nil, nil
+}
 
 func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
 	sub.ID = 1

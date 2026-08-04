@@ -68,7 +68,16 @@ func (c Config) ValidateAll() error {
 
 	// --- URL format ---------------------------------------------------------
 
-	if c.RPCURL == "" {
+	// RPC_URLS takes priority when set: the multi-provider failover client
+	// is used and RPC_URL may be left empty. Otherwise RPC_URL is the
+	// single-provider endpoint and is required to be a valid URL.
+	if len(c.RPCURLS) > 0 {
+		for i, raw := range c.RPCURLS {
+			if u, err := url.Parse(raw); err != nil || u.Scheme == "" || u.Host == "" {
+				errs = append(errs, fmt.Sprintf("RPC_URLS[%d]: %q is not a valid absolute URL (want scheme://host)", i, raw))
+			}
+		}
+	} else if c.RPCURL == "" {
 		errs = append(errs, "RPC_URL: required but empty")
 	} else if u, err := url.Parse(c.RPCURL); err != nil || u.Scheme == "" || u.Host == "" {
 		errs = append(errs, fmt.Sprintf("RPC_URL: %q is not a valid absolute URL (want scheme://host)",

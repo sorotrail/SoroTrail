@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
-	"math/big"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,7 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/khaylebfortune/sorotrail/internal/metrics"
+	"github.com/sorotrail/sorotrail/internal/metrics"
 )
 
 // ErrNotFound is returned when a lookup matches no rows.
@@ -28,12 +27,7 @@ var ErrNotFound = errors.New("not found")
 // requested ordering. It is caller error: the API maps it to 400, not 500.
 var ErrInvalidCursor = errors.New("invalid cursor")
 
-// DefaultQueryLimit applies when EventFilter.Limit is unset; MaxQueryLimit
-// caps requested page sizes as a server-side safety net (the API layer
-// enforces its own configurable limit via API_MAX_LIMIT).
 const (
-	DefaultQueryLimit         = 50
-	MaxQueryLimit             = 500
 	DefaultEventPartitionSpan = 120960
 
 	poolHealthCheckInterval  = 5 * time.Second
@@ -43,6 +37,7 @@ const (
 )
 
 // Postgres implements Store on a pgx connection pool.
+//
 type Postgres struct {
 	pool          *pgxpool.Pool
 	partitionSpan int64
@@ -203,46 +198,25 @@ func (p *Postgres) attemptReconnect(ctx context.Context, logger *slog.Logger) er
 	return nil
 }
 
-func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) ([]Event, error) {
+func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
 	if len(events) == 0 {
-		return nil, nil
+		return 0, nil
 	}
 	return p.upsertEvents(ctx, events, false)
 }
 
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
 // ingest, DO NOTHING) and ReplaceEventsInRange (auditor repair, DO UPDATE).
-// Both paths write all 15 columns of the events table so topics_xdr /
-// value_xdr are never silently dropped on the way in; a repair that
-// arrives without XDR preserves what was already stored via the coalesce()
-// clauses in the UPDATE branch (`sorotrail replay` relies on that).
+// Both paths write the full events row so raw XDR is never silently dropped
+// on the way in; a repair that arrives without XDR preserves what was already
+// stored via the coalesce() clauses in the UPDATE branch (`sorotrail replay`
+// relies on that).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
-	conflict := `ON CONFLICT (network, ledger, id) DO NOTHING`
-	batch := &pgx.Batch{}
-	conflict := `ON CONFLICT (id) DO NOTHING`
-	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
-			contract_id        = COALESCE(EXCLUDED.contract_id,        events.contract_id),
-			ledger             = COALESCE(EXCLUDED.ledger,             events.ledger),
-			type               = COALESCE(EXCLUDED.type,               events.type),
-			tx_hash            = COALESCE(EXCLUDED.tx_hash,            events.tx_hash),
-			tx_index           = COALESCE(EXCLUDED.tx_index,           events.tx_index),
-			op_index           = COALESCE(EXCLUDED.op_index,           events.op_index),
-			in_successful_call = COALESCE(EXCLUDED.in_successful_call, events.in_successful_call),
-			topics             = COALESCE(EXCLUDED.topics,             events.topics),
-			value              = COALESCE(EXCLUDED.value,              events.value),
-			created_at         = COALESCE(EXCLUDED.created_at,         events.created_at),
-			topics_xdr         = COALESCE(EXCLUDED.topics_xdr,         events.topics_xdr),
-			value_xdr          = COALESCE(EXCLUDED.value_xdr,          events.value_xdr),
-			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr,      events.raw_topic_xdr),
-			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr,      events.raw_value_xdr)`
-	conflict := "ON CONFLICT (id) DO NOTHING"
-	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
 	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
 	if onUpdate {
-		conflict = `ON CONFLICT (network, ledger, id) DO UPDATE SET
+		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
 			contract_id        = EXCLUDED.contract_id,
+			ledger             = EXCLUDED.ledger,
 			type               = EXCLUDED.type,
 			tx_hash            = EXCLUDED.tx_hash,
 			tx_index           = EXCLUDED.tx_index,
@@ -250,50 +224,26 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			in_successful_call = EXCLUDED.in_successful_call,
 			topics             = EXCLUDED.topics,
 			value              = EXCLUDED.value,
-			decoded_payload    = EXCLUDED.decoded_payload,
-			decoded_by         = EXCLUDED.decoded_by,
 			created_at         = EXCLUDED.created_at,
 			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
 			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
-			topics_xdr         = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
-			value_xdr          = coalesce(EXCLUDED.value_xdr, events.value_xdr)`
-			raw_topic_xdr      = coalesce(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
-			raw_value_xdr      = coalesce(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
-	batch := &pgx.Batch{}
-	sql := `
+	stmt := `
 		INSERT INTO events
-			(network, id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 			 in_successful_call, topics, value, created_at,
 			 raw_topic_xdr, raw_value_xdr)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		` + conflict
+	batch := &pgx.Batch{}
 	for _, e := range events {
-		batch.Queue(sql,
-			e.Network, e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
-		batch.Queue(`
-			INSERT INTO events
-				(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-				 in_successful_call, topics, value, created_at, raw_topic_xdr, raw_value_xdr)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) `+conflict,
-				 in_successful_call, topics, value, created_at,
-				 raw_topic_xdr, raw_value_xdr)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-			`+conflict,
-			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
-			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
-			nullableTextArray(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
 		// into SQL NULL so the column has one representation of "absent"
 		// rather than two.
 		batch.Queue(stmt,
 			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
-			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value,
-			nil, /* decoded_payload */
-			nil, /* decoded_by */
-			e.CreatedAt,
-			nullableStringSlice(e.RawTopicXDR),
-			nullableText(e.RawValueXDR),
+			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
+			nullableStringSlice(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
 	}
 	return batch
@@ -321,7 +271,7 @@ func (p *Postgres) ensureEventPartitions(ctx context.Context, events []Event) er
 
 func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bool) (int64, error) {
 	if len(events) == 0 {
-		return nil, nil
+		return 0, nil
 	}
 	if err := p.ensureEventPartitions(ctx, events); err != nil {
 		return 0, err
@@ -329,14 +279,14 @@ func (p *Postgres) upsertEvents(ctx context.Context, events []Event, onUpdate bo
 	results := p.pool.SendBatch(ctx, insertEventsBatch(events, onUpdate))
 	defer results.Close()
 
-	var inserted []Event
-	for i := range events {
+	var inserted int64
+	for range events {
 		tag, err := results.Exec()
 		if err != nil {
-			return nil, fmt.Errorf("upserting events: %w", err)
+			return 0, fmt.Errorf("upserting events: %w", err)
 		}
 		if tag.RowsAffected() > 0 {
-			inserted = append(inserted, events[i])
+			inserted++
 		}
 	}
 	return inserted, nil
@@ -390,7 +340,6 @@ func (p *Postgres) ReplaceEventsInRange(ctx context.Context, events []Event, fro
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("committing repair tx: %w", err)
 	}
-	metrics.DBWriteDuration.Observe(time.Since(start).Seconds())
 	return nil
 }
 
@@ -826,17 +775,6 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 		where = append(where,
 			fmt.Sprintf("topics->%d = %s::jsonb", i, arg(topic)))
 	}
-	if len(f.TopicContains) > 0 {
-		// Direct containment — caller controls the shape (object wrapped in
-		// array for element match, multi-element arrays for subset match).
-		where = append(where, "topics @> "+arg(string(f.TopicContains))+"::jsonb")
-	}
-	if f.TopicCount != nil {
-		where = append(where, "jsonb_array_length(topics) = "+arg(*f.TopicCount))
-	}
-	if f.TxHash != "" {
-		where = append(where, "tx_hash = "+arg(f.TxHash))
-	}
 	if f.HasValue != nil {
 		if *f.HasValue {
 			where = append(where, "value IS NOT NULL")
@@ -1079,7 +1017,7 @@ func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error
 		return IngestionState{}, ErrNotFound
 	}
 	if err != nil {
-		return IngestionState{}, fmt.Errorf("loading ingestion state for network %q: %w", network, err)
+		return IngestionState{}, fmt.Errorf("loading ingestion state: %w", err)
 	}
 	return s, nil
 }
@@ -1227,6 +1165,79 @@ func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) er
 		return fmt.Errorf("adding watched contract: %w", err)
 	}
 	return nil
+}
+
+// GetContractCursor returns the stored resume position for one watched
+// contract, or ErrNotFound when the contract has no cursor row yet.
+func (p *Postgres) GetContractCursor(ctx context.Context, contractID string) (ContractCursor, error) {
+	var (
+		c ContractCursor
+		ts time.Time
+	)
+	err := p.pool.QueryRow(ctx,
+		`SELECT contract_id, last_ingested_ledger, last_cursor, updated_at
+		 FROM contract_cursors WHERE contract_id = $1`, contractID,
+	).Scan(&c.ContractID, &c.LastIngestedLedger, &c.LastCursor, &ts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ContractCursor{}, ErrNotFound
+	}
+	if err != nil {
+		return ContractCursor{}, fmt.Errorf("loading cursor for contract %s: %w", contractID, err)
+	}
+	c.UpdatedAt = ts
+	return c, nil
+}
+
+// SaveContractCursor upserts one contract's resume position.
+func (p *Postgres) SaveContractCursor(ctx context.Context, c ContractCursor) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO contract_cursors (contract_id, last_ingested_ledger, last_cursor, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (contract_id) DO UPDATE SET
+			last_ingested_ledger = EXCLUDED.last_ingested_ledger,
+			last_cursor          = EXCLUDED.last_cursor,
+			updated_at           = now()`, c.ContractID, c.LastIngestedLedger, c.LastCursor)
+	if err != nil {
+		return fmt.Errorf("saving cursor for contract %s: %w", c.ContractID, err)
+	}
+	return nil
+}
+
+// DeleteContractCursor removes a contract's cursor row (used when a
+// contract leaves the watch list).
+func (p *Postgres) DeleteContractCursor(ctx context.Context, contractID string) error {
+	tag, err := p.pool.Exec(ctx,
+		`DELETE FROM contract_cursors WHERE contract_id = $1`, contractID)
+	if err != nil {
+		return fmt.Errorf("deleting cursor for contract %s: %w", contractID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListContractCursors returns every tracked per-contract resume position.
+func (p *Postgres) ListContractCursors(ctx context.Context) ([]ContractCursor, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT contract_id, last_ingested_ledger, last_cursor, updated_at FROM contract_cursors`)
+	if err != nil {
+		return nil, fmt.Errorf("listing contract cursors: %w", err)
+	}
+	defer rows.Close()
+	var out []ContractCursor
+	for rows.Next() {
+		var (
+			c  ContractCursor
+			ts time.Time
+		)
+		if err := rows.Scan(&c.ContractID, &c.LastIngestedLedger, &c.LastCursor, &ts); err != nil {
+			return nil, fmt.Errorf("scanning contract cursor: %w", err)
+		}
+		c.UpdatedAt = ts
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // Stats aggregates within sc. The event-derived counters (total, oldest

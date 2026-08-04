@@ -136,6 +136,8 @@ All configuration comes from environment variables (see `.env.example`):
 | `RPC_URL` | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet. |
 | `RPC_URLS` | unset | Comma-separated, priority-ordered list of Stellar RPC endpoints. When set, `RPC_URL` is ignored and the multi-provider failover client is used. List order is priority: index 0 is tried first. |
 | `RPC_RATE_LIMIT_RPS` | `10` | Per-provider request rate limit (`requests/second`) applied to each RPC endpoint independently. Only used when `RPC_URLS` is set. |
+| `HORIZON_URL` | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. |
+| `BACKFILL_RATE_RPS` | `10` | Pace against Horizon when backfilling. 10 req/s is the public-instance cap; private deployments can lift this. |
 | `DATABASE_URL` | — (required) | Postgres connection string. |
 | `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. |
 | `HTTP_ADDR` | `:8080` | API listen address. |
@@ -155,6 +157,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
 | `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
 | `API_MAX_LIMIT` | `500` | Maximum page size accepted for list endpoints (`/events`, `/subscriptions/{id}/deliveries`). Values above this are rejected with 400. |
+| `API_KEY` | empty | Required to use the runtime `/watched-contracts` surface; empty means every request there is rejected with 503. This is a placeholder until #17 (real auth) lands — at that point `API_KEY` will be replaced. |
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
@@ -643,6 +646,42 @@ Fetch a single event by its ID (the TOID-based identifier from the RPC).
 Shell
 
 curl -s localhost:8080/events/0001099511627776-0000000001
+### `GET /contracts`
+
+Lists every contract the indexer has seen, with cached token metadata
+(name, symbol, decimals) when available. Metadata is `null` for contracts
+that haven't been enriched yet or that don't implement the SEP-41 token
+interface.
+
+```sh
+curl -s localhost:8080/contracts
+```
+
+```json
+{
+  "contracts": [
+    {"contract_id":"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"},
+    {"contract_id":"CCW67...","name":"USD Coin","symbol":"USDC","decimals":6}
+  ]
+}
+```
+
+### `GET /contracts/{id}/stats`
+
+```sh
+curl -s localhost:8080/contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC/stats
+```
+
+```json
+{
+  "contract_id":"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+  "name":"USD Coin",
+  "symbol":"USDC",
+  "decimals":6,
+  "event_count":1423
+}
+```
+
 GET /contracts/{id}/events
 Convenience wrapper for GET /events?contract_id={id}; accepts the same
 remaining query parameters.
@@ -1396,6 +1435,45 @@ be defined with a foreign key to `events(id)` and `ON DELETE CASCADE`. The
 pruner therefore deletes only from `events` and lets Postgres cascade the
 dependent rows; today's single-table DELETE is correct because no such
 table exists yet, and the contract is “derived tables ride along”.
+## Contract metadata enrichment
+
+SoroTrail runs a background worker that enriches contracts with
+human-readable token metadata (name, symbol, decimals) by calling the
+SEP-41 token interface via RPC simulation.
+
+**How it works:**
+
+1. The worker periodically scans the events table for contracts that don't
+   yet have cached metadata (or whose cached metadata has exceeded the
+   TTL).
+2. For each candidate, it simulates calling `name()`, `symbol()`, and
+   `decimals()` on the contract via the RPC's `simulateTransaction`
+   endpoint.
+3. Results are stored in the `contract_meta` table with a `fetched_at`
+   timestamp.
+4. Contracts that don't implement the SEP-41 token interface (the
+   simulation traps or returns an error) are negatively cached so they're
+   never re-probed.
+5. Metadata surfaces in `/contracts` and `/contracts/{id}/stats` responses;
+   fields are `null` when unknown.
+
+**Design principles:**
+
+- **Never blocks ingestion** — the enrichment worker runs on its own
+  goroutine with its own poll interval.
+- **Rate-limited** — simulation calls go through the same RPC client with
+  the same ~10 req/s limiter, so enrichment doesn't overwhelm the endpoint.
+- **Failures are data, not errors** — failed RPC calls are logged at debug
+  level and the contract is retried on the next pass.
+- **Negative caching is permanent** — non-token contracts are cached with
+  `is_token=false` and never re-fetched, so contracts that emit events but
+  aren't tokens don't cause wasteful RPC calls.
+- **TTL-based refresh** — token metadata is re-fetched after
+  `CONTRACT_META_TTL` (default 24h) so name/symbol changes (e.g. a token
+  upgrade) are eventually picked up.
+
+Disable enrichment entirely with `CONTRACT_META_ENABLED=false`.
+
 ## Caching
 
 Stored events are immutable — a row written by ingest is never rewritten

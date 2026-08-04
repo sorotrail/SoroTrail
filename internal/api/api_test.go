@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -33,6 +34,7 @@ type stubStore struct {
 	eventByID  map[string]store.Event
 	lastFilter store.EventFilter
 	nextCursor string
+	queryErr   error
 
 	totalCount      int64
 	countEventsErr  error
@@ -87,20 +89,25 @@ type stubStore struct {
 	deadLettersResult  []store.DeadLetter
 	deadLettersCursor  string
 	deadLettersErr     error
+
+	contractCursors map[string]store.ContractCursor
 }
 
-	// Watched contract fields
-	watchedList    []store.WatchedContract
-	watchedListErr error
-	added          []string
-	removed        []string
-	addErr         error
-	removeErr      error
-
-	ingestionState   *store.IngestionState
-	ingestionStateEr error
-
-	pingErr error
+func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastFilter = f
+	if s.queryErr != nil {
+		return nil, "", s.queryErr
+	}
+	n := f.Limit
+	if n <= 0 {
+		n = 50
+	}
+	if n > len(s.events) {
+		n = len(s.events)
+	}
+	return s.events[:n], s.nextCursor, nil
 }
 
 func (s *stubStore) CountEvents(_ context.Context, f store.EventFilter) (int64, error) {
@@ -119,40 +126,8 @@ func (s *stubStore) AggregateEvents(_ context.Context, f store.EventFilter, buck
 func (s *stubStore) ReplaceEventsInRange(context.Context, []store.Event, int64, int64) error {
 	return nil
 }
-func (s *stubStore) GetEvent(ctx context.Context, id string) (store.Event, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.eventByID != nil {
-		if e, ok := s.eventByID[id]; ok {
-			return e, nil
-		}
-		return store.Event{}, store.ErrNotFound
-	}
-	if s.event.ID != "" {
-		return s.event, nil
-	}
-	return store.Event{}, store.ErrNotFound
-}
-func (s *stubStore) EventExists(_ context.Context, id string) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.existsCalls++
-	s.lastExistsID = id
-	if s.eventByID != nil {
-		_, ok := s.eventByID[id]
-		return ok, nil
-	}
-	return s.exists, s.existsErr
-}
-
-// GetIngestionState backs the list-cache frontier lookup. Tests stage
-// LastIngestedLedger to drive the boundary decisions (just-below, at,
-// and above the frontier).
-func (s *stubStore) GetIngestionState(_ context.Context, network string) (store.IngestionState, error) {
-	if s.ingestionState != nil {
-		return *s.ingestionState, s.ingestionStateEr
-	}
-	return s.ingestion, s.ingestionErr
+func (s *stubStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]store.LedgerCensus, error) {
+	return nil, nil
 }
 func (s *stubStore) SaveIngestionState(ctx context.Context, state store.IngestionState) error {
 	return nil
@@ -184,6 +159,10 @@ func (s *stubStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (
 	return 0, nil
 }
 
+func (s *stubStore) DeleteEventsBeforeLedger(context.Context, int64) (int64, error) {
+	return 0, nil
+}
+
 func (s *stubStore) GetEvent(context.Context, string, store.Scope) (store.Event, error) {
 	return s.event, s.eventErr
 }
@@ -209,13 +188,6 @@ func (s *stubStore) EventExists(_ context.Context, id string, _ store.Scope) (bo
 	return s.exists, s.existsErr
 }
 
-func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
-	return nil, store.ErrNotFound
-}
-func (s *stubStore) SetContractSpec(context.Context, string, string, []byte) error {
-	return nil
-}
-
 // GetIngestionState backs the list-cache frontier lookup. Tests stage
 // LastIngestedLedger to drive the boundary decisions (just-below, at,
 // and above the frontier).
@@ -223,14 +195,7 @@ func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, er
 	if s.ingestionState != nil {
 		return *s.ingestionState, s.ingestionStateEr
 	}
-	n := f.Limit
-	if n <= 0 {
-		n = 50
-	}
-	if n > len(s.events) {
-		n = len(s.events)
-	}
-	return s.events[:n], s.nextCursor, nil
+	return s.ingestion, s.ingestionErr
 }
 
 // MigrationVersion backs /readyz's schema check. Tests that need a dirty
@@ -314,25 +279,48 @@ func (s *stubStore) CountAddressEvents(_ context.Context, address string) (int64
 	_ = address
 	return s.addressCount, s.addressCountErr
 }
-
-func (s *stubStore) UpsertTokenBalances(ctx context.Context, network string, state store.TokenBalanceState, updates []store.TokenBalanceUpdate) error {
+func (s *stubStore) GetAddressSummary(context.Context, string) (store.AddressSummary, error) {
+	return store.AddressSummary{}, nil
+}
+func (s *stubStore) UpsertAddressRefs(context.Context, []store.AddressRef) error {
 	return nil
 }
-
-func (s *stubStore) GetTokenBalances(ctx context.Context, contractID, network, minBalance string, cursor string, limit int) ([]store.TokenBalance, string, error) {
-	return nil, "", nil
-}
-
-func (s *stubStore) GetTokenBalanceState(ctx context.Context, network, contractID string) (store.TokenBalanceState, error) {
-	return store.TokenBalanceState{}, store.ErrNotFound
-}
-
-func (s *stubStore) UpsertTokenBalanceState(ctx context.Context, state store.TokenBalanceState) error {
-	return nil
-}
-
-func (s *stubStore) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {
+func (s *stubStore) UpsertEvents(context.Context, []store.Event) (int64, error) {
 	return 0, nil
+}
+
+func (s *stubStore) GetContractCursor(_ context.Context, contractID string) (store.ContractCursor, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c, ok := s.contractCursors[contractID]; ok {
+		return c, nil
+	}
+	return store.ContractCursor{}, store.ErrNotFound
+}
+func (s *stubStore) SaveContractCursor(context.Context, store.ContractCursor) error {
+	return nil
+}
+func (s *stubStore) DeleteContractCursor(context.Context, string) error {
+	return nil
+}
+func (s *stubStore) ListContractCursors(context.Context) ([]store.ContractCursor, error) {
+	return nil, nil
+}
+
+func (s *stubStore) ListContractIDs(context.Context) ([]string, error) {
+	return nil, nil
+}
+func (s *stubStore) GetContractMeta(context.Context, string) (store.ContractMeta, error) {
+	return store.ContractMeta{}, store.ErrNotFound
+}
+func (s *stubStore) UpsertContractMeta(context.Context, store.ContractMeta) error {
+	return nil
+}
+func (s *stubStore) CountContractEvents(context.Context, string) (int64, error) {
+	return 0, nil
+}
+func (s *stubStore) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
+	return nil, nil
 }
 
 type stubRPC struct {
@@ -350,7 +338,7 @@ func newTestServerWithKey(st *stubStore, rc *stubRPC, apiKey string) *Server {
 	if rc == nil {
 		rc = &stubRPC{health: rpc.Health{Status: "healthy"}}
 	}
-	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), apiKey, 17280)
+	return New(st, rc, slog.New(slog.NewTextHandler(io.Discard, nil)), apiKey)
 }
 
 func newTestServer(st *stubStore, rc *stubRPC) *Server {
@@ -361,6 +349,13 @@ func newTestServer(st *stubStore, rc *stubRPC) *Server {
 func doGet(t *testing.T, s *Server, path string) (*http.Response, []byte) {
 	t.Helper()
 	return doGetWithHeader(t, s, path, "", "")
+}
+
+// doGetWithAuth performs a GET against the test server with an api-key
+// header, for the API_KEY-gated admin endpoints.
+func doGetWithAuth(t *testing.T, s *Server, path, apiKey string) (*http.Response, []byte) {
+	t.Helper()
+	return doGetWithHeader(t, s, path, "X-Api-Key", apiKey)
 }
 
 func doGetWithHeader(t *testing.T, s *Server, path, key, value string) (*http.Response, []byte) {
@@ -1146,7 +1141,6 @@ func TestReadyz(t *testing.T) {
 }
 
 func TestListEvents_FieldsProjection(t *testing.T) {
-	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	st := &stubStore{
 		eventByID: map[string]store.Event{
 			"ev-1": {ID: "ev-1", ContractID: "C1", Ledger: 100},
@@ -1197,21 +1191,6 @@ func TestListEvents(t *testing.T) {
 		handler.ServeHTTP(rr, req)
 		assert.Equal(t, http.StatusOK, rr.Code)
 	})
-}
-
-func TestStats(t *testing.T) {
-	st := &stubStore{stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999}}
-	s := newTestServer(st, nil)
-	handler := s.Router()
-
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
-	handler.ServeHTTP(rr, req)
-
-	assert.Equal(t, http.StatusOK, rr.Code)
-	var got store.Stats
-	require.NoError(t, json.NewDecoder(rr.Body).Decode(&got))
-	assert.Equal(t, int64(42), got.TotalEvents)
 }
 
 func TestStats(t *testing.T) {
@@ -1669,7 +1648,7 @@ func TestRequestID(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-			s := New(&stubStore{}, nil, log, "test-key", 17280)
+			s := New(&stubStore{}, nil, log, "test-key")
 			srv := httptest.NewServer(s.Router())
 			defer srv.Close()
 
