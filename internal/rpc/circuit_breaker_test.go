@@ -49,6 +49,10 @@ func (m *mockClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntriesR
 	}
 	return GetLedgerEntriesResponse{}, nil
 }
+func (m *mockClient) SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error) {
+	m.callCount.Add(1)
+	return SimulateTransactionResponse{}, nil
+}
 
 var _ Client = (*mockClient)(nil)
 

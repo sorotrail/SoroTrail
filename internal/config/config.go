@@ -3,7 +3,6 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -22,7 +21,17 @@ type NetworkConfig struct {
 // Config holds all runtime configuration. Every field is settable via the
 // environment variable named in its `env` tag; see .env.example for docs.
 type Config struct {
-	RPCURL                string        `env:"RPC_URL"` // deprecated — use NETWORKS
+	// RPCURL is the single-provider RPC endpoint. When RPC_URLS is set the
+	// multi-provider failover client is used instead and RPC_URL is ignored.
+	RPCURL                string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
+	// RPCURLS, when set, enables the multi-provider failover client
+	// (internal/rpc). List order is priority: index 0 is tried first.
+	// RPC_URL is ignored while it is set; leaving RPC_URLS unset keeps the
+	// single-provider behavior unchanged.
+	RPCURLS               []string      `env:"RPC_URLS"`
+	// RPCRateLimitRPS caps each provider's request rate (requests/second)
+	// when the failover client is in use. Only read by the failover client.
+	RPCRateLimitRPS       float64       `env:"RPC_RATE_LIMIT_RPS" envDefault:"10"`
 	DatabaseURL           string        `env:"DATABASE_URL"`
 	PollInterval          time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
 	HTTPAddr              string        `env:"HTTP_ADDR" envDefault:":8080"`
@@ -223,6 +232,8 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("parsing environment: %w", err)
 	}
 	cfg.WatchedContracts = cleanContractList(cfg.WatchedContracts)
+	cfg.RPCURLS = cleanContractList(cfg.RPCURLS)
+	cfg.CORSAllowedOrigins = cleanOrigins(cfg.CORSAllowedOrigins)
 	if err := cfg.ValidateAll(); err != nil {
 		return Config{}, err
 	}
@@ -243,12 +254,36 @@ func IsSQLite(databaseURL string) bool {
 	return strings.HasPrefix(databaseURL, "sqlite:")
 }
 
+// ParseLogLevel maps a LOG_LEVEL string to a slog.Level. Unknown or empty
+// values fall back to info rather than failing startup.
+func ParseLogLevel(raw string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
 // Validate checks the configuration for values that would fail at runtime.
 func (c Config) Validate() error {
 	if c.DatabaseURL == "" {
 		return fmt.Errorf("DATABASE_URL is required")
 	}
-	if !IsSQLite(c.DatabaseURL) {
+	// RPC_URLS takes priority when set; RPC_URL is the single-provider
+	// fallback that works unchanged for existing deployments.
+	if len(c.RPCURLS) > 0 {
+		for i, raw := range c.RPCURLS {
+			u, err := url.Parse(raw)
+			if err != nil || u.Scheme == "" || u.Host == "" {
+				return fmt.Errorf("RPC_URLS[%d] %q is not a valid URL", i, raw)
+			}
+		}
+	} else if !IsSQLite(c.DatabaseURL) {
 		u, err := url.Parse(c.RPCURL)
 		if err != nil || u.Scheme == "" || u.Host == "" {
 			return fmt.Errorf("RPC_URL %q is not a valid URL", c.RPCURL)
@@ -318,6 +353,9 @@ func (c Config) Validate() error {
 	}
 	if c.AuditFindingMaxLgrs == 0 {
 		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
+	}
+	if c.RPCRateLimitRPS <= 0 {
+		return fmt.Errorf("RPC_RATE_LIMIT_RPS must be positive")
 	}
 	if c.RetentionBatchSize <= 0 {
 		return fmt.Errorf("RETENTION_BATCH_SIZE must be positive")
@@ -432,21 +470,6 @@ func ValidCursor(s string) bool {
 		return false
 	}
 	for _, r := range s {
-		if !strings.ContainsRune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:", r) {
-			return false
-		}
-	}
-	return true
-}
-
-// ValidCursor reports whether s is a valid pagination cursor.
-// A cursor must be non-empty, at most 128 characters, and consist only of
-// alphanumeric characters, hyphens, underscores, dots, or colons.
-func ValidCursor(s string) bool {
-	if len(s) == 0 || len(s) > 128 {
-		return false
-	}
-	for _, r := range s {
 		if (r < 'a' || r > 'z') &&
 			(r < 'A' || r > 'Z') &&
 			(r < '0' || r > '9') &&
@@ -478,24 +501,6 @@ func ValidOrigin(s string) bool {
 	return true
 }
 
-// ValidCursor reports whether s is a valid pagination cursor.
-// A cursor must be non-empty, at most 128 characters, and consist only of
-// alphanumeric characters, hyphens, underscores, dots, or colons.
-func ValidCursor(s string) bool {
-	if len(s) == 0 || len(s) > 128 {
-		return false
-	}
-	for _, r := range s {
-		if (r < 'a' || r > 'z') &&
-			(r < 'A' || r > 'Z') &&
-			(r < '0' || r > '9') &&
-			r != '-' && r != '_' && r != '.' && r != ':' {
-			return false
-		}
-	}
-	return true
-}
-
 func cleanContractList(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
@@ -514,6 +519,19 @@ func cleanContractList(in []string) []string {
 //
 // "*" is a valid literal but documented separately as a special case the
 // middleware recognizes (see API CORS handler).
+// cleanOrigins normalizes CORS origin entries: env/v11 splits on commas but
+// preserves whitespace, and operators commonly paste origins with a trailing
+// slash, so each entry is trimmed and any trailing "/" removed.
+func cleanOrigins(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, strings.TrimSuffix(s, "/"))
+		}
+	}
+	return out
+}
+
 func validateCORSOrigins(in []string) error {
 	for _, o := range in {
 		o = strings.TrimSpace(o)
@@ -523,8 +541,7 @@ func validateCORSOrigins(in []string) error {
 		if strings.EqualFold(o, "null") {
 			return fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q is not allowed (sandboxed Origin: null is a credentialed-origin bypass)", o)
 		}
-		u, err := url.Parse(o)
-		if err != nil || u.Scheme == "" || u.Host == "" {
+		if !ValidOrigin(o) {
 			return fmt.Errorf("CORS_ALLOWED_ORIGINS entry %q is not a valid origin (want scheme://host[:port])", o)
 		}
 	}

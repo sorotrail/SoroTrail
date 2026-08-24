@@ -17,7 +17,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/khaylebfortune/sorotrail/internal/metrics"
+	"github.com/sorotrail/sorotrail/internal/metrics"
 )
 
 
@@ -32,6 +32,11 @@ type Client interface {
 	// Keys are base64-encoded LedgerKey XDR, returned entries include the
 	// base64-encoded LedgerEntry XDR.
 	GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error)
+	// SimulateTransaction simulates a transaction (typically a contract
+	// invocation) against the current ledger state. Used by the contract
+	// metadata worker to call SEP-41 token interface functions (name,
+	// symbol, decimals) without submitting a real transaction.
+	SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error)
 }
 
 // RequestObserver is called after each RPC call completes so callers can
@@ -143,14 +148,14 @@ func (c *HTTPClient) GetEvents(ctx context.Context, req GetEventsRequest) (GetEv
 	var resp GetEventsResponse
 	start := time.Now()
 	err := c.call(ctx, "getEvents", req, &resp)
-	metrics.RPCCallDuration.WithLabelValues("getEvents").Observe(time.Since(start).Seconds())
+	metrics.RPCCallLatency.Observe(time.Since(start).Seconds())
 	if err != nil && isXDRFormatRejected(err) {
 		// Older server: remember and retry once without the param.
 		c.xdrJSONUnsupported.Store(true)
 		req.XDRFormat = ""
 		start = time.Now()
 		err = c.call(ctx, "getEvents", req, &resp)
-		metrics.RPCCallDuration.WithLabelValues("getEvents").Observe(time.Since(start).Seconds())
+		metrics.RPCCallLatency.Observe(time.Since(start).Seconds())
 	}
 	return resp, err
 }
@@ -160,7 +165,7 @@ func (c *HTTPClient) GetLatestLedger(ctx context.Context) (LatestLedger, error) 
 	var resp LatestLedger
 	start := time.Now()
 	err := c.call(ctx, "getLatestLedger", nil, &resp)
-	metrics.RPCCallDuration.WithLabelValues("getLatestLedger").Observe(time.Since(start).Seconds())
+	metrics.RPCCallLatency.Observe(time.Since(start).Seconds())
 	return resp, err
 }
 
@@ -169,7 +174,7 @@ func (c *HTTPClient) GetHealth(ctx context.Context) (Health, error) {
 	var resp Health
 	start := time.Now()
 	err := c.call(ctx, "getHealth", nil, &resp)
-	metrics.RPCCallDuration.WithLabelValues("getHealth").Observe(time.Since(start).Seconds())
+	metrics.RPCCallLatency.Observe(time.Since(start).Seconds())
 	return resp, err
 }
 
@@ -177,7 +182,13 @@ func (c *HTTPClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntriesR
 	var resp GetLedgerEntriesResponse
 	start := time.Now()
 	err := c.call(ctx, "getLedgerEntries", req, &resp)
-	metrics.RPCCallDuration.WithLabelValues("getLedgerEntries").Observe(time.Since(start).Seconds())
+	metrics.RPCCallLatency.Observe(time.Since(start).Seconds())
+	return resp, err
+}
+
+func (c *HTTPClient) SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error) {
+	var resp SimulateTransactionResponse
+	err := c.call(ctx, "simulateTransaction", req, &resp)
 	return resp, err
 }
 

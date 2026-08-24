@@ -31,9 +31,10 @@ func TestEventsIngestedTotal_SingleSuccess(t *testing.T) {
 	st := newMockStore()
 	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
 
+	before := testutil.ToFloat64(metrics.EventsIngested)
 	_, err := ing.runOnce(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, uint64(3), ing.EventsIngestedTotal(),
+	assert.Equal(t, before+3, testutil.ToFloat64(metrics.EventsIngested),
 		"counter must equal the number of events persisted in one successful write")
 }
 
@@ -71,13 +72,14 @@ func TestEventsIngestedTotal_CumulativeMultipleWrites(t *testing.T) {
 	st := newMockStore()
 	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 2})
 
+	before := testutil.ToFloat64(metrics.EventsIngested)
 	_, err := ing.runOnce(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, uint64(2), ing.EventsIngestedTotal(), "after first pass")
+	assert.Equal(t, before+2, testutil.ToFloat64(metrics.EventsIngested), "after first pass")
 
 	_, err = ing.runOnce(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, uint64(5), ing.EventsIngestedTotal(),
+	assert.Equal(t, before+5, testutil.ToFloat64(metrics.EventsIngested),
 		"counter must accumulate across multiple successful writes")
 }
 
@@ -90,9 +92,10 @@ func TestEventsIngestedTotal_FailedWriteDoesNotIncrement(t *testing.T) {
 	st.upsertErr = fmt.Errorf("database connection lost")
 	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
 
+	before := testutil.ToFloat64(metrics.EventsIngested)
 	_, err := ing.runOnce(context.Background())
 	assert.Error(t, err)
-	assert.Equal(t, uint64(0), ing.EventsIngestedTotal(),
+	assert.Equal(t, before, testutil.ToFloat64(metrics.EventsIngested),
 		"counter must not increment when the store write fails")
 }
 
@@ -104,16 +107,18 @@ func TestEventsIngestedTotal_MixedSuccessAndFailure(t *testing.T) {
 	st := newMockStore()
 	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
 
+	before := testutil.ToFloat64(metrics.EventsIngested)
+
 	// First pass succeeds.
 	_, err := ing.runOnce(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, uint64(2), ing.EventsIngestedTotal())
+	assert.Equal(t, before+2, testutil.ToFloat64(metrics.EventsIngested))
 
 	// Inject failure for second pass.
 	st.upsertErr = fmt.Errorf("deadlock detected")
 	_, err = ing.runOnce(context.Background())
 	assert.Error(t, err)
-	assert.Equal(t, uint64(2), ing.EventsIngestedTotal(),
+	assert.Equal(t, before+2, testutil.ToFloat64(metrics.EventsIngested),
 		"failed write must not change the counter; prior successes preserved")
 }
 

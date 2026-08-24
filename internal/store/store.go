@@ -15,8 +15,10 @@ import (
 const DefaultQueryLimit = 50
 
 // MaxQueryLimit is the upper bound for the ?limit= parameter; values above
-// this are rejected by the API layer before the store sees them.
-const MaxQueryLimit = 200
+// this are rejected by the API layer before the store sees them. The API
+// enforces its own configurable limit (API_MAX_LIMIT, default 500), so
+// this value only matters as a store-level safety net.
+const MaxQueryLimit = 500
 
 // Event is a Soroban contract event as persisted by SoroTrail.
 type Event struct {
@@ -115,6 +117,26 @@ type ReplayState struct {
 	CompletedAt *time.Time
 }
 
+// ContractMeta holds cached token metadata fetched via RPC simulation.
+// Fields are nil when unknown — a row with IsToken=false means the contract
+// was probed and does not implement the SEP-41 token interface (negative
+// cache). A row with IsToken=true and nil fields means the contract IS a
+// token but the RPC call hasn't resolved yet (should be rare).
+type ContractMeta struct {
+	ContractID string    `json:"contract_id"`
+	Name       *string   `json:"name"`
+	Symbol     *string   `json:"symbol"`
+	Decimals   *int      `json:"decimals"`
+	IsToken    bool      `json:"is_token"`
+	FetchedAt  time.Time `json:"fetched_at"`
+}
+
+// HasMetadata reports whether the contract has resolved token metadata
+// (name, symbol, and decimals are all non-nil).
+func (m ContractMeta) HasMetadata() bool {
+	return m.IsToken && m.Name != nil && m.Symbol != nil && m.Decimals != nil
+}
+
 // Done reports whether the recorded run finished its whole range.
 func (s ReplayState) Done() bool { return s.CompletedAt != nil }
 
@@ -158,12 +180,6 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	// Topic0-Topic3 match the exact JSON value at that specific topic array
-	// position. Unspecified positions are wildcards.
-	Topic0     json.RawMessage
-	Topic1     json.RawMessage
-	Topic2     json.RawMessage
-	Topic3     json.RawMessage
 	// HasValue filters events by whether they carry a value payload.
 	// nil means no constraint; true means value IS NOT NULL;
 	// false means value IS NULL.
@@ -295,6 +311,21 @@ type ContractSummary struct {
 // ContractIDPrefix, when set, constrains the result to contracts whose
 // ID starts with the prefix. Indexed lookups (the contract_id index)
 // can serve this directly; no full scan.
+
+// ContractEventTypeCount is one entry in a per-type event count breakdown
+// for a single contract.
+type ContractEventTypeCount struct {
+	Type  string `json:"type"`
+	Count int64  `json:"count"`
+}
+
+// ContractStats is the full per-contract statistics response, including
+// the summary row and the event-type breakdown.
+type ContractStats struct {
+	ContractSummary
+	TypeBreakdown []ContractEventTypeCount `json:"type_breakdown"`
+}
+
 type ContractsFilter struct {
 	ContractIDPrefix string
 	SortKey          string // "" | "count" | "first_ledger" | "last_ledger" | "last_seen"
@@ -412,52 +443,7 @@ func (f SubscriptionFilter) MatchesEvent(e Event) bool {
 			return false
 		}
 	}
-	if len(f.TopicContains) > 0 && len(e.Topics) > 0 {
-		var topics []json.RawMessage
-		if err := json.Unmarshal(e.Topics, &topics); err != nil {
-			return false
-		}
-		// Unwrap a single-element array so topic_contains=[{...}] works
-		// the same way in-memory as it does in Postgres @> containment.
-		needle := f.TopicContains
-		var arr []json.RawMessage
-		if err := json.Unmarshal(f.TopicContains, &arr); err == nil && len(arr) == 1 {
-			needle = arr[0]
-		}
-		matched := false
-		for _, t := range topics {
-			if jsonbContains(t, needle) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return false
-		}
-	}
 	return true
-}
-
-// jsonbContains reports whether the container jsonb-contains the contained
-// value. For objects it checks that every key in contained exists with the
-// same raw JSON value in container; for scalars/arrays it falls back to
-// direct byte comparison (JSON string equality). This mirrors the Postgres
-// @> operator's semantics for the topic-matching use case.
-func jsonbContains(container, contained json.RawMessage) bool {
-	// If both are objects, check key-value subset.
-	var cMap, dMap map[string]json.RawMessage
-	if json.Unmarshal(container, &cMap) == nil && json.Unmarshal(contained, &dMap) == nil {
-		for k, v := range dMap {
-			cv, ok := cMap[k]
-			if !ok || string(cv) != string(v) {
-				return false
-			}
-		}
-		return true
-	}
-	// Fallback: exact JSON string match (handles strings, numbers, and
-	// cases where unmarshalling into map failed — e.g. arrays).
-	return string(container) == string(contained)
 }
 
 // Subscription is one registered webhook callback.
@@ -723,6 +709,14 @@ type Store interface {
 	// API can surface 404 for typos.
 	RemoveWatchedContract(ctx context.Context, contractID string) error
 
+	// Per-contract resume cursors for watched-contract ingestion. A
+	// contract that falls behind does not hold back the others; each row
+	// tracks its own last ingested ledger + pagination cursor.
+	GetContractCursor(ctx context.Context, contractID string) (ContractCursor, error)
+	SaveContractCursor(ctx context.Context, c ContractCursor) error
+	DeleteContractCursor(ctx context.Context, contractID string) error
+	ListContractCursors(ctx context.Context) ([]ContractCursor, error)
+
 	RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error)
 	UpdateAuditFinding(ctx context.Context, f AuditFinding) error
 	// ListOpenFindingsByRange returns the most recent open finding whose
@@ -790,6 +784,13 @@ type Store interface {
 	// tenants' ingestion activity.
 	Stats(ctx context.Context, sc Scope) (Stats, error)
 	Ping(ctx context.Context) error
+
+	// Contract metadata (token enrichment).
+	ListContractIDs(ctx context.Context) ([]string, error)
+	GetContractMeta(ctx context.Context, contractID string) (ContractMeta, error)
+	UpsertContractMeta(ctx context.Context, m ContractMeta) error
+	CountContractEvents(ctx context.Context, contractID string) (int64, error)
+	ListContractsNeedingRefresh(ctx context.Context, olderThan time.Time) ([]string, error)
 }
 
 // DeadLetterInput is the payload handed to Store.DeadLetterEvent. The
