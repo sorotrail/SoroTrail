@@ -1451,6 +1451,17 @@ func (s *SQLite) ListContractsNeedingRefresh(context.Context, time.Time) ([]stri
 
 // ListContracts is not implemented for the SQLite backend: the contract
 // inventory endpoint is Postgres-only.
+
+// GetContractSummary is not implemented for the SQLite backend.
+func (s *SQLite) GetContractSummary(ctx context.Context, contractID string) (ContractSummary, error) {
+	return ContractSummary{}, fmt.Errorf("GetContractSummary: not supported by the sqlite backend")
+}
+
+// ContractEventTypeCounts is not implemented for the SQLite backend.
+func (s *SQLite) ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error) {
+	return nil, fmt.Errorf("ContractEventTypeCounts: not supported by the sqlite backend")
+}
+
 func (s *SQLite) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
 	return nil, "", fmt.Errorf("ListContracts: not supported by the sqlite backend")
 }

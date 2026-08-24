@@ -12,14 +12,42 @@ import (
 
 // contractStatsResponse is the JSON shape for GET /contracts/{id}/stats.
 type contractStatsResponse struct {
-	ContractID string  `json:"contract_id"`
-	Name       *string `json:"name,omitempty"`
-	Symbol     *string `json:"symbol,omitempty"`
-	Decimals   *int    `json:"decimals,omitempty"`
-	EventCount int64   `json:"event_count"`
+	ContractID    string                        `json:"contract_id"`
+	Name          *string                       `json:"name,omitempty"`
+	Symbol        *string                       `json:"symbol,omitempty"`
+	Decimals      *int                          `json:"decimals,omitempty"`
+	EventCount    int64                         `json:"event_count"`
+	TypeBreakdown []store.ContractEventTypeCount `json:"type_breakdown,omitempty"`
 }
 
 // handleContractStats returns per-contract statistics with cached metadata.
+
+// handleGetContract returns a single contract's summary (event count, ledger
+// range, last-seen timestamp). This is a GET /contracts/{id} that mirrors
+// one row of the GET /contracts listing without requiring the caller to page
+// through the entire list.
+func (s *Server) handleGetContract(w http.ResponseWriter, r *http.Request) {
+	contractID := chi.URLParam(r, "id")
+	if !config.ValidContractID(contractID) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid contract ID %q", contractID))
+		return
+	}
+
+	summary, err := s.store.GetContractSummary(r.Context(), contractID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("contract %q not found", contractID))
+		return
+	}
+	if err != nil {
+		s.log.Error("loading contract summary", "contract_id", contractID, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading contract summary failed"))
+		return
+	}
+
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, summary)
+}
+
 func (s *Server) handleContractStats(w http.ResponseWriter, r *http.Request) {
 	contractID := chi.URLParam(r, "id")
 	if !config.ValidContractID(contractID) {
@@ -49,6 +77,12 @@ func (s *Server) handleContractStats(w http.ResponseWriter, r *http.Request) {
 		resp.Name = meta.Name
 		resp.Symbol = meta.Symbol
 		resp.Decimals = meta.Decimals
+	}
+
+	// Attach per-type event counts when available (non-blocking: a failure
+	// here still returns the basic stats the caller asked for).
+	if types, err := s.store.ContractEventTypeCounts(r.Context(), contractID); err == nil {
+		resp.TypeBreakdown = types
 	}
 
 	writeCacheHeaders(w, cacheNoCache, 0, "")
