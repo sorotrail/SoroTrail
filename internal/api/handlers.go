@@ -28,17 +28,15 @@ import (
 
 	"time"
 
-	"github.com/khaylebfortune/sorotrail/internal/config"
-	"github.com/khaylebfortune/sorotrail/internal/metrics"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/coder/websocket"
+	"github.com/go-chi/chi/v5"
+
 	"github.com/sorotrail/sorotrail/internal/api/queries"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
-
 	"github.com/sorotrail/sorotrail/internal/config"
-
+	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/store"
-
 )
 
 
@@ -175,38 +173,6 @@ type eventsWithXDRResponse struct {
 
 	Events []eventWithXDR `json:"events"`
 	Cursor string         `json:"cursor,omitempty"`
-}
-
-// eventWithXDR is an event plus the raw XDR it was decoded from, returned
-// when ?include_xdr=true. ValueXDR is a pointer so an event with no value
-// serialises as null rather than an empty string.
-type eventWithXDR struct {
-
-	store.Event
-
-	TopicsXDR []string `json:"topics_xdr"`
-
-	ValueXDR  *string  `json:"value_xdr"`
-
-}
-
-// enrichedEventWithXDR combines the raw-XDR view with spec-decoded fields.
-type enrichedEventWithXDR struct {
-
-	eventWithXDR
-
-	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
-
-	Decoded      bool                        `json:"decoded"`
-
-}
-
-type enrichedEventsWithXDRResponse struct {
-	Events []enrichedEventWithXDR `json:"events"`
-	// Cursor is non-empty when another page exists.
-
-	Cursor string `json:"cursor,omitempty"`
-
 }
 
 // envelopeResponse is the JSON body returned when ?envelope=true is set on
@@ -483,9 +449,65 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleMetrics serves the Prometheus /metrics endpoint. The response is
 // always cacheNoStore so scrapers never see a stale snapshot.
+func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Checks: map[string]string{"process": "ok"}})
+}
+
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	resp := healthResponse{Status: "ok", Checks: map[string]string{
+		"database":      "ok",
+		"rpc":           "ok",
+		"ingestion_lag": "ok",
+	}}
+	status := http.StatusOK
+
+	if err := s.store.Ping(ctx); err != nil {
+		resp.Status = "degraded"
+		resp.Checks["database"] = err.Error()
+		status = http.StatusServiceUnavailable
+	}
+	if health, err := s.rpc.GetHealth(ctx); err != nil {
+		resp.Status = "degraded"
+		resp.Checks["rpc"] = err.Error()
+		status = http.StatusServiceUnavailable
+	} else if health.Status != "healthy" {
+		resp.Status = "degraded"
+		resp.Checks["rpc"] = fmt.Sprintf("rpc reports %q", health.Status)
+		status = http.StatusServiceUnavailable
+	}
+
+	// Check ingestion lag: if we're more than 100 ledgers behind the chain
+	// head, mark the instance as not ready (it should be pulled from the
+	// load balancer until it catches up).
+	if state, err := s.store.GetIngestionState(ctx); err == nil {
+		// Only check lag if we have an ingestion state and an RPC client.
+		if s.rpc != nil {
+			if health, err := s.rpc.GetHealth(ctx); err == nil {
+				lag := health.LatestLedger - state.LastIngestedLedger
+				if lag > 100 && state.LastIngestedLedger > 0 {
+					resp.Status = "degraded"
+					resp.Checks["ingestion_lag"] = fmt.Sprintf(
+						"%d ledgers behind (last ingested: %d, chain head: %d)",
+						lag, state.LastIngestedLedger, health.LatestLedger)
+					status = http.StatusServiceUnavailable
+				}
+			}
+		}
+	}
+
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, status, resp)
+}
+
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	metrics.Handler().ServeHTTP(w, r)
+}
+
 // handleDeleteEvents is the admin-only bulk delete endpoint. It deletes all
 // events whose ledger is strictly less than the ?before_ledger= query parameter.
 // The endpoint is protected by apiKeyAuth middleware (same as watched-contracts).
@@ -510,26 +532,22 @@ func (s *Server) handleDeleteEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	deleted, err := s.store.DeleteEventsBeforeLedger(r.Context(), beforeLedger)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("bulk delete events", "before_ledger", beforeLedger, "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("deleting events failed"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"deleted": deleted})
+}
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
-
 	writeCacheHeaders(w, cacheNoStore, 0, "")
-
 	writeJSON(w, http.StatusOK, versionResponse{
-
-	resp := healthResponse{Status: "ok", Checks: map[string]string{
-		"database":       "ok",
-		"rpc":            "ok",
-		"schema_version": "ok",
-	}}
-	status := http.StatusOK
-
+		Version:   buildinfo.Version,
 		Commit:    buildinfo.Commit,
-
 		BuildDate: buildinfo.BuildDate,
-
 	})
-
 }
 
 
@@ -574,6 +592,20 @@ func (s *Server) handleCountEvents(w http.ResponseWriter, r *http.Request) {
 	filter.OrderBy = ""
 	filter.Limit = 0
 
+	total, err := s.store.CountEvents(r.Context(), filter)
+	if err != nil {
+		loggerFromContext(r.Context()).Error("counting events", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("counting events failed"))
+		return
+	}
+	writeCacheHeaders(w, cacheNoCache, 0, "")
+	writeJSON(w, http.StatusOK, countResponse{Count: total})
+}
+
+// countResponse is the JSON body for GET /events/count.
+type countResponse struct {
+	Count int64 `json:"count"`
+}
 
 // bucketResponse is the JSON body for GET /events/aggregate.
 type bucketResponse struct {
@@ -636,6 +668,10 @@ func (s *Server) handleAggregateEvents(w http.ResponseWriter, r *http.Request) {
 // sees progress.
 
 const streamBatchSize = 500
+
+// recentDefaultLimit is the page size applied by ?recent=N shorthand when
+// the value is the bare "true" (no explicit count).
+const recentDefaultLimit = 20
 
 
 
@@ -1102,10 +1138,12 @@ func (s *Server) handleGetEventRaw(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("loading event failed"))
 		return
 	}
+	if len(event.RawTopicXDR) == 0 && event.RawValueXDR == "" {
+		writeError(w, http.StatusNotFound, fmt.Errorf("event %q has no stored raw XDR", id))
+		return
+	}
 
-
-func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
-
+	etag := `"` + id + `:raw"`
 	if ifNoneMatch(r, etag) {
 		exists, err := s.store.EventExists(r.Context(), id, scope)
 		if err != nil {
@@ -1121,6 +1159,18 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeCacheHeaders(w, cacheImmutable, immutableMaxAge, etag)
+	writeJSON(w, http.StatusOK, rawEventResponse{
+		TopicsXDR: event.RawTopicXDR,
+		ValueXDR:  event.RawValueXDR,
+	})
+}
+
+// rawEventResponse is the JSON body for GET /events/{id}/raw.
+type rawEventResponse struct {
+	TopicsXDR []string `json:"topics_xdr"`
+	ValueXDR  string   `json:"value_xdr,omitempty"`
+}
 
 // handleGetEventTransaction returns all sibling events from the same
 // transaction as the event with the given {id}. The referenced event
@@ -1146,7 +1196,7 @@ func (s *Server) handleGetEventTransaction(w http.ResponseWriter, r *http.Reques
 
 	}
 
-	event, err := s.store.GetEvent(r.Context(), id, scopeFrom(r.Context()))
+	event, err := s.store.GetEvent(r.Context(), id, scope)
 	if errors.Is(err, store.ErrNotFound) {
 
 		writeError(w, http.StatusNotFound, fmt.Errorf("event %q not found", id))
@@ -1729,7 +1779,7 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	state, err := s.store.GetIngestionState(r.Context(), s.defaultNetwork)
+	state, err := s.store.GetIngestionState(r.Context())
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 
 		s.log.Error("loading ingestion state for add", "error", err)
@@ -1995,7 +2045,7 @@ func (s *Server) listCachePolicy(ctx context.Context, filter store.EventFilter) 
 		return cacheNoCache, "", nil
 
 	}
-	frontier, err := s.lastIngestedLedger(ctx, filter.Network)
+	frontier, err := s.lastIngestedLedger(ctx)
 	if err != nil {
 
 		return cacheNoCache, "", err
@@ -2012,8 +2062,8 @@ func (s *Server) listCachePolicy(ctx context.Context, filter store.EventFilter) 
 }
 
 // lastIngestedLedger reads the frontier from the persisted ingestion state.
-func (s *Server) lastIngestedLedger(ctx context.Context, network string) (int64, error) {
-	state, err := s.store.GetIngestionState(ctx, network)
+func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
+	state, err := s.store.GetIngestionState(ctx)
 	if errors.Is(err, store.ErrNotFound) {
 
 		return 0, nil
@@ -2030,52 +2080,32 @@ func (s *Server) lastIngestedLedger(ctx context.Context, network string) (int64,
 
 }
 
-// resolveNetwork returns the network to use for the current request.
-func (s *Server) resolveNetwork(r *http.Request) (string, error) {
-	q := r.URL.Query().Get("network")
-	if q == "" {
-		if s.defaultNetwork != "" {
-			return s.defaultNetwork, nil
-		}
-		if len(s.networkNames) == 0 {
-			return "", nil
-		}
-		return "", fmt.Errorf("network query parameter is required when multiple networks are configured; available: %s", strings.Join(s.networkNames, ", "))
-	}
-	if len(s.networkNames) == 0 {
-		return "", fmt.Errorf("unknown network %q; no networks configured", q)
-	}
-	for _, n := range s.networkNames {
-		if n == q {
-			return q, nil
-		}
-	}
-	return "", fmt.Errorf("unknown network %q; available: %s", q, strings.Join(s.networkNames, ", "))
-}
-
 func listETag(f store.EventFilter) string {
 	key := struct {
 
-		ContractID    string          `json:"c"`
+		ContractID       string          `json:"c"`
 
-		Types         []string        `json:"t"`
+		ContractIDPrefix string          `json:"cp,omitempty"`
+		Types            []string        `json:"t"`
 
-		Topic         json.RawMessage `json:"p,omitempty"`
+		Topic            json.RawMessage `json:"p,omitempty"`
 
-		Topic0        json.RawMessage `json:"p0,omitempty"`
+		Topic0           json.RawMessage `json:"p0,omitempty"`
 
-		Topic1        json.RawMessage `json:"p1,omitempty"`
+		Topic1           json.RawMessage `json:"p1,omitempty"`
 
-		Topic2        json.RawMessage `json:"p2,omitempty"`
+		Topic2           json.RawMessage `json:"p2,omitempty"`
 
-		Topic3        json.RawMessage `json:"p3,omitempty"`
+		Topic3           json.RawMessage `json:"p3,omitempty"`
 
-		TopicContains json.RawMessage `json:"pc,omitempty"`
+		TopicContains    json.RawMessage `json:"pc,omitempty"`
 
-		TxHash        string          `json:"th,omitempty"`
+		TxHash           string          `json:"th,omitempty"`
 
-		HasValue      *bool           `json:"hv,omitempty"`
-		FromLedger    int64           `json:"fl"`
+		HasValue         *bool           `json:"hv,omitempty"`
+		TxIndex          *int32          `json:"txi,omitempty"`
+		OpIndex          *int32          `json:"opi,omitempty"`
+		FromLedger       int64           `json:"fl"`
 
 		ToLedger      int64           `json:"tl"`
 
@@ -2129,7 +2159,6 @@ func listETag(f store.EventFilter) string {
 		FromTime:      timeOrEmpty(f.FromTime),
 
 		ToTime:        timeOrEmpty(f.ToTime),
-		HasValue:      f.HasValue,
 		Cursor:        f.Cursor,
 
 		Limit:         resolvedLimit(f.Limit),
@@ -2510,7 +2539,9 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		return f, fmt.Errorf("invalid in_successful_call %q (want true or false)", raw)
 	}
 
-
+	// order/order_by/topic/topic0..topic3/topic_contains/from_ledger/
+	// to_ledger/from_time/to_time are applied by queries.BuildEventFilter
+	// above (via the args struct populated at the top of this function).
 
 	if raw := q.Get("limit"); raw != "" {
 
@@ -2519,9 +2550,6 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		if err != nil || limit < 1 || limit > store.MaxQueryLimit {
 
 			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
-
-		if err != nil || limit < 1 || limit > maxLimit {
-			return f, fmt.Errorf("limit must be an integer in [1,%d]", maxLimit)
 		}
 
 		f.Limit = limit
@@ -2529,6 +2557,8 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	} else {
 
 		f.Limit = store.DefaultQueryLimit
+
+	}
 
 	// ?recent=N: shorthand for "newest N events" — sets order=desc and
 	// limit=N (default 20). This isn't a general-purpose filter (it
@@ -2640,80 +2670,6 @@ func (s *Server) syncStreamScope(ctx context.Context, sub *broadcast.Subscriptio
 		}
 	}()
 }
-
-// Holders endpoint types.
-
-type holderResponse struct {
-	Address    string `json:"address"`
-	Balance    string `json:"balance"`
-	LastLedger int64  `json:"last_ledger"`
-}
-
-type holdersResponse struct {
-	ContractID     string           `json:"contract_id"`
-	EarliestLedger int64            `json:"earliest_ledger"`
-	Holders        []holderResponse `json:"holders"`
-	Cursor         string           `json:"cursor,omitempty"`
-}
-
-func (s *Server) handleContractHolders(w http.ResponseWriter, r *http.Request) {
-	contractID := chi.URLParam(r, "id")
-	if !config.ValidContractID(contractID) {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid contract ID %q", contractID))
-		return
-	}
-
-	network, err := s.resolveNetwork(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-
-	minBalance := r.URL.Query().Get("min_balance")
-	cursor := r.URL.Query().Get("cursor")
-	limit := store.DefaultQueryLimit
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 1 || parsed > store.MaxQueryLimit {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit))
-			return
-		}
-		limit = parsed
-	}
-
-	// Determine the earliest ledger for coverage indication.
-	earliestLedger, err := s.store.GetEarliestLedger(r.Context(), network, contractID)
-	if err != nil {
-		// non-fatal; surface as 0 to indicate unknown coverage
-		loggerFromContext(r.Context()).Warn("getting earliest ledger", "contract_id", contractID, "error", err)
-	}
-
-	balances, next, err := s.store.GetTokenBalances(r.Context(), contractID, network, minBalance, cursor, limit)
-	if err != nil {
-		loggerFromContext(r.Context()).Error("querying token holders", "contract_id", contractID, "error", err)
-		writeError(w, http.StatusInternalServerError, errors.New("querying token holders failed"))
-		return
-	}
-
-	holders := make([]holderResponse, len(balances))
-	for i, tb := range balances {
-		holders[i] = holderResponse{
-			Address:    tb.Address,
-			Balance:    tb.Balance,
-			LastLedger: tb.LastLedger,
-		}
-	}
-
-	writeCacheHeaders(w, cacheNoCache, 0, "")
-	writeJSON(w, http.StatusOK, holdersResponse{
-		ContractID:     contractID,
-		EarliestLedger: earliestLedger,
-		Holders:        holders,
-		Cursor:         next,
-	})
-}
-
-
 
 func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 

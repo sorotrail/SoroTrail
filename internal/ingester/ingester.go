@@ -13,17 +13,12 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/khaylebfortune/sorotrail/internal/broadcast"
-	"github.com/khaylebfortune/sorotrail/internal/decode"
-	"github.com/khaylebfortune/sorotrail/internal/metrics"
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
-	"golang.org/x/sync/errgroup"
-
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
+	"golang.org/x/sync/errgroup"
 )
 
 // Clock abstracts time operations so tests and simulations can supply a
@@ -216,7 +211,7 @@ type Ingester struct {
 // New wires an Ingester.
 func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, opts Options) *Ingester {
 	opts.applyDefaults()
-	return &Ingester{client: client, store: st, decoder: dec, log: log, metrics: obs, opts: opts}
+	return &Ingester{client: client, store: st, decoder: dec, log: log, opts: opts}
 }
 
 // WithBroadcaster attaches a live event broadcaster so ingested events are
@@ -364,15 +359,6 @@ func (ing *Ingester) rescanForReorg(ctx context.Context) error {
 // ingestion_state row — backward-compatible behavior unchanged.
 // Watched mode uses per-contract cursors in the contract_cursors table.
 func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
-	ctx, span := ing.tracer.Start(ctx, "ingester.poll_cycle")
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
 	startLedger, cursor, err := ing.resolvePosition(ctx)
 	if err != nil {
 		return false, err
@@ -382,20 +368,12 @@ func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
 		return false, err
 	}
 	if len(batches) == 1 {
-		return ing.singlePageUnwatched(ctx, startLedger, cursor, batches[0])
+		return ing.singlePage(ctx, startLedger, cursor, batches[0])
 	}
 	return ing.windowSweepUnwatched(ctx, startLedger, batches)
 }
 
 func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor string, filters []rpc.EventFilter) (bool, error) {
-	ctx, span := ing.tracer.Start(ctx, "ingester.fetch_page")
-	defer span.End()
-	span.SetAttributes(
-		attribute.Int64("ingester.start_ledger", int64(startLedger)),
-		attribute.String("ingester.cursor", cursor),
-		attribute.Int("ingester.filter_count", len(filters)),
-	)
-
 	resp, err := ing.client.GetEvents(ctx, rpc.GetEventsRequest{
 		StartLedger: startLedger,
 		Filters:     filters,
@@ -407,7 +385,6 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 		return false, err
 	}
 	if rpc.IsLedgerOutOfRange(err) {
-		span.AddEvent("retention_clamp")
 		return false, ing.reclampToOldest(ctx, startLedger)
 	}
 	if err != nil {
@@ -422,7 +399,6 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 	if state.LastCursor == "" && state.LastIngestedLedger <= 0 {
 		state.LastIngestedLedger = int64(startLedger) - 1
 	}
-	state.Network = ing.opts.Network
 	if err := ing.store.SaveIngestionState(ctx, state); err != nil {
 		return false, err
 	}
@@ -511,7 +487,7 @@ func (ing *Ingester) BuildFilterBatches(ctx context.Context) ([][]rpc.EventFilte
 func (ing *Ingester) PageLimit() uint { return ing.opts.PageLimit }
 
 // Network returns the network this ingester is responsible for.
-func (ing *Ingester) Network() string { return ing.opts.Network }
+func (ing *Ingester) Network() string { return "" }
 
 func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState, bool) {
 	caughtUp := uint(len(resp.Events)) < pageLimit
@@ -639,24 +615,10 @@ func (ing *Ingester) windowSweepWatched(ctx context.Context, batches [][]rpc.Eve
 	}
 	if err := g.Wait(); err != nil {
 		if ledgerOutOfRange.Load() || rpc.IsLedgerOutOfRange(err) {
-			// Collect all watched contract IDs and reclamp.
-			watched, wErr := ing.store.ListWatchedContracts(ctx)
-			if wErr != nil {
-				return false, wErr
-			}
-			ids := make([]string, len(watched))
-			for i, wc := range watched {
-				ids[i] = wc.ContractID
-			}
-			// reclampToOldest saves per-contract cursors.
-			if err := ing.reclampToOldest(ctx, start, ids...); err != nil {
-				return false, err
-			}
-			// Also update global ingestion state so existing callers
-			// (and tests) see the reclamped position.
-			clamped := int64(health.OldestLedger) - 1
-			if err := ing.store.SaveIngestionState(ctx, store.IngestionState{LastIngestedLedger: clamped}); err != nil {
-				return false, err
+			// Reclamp to the oldest retained ledger; the next runOnce
+			// retries the window from there.
+			if rerr := ing.reclampToOldest(ctx, start); rerr != nil {
+				return false, rerr
 			}
 			return false, nil
 		}
@@ -710,6 +672,11 @@ func (ing *Ingester) sweepBatch(ctx context.Context, ledgerOutOfRange *atomic.Bo
 			ledgerOutOfRange.Store(true)
 			return err
 		}
+		if rpc.IsFailoverReanchor(err) {
+			ing.log.Warn("failover re-anchor during window sweep: discarding cursor")
+			ing.discardCursor(ctx)
+			return err
+		}
 		if err != nil {
 			return fmt.Errorf("getEvents sweep [%d,%d]: %w", start, end, err)
 		}
@@ -737,9 +704,6 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	if len(rpcEvents) == 0 {
 		return nil
 	}
-	ctx, span := ing.tracer.Start(ctx, "ingester.persist_events")
-	defer span.End()
-	span.SetAttributes(attribute.Int("ingester.event_count", len(rpcEvents)), attribute.Int64("ingester.latest_ledger", int64(latestLedger)))
 	events := make([]store.Event, 0, len(rpcEvents))
 	for _, re := range rpcEvents {
 		ev, err := ing.toStoreEvent(re)
@@ -791,7 +755,6 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	}
 
 	ing.log.Info("ingested events",
-		"network", ing.opts.Network,
 		"count", len(events), "new", inserted,
 		"through_ledger", rpcEvents[len(rpcEvents)-1].Ledger,
 		"latest_ledger", latestLedger)
@@ -808,7 +771,7 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 }
 
 func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, cursor string, err error) {
-	state, err := ing.store.GetIngestionState(ctx, ing.opts.Network)
+	state, err := ing.store.GetIngestionState(ctx)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return 0, "", err
 	}
@@ -833,7 +796,7 @@ func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, c
 	if start < 2 {
 		start = 2
 	}
-	ing.log.Info("cold start", "network", ing.opts.Network, "start_ledger", start, "latest_ledger", health.LatestLedger)
+	ing.log.Info("cold start", "start_ledger", start, "latest_ledger", health.LatestLedger)
 	return uint32(start), "", nil
 }
 
@@ -843,11 +806,34 @@ func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) erro
 		return fmt.Errorf("getHealth while re-clamping: %w", err)
 	}
 	ing.log.Warn("resume ledger fell outside RPC retention window; skipping ahead — events in the gap are lost",
-		"network", ing.opts.Network, "requested_ledger", requested, "oldest_retained", health.OldestLedger)
+		"requested_ledger", requested, "oldest_retained", health.OldestLedger)
 	return ing.store.SaveIngestionState(ctx, store.IngestionState{
-		Network:            ing.opts.Network,
 		LastIngestedLedger: int64(health.OldestLedger) - 1,
 	})
+}
+
+// discardCursor reads the persisted ingestion state and re-saves it without
+// the cursor, so the next resolvePosition falls through to the
+// ledger-based path. Idempotent upserts absorb the overlap from re-scanning.
+//
+// In windowSweep the internal cursor is never persisted (only
+// LastIngestedLedger is saved at sweep end), so this is a defensive no-op
+// in that path — it guards against any future change that might persist a
+// cursor mid-sweep.
+func (ing *Ingester) discardCursor(ctx context.Context) {
+	state, err := ing.store.GetIngestionState(ctx)
+	if err != nil {
+		ing.log.Warn("discardCursor: could not read state", "error", err)
+		return
+	}
+	if state.LastCursor == "" {
+		return
+	}
+	if err := ing.store.SaveIngestionState(ctx, store.IngestionState{
+		LastIngestedLedger: state.LastIngestedLedger,
+	}); err != nil {
+		ing.log.Warn("discardCursor: could not save state", "error", err)
+	}
 }
 
 // checkLag evaluates the ingest-lag alarm against the chain head and
@@ -1009,7 +995,6 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 		Topics:           topics,
 		Value:            value,
 		CreatedAt:        createdAt,
-		Network:          ing.opts.Network,
 		// Keep the raw XDR so `sorotrail replay` can re-decode this event
 		// with a future decoder. Empty when the RPC delivered JSON directly
 		// (xdrFormat "json") — there is no XDR to keep in that case, and

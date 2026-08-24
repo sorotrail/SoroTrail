@@ -1,7 +1,6 @@
 package config
 
 import (
-	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -13,7 +12,8 @@ import (
 const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
 var envKeys = []string{
-	"RPC_URL", "DATABASE_URL", "POLL_INTERVAL", "HTTP_ADDR",
+	"RPC_URL", "RPC_URLS", "RPC_RATE_LIMIT_RPS", "DATABASE_URL",
+	"POLL_INTERVAL", "HTTP_ADDR",
 	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL", "LOG_FORMAT",
 	"API_QUERY_TIMEOUT", "API_SLOW_QUERY_THRESHOLD",
 	"HORIZON_URL", "BACKFILL_RATE_RPS",
@@ -82,50 +82,6 @@ func TestLoad(t *testing.T) {
 			name:    "missing DATABASE_URL",
 			env:     map[string]string{},
 			wantErr: "DATABASE_URL: required but empty",
-		},
-		{
-			name: "NETWORKS with single network",
-			env: map[string]string{
-				"DATABASE_URL": "postgres://localhost/db",
-				"NETWORKS":     `[{"name":"testnet","rpc_url":"https://testnet.stellar.org"}]`,
-			},
-			check: func(t *testing.T, c Config) {
-				networks := c.NetworksOrDefault()
-				require.Len(t, networks, 1)
-				assert.Equal(t, "testnet", networks[0].Name)
-				assert.Equal(t, "https://testnet.stellar.org", networks[0].RPCURL)
-			},
-		},
-		{
-			name: "NETWORKS with two networks requires DEFAULT_NETWORK",
-			env: map[string]string{
-				"DATABASE_URL": "postgres://localhost/db",
-				"NETWORKS":     `[{"name":"testnet","rpc_url":"https://testnet.stellar.org"},{"name":"mainnet","rpc_url":"https://mainnet.stellar.org"}]`,
-			},
-			wantErr: "DEFAULT_NETWORK is required when multiple networks are configured",
-		},
-		{
-			name: "NETWORKS with two networks and DEFAULT_NETWORK works",
-			env: map[string]string{
-				"DATABASE_URL":    "postgres://localhost/db",
-				"NETWORKS":        `[{"name":"testnet","rpc_url":"https://testnet.stellar.org"},{"name":"mainnet","rpc_url":"https://mainnet.stellar.org"}]`,
-				"DEFAULT_NETWORK": "testnet",
-			},
-			check: func(t *testing.T, c Config) {
-				networks := c.NetworksOrDefault()
-				require.Len(t, networks, 2)
-				assert.Equal(t, "testnet", c.DefaultNetworkName())
-				assert.Equal(t, []string{"testnet", "mainnet"}, c.NetworkNames())
-			},
-		},
-		{
-			name: "RPC_URL and NETWORKS both set is rejected",
-			env: map[string]string{
-				"DATABASE_URL": "postgres://localhost/db",
-				"RPC_URL":      "https://testnet.stellar.org",
-				"NETWORKS":     `[{"name":"testnet","rpc_url":"https://testnet.stellar.org"}]`,
-			},
-			wantErr: "RPC_URL and NETWORKS cannot both be set",
 		},
 		{
 			name: "watched contracts parsed and trimmed",
@@ -463,6 +419,53 @@ func TestLoad(t *testing.T) {
 			},
 			wantErr: "CORS_ALLOWED_ORIGINS entry",
 		},
+		{
+			name: "RPC_URLS with valid URLs accepted",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"RPC_URLS":     "https://rpc1.example.com,https://rpc2.example.com",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{"https://rpc1.example.com", "https://rpc2.example.com"}, c.RPCURLS)
+				assert.Equal(t, float64(10), c.RPCRateLimitRPS)
+			},
+		},
+		{
+			name: "RPC_URLS invalid URL rejected",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"RPC_URLS":     "https://good.example.com,not a url",
+			},
+			wantErr: "RPC_URLS[1]",
+		},
+		{
+			name: "RPC_URLS empty entries trimmed",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+				"RPC_URLS":     "https://rpc.example.com, ,",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, []string{"https://rpc.example.com"}, c.RPCURLS)
+			},
+		},
+		{
+			name: "RPC_RATE_LIMIT_RPS custom value",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"RPC_RATE_LIMIT_RPS": "5",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, float64(5), c.RPCRateLimitRPS)
+			},
+		},
+		{
+			name: "RPC_RATE_LIMIT_RPS zero rejected",
+			env: map[string]string{
+				"DATABASE_URL":       "postgres://localhost/db",
+				"RPC_RATE_LIMIT_RPS": "0",
+			},
+			wantErr: "RPC_RATE_LIMIT_RPS must be positive",
+		},
 	}
 
 	for _, tt := range tests {
@@ -508,20 +511,6 @@ func TestValidContractID(t *testing.T) {
 	assert.False(t, ValidContractID("G"+validContract[1:]), "account keys are not contracts")
 	assert.False(t, ValidContractID(validContract[:55]), "too short")
 	assert.False(t, ValidContractID(validContract[:55]+"a"), "lowercase is not base32")
-}
-
-func TestParseNetworks(t *testing.T) {
-	networks, err := ParseNetworks(`[{"name":"test","rpc_url":"https://test.stellar.org"}]`)
-	require.NoError(t, err)
-	require.Len(t, networks, 1)
-	assert.Equal(t, "test", networks[0].Name)
-
-	_, err = ParseNetworks("invalid")
-	require.Error(t, err)
-
-	networks, err = ParseNetworks("")
-	require.NoError(t, err)
-	assert.Nil(t, networks)
 }
 
 func TestValidCursor(t *testing.T) {

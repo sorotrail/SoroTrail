@@ -66,7 +66,7 @@ func (m *mockStore) LedgerRangeCensus(context.Context, int64, int64, bool) ([]st
 	return nil, nil
 }
 
-func (m *mockStore) GetAuditState(context.Context) (store.AuditState, error) {
+func (m *mockStore) GetAuditState(context.Context, string) (store.AuditState, error) {
 	return store.AuditState{}, store.ErrNotFound
 }
 
@@ -74,7 +74,7 @@ func (m *mockStore) SaveAuditState(_ context.Context, s store.AuditState) error 
 	return nil
 }
 
-func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, ledger int64) (store.AuditState, error) {
+func (m *mockStore) SaveAuditStateIfGreater(_ context.Context, _ string, ledger int64) (store.AuditState, error) {
 	return store.AuditState{VerifiedThroughLedger: ledger}, nil
 }
 
@@ -87,7 +87,7 @@ func (m *mockStore) UpdateAuditFinding(context.Context, store.AuditFinding) erro
 	return nil
 }
 
-func (m *mockStore) ListOpenFindingsByRange(context.Context, int64, int64) (store.AuditFinding, error) {
+func (m *mockStore) ListOpenFindingsByRange(context.Context, string, int64, int64) (store.AuditFinding, error) {
 	return store.AuditFinding{}, store.ErrNotFound
 }
 

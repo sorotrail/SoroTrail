@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	_ "modernc.org/sqlite"
 
 	"github.com/sorotrail/sorotrail/internal/api"
 	"github.com/sorotrail/sorotrail/internal/api/graphql"
@@ -33,17 +32,9 @@ import (
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/spec"
 	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/telemetry"
 	"github.com/sorotrail/sorotrail/internal/webhook"
 )
-
-// compositeNotifier fans out to multiple EventNotifiers.
-type compositeNotifier []ingester.EventNotifier
-
-func (n compositeNotifier) NotifyEvents(ctx context.Context, events []store.Event) {
-	for _, notifier := range n {
-		notifier.NotifyEvents(ctx, events)
-	}
-}
 
 var errInterrupted = errors.New("interrupted")
 
@@ -59,6 +50,8 @@ func main() {
 	}
 }
 
+// dispatch routes to a subcommand, defaulting to the indexer so existing
+// deployments (and the Dockerfile entrypoint) keep working unchanged.
 func dispatch(args []string) error {
 	if len(args) == 0 {
 		return run()
@@ -188,54 +181,19 @@ func run() error {
 		st = pg
 	}
 
-	// Tag any events that have empty network with the default network.
-	// This handles the upgrade path for single-network deployments.
-	if pool != nil {
-		defaultNetwork := cfg.DefaultNetworkName()
-		if defaultNetwork == "" {
-			networks := cfg.NetworksOrDefault()
-			if len(networks) > 0 {
-				defaultNetwork = networks[0].Name
-			}
-		}
-		if defaultNetwork != "" {
-			if _, err := pool.Exec(ctx, `UPDATE events SET network = $1 WHERE network = '' OR network IS NULL`, defaultNetwork); err != nil {
-				log.Warn("tagging legacy events with default network", "error", err)
-			}
-			if _, err := pool.Exec(ctx, `INSERT INTO ingestion_state (network, last_ingested_ledger, last_cursor, updated_at)
-				SELECT $1, last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE network = '' OR network IS NULL
-				ON CONFLICT (network) DO NOTHING`, defaultNetwork); err != nil {
-				log.Warn("migrating ingestion state", "error", err)
-			}
-			if _, err := pool.Exec(ctx, `INSERT INTO audit_state (network, verified_through_ledger, updated_at)
-				SELECT $1, verified_through_ledger, updated_at FROM audit_state WHERE network = '' OR network IS NULL
-				ON CONFLICT (network) DO NOTHING`, defaultNetwork); err != nil {
-				log.Warn("migrating audit state", "error", err)
-			}
-		}
-	}
-
 	for _, id := range cfg.WatchedContracts {
-		// In multi-network mode, watched contracts apply to all networks.
-		for _, n := range cfg.NetworksOrDefault() {
-			if err := st.AddWatchedContract(ctx, id); err != nil {
-				return err
-			}
-			_ = n // preserve for per-network contract lists
+		if err := st.AddWatchedContract(ctx, id); err != nil {
+			return err
 		}
 	}
 
 	// Shared broadcaster for live event streaming across all networks.
 	bcast := broadcast.New(broadcast.DefaultBufferSize)
 
-	// Build per-network components.
-	networks := cfg.NetworksOrDefault()
-	type networkIngester struct {
-		ing     *ingester.Ingester
-		auditor *audit.Auditor
-		rpc     rpc.Client
-	}
-	ingesters := make([]networkIngester, 0, len(networks))
+	rpcClient := rpc.NewHTTPClient(cfg.RPCURL)
+	wh := webhook.NewNotifier(st, log)
+
+	// Wire the spec cache and enricher for spec-decoded event views.
 	specCache := spec.NewCache(st)
 	specFetcher := spec.NewFetcher(rpcClient)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
@@ -340,10 +298,6 @@ func run() error {
 	limiter.Start(ctx)
 	defer limiter.Stop()
 
-	// Wire spec enricher for the API using the first network's fetcher.
-	firstSpecFetcher := spec.NewFetcher(ingesters[0].rpc)
-	firstSpecEnricher := spec.NewEnricher(firstSpecFetcher, specCache, log)
-
 	// Guarded store for API-originated reads with timeout and slow-query logging.
 	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
 		Timeout:            cfg.APIQueryTimeout,
@@ -429,7 +383,7 @@ func run() error {
 	if ingesterEnabled {
 		remaining++ // + ingester
 		go func() {
-			log.Info("ingester starting", "rpc_url", cfg.RPCURL, "poll_interval", cfg.PollInterval)
+			log.Info("ingester starting", "rpc_urls", rpcURLsForLog(cfg), "poll_interval", cfg.PollInterval)
 			if err := ing.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- fmt.Errorf("ingester: %w", err)
 			} else {
@@ -446,13 +400,27 @@ func run() error {
 		}
 	}()
 
-	// Count expected goroutines that send to errCh.
-	remaining := 2 + len(ingesters) // http server + webhook + ingesters
-	for _, ni := range ingesters {
-		if ni.auditor != nil {
-			remaining++
-		}
+	// The auditor runs alongside ingestion and reports into the same
+	// error channel when enabled.
+	if aud != nil {
+		remaining++ // + auditor
+		go func() {
+			log.Info("auditor starting",
+				"budget_share", cfg.AuditBudgetShare,
+				"batch_ledgers", cfg.AuditBatchLedgers,
+				"lag_threshold", cfg.AuditLagThreshold,
+				"max_repair_attempts", cfg.AuditMaxRepair)
+			if err := aud.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("auditor: %w", err)
+			} else {
+				errCh <- nil
+			}
+		}()
 	}
+
+	// The pruner goroutine always runs; without a retention policy it
+	// returns immediately and reports nil so shutdown accounting holds.
+	remaining++ // + pruner
 	go func() {
 		if cfg.RetentionEnabled() {
 			log.Info("pruner starting",
@@ -470,9 +438,6 @@ func run() error {
 	}()
 
 	var firstErr error
-	if aud != nil {
-		remaining++
-	}
 	select {
 	case <-ctx.Done():
 		log.Info("shutdown signal received")
@@ -483,7 +448,6 @@ func run() error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-	broker.Shutdown()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Error("http shutdown", "error", err)
 	}
@@ -513,7 +477,7 @@ func bootstrapAdminKey(ctx context.Context, ts store.TenantStore, key string, lo
 	}
 	prefix, digest, ok := api.ParseAPIKeyForBootstrap(key)
 	if !ok {
-		return fmt.Errorf("MULTI_TENANT_BOOTSTRAP_KEY is not a valid key; " +
+		return fmt.Errorf("MULTI_TENANT_BOOTSTRAP_KEY is not a valid key; "+
 			"generate one with `sorotrail help` format st_<12 chars>_<secret>")
 	}
 	tenant, err := ts.GetTenantByName(ctx, "default")

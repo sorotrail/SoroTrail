@@ -30,26 +30,6 @@ func (e *stubEnricher) EnrichEvents(_ context.Context, events []store.Event) []s
 	}}
 }
 
-// doGetWithHeader is doGet plus a header for conditional requests. The
-// 304 tests use this so the If-None-Match setup reads naturally without
-// the caller constructing http.Request by hand.
-func doGetWithHeader(t *testing.T, s *Server, path, header, value string) (*http.Response, []byte) {
-	t.Helper()
-	srv := httptest.NewServer(s.Router())
-	defer srv.Close()
-	req, err := http.NewRequest(http.MethodGet, srv.URL+path, nil)
-	require.NoError(t, err)
-	if header != "" {
-		req.Header.Set(header, value)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	resp.Body.Close()
-	return resp, body
-}
-
 // assertImmutable asserts that a response carries the immutable-cache
 // header set: strong ETag (when expected), Vary: Accept-Encoding,
 // Cache-Control: public + max-age + immutable.
@@ -497,7 +477,6 @@ func TestListETag_CoversEveryFilterField(t *testing.T) {
 		{"Topic2", func(f *store.EventFilter) { f.Topic2 = json.RawMessage(`{"symbol":"transfer"}`) }},
 		{"Topic3", func(f *store.EventFilter) { f.Topic3 = json.RawMessage(`{"symbol":"transfer"}`) }},
 		{"TopicContains", func(f *store.EventFilter) { f.TopicContains = json.RawMessage(`[{"u64":7}]`) }},
-		{"TopicCount", func(f *store.EventFilter) { n := 2; f.TopicCount = &n }},
 		{"TxHash", func(f *store.EventFilter) { f.TxHash = "abc123def" }},
 		{"HasValueTrue", func(f *store.EventFilter) { t := true; f.HasValue = &t }},
 		{"HasValueFalse", func(f *store.EventFilter) { v := false; f.HasValue = &v }},
@@ -591,7 +570,7 @@ func TestListEvents_TopicFilterCannotReuseAnothersValidator(t *testing.T) {
 func TestGetEvent_Decoded_Immutable(t *testing.T) {
 	const id = "0001099511627776-0000000001"
 	st := &stubStore{event: store.Event{ID: id, Ledger: 100}}
-	s := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key", 17280, &stubEnricher{})
+	s := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key", &stubEnricher{})
 
 	resp, _ := doGet(t, s, "/events/"+id+"?decoded=true")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -603,7 +582,7 @@ func TestGetEvent_Decoded_Immutable(t *testing.T) {
 func TestGetEvent_DecodedWithXDR_Immutable(t *testing.T) {
 	const id = "0001099511627776-0000000002"
 	st := &stubStore{event: store.Event{ID: id, Ledger: 100}}
-	s := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key", 17280, &stubEnricher{})
+	s := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key", &stubEnricher{})
 
 	resp, _ := doGet(t, s, "/events/"+id+"?decoded=true&include_xdr=true")
 	require.Equal(t, http.StatusOK, resp.StatusCode)

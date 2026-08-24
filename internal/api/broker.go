@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"sync"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // subscriberBufferSize bounds the event channel per subscriber. When a
@@ -127,11 +127,21 @@ func (b *Broker) Shutdown() {
 
 // eventMatches reports whether e satisfies every constraint in f. Zero-value
 // fields mean "unconstrained".
+// containsType reports whether want appears in types.
+func containsType(types []string, want string) bool {
+	for _, t := range types {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
 func eventMatches(f store.EventFilter, e store.Event) bool {
 	if f.ContractID != "" && e.ContractID != f.ContractID {
 		return false
 	}
-	if f.Type != "" && e.Type != f.Type {
+	if len(f.Types) > 0 && !containsType(f.Types, e.Type) {
 		return false
 	}
 	if f.FromLedger > 0 && e.Ledger < f.FromLedger {

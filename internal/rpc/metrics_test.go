@@ -30,6 +30,9 @@ func (s *stubClient) GetHealth(_ context.Context) (Health, error) {
 func (s *stubClient) GetLedgerEntries(_ context.Context, _ GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
 	return GetLedgerEntriesResponse{}, s.errGetLedgerEntries
 }
+func (s *stubClient) SimulateTransaction(_ context.Context, _ SimulateTransactionRequest) (SimulateTransactionResponse, error) {
+	return SimulateTransactionResponse{}, nil
+}
 
 func TestCountingClient_CountsErrorsByMethod(t *testing.T) {
 	sentinel := errors.New("rpc failure")
