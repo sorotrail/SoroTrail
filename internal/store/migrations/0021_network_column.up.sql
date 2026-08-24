@@ -1,5 +1,13 @@
 -- Adds the network dimension the store layer already reads and writes.
 --
+-- This runs after 0008_partition_events, not before it, and must stay
+-- there: 0008 renames events to events_legacy and creates a fresh,
+-- partitioned events table from an explicit column list. Anything that
+-- adds a column to events at a lower version is silently discarded by
+-- that rebuild, which is exactly how an earlier draft of this migration
+-- passed the unit tests and then failed every integration test with
+-- "column \"network\" does not exist".
+--
 -- This replaces two competing, mutually incompatible drafts of the same
 -- change (0005_add_network_column and 0005_multi_network) that both landed
 -- under version 0005 during a batch of merges. Neither matched the Go code:
