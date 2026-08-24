@@ -10,6 +10,7 @@ package api_test
 // expanding by one event when someone changes the ORDER BY clause.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +30,41 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 	"github.com/sorotrail/sorotrail/internal/testdb"
 )
+
+// captureLogger buffers the server's log and prints it only when the test
+// fails. Discarding it hides the one thing that explains a 500: handlers
+// answer with a generic message and log the underlying SQL error, so a
+// failing assertion on the status code otherwise tells you nothing.
+func captureLogger(t *testing.T) *slog.Logger {
+	t.Helper()
+	buf := &lockedBuffer{}
+	t.Cleanup(func() {
+		if t.Failed() {
+			if out := buf.String(); out != "" {
+				t.Logf("server log:\n%s", out)
+			}
+		}
+	})
+	return slog.New(slog.NewTextHandler(buf, nil))
+}
+
+// lockedBuffer is written from the httptest server's handler goroutines.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 const (
 	apiContractA = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
@@ -107,7 +144,7 @@ func TestListEvents_FilterCombinationsAgainstSeededData(t *testing.T) {
 		t.Fatalf("seeding api events: %v", err)
 	}
 
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	log := captureLogger(t)
 	srv := httptest.NewServer(api.New(st, healthOnlyRPC{}, log, "test-key").Router())
 	t.Cleanup(srv.Close)
 
