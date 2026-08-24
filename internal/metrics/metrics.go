@@ -51,6 +51,15 @@ var (
 		Buckets: prometheus.DefBuckets,
 	})
 
+	// DBQueryDuration records the wall-clock duration of a database query
+	// (SELECT operations). Labelled by operation (e.g. "list_events",
+	// "count_events", "get_contract").
+	DBQueryDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "sorotrail_db_query_duration_seconds",
+		Help:    "Database query duration in seconds, labelled by operation.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"operation"})
+
 	// IngestionLag is the number of ledgers the indexer is behind the
 	// Stellar RPC chain head. Updated after every ingestion pass that
 	// has access to the chain head.
@@ -66,6 +75,7 @@ func init() {
 		IngestErrors,
 		RPCCallLatency,
 		DBWriteLatency,
+		DBQueryDuration,
 		IngestionLag,
 	)
 }

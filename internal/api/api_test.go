@@ -29,12 +29,18 @@ import (
 
 // stubStore implements store.Store for API tests.
 type stubStore struct {
-	mu         sync.Mutex
-	events     []store.Event
-	eventByID  map[string]store.Event
-	lastFilter store.EventFilter
-	nextCursor string
-	queryErr   error
+	mu        sync.Mutex
+	events    []store.Event
+	eventByID map[string]store.Event
+	// Contract summary/type-count responses for the /contracts/{id}
+	// routes; nil means "return a bare summary for the requested id".
+	contractSummary    *store.ContractSummary
+	contractSummaryErr error
+	eventTypeCounts    []store.ContractEventTypeCount
+	eventTypeCountsErr error
+	lastFilter         store.EventFilter
+	nextCursor         string
+	queryErr           error
 
 	totalCount      int64
 	countEventsErr  error
@@ -328,6 +334,20 @@ func (s *stubStore) UpsertContractMeta(context.Context, store.ContractMeta) erro
 }
 func (s *stubStore) CountContractEvents(context.Context, string) (int64, error) {
 	return 0, nil
+}
+
+func (s *stubStore) GetContractSummary(_ context.Context, id string) (store.ContractSummary, error) {
+	if s.contractSummaryErr != nil {
+		return store.ContractSummary{}, s.contractSummaryErr
+	}
+	if s.contractSummary != nil {
+		return *s.contractSummary, nil
+	}
+	return store.ContractSummary{ContractID: id}, nil
+}
+
+func (s *stubStore) ContractEventTypeCounts(context.Context, string) ([]store.ContractEventTypeCount, error) {
+	return s.eventTypeCounts, s.eventTypeCountsErr
 }
 func (s *stubStore) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
 	return nil, nil

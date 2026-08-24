@@ -33,6 +33,9 @@ func TestValidateAll_ValidConfig(t *testing.T) {
 		AuditMaxRepair:      3,
 		AuditFindingMaxLgrs: 100,
 		LogLevel:            "info",
+		// Matches the envDefault; a config parsed from the environment
+		// always carries a format, and ValidateAll rejects an empty one.
+		LogFormat: "text",
 	}
 	if err := cfg.ValidateAll(); err != nil {
 		t.Fatalf("unexpected error: %s", err)

@@ -16,7 +16,7 @@ jobs:
         with:
           fetch-depth: 0 # goreleaser needs the full history for changelog
 
-      - uses: actions/setup-go@v5.5.0
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -24,7 +24,7 @@ jobs:
             **/*.go
           cache: true
 
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: latest

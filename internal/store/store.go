@@ -311,6 +311,21 @@ type ContractSummary struct {
 // ContractIDPrefix, when set, constrains the result to contracts whose
 // ID starts with the prefix. Indexed lookups (the contract_id index)
 // can serve this directly; no full scan.
+
+// ContractEventTypeCount is one entry in a per-type event count breakdown
+// for a single contract.
+type ContractEventTypeCount struct {
+	Type  string `json:"type"`
+	Count int64  `json:"count"`
+}
+
+// ContractStats is the full per-contract statistics response, including
+// the summary row and the event-type breakdown.
+type ContractStats struct {
+	ContractSummary
+	TypeBreakdown []ContractEventTypeCount `json:"type_breakdown"`
+}
+
 type ContractsFilter struct {
 	ContractIDPrefix string
 	SortKey          string // "" | "count" | "first_ledger" | "last_ledger" | "last_seen"
@@ -775,6 +790,10 @@ type Store interface {
 	GetContractMeta(ctx context.Context, contractID string) (ContractMeta, error)
 	UpsertContractMeta(ctx context.Context, m ContractMeta) error
 	CountContractEvents(ctx context.Context, contractID string) (int64, error)
+	// GetContractSummary returns the aggregate row for one contract.
+	GetContractSummary(ctx context.Context, contractID string) (ContractSummary, error)
+	// ContractEventTypeCounts breaks one contract's events down by type.
+	ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error)
 	ListContractsNeedingRefresh(ctx context.Context, olderThan time.Time) ([]string, error)
 }
 

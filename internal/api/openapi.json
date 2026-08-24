@@ -1040,6 +1040,81 @@
         }
       }
     },
+    "/contracts/{id}": {
+      "get": {
+        "operationId": "getContract",
+        "summary": "Get a single contract's summary",
+        "description": "Aggregate row for one indexed contract: how many events it has, the ledger range they span, and when it was last seen. Returns 404 for a contract with no indexed events.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Stellar contract ID (C-prefixed)",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Contract summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "contract_id",
+                    "event_count",
+                    "first_ledger",
+                    "last_ledger",
+                    "last_seen"
+                  ],
+                  "properties": {
+                    "contract_id": {
+                      "type": "string",
+                      "description": "Stellar contract ID (C-prefixed)"
+                    },
+                    "event_count": {
+                      "type": "integer",
+                      "format": "int64",
+                      "description": "Number of stored events for this contract"
+                    },
+                    "first_ledger": {
+                      "type": "integer",
+                      "format": "int64",
+                      "description": "Earliest ledger holding an event for this contract"
+                    },
+                    "last_ledger": {
+                      "type": "integer",
+                      "format": "int64",
+                      "description": "Most recent ledger holding an event for this contract"
+                    },
+                    "last_seen": {
+                      "type": "string",
+                      "format": "date-time",
+                      "description": "Timestamp of the most recent event"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
     "/contracts/{id}/stats": {
       "get": {
         "operationId": "contractStats",

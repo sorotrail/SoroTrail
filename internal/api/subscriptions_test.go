@@ -395,3 +395,11 @@ func TestCountEvents_BadFilterPaths(t *testing.T) {
 		})
 	}
 }
+
+func (s *subErrorStub) GetContractSummary(_ context.Context, id string) (store.ContractSummary, error) {
+	return store.ContractSummary{ContractID: id}, nil
+}
+
+func (s *subErrorStub) ContractEventTypeCounts(context.Context, string) ([]store.ContractEventTypeCount, error) {
+	return nil, nil
+}

@@ -121,6 +121,13 @@ func TestGuardedStore_CountsQueryErrors(t *testing.T) {
 	}
 }
 
+func (m *errorStore) GetContractSummary(context.Context, string) (ContractSummary, error) {
+	return ContractSummary{}, nil
+}
+func (m *errorStore) ContractEventTypeCounts(context.Context, string) ([]ContractEventTypeCount, error) {
+	return nil, nil
+}
+
 func (m *errorStore) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
 	return nil, "", nil
 }
