@@ -159,6 +159,15 @@ func TestListEvents_FilterCombinationsAgainstSeededData(t *testing.T) {
 		wantIDs []string
 		wantBad bool
 	}
+	// Event 3 is the deliberate odd one out in apiSeed: type=diagnostic with
+	// topics [{"symbol":"mint"}]. Both topic filters below therefore match
+	// the other nine, not all ten.
+	allButThree := []string{
+		apiEventID(1), apiEventID(2), apiEventID(4), apiEventID(5),
+		apiEventID(6), apiEventID(7), apiEventID(8), apiEventID(9),
+		apiEventID(10),
+	}
+
 	cases := []tcase{
 		{"no filter", "/events", allTen, false},
 		{"by contract A", "/events?contract_id=" + apiContractA,
@@ -169,13 +178,9 @@ func TestListEvents_FilterCombinationsAgainstSeededData(t *testing.T) {
 			[]string{apiEventID(4), apiEventID(5), apiEventID(6)}, false},
 		{"by type=diagnostic", "/events?type=diagnostic",
 			[]string{apiEventID(3)}, false},
-		{"topic match in second position", "/events?topic={\"u64\":7}", allTen, false},
+		{"topic match in second position", "/events?topic={\"u64\":7}", allButThree, false},
 		{"topic match in first position", "/events?topic={\"symbol\":\"transfer\"}",
-			[]string{
-				apiEventID(1), apiEventID(2), apiEventID(4), apiEventID(5),
-				apiEventID(6), apiEventID(7), apiEventID(8), apiEventID(9),
-				apiEventID(10),
-			}, false},
+			allButThree, false},
 		{"intersection: contract + ledger", "/events?contract_id=" + apiContractA + "&from_ledger=104&to_ledger=108",
 			[]string{apiEventID(5), apiEventID(7)}, false},
 		{"intersection: ledger range + time", "/events?from_ledger=104&to_ledger=106&from_time=" + fromTimeBound(),
