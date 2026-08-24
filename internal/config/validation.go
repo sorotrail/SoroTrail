@@ -138,6 +138,14 @@ func (c Config) ValidateAll() error {
 			redact("LOG_LEVEL", c.LogLevel)))
 	}
 
+	// --- logging format -----------------------------------------------------
+
+	validFormats := map[string]bool{"json": true, "text": true}
+	if !validFormats[strings.ToLower(c.LogFormat)] {
+		errs = append(errs, fmt.Sprintf("LOG_FORMAT: %q must be one of json|text",
+			redact("LOG_FORMAT", c.LogFormat)))
+	}
+
 	// --- contract ID format -------------------------------------------------
 
 	for _, id := range c.WatchedContracts {
