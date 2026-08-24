@@ -499,6 +499,58 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 	return out, next, nil
 }
 
+
+// GetContractSummary returns a single contract's summary row. It queries
+// the events table directly so it reflects the same data as ListContracts.
+func (p *Postgres) GetContractSummary(ctx context.Context, contractID string) (ContractSummary, error) {
+	var c ContractSummary
+	err := p.pool.QueryRow(ctx,
+		`SELECT contract_id,
+		        COUNT(*)::bigint,
+		        MIN(ledger)::bigint,
+		        MAX(ledger)::bigint,
+		        MAX(created_at)
+		   FROM events
+		  WHERE contract_id = $1
+		  GROUP BY contract_id`, contractID,
+	).Scan(&c.ContractID, &c.EventCount, &c.FirstLedger, &c.LastLedger, &c.LastSeen)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return c, ErrNotFound
+		}
+		return c, fmt.Errorf("get contract summary %s: %w", contractID, err)
+	}
+	return c, nil
+}
+
+// ContractEventTypeCounts returns per-type event counts for a single
+// contract, ordered by count descending.
+func (p *Postgres) ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT type, COUNT(*)::bigint
+		   FROM events
+		  WHERE contract_id = $1
+		  GROUP BY type
+		  ORDER BY count DESC`, contractID)
+	if err != nil {
+		return nil, fmt.Errorf("contract event type counts %s: %w", contractID, err)
+	}
+	defer rows.Close()
+
+	var out []ContractEventTypeCount
+	for rows.Next() {
+		var c ContractEventTypeCount
+		if err := rows.Scan(&c.Type, &c.Count); err != nil {
+			return nil, fmt.Errorf("scanning contract event type count: %w", err)
+		}
+		out = append(out, c)
+	}
+	if out == nil {
+		out = []ContractEventTypeCount{}
+	}
+	return out, rows.Err()
+}
+
 func (p *Postgres) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
 	args := []any{}
 	arg := func(v any) string {
