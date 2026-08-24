@@ -11,13 +11,11 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	otelhttp "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
+	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/pruner"
 	"github.com/sorotrail/sorotrail/internal/rpc"
@@ -125,16 +123,17 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store     store.Store
-	enableMetrics bool
-	rpc       rpc.Client
-	enricher  Enricher
-	log       *slog.Logger
-	apiKey    string
-	limiter   *RateLimiter
-	recoverer *Recoverer
-	bcast     *broadcast.Broadcaster
-	metrics   *metrics.HTTPMetrics
+	store          store.Store
+	rpc            rpc.Client
+	log            *slog.Logger
+	apiKey         string
+	limiter        *RateLimiter
+	bcast          *broadcast.Broadcaster
+	enricher       Enricher
+	enableMetrics  bool
+	recoverer      *Recoverer
+	metrics        *metrics.HTTPMetrics
+	tracer         trace.Tracer
 
 	// GraphQL transport, injected by main after the server is built.
 	// internal/api/graphql imports this package for its ServerDeps, so
@@ -178,6 +177,8 @@ func (s *Server) SetCompressMinSize(n int) {
 // SetMetricsEnabled enables or disables the /metrics endpoint.
 func (s *Server) SetMetricsEnabled(enabled bool) {
 	s.enableMetrics = enabled
+}
+
 // maxLimit is the API's upper bound for page-size parameters (limit and
 // recent). It is set once at startup via SetMaxLimit (driven by the
 // API_MAX_LIMIT env var) before any requests are served so no mutex is
@@ -257,13 +258,6 @@ func (s *Server) SetRateLimiter(l *RateLimiter) {
 	s.limiter = l
 }
 
-// SetCORS configures the cross-origin allow-list (CORS_ALLOWED_ORIGINS).
-// Pass nil or an empty slice to leave CORS disabled (the default — the
-// router emits no CORS headers, so existing deployments are unaffected).
-func (s *Server) SetCORS(allowedOrigins []string) {
-	s.corsOrigins = allowedOrigins
-}
-
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
 // can deliver events as they arrive.
 func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
@@ -329,14 +323,13 @@ func (s *Server) router() chi.Router {
 	// Non-list routes: health, metrics, writes — responses are always
 	// small, so compression is just overhead with no benefit.
 	r.Get("/health", s.handleHealth)
-	r.Get("/metrics", s.handleMetrics)
-	r.Get("/livez", s.handleLivez)
-	r.Get("/readyz", s.handleReadyz)
-	r.Get("/version", s.handleVersion)
 	// Registered as GET, not Handle: Handle advertises every method (the
 	// route-drift test then demands CONNECT/TRACE entries in the OpenAPI
 	// spec), and scraping is a GET.
 	r.Get("/metrics", s.metrics.Handler().ServeHTTP)
+	r.Get("/livez", s.handleLivez)
+	r.Get("/readyz", s.handleReadyz)
+	r.Get("/version", s.handleVersion)
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/count", s.handleCountEvents)
 	r.Get("/events/aggregate", s.handleAggregateEvents)
@@ -345,11 +338,11 @@ func (s *Server) router() chi.Router {
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/events.csv", s.handleEventsCSV)
 	r.Get("/contracts", s.handleListContracts)
+	r.Get("/contracts/{id}", s.handleGetContract)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/contracts/{id}/export", s.handleContractExport)
-
+	r.Get("/contracts/{id}/stats", s.handleContractStats)
 	r.Get("/stats", s.handleStats)
-	r.Handle("/metrics", promhttp.Handler())
 	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.
@@ -409,7 +402,8 @@ func (s *Server) router() chi.Router {
 		r.Get("/events/count", s.handleCountEvents)
 		r.Get("/events/{id}/raw", s.handleGetEventRaw)
 		r.Get("/events/{id}", s.handleGetEvent)
-		r.Get("/contracts/{id}/events", s.handleContractEvents)
+		r.Get("/contracts/{id}", s.handleGetContract)
+	r.Get("/contracts/{id}/events", s.handleContractEvents)
 		r.Get("/contracts/{id}/export", s.handleContractExport)
 		r.Get("/events.csv", s.handleEventsCSV)
 		r.Get("/subscriptions", s.handleListSubscriptions)
@@ -451,7 +445,7 @@ func (s *Server) router() chi.Router {
 	r.Get("/addresses/{address}/events", s.handleAddressEvents)
 	r.Get("/addresses/{address}/summary", s.handleAddressSummary)
 
-	return otelhttp.NewHandler(r, "HTTP")
+	return r
 }
 
 // handleOpenAPI serves the embedded OpenAPI 3.1 specification.
@@ -483,13 +477,6 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 			"status", ww.Status(),
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
-		if s.metrics != nil {
-			path := chi.RouteContext(r.Context()).RoutePattern()
-			if path == "" {
-				path = r.URL.Path
-			}
-			s.metrics.RecordHTTPRequest(path, ww.Status(), time.Since(start).Seconds())
-		}
 	})
 }
 

@@ -221,6 +221,16 @@ func (c *RetryClient) GetHealth(ctx context.Context) (Health, error) {
 	return resp, err
 }
 
+func (c *RetryClient) SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error) {
+	var resp SimulateTransactionResponse
+	err := c.doWithRetry(ctx, func(ctx context.Context) error {
+		var innerErr error
+		resp, innerErr = c.inner.SimulateTransaction(ctx, req)
+		return innerErr
+	})
+	return resp, err
+}
+
 func (c *RetryClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
 	var resp GetLedgerEntriesResponse
 	err := c.doWithRetry(ctx, func(ctx context.Context) error {

@@ -140,11 +140,11 @@ func (f *fakeExportStore) GetIngestionState(context.Context) (store.IngestionSta
 func (f *fakeExportStore) SaveIngestionState(context.Context, store.IngestionState) error {
 	return nil
 }
-func (f *fakeExportStore) GetAuditState(context.Context) (store.AuditState, error) {
+func (f *fakeExportStore) GetAuditState(context.Context, string) (store.AuditState, error) {
 	return store.AuditState{}, store.ErrNotFound
 }
 func (f *fakeExportStore) SaveAuditState(context.Context, store.AuditState) error { return nil }
-func (f *fakeExportStore) SaveAuditStateIfGreater(context.Context, int64) (store.AuditState, error) {
+func (f *fakeExportStore) SaveAuditStateIfGreater(context.Context, string, int64) (store.AuditState, error) {
 	return store.AuditState{}, store.ErrNotFound
 }
 func (f *fakeExportStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
@@ -156,7 +156,7 @@ func (f *fakeExportStore) RecordAuditFinding(context.Context, store.AuditFinding
 	return store.AuditFinding{}, nil
 }
 func (f *fakeExportStore) UpdateAuditFinding(context.Context, store.AuditFinding) error { return nil }
-func (f *fakeExportStore) ListOpenFindingsByRange(context.Context, int64, int64) (store.AuditFinding, error) {
+func (f *fakeExportStore) ListOpenFindingsByRange(context.Context, string, int64, int64) (store.AuditFinding, error) {
 	return store.AuditFinding{}, store.ErrNotFound
 }
 func (f *fakeExportStore) CreateSubscription(context.Context, store.Subscription) (store.Subscription, error) {
@@ -201,7 +201,7 @@ func (f *fakeExportStore) Ping(context.Context) error { return nil }
 func testServer(t *testing.T, st store.Store, maxRange int64) http.Handler {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := New(st, nil, logger, "", 0)
+	s := New(st, nil, logger, "")
 	s.SetExportMaxRange(maxRange)
 	return s.Router()
 }

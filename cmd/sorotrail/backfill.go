@@ -119,7 +119,6 @@ flags:
 	minInterval := time.Duration(float64(time.Second) / rpsFinal)
 
 	st := store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan))
-	tokenProc := ingester.NewTokenBalanceProcessor(st, log)
 	hClient := horizon.NewHTTPClient(hURL, minInterval)
 
 	b := backfill.New(hClient, st, decode.XDRDecoder{}, log, backfill.Options{
@@ -153,20 +152,6 @@ flags:
 	sum, err := runBackfillWithRetry(ctx, b, log)
 	if err != nil {
 		return err
-	}
-
-	if !*dryRun && sum.Completed && sum.Extracted > 0 {
-		// Process token balances for newly backfilled events. We query the
-		// store for events in the backfilled range and feed them through
-		// the token balance processor so holders are up-to-date.
-		log.Info("processing token balances for backfilled events",
-			"contract_id", *contractID,
-			"from_ledger", *fromLedger,
-			"to_ledger", sum.ThroughLedger,
-			"extracted", sum.Extracted)
-		if err := processBackfillTokenBalances(ctx, st, tokenProc, *contractID, *fromLedger, sum.ThroughLedger, cfg.DefaultNetworkName()); err != nil {
-			log.Warn("token balance processing for backfilled events", "error", err)
-		}
 	}
 
 	printBackfillSummary(sum, *dryRun)
@@ -289,41 +274,6 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
-}
-
-// processBackfillTokenBalances reads events for the backfilled range and feeds
-// them through the token balance processor so holder balances stay accurate.
-func processBackfillTokenBalances(ctx context.Context, st store.Store, proc *ingester.TokenBalanceProcessor, contractID string, fromLedger, toLedger int64, network string) error {
-	if toLedger <= 0 {
-		return nil
-	}
-	// Query events in batches to avoid loading everything into memory.
-	// We use the store's QueryEvents with order=asc to page through.
-	var cursor string
-	limit := 500
-	for {
-		events, next, err := st.QueryEvents(ctx, store.EventFilter{
-			ContractID: contractID,
-			Network:    network,
-			FromLedger: fromLedger,
-			ToLedger:   toLedger,
-			Limit:      limit,
-			Order:      "asc",
-			Cursor:     cursor,
-		})
-		if err != nil {
-			return fmt.Errorf("querying backfilled events: %w", err)
-		}
-		if len(events) == 0 {
-			break
-		}
-		proc.NotifyEvents(ctx, events)
-		if next == "" || len(events) < limit {
-			break
-		}
-		cursor = next
-	}
-	return nil
 }
 
 // printBackfillSummary mirrors replay's printReplaySummary shape so

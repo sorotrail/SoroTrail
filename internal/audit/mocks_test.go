@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -65,6 +66,13 @@ func (m *mockRPC) GetLedgerEntries(_ context.Context, _ rpc.GetLedgerEntriesRequ
 	return rpc.GetLedgerEntriesResponse{}, nil
 }
 
+func (m *mockRPC) SimulateTransaction(context.Context, rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error) {
+	return rpc.SimulateTransactionResponse{}, nil
+}
+
+// mockStore is an in-memory implementation of store.Store good enough
+// for the auditor. It mirrors and extends the ingester test mock so we
+// don't import the ingester test package.
 type mockStore struct {
 	// Embedded so the mock keeps satisfying store.Store as the
 	// interface grows; unstubbed methods panic if a test calls them.
@@ -74,8 +82,9 @@ type mockStore struct {
 
 	events map[string]store.Event
 
-	ingestionState *store.IngestionState
-	auditState     *store.AuditState
+	ingress *store.IngestionState
+	audit   *store.AuditState
+	watched []store.WatchedContract
 
 	findings []store.AuditFinding
 	nextFID  int64
@@ -179,12 +188,12 @@ func (m *mockStore) LedgerRangeCensus(_ context.Context, from, to int64, idsOnly
 	defer m.mu.Unlock()
 	byLedger := map[int64][]string{}
 	for _, e := range m.events {
-		if e.Ledger >= fromLedger && e.Ledger <= toLedger {
+		if e.Ledger >= from && e.Ledger <= to {
 			byLedger[e.Ledger] = append(byLedger[e.Ledger], e.ID)
 		}
 	}
 	var out []store.LedgerCensus
-	for l := fromLedger; l <= toLedger; l++ {
+	for l := from; l <= to; l++ {
 		ids := byLedger[l]
 		if len(ids) == 0 {
 			continue
@@ -198,19 +207,19 @@ func (m *mockStore) LedgerRangeCensus(_ context.Context, from, to int64, idsOnly
 	return out, nil
 }
 
-func (m *mockStore) GetIngestionState(_ context.Context, _ string) (store.IngestionState, error) {
+func (m *mockStore) GetIngestionState(_ context.Context) (store.IngestionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.ingress.LastIngestedLedger <= 0 && m.ingress.LastCursor == "" {
 		return store.IngestionState{}, store.ErrNotFound
 	}
-	return m.ingress, nil
+	return *m.ingress, nil
 }
 
 func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.ingress = s
+	m.ingress = &s
 	return nil
 }
 
@@ -327,11 +336,21 @@ func (m *mockStore) MigrationVersion(context.Context) (int, bool, error) {
 }
 
 func (m *mockStore) Ping(context.Context) error { return nil }
-
-func (m *mockStore) GetContractSpec(context.Context, string) ([]byte, error) {
-	return nil, store.ErrNotFound
+func (m *mockStore) ListContractIDs(context.Context) ([]string, error) {
+	return nil, nil
 }
-func (m *mockStore) SetContractSpec(context.Context, string, string, []byte) error { return nil }
+func (m *mockStore) GetContractMeta(context.Context, string) (store.ContractMeta, error) {
+	return store.ContractMeta{}, store.ErrNotFound
+}
+func (m *mockStore) UpsertContractMeta(context.Context, store.ContractMeta) error {
+	return nil
+}
+func (m *mockStore) CountContractEvents(context.Context, string) (int64, error) {
+	return 0, nil
+}
+func (m *mockStore) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
+	return nil, nil
+}
 
 func (m *mockStore) CreateSubscription(_ context.Context, sub store.Subscription) (store.Subscription, error) {
 	sub.ID = 1
@@ -362,22 +381,6 @@ func (m *mockStore) RecordDeliveryAttempt(_ context.Context, a store.DeliveryAtt
 }
 func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int, store.SubscriptionOwner) ([]store.DeliveryAttempt, error) {
 	return nil, nil
-}
-
-func (m *mockStore) UpsertTokenBalances(ctx context.Context, network string, state store.TokenBalanceState, updates []store.TokenBalanceUpdate) error {
-	return nil
-}
-
-func (m *mockStore) GetTokenBalances(ctx context.Context, contractID, network, minBalance string, cursor string, limit int) ([]store.TokenBalance, string, error) {
-	return nil, "", nil
-}
-
-func (m *mockStore) GetTokenBalanceState(ctx context.Context, network, contractID string) (store.TokenBalanceState, error) {
-	return store.TokenBalanceState{}, store.ErrNotFound
-}
-
-func (m *mockStore) UpsertTokenBalanceState(ctx context.Context, state store.TokenBalanceState) error {
-	return nil
 }
 
 func (m *mockStore) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {

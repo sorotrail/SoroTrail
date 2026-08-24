@@ -445,3 +445,9 @@ func BuildEvent(id string, ledger uint32, contractID string) rpc.Event {
 func (c *VirtualChain) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
 	return rpc.GetLedgerEntriesResponse{}, nil
 }
+
+// SimulateTransaction satisfies rpc.Client. The virtual chain does not model
+// contract simulation, so it returns an empty response.
+func (c *VirtualChain) SimulateTransaction(context.Context, rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error) {
+	return rpc.SimulateTransactionResponse{}, nil
+}
