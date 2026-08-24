@@ -1,6 +1,6 @@
 openapi: "3.1.0"
 info:
-  title: SoroTrail
+  title: SoroTrail API
   description: |
     A contract event indexer for the Stellar/Soroban network. SoroTrail polls
     a Stellar RPC endpoint, stores contract events durably in Postgres, and
@@ -654,6 +654,54 @@ paths:
       responses:
         "200":
           description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /contracts/{id}/stats:
+    get:
+      operationId: contractStats
+      summary: Get per-contract statistics
+      description: >-
+        Event count for one contract, plus cached token metadata (name,
+        symbol, decimals) when the contract has been resolved as a token.
+        The metadata fields are omitted for contracts with no cached
+        metadata.
+      tags: [Operations]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Stellar contract ID (C-prefixed)
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Contract statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract_id, event_count]
+                properties:
+                  contract_id:
+                    type: string
+                    description: Stellar contract ID (C-prefixed)
+                  name:
+                    type: string
+                    description: Token name, when cached metadata is available
+                  symbol:
+                    type: string
+                    description: Token symbol, when cached metadata is available
+                  decimals:
+                    type: integer
+                    description: Token decimals, when cached metadata is available
+                  event_count:
+                    type: integer
+                    format: int64
+                    description: Number of stored events for this contract
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
   /contracts/{id}/export:

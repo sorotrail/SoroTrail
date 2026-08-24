@@ -80,7 +80,9 @@ func (s *stubStore) GetEvent(context.Context, string, store.Scope) (store.Event,
 func (s *stubStore) GetEventsByTxHash(context.Context, string, string) ([]store.Event, error) {
 	return nil, nil
 }
-func (s *stubStore) EventExists(context.Context, string, store.Scope) (bool, error) { return false, nil }
+func (s *stubStore) EventExists(context.Context, string, store.Scope) (bool, error) {
+	return false, nil
+}
 func (s *stubStore) QueryEvents(context.Context, store.EventFilter) ([]store.Event, string, error) {
 	return nil, "", nil
 }
@@ -121,8 +123,8 @@ func (s *stubStore) SaveAuditStateIfGreater(context.Context, string, int64) (sto
 func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return nil, nil
 }
-func (s *stubStore) AddWatchedContract(context.Context, string) error             { return nil }
-func (s *stubStore) RemoveWatchedContract(context.Context, string) error          { return nil }
+func (s *stubStore) AddWatchedContract(context.Context, string) error    { return nil }
+func (s *stubStore) RemoveWatchedContract(context.Context, string) error { return nil }
 func (s *stubStore) GetContractCursor(context.Context, string) (store.ContractCursor, error) {
 	return store.ContractCursor{}, store.ErrNotFound
 }
@@ -138,8 +140,10 @@ func (s *stubStore) UpdateAuditFinding(context.Context, store.AuditFinding) erro
 func (s *stubStore) ListOpenFindingsByRange(context.Context, string, int64, int64) (store.AuditFinding, error) {
 	return store.AuditFinding{}, store.ErrNotFound
 }
-func (s *stubStore) Stats(context.Context, store.Scope) (store.Stats, error) { return store.Stats{}, nil }
-func (s *stubStore) Ping(context.Context) error                              { return nil }
+func (s *stubStore) Stats(context.Context, store.Scope) (store.Stats, error) {
+	return store.Stats{}, nil
+}
+func (s *stubStore) Ping(context.Context) error { return nil }
 func (s *stubStore) GetContractSpec(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound
 }

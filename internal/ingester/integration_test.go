@@ -58,7 +58,7 @@ func TestIntegration_CursorResumeAcrossRestart(t *testing.T) {
 
 	// Page 1's events must be queryable through the store interface, and
 	// the persisted state must carry the cursor and last ledger.
-	e1, err := st.GetEvent(ctx, "cursor-e1")
+	e1, err := st.GetEvent(ctx, "cursor-e1", store.SystemScope())
 	require.NoError(t, err)
 	assert.Equal(t, int64(100), e1.Ledger)
 
@@ -104,7 +104,7 @@ func TestIntegration_CursorResumeAcrossRestart(t *testing.T) {
 	// The third event must be present, and idempotency must keep the row
 	// count at exactly 3 — none of cursor-e1/cursor-e2/cursor-e3 were
 	// duplicated by the resumed run.
-	e3, err := st.GetEvent(ctx, "cursor-e3")
+	e3, err := st.GetEvent(ctx, "cursor-e3", store.SystemScope())
 	require.NoError(t, err)
 	assert.Equal(t, int64(102), e3.Ledger)
 
@@ -150,7 +150,7 @@ func TestIntegration_WarmStartResumesByLedgerPlusOne(t *testing.T) {
 	assert.Nil(t, req.Pagination,
 		"warm start goes through the StartLedger path, not cursor pagination")
 
-	ev, err := st.GetEvent(ctx, "warm-e1")
+	ev, err := st.GetEvent(ctx, "warm-e1", store.SystemScope())
 	require.NoError(t, err)
 	assert.Equal(t, int64(501), ev.Ledger)
 }

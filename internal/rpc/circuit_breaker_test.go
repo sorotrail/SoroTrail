@@ -14,11 +14,11 @@ import (
 
 // mockClient is a minimal rpc.Client for testing the breaker wrapper.
 type mockClient struct {
-	getEventsFn    func(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error)
-	getHealthFn    func(ctx context.Context) (Health, error)
-	getLedgerFn    func(ctx context.Context) (LatestLedger, error)
-	getEntriesFn   func(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error)
-	callCount      atomic.Int64
+	getEventsFn  func(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error)
+	getHealthFn  func(ctx context.Context) (Health, error)
+	getLedgerFn  func(ctx context.Context) (LatestLedger, error)
+	getEntriesFn func(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error)
+	callCount    atomic.Int64
 }
 
 func (m *mockClient) GetEvents(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error) {

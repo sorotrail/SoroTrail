@@ -45,6 +45,12 @@ func (healthOnlyRPC) GetLatestLedger(context.Context) (rpc.LatestLedger, error) 
 func (healthOnlyRPC) GetHealth(context.Context) (rpc.Health, error) {
 	return rpc.Health{Status: "healthy"}, nil
 }
+func (healthOnlyRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+	return rpc.GetLedgerEntriesResponse{}, nil
+}
+func (healthOnlyRPC) SimulateTransaction(context.Context, rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error) {
+	return rpc.SimulateTransactionResponse{}, nil
+}
 
 func apiEventID(n int) string { return fmt.Sprintf("%020d-%010d", n, 0) }
 
@@ -102,7 +108,7 @@ func TestListEvents_FilterCombinationsAgainstSeededData(t *testing.T) {
 	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(api.New(st, healthOnlyRPC{}, log).Router())
+	srv := httptest.NewServer(api.New(st, healthOnlyRPC{}, log, "test-key").Router())
 	t.Cleanup(srv.Close)
 
 	allTen := []string{

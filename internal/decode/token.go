@@ -200,5 +200,3 @@ func ParseTokenEvent(contractID, eventID string, ledger int64, network string, t
 
 	return te
 }
-
-

@@ -11,11 +11,13 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	otelhttp "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
-	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/pruner"
 	"github.com/sorotrail/sorotrail/internal/rpc"
@@ -95,27 +97,6 @@ func getRPCCounter() *rpc.CountingClient {
 	return rpcCounter
 }
 
-// SetIngester registers the Ingester so /stats can surface its
-// EventsIngestedTotal counter. Call this before ListenAndServe.
-// The setter is guarded by a RWMutex so concurrent /stats readers
-// never observe a torn pointer.
-var (
-	ingesterMu sync.RWMutex
-	ing        *ingester.Ingester
-)
-
-func SetIngester(i *ingester.Ingester) {
-	ingesterMu.Lock()
-	ing = i
-	ingesterMu.Unlock()
-}
-
-func getIngester() *ingester.Ingester {
-	ingesterMu.RLock()
-	defer ingesterMu.RUnlock()
-	return ing
-}
-
 // Enricher is the spec-based event enrichment interface used by the API.
 type Enricher interface {
 	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
@@ -123,17 +104,17 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store          store.Store
-	rpc            rpc.Client
-	log            *slog.Logger
-	apiKey         string
-	limiter        *RateLimiter
-	bcast          *broadcast.Broadcaster
-	enricher       Enricher
-	enableMetrics  bool
-	recoverer      *Recoverer
-	metrics        *metrics.HTTPMetrics
-	tracer         trace.Tracer
+	store         store.Store
+	rpc           rpc.Client
+	log           *slog.Logger
+	apiKey        string
+	limiter       *RateLimiter
+	bcast         *broadcast.Broadcaster
+	enricher      Enricher
+	enableMetrics bool
+	recoverer     *Recoverer
+	metrics       *metrics.HTTPMetrics
+	tracer        trace.Tracer
 
 	// GraphQL transport, injected by main after the server is built.
 	// internal/api/graphql imports this package for its ServerDeps, so
@@ -165,14 +146,11 @@ type Server struct {
 	cors CORSConfig
 }
 
-
 // SetCompressMinSize overrides the body size at which responses are
 // compressed. Pass a negative value to disable compression.
 func (s *Server) SetCompressMinSize(n int) {
 	s.compressMinSize = n
 }
-
-
 
 // SetMetricsEnabled enables or disables the /metrics endpoint.
 func (s *Server) SetMetricsEnabled(enabled bool) {
@@ -197,7 +175,8 @@ func SetMaxLimit(n int) {
 // apiKey gates the watched-contracts management endpoints; pass "" to
 // fail closed (every request gets a 503 with "API_KEY not configured").
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New()}
+	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New(),
+		tracer: otel.GetTracerProvider().Tracer("sorotrail/api")}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
@@ -291,6 +270,7 @@ func (s *Server) Router() http.Handler {
 func (s *Server) router() chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
+	r.Use(s.otelMiddleware)
 	r.Use(s.requestLogger)
 	r.Use(s.metrics.Middleware)
 	// CORS runs before Recoverer/Timeout so a preflight never blocks
@@ -327,6 +307,11 @@ func (s *Server) router() chi.Router {
 	// route-drift test then demands CONNECT/TRACE entries in the OpenAPI
 	// spec), and scraping is a GET.
 	r.Get("/metrics", s.metrics.Handler().ServeHTTP)
+	// The spec and its Swagger UI are served from the router but are
+	// deliberately absent from the spec itself; the route-drift tests
+	// exclude them on both sides.
+	r.Get("/openapi.json", s.handleOpenAPI)
+	r.Get("/docs", s.handleDocs)
 	r.Get("/livez", s.handleLivez)
 	r.Get("/readyz", s.handleReadyz)
 	r.Get("/version", s.handleVersion)
@@ -462,6 +447,37 @@ func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(swaggerUI))
 }
 
+// otelMiddleware starts the server span for each request and extracts any
+// inbound W3C traceparent via the global propagator, so a client's trace
+// continues through the API and into the store spans.
+//
+// It is registered as chi middleware rather than wrapping the handler
+// Router() returns, because the route-drift tests type-assert that value
+// back to *chi.Mux to walk the route tree.
+func (s *Server) otelMiddleware(next http.Handler) http.Handler {
+	return otelhttp.NewHandler(next, "HTTP",
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			return r.Method
+		}),
+	)
+}
+
+// routePattern reports the chi route pattern for a request ("/events/{id}"),
+// falling back to the raw path when the router has not matched yet. Spans are
+// tagged with the pattern, not the path, so per-id URLs don't explode
+// cardinality.
+func (s *Server) routePattern(r *http.Request) string {
+	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+		if len(rctx.RoutePatterns) > 0 {
+			return rctx.RoutePatterns[0]
+		}
+		if rctx.RoutePath != "" {
+			return rctx.RoutePath
+		}
+	}
+	return r.URL.Path
+}
+
 func (s *Server) requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
@@ -471,6 +487,13 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), loggerCtxKey, log)
 		ww.Header().Set("X-Request-ID", reqID)
 		next.ServeHTTP(ww, r.WithContext(ctx))
+		if span := trace.SpanFromContext(r.Context()); span.IsRecording() {
+			span.SetAttributes(
+				attribute.String("http.route", s.routePattern(r)),
+				attribute.String("request.id", reqID),
+				attribute.Int("http.status_code", ww.Status()),
+			)
+		}
 		log.Info("http request",
 			"status", ww.Status(),
 			"duration_ms", time.Since(start).Milliseconds(),

@@ -37,6 +37,12 @@ func TestNoRouteDrift(t *testing.T) {
 	}
 
 	for _, r := range routerRoutes {
+		// The routes that serve the spec and its Swagger UI are not part of
+		// the documented API surface; internal/api/openapi_test.go applies
+		// the same exclusion.
+		if r.Path == "/openapi.json" || r.Path == "/docs" {
+			continue
+		}
 		if !slices.ContainsFunc(specRoutes, func(sr routePair) bool {
 			return sr.Method == r.Method && sr.Path == r.Path
 		}) {

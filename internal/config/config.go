@@ -23,12 +23,12 @@ type NetworkConfig struct {
 type Config struct {
 	// RPCURL is the single-provider RPC endpoint. When RPC_URLS is set the
 	// multi-provider failover client is used instead and RPC_URL is ignored.
-	RPCURL                string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
+	RPCURL string `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
 	// RPCURLS, when set, enables the multi-provider failover client
 	// (internal/rpc). List order is priority: index 0 is tried first.
 	// RPC_URL is ignored while it is set; leaving RPC_URLS unset keeps the
 	// single-provider behavior unchanged.
-	RPCURLS               []string      `env:"RPC_URLS"`
+	RPCURLS []string `env:"RPC_URLS"`
 	// RPCRateLimitRPS caps each provider's request rate (requests/second)
 	// when the failover client is in use. Only read by the failover client.
 	RPCRateLimitRPS       float64       `env:"RPC_RATE_LIMIT_RPS" envDefault:"10"`
@@ -118,7 +118,6 @@ type Config struct {
 	// responses are gzip/deflate encoded for clients that advertise support.
 	// Negative disables compression entirely; 0 uses api.CompressMinSize.
 	CompressMinSize int `env:"COMPRESS_MIN_SIZE" envDefault:"0"`
-
 
 	// EnableMetrics exposes the Prometheus /metrics endpoint.
 	EnableMetrics bool `env:"ENABLE_METRICS" envDefault:"false"`

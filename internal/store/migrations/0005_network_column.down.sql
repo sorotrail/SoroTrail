@@ -1,0 +1,9 @@
+ALTER TABLE audit_findings DROP COLUMN IF EXISTS network;
+
+ALTER TABLE audit_state DROP CONSTRAINT IF EXISTS audit_state_pkey CASCADE;
+ALTER TABLE audit_state ADD COLUMN IF NOT EXISTS id int NOT NULL DEFAULT 1;
+ALTER TABLE audit_state DROP COLUMN IF EXISTS network;
+ALTER TABLE audit_state ADD PRIMARY KEY (id);
+
+DROP INDEX IF EXISTS idx_events_network_ledger;
+ALTER TABLE events DROP COLUMN IF EXISTS network;

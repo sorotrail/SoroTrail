@@ -54,7 +54,7 @@ func TestUpsertEvents_SameTOIDTwiceYieldsOneRow(t *testing.T) {
 	assert.Zero(t, second,
 		"duplicate TOID writes must return zero new rows")
 
-	got, err := st.GetEvent(ctx, original.ID)
+	got, err := st.GetEvent(ctx, original.ID, SystemScope())
 	require.NoError(t, err)
 	assert.Equal(t, original.ContractID, got.ContractID)
 	assert.Equal(t, original.Ledger, got.Ledger)

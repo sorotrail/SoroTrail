@@ -1443,7 +1443,7 @@ func (s *SQLite) ListContractIDs(context.Context) ([]string, error) { return nil
 func (s *SQLite) GetContractMeta(context.Context, string) (ContractMeta, error) {
 	return ContractMeta{}, ErrNotFound
 }
-func (s *SQLite) UpsertContractMeta(context.Context, ContractMeta) error { return nil }
+func (s *SQLite) UpsertContractMeta(context.Context, ContractMeta) error     { return nil }
 func (s *SQLite) CountContractEvents(context.Context, string) (int64, error) { return 0, nil }
 func (s *SQLite) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
 	return nil, nil
@@ -1461,7 +1461,7 @@ func (s *SQLite) GetContractCursor(context.Context, string) (ContractCursor, err
 	return ContractCursor{}, ErrNotFound
 }
 func (s *SQLite) SaveContractCursor(context.Context, ContractCursor) error { return nil }
-func (s *SQLite) DeleteContractCursor(context.Context, string) error        { return nil }
+func (s *SQLite) DeleteContractCursor(context.Context, string) error       { return nil }
 func (s *SQLite) ListContractCursors(context.Context) ([]ContractCursor, error) {
 	return nil, nil
 }

@@ -477,7 +477,7 @@ func bootstrapAdminKey(ctx context.Context, ts store.TenantStore, key string, lo
 	}
 	prefix, digest, ok := api.ParseAPIKeyForBootstrap(key)
 	if !ok {
-		return fmt.Errorf("MULTI_TENANT_BOOTSTRAP_KEY is not a valid key; "+
+		return fmt.Errorf("MULTI_TENANT_BOOTSTRAP_KEY is not a valid key; " +
 			"generate one with `sorotrail help` format st_<12 chars>_<secret>")
 	}
 	tenant, err := ts.GetTenantByName(ctx, "default")
