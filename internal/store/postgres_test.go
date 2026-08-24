@@ -835,15 +835,30 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		FROM events_partitioned
 		ORDER BY ledger, id;
 		DROP TABLE events_partitioned CASCADE;
+		-- Every table created above legacySchemaMigrationsVersion has to go.
+		-- Replaying the series re-runs each CREATE statement, and a plain
+		-- CREATE TABLE or CREATE INDEX against a surviving object fails the
+		-- migration and leaves the series dirty. CREATE TABLE IF NOT EXISTS
+		-- is not enough on its own either: contract_cursors is idempotent but
+		-- the index beside it is not. CASCADE takes the indexes with the
+		-- table, so dropping every table above v3 covers both.
+		--
+		-- events is deliberately absent: this test rebuilds it from
+		-- events_legacy to prove the upgrade preserves rows.
+		DROP TABLE IF EXISTS contract_meta CASCADE;
 		DROP TABLE IF EXISTS contract_specs CASCADE;
+		DROP TABLE IF EXISTS backfill_state CASCADE;
+		DROP TABLE IF EXISTS contract_cursors CASCADE;
+		DROP TABLE IF EXISTS dead_letters CASCADE;
 		DROP TABLE IF EXISTS replay_state CASCADE;
 		DROP TABLE IF EXISTS subscriptions CASCADE;
 		DROP TABLE IF EXISTS delivery_attempts CASCADE;
-		-- Every table created above legacySchemaMigrationsVersion has to go,
-		-- or replaying the series re-runs its CREATE TABLE against a table
-		-- that is still there. Only the migrations that spell CREATE TABLE
-		-- IF NOT EXISTS survive that; these do not.
-		DROP TABLE IF EXISTS contract_meta CASCADE;
+		DROP TABLE IF EXISTS tenant_usage CASCADE;
+		DROP TABLE IF EXISTS tenant_watched_contracts CASCADE;
+		DROP TABLE IF EXISTS tenant_contract_grants CASCADE;
+		DROP TABLE IF EXISTS api_keys CASCADE;
+		DROP TABLE IF EXISTS tenants CASCADE;
+		DROP TABLE IF EXISTS event_addresses CASCADE;
 		DROP TABLE IF EXISTS token_balances CASCADE;
 		DROP TABLE IF EXISTS token_balance_state CASCADE;
 		DROP FUNCTION IF EXISTS ensure_event_partitions(bigint, bigint, bigint);
