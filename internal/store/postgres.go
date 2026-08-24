@@ -1810,9 +1810,13 @@ func scanEvent(row pgx.Row) (Event, error) {
 	var (
 		e Event
 	)
+	// The destinations must line up 1:1 with eventColumns, which ends in
+	// raw_topic_xdr and raw_value_xdr; omitting them here makes pgx reject
+	// every row with "number of field descriptions must equal number of
+	// destinations".
 	err := row.Scan(&e.Network, &e.ID, &e.ContractID, &e.Ledger, &e.Type, &e.TxHash,
 		&e.TxIndex, &e.OpIndex, &e.InSuccessfulCall, &e.Topics, &e.Value,
-		&e.CreatedAt)
+		&e.CreatedAt, &e.RawTopicXDR, &e.RawValueXDR)
 	if err != nil {
 		return Event{}, err
 	}

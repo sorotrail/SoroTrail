@@ -839,6 +839,13 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		DROP TABLE IF EXISTS replay_state CASCADE;
 		DROP TABLE IF EXISTS subscriptions CASCADE;
 		DROP TABLE IF EXISTS delivery_attempts CASCADE;
+		-- Every table created above legacySchemaMigrationsVersion has to go,
+		-- or replaying the series re-runs its CREATE TABLE against a table
+		-- that is still there. Only the migrations that spell CREATE TABLE
+		-- IF NOT EXISTS survive that; these do not.
+		DROP TABLE IF EXISTS contract_meta CASCADE;
+		DROP TABLE IF EXISTS token_balances CASCADE;
+		DROP TABLE IF EXISTS token_balance_state CASCADE;
 		DROP FUNCTION IF EXISTS ensure_event_partitions(bigint, bigint, bigint);
 		UPDATE schema_migrations SET version = %d, dirty = false;
 	`, legacySchemaMigrationsVersion)
