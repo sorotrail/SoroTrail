@@ -10,45 +10,49 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// mockClient implements Client for testing.
-type mockClient struct {
+// retryMockClient implements Client for testing.
+type retryMockClient struct {
 	getEvents        func(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error)
 	getLatestLedger  func(ctx context.Context) (LatestLedger, error)
 	getHealth        func(ctx context.Context) (Health, error)
 	getLedgerEntries func(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error)
 }
 
-func (m *mockClient) GetEvents(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error) {
+func (m *retryMockClient) GetEvents(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error) {
 	if m.getEvents != nil {
 		return m.getEvents(ctx, req)
 	}
 	return GetEventsResponse{}, nil
 }
 
-func (m *mockClient) GetLatestLedger(ctx context.Context) (LatestLedger, error) {
+func (m *retryMockClient) GetLatestLedger(ctx context.Context) (LatestLedger, error) {
 	if m.getLatestLedger != nil {
 		return m.getLatestLedger(ctx)
 	}
 	return LatestLedger{}, nil
 }
 
-func (m *mockClient) GetHealth(ctx context.Context) (Health, error) {
+func (m *retryMockClient) GetHealth(ctx context.Context) (Health, error) {
 	if m.getHealth != nil {
 		return m.getHealth(ctx)
 	}
 	return Health{}, nil
 }
 
-func (m *mockClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
+func (m *retryMockClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
 	if m.getLedgerEntries != nil {
 		return m.getLedgerEntries(ctx, req)
 	}
 	return GetLedgerEntriesResponse{}, nil
 }
 
+func (m *retryMockClient) SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error) {
+	return SimulateTransactionResponse{}, nil
+}
+
 func TestRetryClient_SuccessOnFirstAttempt(t *testing.T) {
 	var calls int
-	inner := &mockClient{
+	inner := &retryMockClient{
 		getHealth: func(ctx context.Context) (Health, error) {
 			calls++
 			return Health{Status: "healthy", LatestLedger: 100}, nil
@@ -63,7 +67,7 @@ func TestRetryClient_SuccessOnFirstAttempt(t *testing.T) {
 
 func TestRetryClient_RetriesOnTransientError(t *testing.T) {
 	var calls int
-	inner := &mockClient{
+	inner := &retryMockClient{
 		getHealth: func(ctx context.Context) (Health, error) {
 			calls++
 			if calls < 3 {
@@ -81,7 +85,7 @@ func TestRetryClient_RetriesOnTransientError(t *testing.T) {
 
 func TestRetryClient_ExhaustsRetries(t *testing.T) {
 	var calls int
-	inner := &mockClient{
+	inner := &retryMockClient{
 		getHealth: func(ctx context.Context) (Health, error) {
 			calls++
 			return Health{}, &Error{Code: 0, Message: "persistent error"}
@@ -96,7 +100,7 @@ func TestRetryClient_ExhaustsRetries(t *testing.T) {
 
 func TestRetryClient_NonRetryableError(t *testing.T) {
 	var calls int
-	inner := &mockClient{
+	inner := &retryMockClient{
 		getHealth: func(ctx context.Context) (Health, error) {
 			calls++
 			return Health{}, &Error{Code: -32601, Message: "Method not found"}
@@ -113,7 +117,7 @@ func TestRetryClient_ContextCancellation(t *testing.T) {
 	cancel()
 
 	var calls int
-	inner := &mockClient{
+	inner := &retryMockClient{
 		getHealth: func(ctx context.Context) (Health, error) {
 			calls++
 			return Health{Status: "healthy"}, nil
@@ -129,7 +133,7 @@ func TestRetryClient_ContextCancellation(t *testing.T) {
 
 func TestRetryClient_BackoffRespectsMax(t *testing.T) {
 	var calls int
-	inner := &mockClient{
+	inner := &retryMockClient{
 		getHealth: func(ctx context.Context) (Health, error) {
 			calls++
 			return Health{}, errors.New("EOF")
@@ -167,7 +171,7 @@ func TestIsRetryable_ErrorCodes(t *testing.T) {
 }
 
 func TestNewRetryClient_DefaultConfig(t *testing.T) {
-	rc := NewRetryClient(&mockClient{}, RetryConfig{})
+	rc := NewRetryClient(&retryMockClient{}, RetryConfig{})
 	assert.Equal(t, 3, rc.config.MaxAttempts)
 	assert.Equal(t, 500*time.Millisecond, rc.config.BaseBackoff)
 	assert.Equal(t, 30*time.Second, rc.config.MaxBackoff)

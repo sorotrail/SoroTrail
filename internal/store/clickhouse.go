@@ -25,6 +25,31 @@ type clickHouseConfig struct {
 	ssl      bool
 }
 
+// Contract metadata (token enrichment) is Postgres-only; the ClickHouse
+// backend reports "not found"/empty so the enrichment worker stays a no-op.
+func (c *ClickHouse) ListContractIDs(context.Context) ([]string, error) { return nil, nil }
+func (c *ClickHouse) GetContractMeta(context.Context, string) (ContractMeta, error) {
+	return ContractMeta{}, ErrNotFound
+}
+func (c *ClickHouse) UpsertContractMeta(context.Context, ContractMeta) error { return nil }
+func (c *ClickHouse) CountContractEvents(context.Context, string) (int64, error) { return 0, nil }
+
+// GetContractSummary returns a single contract's summary from ClickHouse.
+func (c *ClickHouse) GetContractSummary(ctx context.Context, contractID string) (ContractSummary, error) {
+	// TODO: implement ClickHouse-specific query
+	return ContractSummary{}, fmt.Errorf("GetContractSummary: not yet implemented for ClickHouse")
+}
+
+// ContractEventTypeCounts returns per-type event counts from ClickHouse.
+func (c *ClickHouse) ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error) {
+	// TODO: implement ClickHouse-specific query
+	return nil, fmt.Errorf("ContractEventTypeCounts: not yet implemented for ClickHouse")
+}
+
+func (c *ClickHouse) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
+	return nil, nil
+}
+
 func parseClickHouseConfig(raw string) (clickHouseConfig, error) {
 	u, err := url.Parse(raw)
 	if err != nil {

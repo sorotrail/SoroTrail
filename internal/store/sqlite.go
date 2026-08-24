@@ -916,7 +916,7 @@ func (s *SQLite) SaveIngestionState(ctx context.Context, st IngestionState) erro
 	return nil
 }
 
-func (s *SQLite) GetAuditState(ctx context.Context) (AuditState, error) {
+func (s *SQLite) GetAuditState(ctx context.Context, _ string) (AuditState, error) {
 	var (
 		st AuditState
 		ts string
@@ -950,7 +950,7 @@ func (s *SQLite) SaveAuditState(ctx context.Context, st AuditState) error {
 	return nil
 }
 
-func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (AuditState, error) {
+func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, _ string, ledger int64) (AuditState, error) {
 	now := formatTime(time.Now().UTC())
 
 	// First INSERT will succeed when the table is empty.
@@ -973,10 +973,10 @@ func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, ledger int64) (Aud
 	}
 	n, _ := res.RowsAffected()
 	if n > 0 {
-		return s.GetAuditState(ctx)
+		return s.GetAuditState(ctx, "")
 	}
 	// Candidate was not greater — return the current stored state.
-	return s.GetAuditState(ctx)
+	return s.GetAuditState(ctx, "")
 }
 
 func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
@@ -1066,7 +1066,7 @@ func (s *SQLite) UpdateAuditFinding(ctx context.Context, f AuditFinding) error {
 	return nil
 }
 
-func (s *SQLite) ListOpenFindingsByRange(ctx context.Context, fromLedger, toLedger int64) (AuditFinding, error) {
+func (s *SQLite) ListOpenFindingsByRange(ctx context.Context, _ string, fromLedger, toLedger int64) (AuditFinding, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, from_ledger, to_ledger, expected_count, actual_count,
 		       missing_ids, status, attempts, last_attempted_at, last_error, created_at
@@ -1437,92 +1437,42 @@ func nullableXDRTopics(s []string) any {
 	return string(b)
 }
 
-// AggregateEvents is not implemented for the SQLite backend: the analytics
-// endpoints are Postgres-only. Returning an error beats returning empty
-// buckets, which a caller would read as "no events in range".
-func (s *SQLite) AggregateEvents(context.Context, EventFilter, string) ([]AggregateBucket, error) {
-	return nil, fmt.Errorf("AggregateEvents: not supported by the sqlite backend")
+// Contract metadata (token enrichment) is Postgres-only; the SQLite backend
+// reports "not found"/empty so the enrichment worker stays a no-op.
+func (s *SQLite) ListContractIDs(context.Context) ([]string, error) { return nil, nil }
+func (s *SQLite) GetContractMeta(context.Context, string) (ContractMeta, error) {
+	return ContractMeta{}, ErrNotFound
+}
+func (s *SQLite) UpsertContractMeta(context.Context, ContractMeta) error { return nil }
+func (s *SQLite) CountContractEvents(context.Context, string) (int64, error) { return 0, nil }
+func (s *SQLite) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
+	return nil, nil
 }
 
-// CountAddressEvents is not implemented for the SQLite backend: the address
-// activity index is Postgres-only.
-func (s *SQLite) CountAddressEvents(context.Context, string) (int64, error) {
-	return 0, fmt.Errorf("CountAddressEvents: not supported by the sqlite backend")
-}
-
-// CountContracts is not implemented for the SQLite backend: the contract
+// ListContracts is not implemented for the SQLite backend: the contract
 // inventory endpoint is Postgres-only.
-func (s *SQLite) CountContracts(context.Context, ContractsFilter) (int64, error) {
-	return 0, fmt.Errorf("CountContracts: not supported by the sqlite backend")
+
+// GetContractSummary is not implemented for the SQLite backend.
+func (s *SQLite) GetContractSummary(ctx context.Context, contractID string) (ContractSummary, error) {
+	return ContractSummary{}, fmt.Errorf("GetContractSummary: not supported by the sqlite backend")
 }
 
-// CountEvents is not implemented for the SQLite backend: total-count
-// pagination metadata is Postgres-only.
-func (s *SQLite) CountEvents(context.Context, EventFilter) (int64, error) {
-	return 0, fmt.Errorf("CountEvents: not supported by the sqlite backend")
+// ContractEventTypeCounts is not implemented for the SQLite backend.
+func (s *SQLite) ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error) {
+	return nil, fmt.Errorf("ContractEventTypeCounts: not supported by the sqlite backend")
 }
 
-// DeadLetterEvent is not implemented for the SQLite backend.
-func (s *SQLite) DeadLetterEvent(context.Context, DeadLetterInput) (DeadLetter, error) {
-	return DeadLetter{}, fmt.Errorf("DeadLetterEvent: not supported by the sqlite backend")
-}
-
-// DeleteDeadLetter is not implemented for the SQLite backend.
-func (s *SQLite) DeleteDeadLetter(context.Context, int64) error {
-	return fmt.Errorf("DeleteDeadLetter: not supported by the sqlite backend")
-}
-
-// DeleteEventsBefore is not implemented for the SQLite backend.
-func (s *SQLite) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
-	return 0, fmt.Errorf("DeleteEventsBefore: not supported by the sqlite backend")
-}
-
-// DeleteEventsBeforeLedger is not implemented for the SQLite backend.
-func (s *SQLite) DeleteEventsBeforeLedger(context.Context, int64) (int64, error) {
-	return 0, fmt.Errorf("DeleteEventsBeforeLedger: not supported by the sqlite backend")
-}
-
-// GetAddressSummary is not implemented for the SQLite backend.
-func (s *SQLite) GetAddressSummary(context.Context, string) (AddressSummary, error) {
-	return AddressSummary{}, fmt.Errorf("GetAddressSummary: not supported by the sqlite backend")
-}
-
-// GetDeadLetter is not implemented for the SQLite backend.
-func (s *SQLite) GetDeadLetter(context.Context, int64) (DeadLetter, error) {
-	return DeadLetter{}, fmt.Errorf("GetDeadLetter: not supported by the sqlite backend")
-}
-
-// GetEventsByTxHash is not implemented for the SQLite backend.
-func (s *SQLite) GetEventsByTxHash(context.Context, string, string) ([]Event, error) {
-	return nil, fmt.Errorf("GetEventsByTxHash: not supported by the sqlite backend")
-}
-
-// ListContracts is not implemented for the SQLite backend.
 func (s *SQLite) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
 	return nil, "", fmt.Errorf("ListContracts: not supported by the sqlite backend")
 }
 
-// ListDeadLetters is not implemented for the SQLite backend.
-func (s *SQLite) ListDeadLetters(context.Context, string, int, string) ([]DeadLetter, string, error) {
-	return nil, "", fmt.Errorf("ListDeadLetters: not supported by the sqlite backend")
+// Per-contract cursors are not implemented for the SQLite backend: watched
+// ingestion always uses the single global ingestion_state row.
+func (s *SQLite) GetContractCursor(context.Context, string) (ContractCursor, error) {
+	return ContractCursor{}, ErrNotFound
 }
-
-// MigrationVersion is not implemented for the SQLite backend.
-func (s *SQLite) MigrationVersion(context.Context) (int, bool, error) {
-	return 0, false, fmt.Errorf("MigrationVersion: not supported by the sqlite backend")
-}
-
-// QueryAddressEvents is not implemented for the SQLite backend.
-func (s *SQLite) QueryAddressEvents(context.Context, string, EventFilter) ([]Event, string, error) {
-	return nil, "", fmt.Errorf("QueryAddressEvents: not supported by the sqlite backend")
-}
-
-// RemoveWatchedContract is not implemented for the SQLite backend.
-func (s *SQLite) RemoveWatchedContract(context.Context, string) error {
-	return fmt.Errorf("RemoveWatchedContract: not supported by the sqlite backend")
-}
-
-// UpsertAddressRefs is not implemented for the SQLite backend.
-func (s *SQLite) UpsertAddressRefs(context.Context, []AddressRef) error {
-	return fmt.Errorf("UpsertAddressRefs: not supported by the sqlite backend")
+func (s *SQLite) SaveContractCursor(context.Context, ContractCursor) error { return nil }
+func (s *SQLite) DeleteContractCursor(context.Context, string) error        { return nil }
+func (s *SQLite) ListContractCursors(context.Context) ([]ContractCursor, error) {
+	return nil, nil
 }

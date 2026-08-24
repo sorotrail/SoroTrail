@@ -84,3 +84,10 @@ func (c *CountingClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntr
 	}
 	return resp, err
 }
+
+// SimulateTransaction passes through to the wrapped client. Simulation
+// calls are not counted toward ingestion error totals (spec lookups and
+// contract-metadata enrichment use this method).
+func (c *CountingClient) SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error) {
+	return c.inner.SimulateTransaction(ctx, req)
+}

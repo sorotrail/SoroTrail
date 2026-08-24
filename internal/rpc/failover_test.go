@@ -20,8 +20,8 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// mockClient is a controllable rpc.Client for failover tests.
-type mockClient struct {
+// failoverMockClient is a controllable rpc.Client for failover tests.
+type failoverMockClient struct {
 	mu            sync.Mutex
 	url           string
 	getEventsResp []GetEventsResponse
@@ -31,7 +31,7 @@ type mockClient struct {
 	callCount     atomic.Int32
 }
 
-func (m *mockClient) GetEvents(_ context.Context, _ GetEventsRequest) (GetEventsResponse, error) {
+func (m *failoverMockClient) GetEvents(_ context.Context, _ GetEventsRequest) (GetEventsResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	idx := int(m.callCount.Add(1) - 1)
@@ -44,11 +44,11 @@ func (m *mockClient) GetEvents(_ context.Context, _ GetEventsRequest) (GetEvents
 	return GetEventsResponse{LatestLedger: 100}, nil
 }
 
-func (m *mockClient) GetLatestLedger(_ context.Context) (LatestLedger, error) {
+func (m *failoverMockClient) GetLatestLedger(_ context.Context) (LatestLedger, error) {
 	return LatestLedger{Sequence: 100}, nil
 }
 
-func (m *mockClient) GetHealth(_ context.Context) (Health, error) {
+func (m *failoverMockClient) GetHealth(_ context.Context) (Health, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(m.getHealthErr) > 0 {
@@ -64,17 +64,17 @@ func (m *mockClient) GetHealth(_ context.Context) (Health, error) {
 	return Health{Status: "healthy", LatestLedger: 100, OldestLedger: 10}, nil
 }
 
-func (m *mockClient) GetLedgerEntries(_ context.Context, _ GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
+func (m *failoverMockClient) GetLedgerEntries(_ context.Context, _ GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
 	return GetLedgerEntriesResponse{}, nil
 }
 
-func (m *mockClient) SimulateTransaction(_ context.Context, _ SimulateTransactionRequest) (SimulateTransactionResponse, error) {
+func (m *failoverMockClient) SimulateTransaction(_ context.Context, _ SimulateTransactionRequest) (SimulateTransactionResponse, error) {
 	return SimulateTransactionResponse{}, nil
 }
 
 // resetCallCount resets the call counter. Must only be called between test
 // phases (not concurrently with GetEvents/GetHealth).
-func (m *mockClient) resetCallCount() {
+func (m *failoverMockClient) resetCallCount() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.callCount.Store(0)
@@ -82,8 +82,8 @@ func (m *mockClient) resetCallCount() {
 
 // newFailoverTestClient creates a FailoverClient backed by mockClients.
 // Returns the failover client and the individual mocks for scripting.
-func newFailoverTestClient(urls []string, opts ...FailoverOption) (*FailoverClient, []*mockClient) {
-	mocks := make([]*mockClient, len(urls))
+func newFailoverTestClient(urls []string, opts ...FailoverOption) (*FailoverClient, []*failoverMockClient) {
+	mocks := make([]*failoverMockClient, len(urls))
 	newClient := func(url string, _ float64) Client {
 		for i, u := range urls {
 			if u == url {
@@ -93,7 +93,7 @@ func newFailoverTestClient(urls []string, opts ...FailoverOption) (*FailoverClie
 		panic("unexpected url: " + url)
 	}
 	for i, u := range urls {
-		mocks[i] = &mockClient{url: u}
+		mocks[i] = &failoverMockClient{url: u}
 	}
 	fc := NewFailoverClient(urls, 10.0, newClient, opts...)
 	return fc, mocks
