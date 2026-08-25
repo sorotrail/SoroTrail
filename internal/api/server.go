@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sorotrail/sorotrail/internal/audit"
@@ -479,6 +480,22 @@ func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(swaggerUI))
 }
 
+// routePattern reports the chi route pattern for a request ("/events/{id}"),
+// falling back to the raw path when the router has not matched yet. Spans are
+// tagged with the pattern, not the path, so per-id URLs don't explode
+// cardinality.
+func (s *Server) routePattern(r *http.Request) string {
+	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+		if len(rctx.RoutePatterns) > 0 {
+			return rctx.RoutePatterns[0]
+		}
+		if rctx.RoutePath != "" {
+			return rctx.RoutePath
+		}
+	}
+	return r.URL.Path
+}
+
 func (s *Server) requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
@@ -488,6 +505,13 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), loggerCtxKey, log)
 		ww.Header().Set("X-Request-ID", reqID)
 		next.ServeHTTP(ww, r.WithContext(ctx))
+		if span := trace.SpanFromContext(r.Context()); span.IsRecording() {
+			span.SetAttributes(
+				attribute.String("http.route", s.routePattern(r)),
+				attribute.String("request.id", reqID),
+				attribute.Int("http.status_code", ww.Status()),
+			)
+		}
 		log.Info("http request",
 			"status", ww.Status(),
 			"duration_ms", time.Since(start).Milliseconds(),

@@ -10,6 +10,7 @@ package api_test
 // expanding by one event when someone changes the ORDER BY clause.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +30,41 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 	"github.com/sorotrail/sorotrail/internal/testdb"
 )
+
+// captureLogger buffers the server's log and prints it only when the test
+// fails. Discarding it hides the one thing that explains a 500: handlers
+// answer with a generic message and log the underlying SQL error, so a
+// failing assertion on the status code otherwise tells you nothing.
+func captureLogger(t *testing.T) *slog.Logger {
+	t.Helper()
+	buf := &lockedBuffer{}
+	t.Cleanup(func() {
+		if t.Failed() {
+			if out := buf.String(); out != "" {
+				t.Logf("server log:\n%s", out)
+			}
+		}
+	})
+	return slog.New(slog.NewTextHandler(buf, nil))
+}
+
+// lockedBuffer is written from the httptest server's handler goroutines.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 const (
 	apiContractA = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
@@ -44,6 +81,12 @@ func (healthOnlyRPC) GetLatestLedger(context.Context) (rpc.LatestLedger, error) 
 }
 func (healthOnlyRPC) GetHealth(context.Context) (rpc.Health, error) {
 	return rpc.Health{Status: "healthy"}, nil
+}
+func (healthOnlyRPC) GetLedgerEntries(context.Context, rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+	return rpc.GetLedgerEntriesResponse{}, nil
+}
+func (healthOnlyRPC) SimulateTransaction(context.Context, rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error) {
+	return rpc.SimulateTransactionResponse{}, nil
 }
 
 func apiEventID(n int) string { return fmt.Sprintf("%020d-%010d", n, 0) }
@@ -101,8 +144,8 @@ func TestListEvents_FilterCombinationsAgainstSeededData(t *testing.T) {
 		t.Fatalf("seeding api events: %v", err)
 	}
 
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(api.New(st, healthOnlyRPC{}, log).Router())
+	log := captureLogger(t)
+	srv := httptest.NewServer(api.New(st, healthOnlyRPC{}, log, "test-key").Router())
 	t.Cleanup(srv.Close)
 
 	allTen := []string{
@@ -116,6 +159,15 @@ func TestListEvents_FilterCombinationsAgainstSeededData(t *testing.T) {
 		wantIDs []string
 		wantBad bool
 	}
+	// Event 3 is the deliberate odd one out in apiSeed: type=diagnostic with
+	// topics [{"symbol":"mint"}]. Both topic filters below therefore match
+	// the other nine, not all ten.
+	allButThree := []string{
+		apiEventID(1), apiEventID(2), apiEventID(4), apiEventID(5),
+		apiEventID(6), apiEventID(7), apiEventID(8), apiEventID(9),
+		apiEventID(10),
+	}
+
 	cases := []tcase{
 		{"no filter", "/events", allTen, false},
 		{"by contract A", "/events?contract_id=" + apiContractA,
@@ -126,13 +178,9 @@ func TestListEvents_FilterCombinationsAgainstSeededData(t *testing.T) {
 			[]string{apiEventID(4), apiEventID(5), apiEventID(6)}, false},
 		{"by type=diagnostic", "/events?type=diagnostic",
 			[]string{apiEventID(3)}, false},
-		{"topic match in second position", "/events?topic={\"u64\":7}", allTen, false},
+		{"topic match in second position", "/events?topic={\"u64\":7}", allButThree, false},
 		{"topic match in first position", "/events?topic={\"symbol\":\"transfer\"}",
-			[]string{
-				apiEventID(1), apiEventID(2), apiEventID(4), apiEventID(5),
-				apiEventID(6), apiEventID(7), apiEventID(8), apiEventID(9),
-				apiEventID(10),
-			}, false},
+			allButThree, false},
 		{"intersection: contract + ledger", "/events?contract_id=" + apiContractA + "&from_ledger=104&to_ledger=108",
 			[]string{apiEventID(5), apiEventID(7)}, false},
 		{"intersection: ledger range + time", "/events?from_ledger=104&to_ledger=106&from_time=" + fromTimeBound(),

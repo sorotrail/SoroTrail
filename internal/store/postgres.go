@@ -1809,12 +1809,24 @@ func statementTimeoutFromContext(ctx context.Context) (time.Duration, bool) {
 func scanEvent(row pgx.Row) (Event, error) {
 	var (
 		e Event
+		// raw_value_xdr is nullable and Event.RawValueXDR is a plain
+		// string, so it has to land in a pointer first - the same shape
+		// rawXDRInRange uses. raw_topic_xdr needs no such care: a NULL
+		// text[] scans into a nil slice.
+		rawValueXDR *string
 	)
+	// The destinations must line up 1:1 with eventColumns, which ends in
+	// raw_topic_xdr and raw_value_xdr; omitting them here makes pgx reject
+	// every row with "number of field descriptions must equal number of
+	// destinations".
 	err := row.Scan(&e.Network, &e.ID, &e.ContractID, &e.Ledger, &e.Type, &e.TxHash,
 		&e.TxIndex, &e.OpIndex, &e.InSuccessfulCall, &e.Topics, &e.Value,
-		&e.CreatedAt)
+		&e.CreatedAt, &e.RawTopicXDR, &rawValueXDR)
 	if err != nil {
 		return Event{}, err
+	}
+	if rawValueXDR != nil {
+		e.RawValueXDR = *rawValueXDR
 	}
 	return e, nil
 }

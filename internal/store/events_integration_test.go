@@ -54,7 +54,7 @@ func TestUpsertEvents_SameTOIDTwiceYieldsOneRow(t *testing.T) {
 	assert.Zero(t, second,
 		"duplicate TOID writes must return zero new rows")
 
-	got, err := st.GetEvent(ctx, original.ID)
+	got, err := st.GetEvent(ctx, original.ID, SystemScope())
 	require.NoError(t, err)
 	assert.Equal(t, original.ContractID, got.ContractID)
 	assert.Equal(t, original.Ledger, got.Ledger)
@@ -64,6 +64,9 @@ func TestUpsertEvents_SameTOIDTwiceYieldsOneRow(t *testing.T) {
 		"raw topic XDR must not be overwritten by a duplicate upsert")
 	assert.Equal(t, original.RawValueXDR, got.RawValueXDR,
 		"raw value XDR must not be overwritten by a duplicate upsert")
-	assert.Equal(t, original.CreatedAt, got.CreatedAt,
+	// Compared in UTC: the column is timestamptz and pgx hands it back in
+	// the local zone, so the two are the same instant carrying different
+	// time.Location values - which assert.Equal treats as unequal.
+	assert.Equal(t, original.CreatedAt.UTC(), got.CreatedAt.UTC(),
 		"created_at must not change on a duplicate upsert (DO NOTHING, not DO UPDATE)")
 }
