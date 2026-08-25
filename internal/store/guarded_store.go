@@ -185,11 +185,21 @@ func (s *guardedStore) SaveAuditStateIfGreater(ctx context.Context, network stri
 }
 
 func (s *guardedStore) GetContractSummary(ctx context.Context, contractID string) (ContractSummary, error) {
-	return s.Store.GetContractSummary(ctx, contractID)
+	ctx, cancel := s.wrapContext(ctx, "store.GetContractSummary")
+	defer cancel()
+	start := time.Now()
+	summary, err := s.Store.GetContractSummary(ctx, contractID)
+	s.logSlowQuery("store.GetContractSummary", start, err)
+	return summary, err
 }
 
 func (s *guardedStore) ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error) {
-	return s.Store.ContractEventTypeCounts(ctx, contractID)
+	ctx, cancel := s.wrapContext(ctx, "store.ContractEventTypeCounts")
+	defer cancel()
+	start := time.Now()
+	counts, err := s.Store.ContractEventTypeCounts(ctx, contractID)
+	s.logSlowQuery("store.ContractEventTypeCounts", start, err)
+	return counts, err
 }
 
 func (s *guardedStore) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {

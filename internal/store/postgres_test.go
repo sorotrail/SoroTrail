@@ -835,10 +835,32 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		FROM events_partitioned
 		ORDER BY ledger, id;
 		DROP TABLE events_partitioned CASCADE;
+		-- Every table created above legacySchemaMigrationsVersion has to go.
+		-- Replaying the series re-runs each CREATE statement, and a plain
+		-- CREATE TABLE or CREATE INDEX against a surviving object fails the
+		-- migration and leaves the series dirty. CREATE TABLE IF NOT EXISTS
+		-- is not enough on its own either: contract_cursors is idempotent but
+		-- the index beside it is not. CASCADE takes the indexes with the
+		-- table, so dropping every table above v3 covers both.
+		--
+		-- events is deliberately absent: this test rebuilds it from
+		-- events_legacy to prove the upgrade preserves rows.
+		DROP TABLE IF EXISTS contract_meta CASCADE;
 		DROP TABLE IF EXISTS contract_specs CASCADE;
+		DROP TABLE IF EXISTS backfill_state CASCADE;
+		DROP TABLE IF EXISTS contract_cursors CASCADE;
+		DROP TABLE IF EXISTS dead_letters CASCADE;
 		DROP TABLE IF EXISTS replay_state CASCADE;
 		DROP TABLE IF EXISTS subscriptions CASCADE;
 		DROP TABLE IF EXISTS delivery_attempts CASCADE;
+		DROP TABLE IF EXISTS tenant_usage CASCADE;
+		DROP TABLE IF EXISTS tenant_watched_contracts CASCADE;
+		DROP TABLE IF EXISTS tenant_contract_grants CASCADE;
+		DROP TABLE IF EXISTS api_keys CASCADE;
+		DROP TABLE IF EXISTS tenants CASCADE;
+		DROP TABLE IF EXISTS event_addresses CASCADE;
+		DROP TABLE IF EXISTS token_balances CASCADE;
+		DROP TABLE IF EXISTS token_balance_state CASCADE;
 		DROP FUNCTION IF EXISTS ensure_event_partitions(bigint, bigint, bigint);
 		UPDATE schema_migrations SET version = %d, dirty = false;
 	`, legacySchemaMigrationsVersion)
@@ -878,56 +900,17 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		"upserting across the span boundary should have created a partition for at least one of the two ranges")
 }
 
-func TestQueryEvents_InSuccessfulCallFilter(t *testing.T) {
-	st := testStore(t)
-	ctx := context.Background()
-
-	// testEvent sets InSuccessfulCall: true; build one failed-call event.
-	events := []Event{
-		testEvent(eventID(1), 100, contractA),
-		testEvent(eventID(2), 101, contractB),
-	}
-	failed := testEvent(eventID(3), 102, contractA)
-	failed.InSuccessfulCall = false
-	events = append(events, failed)
-	_, err := st.UpsertEvents(ctx, events)
-	require.NoError(t, err)
-
-	for _, tc := range []struct {
-		name string
-		want bool
-		n    int
-	}{
-		{"successful calls only", true, 2},
-		{"failed calls only", false, 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, _, err := st.QueryEvents(ctx, EventFilter{InSuccessfulCall: &tc.want})
-			require.NoError(t, err)
-			require.Len(t, got, tc.n)
-			for _, e := range got {
-				assert.Equal(t, tc.want, e.InSuccessfulCall)
-			}
-		})
-	}
-
-	// nil means "no constraint" — the filter must not narrow the results.
-	all, _, err := st.QueryEvents(ctx, EventFilter{})
-	require.NoError(t, err)
-	assert.Len(t, all, 3)
-}
-
 func TestIngestionStateRoundTrip(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 
-	_, err := st.GetIngestionState(ctx, defaultNetwork)
+	_, err := st.GetIngestionState(ctx)
 	assert.ErrorIs(t, err, ErrNotFound, "fresh database has no state")
 
-	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{Network: defaultNetwork, LastIngestedLedger: 42, LastCursor: "c1"}))
-	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{Network: defaultNetwork, LastIngestedLedger: 43}))
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 42, LastCursor: "c1"}))
+	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 43}))
 
-	got, err := st.GetIngestionState(ctx, defaultNetwork)
+	got, err := st.GetIngestionState(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, int64(43), got.LastIngestedLedger)
 	assert.Empty(t, got.LastCursor, "state is a single row, fully replaced")

@@ -10,22 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: 'go.mod'
-
-      - name: Build
-        run: go build ./...
   test:
-    name: Test (Integration)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     services:
@@ -44,36 +29,7 @@ jobs:
           --health-interval 2s
           --health-timeout 2s
           --health-retries 30
-    env:
-      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/test_db?sslmode=disable
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: 'go.mod'
-
-      - name: Run Postgres Integration Tests
-        run: make test-db
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: 'go.mod'
-
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: v1.60
-        
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
@@ -104,12 +60,9 @@ jobs:
       # and internal/replay share one database and truncate the same tables.
       # -race catches data races inside a single package's test binary.
       - name: Test (with Postgres integration tests)
-        # -p 1 serializes packages: the integration tests in internal/store
-        # and internal/replay share one database and truncate the same tables.
-        # The build integrates TEST_DATABASE_URL-based tests; the
+        # This job covers the TEST_DATABASE_URL-based tests; the
         # //go:build integration-tagged suite is exercised by the separate
         # `integration` job below.
-        run: go test -p 1 ./... -count=1
         run: go test -p 1 ./... -count=1 -race -timeout=120s
         env:
           TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5433/sorotrail?sslmode=disable

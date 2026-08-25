@@ -61,7 +61,7 @@ func TestOpenAPISpecCoversAllRoutes(t *testing.T) {
 	var doc openapiSchema
 	require.NoError(t, json.Unmarshal(openapiSpec, &doc))
 
-	s := &Server{log: testLogger()}
+	s := New(nil, nil, testLogger(), "")
 	routes := collectRoutes(s.router())
 
 	for _, route := range routes {
@@ -87,7 +87,7 @@ func TestOpenAPISpecHasNoExtraRoutes(t *testing.T) {
 	var doc openapiSchema
 	require.NoError(t, json.Unmarshal(openapiSpec, &doc))
 
-	s := &Server{log: testLogger()}
+	s := New(nil, nil, testLogger(), "")
 	routes := collectRoutes(s.router())
 
 	registered := make(map[string]bool)
@@ -107,7 +107,7 @@ func TestOpenAPISpecHasNoExtraRoutes(t *testing.T) {
 // TestOpenAPISpecIsServed verifies the /openapi.json endpoint returns
 // the spec with the correct content type.
 func TestOpenAPISpecIsServed(t *testing.T) {
-	s := &Server{log: testLogger()}
+	s := New(nil, nil, testLogger(), "")
 	handler := s.Router()
 
 	req := httptest.NewRequest(http.MethodGet, "/openapi.json", nil)
@@ -126,7 +126,7 @@ func TestOpenAPISpecIsServed(t *testing.T) {
 // TestDocsIsServed verifies the /docs endpoint returns an HTML page
 // that loads Swagger UI pointing at /openapi.json.
 func TestDocsIsServed(t *testing.T) {
-	s := &Server{log: testLogger()}
+	s := New(nil, nil, testLogger(), "")
 	handler := s.Router()
 
 	req := httptest.NewRequest(http.MethodGet, "/docs", nil)
