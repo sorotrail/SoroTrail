@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -264,7 +265,11 @@ func TestPagination_BoundaryCases(t *testing.T) {
 		var allIDs []string
 		cursor := ""
 		for i := 0; i < 50; i++ { // safety cap
-			path := fmt.Sprintf("%s?limit=%d", basePath, limit)
+			sep := "?"
+			if strings.Contains(basePath, "?") {
+				sep = "&"
+			}
+			path := fmt.Sprintf("%s%slimit=%d", basePath, sep, limit)
 			if cursor != "" {
 				path += "&cursor=" + cursor
 			}
@@ -283,7 +288,8 @@ func TestPagination_BoundaryCases(t *testing.T) {
 
 	t.Run("empty results", func(t *testing.T) {
 		// Filter for a contract that has zero events in the seed.
-		pg := fetchPage(t, "/events?contract_id=" + apiContractB[0:5] + "ZZZZZZZZZZZZZZZZZZZZZZZZ")
+		// Must be a valid 56-char strkey (starts with C, rest is base32).
+		pg := fetchPage(t, "/events?contract_id=CZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ")
 		assert.Empty(t, pg.Events, "empty result must return an empty array")
 		assert.Empty(t, pg.Cursor, "empty result must not return a cursor")
 	})
@@ -438,7 +444,7 @@ func TestPagination_BoundaryCases(t *testing.T) {
 	})
 
 	t.Run("invalid cursor returns 400", func(t *testing.T) {
-		resp, err := http.Get(srv.URL + "/events?limit=5&cursor=NOT_A_REAL_CURSOR")
+		resp, err := http.Get(srv.URL + "/events?limit=5&cursor=NOT A REAL CURSOR")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
@@ -446,7 +452,7 @@ func TestPagination_BoundaryCases(t *testing.T) {
 	})
 
 	t.Run("envelope mode preserves empty result shape", func(t *testing.T) {
-		resp, err := http.Get(srv.URL + "/events?contract_id=NOPE&envelope=true")
+		resp, err := http.Get(srv.URL + "/events?contract_id=CZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ&envelope=true")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		require.Equal(t, http.StatusOK, resp.StatusCode)
