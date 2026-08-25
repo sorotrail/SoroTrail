@@ -1,9 +1,6 @@
 package api
 
-
-
 import (
-
 	"bufio"
 	"context"
 
@@ -19,6 +16,7 @@ import (
 
 	"net"
 	"net/http"
+	"net/url"
 
 	"strconv"
 
@@ -35,11 +33,8 @@ import (
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
 	"github.com/sorotrail/sorotrail/internal/config"
-	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
-
-
 
 // decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
 
@@ -114,35 +109,22 @@ const immutableMaxAge = 365 * 24 * time.Hour
 
 type cacheability int
 
-
-
 const (
 	cacheImmutable cacheability = iota
 	cacheNoCache
 	cacheNoStore
-
 )
 
-
-
 type errorResponse struct {
-
 	Error string `json:"error"`
-
 }
 
-
-
 type eventsResponse struct {
-
 	Events []store.Event `json:"events"`
 	Cursor string        `json:"cursor,omitempty"`
 }
 
-
-
 type enrichedEventsResponse struct {
-
 	Events []store.EnrichedEvent `json:"events"`
 	Cursor string                `json:"cursor,omitempty"`
 }
@@ -156,21 +138,15 @@ type eventWithXDR struct {
 type enrichedEventWithXDR struct {
 	eventWithXDR
 	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
-	Decoded      bool                          `json:"decoded"`
+	Decoded      bool                        `json:"decoded"`
 }
-
-
 
 type enrichedEventsWithXDRResponse struct {
-
 	Events []enrichedEventWithXDR `json:"events"`
-	Cursor string                  `json:"cursor,omitempty"`
+	Cursor string                 `json:"cursor,omitempty"`
 }
 
-
-
 type eventsWithXDRResponse struct {
-
 	Events []eventWithXDR `json:"events"`
 	Cursor string         `json:"cursor,omitempty"`
 }
@@ -199,52 +175,42 @@ func wrapEnvelope(data any, cursor string) envelopeResponse {
 type healthResponse struct {
 	Status string            `json:"status"`
 	Checks map[string]string `json:"checks"`
-
 }
-
-
 
 type versionResponse struct {
+	Version string `json:"version"`
 
-	Version   string `json:"version"`
-
-	Commit    string `json:"commit"`
+	Commit string `json:"commit"`
 
 	BuildDate string `json:"build_date"`
-
 }
-
-
 
 // eventFieldNames is the set of JSON keys on store.Event that the ?fields=
 // allowlist accepts.
 var eventFieldNames = map[string]bool{
 
-	"id":                 true,
+	"id": true,
 
-	"contract_id":        true,
+	"contract_id": true,
 
-	"ledger":             true,
+	"ledger": true,
 
-	"type":               true,
+	"type": true,
 
-	"tx_hash":            true,
+	"tx_hash": true,
 
-	"tx_index":           true,
+	"tx_index": true,
 
-	"op_index":           true,
+	"op_index": true,
 
 	"in_successful_call": true,
 
-	"topics":             true,
+	"topics": true,
 
-	"value":              true,
+	"value": true,
 
-	"created_at":         true,
-
+	"created_at": true,
 }
-
-
 
 // parseFields splits a comma-separated ?fields= value and returns the
 
@@ -290,8 +256,6 @@ func parseFields(raw string) (map[string]bool, error) {
 	return set, nil
 
 }
-
-
 
 // projectEvent returns the event unchanged when fields is nil, or a
 
@@ -404,8 +368,6 @@ func eventToMap(ev store.Event, fields map[string]bool) map[string]any {
 
 }
 
-
-
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -414,8 +376,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok"}}
 	status := http.StatusOK
-
-
 
 	// DB connectivity check: Ping the store to verify the database is reachable.
 
@@ -487,7 +447,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		// Only check lag if we have an ingestion state and an RPC client.
 		if s.rpc != nil {
 			if health, err := s.rpc.GetHealth(ctx); err == nil {
-				lag := health.LatestLedger - state.LastIngestedLedger
+				lag := int64(health.LatestLedger) - state.LastIngestedLedger
 				if lag > 100 && state.LastIngestedLedger > 0 {
 					resp.Status = "degraded"
 					resp.Checks["ingestion_lag"] = fmt.Sprintf(
@@ -501,11 +461,6 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, status, resp)
-}
-
-func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	writeCacheHeaders(w, cacheNoStore, 0, "")
-	metrics.Handler().ServeHTTP(w, r)
 }
 
 // handleDeleteEvents is the admin-only bulk delete endpoint. It deletes all
@@ -549,8 +504,6 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 		BuildDate: buildinfo.BuildDate,
 	})
 }
-
-
 
 func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 
@@ -673,8 +626,6 @@ const streamBatchSize = 500
 // the value is the bare "true" (no explicit count).
 const recentDefaultLimit = 20
 
-
-
 func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) {
 
 	filter, fields, err := parseFilterAndFields(r)
@@ -687,23 +638,15 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 
 	}
 
-
-
 	// Streaming overrides pagination: the limit is an internal batch size.
 
 	filter.Limit = streamBatchSize
-
-
 
 	includeXDR := r.URL.Query().Get("include_xdr") == "true"
 
 	decoded := r.URL.Query().Get("decoded") == "true"
 
-
-
 	ctx := r.Context()
-
-
 
 	// Fetch the first batch BEFORE writing headers so a query failure
 
@@ -723,15 +666,11 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 
 	}
 
-
-
 	w.Header().Set("Content-Type", "application/x-ndjson")
 
 	writeCacheHeaders(w, cacheNoCache, 0, "")
 
 	w.WriteHeader(http.StatusOK)
-
-
 
 	// Grab the flusher before streaming so a non-streamable wrapper is
 
@@ -743,11 +682,7 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 
 	flusher, flushable := w.(http.Flusher)
 
-
-
 	enc := json.NewEncoder(w)
-
-
 
 	// writeEvents marshals and writes a batch of events as NDJSON lines.
 
@@ -791,11 +726,7 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 
 	}
 
-
-
 	writeEvents(events)
-
-
 
 	// Flush the first batch so the client sees data immediately even
 
@@ -807,9 +738,18 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 
 	}
 
-
+	// prevCursor tracks the last cursor fed back into the store so a
+	// backend that keeps returning the same page (a stuck or buggy
+	// driver, a misbehaving store) cannot spin this loop forever: no
+	// cursor progress means the stream is done.
+	prevCursor := filter.Cursor
 
 	for cursor != "" {
+
+		if cursor == prevCursor {
+			break
+		}
+		prevCursor = cursor
 
 		filter.Cursor = cursor
 
@@ -823,11 +763,7 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 
 		}
 
-
-
 		writeEvents(events)
-
-
 
 		// Flush after every batch so clients see progress, and so the
 
@@ -838,8 +774,6 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 			flusher.Flush()
 
 		}
-
-
 
 		// Check for client disconnect so we don't keep querying forever.
 
@@ -856,8 +790,6 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 	}
 
 }
-
-
 
 func (s *Server) handleContractEvents(w http.ResponseWriter, r *http.Request) {
 
@@ -926,8 +858,6 @@ func writeForbiddenContract(w http.ResponseWriter, contractID string) {
 		errForbiddenContract{contractID: contractID})
 }
 
-
-
 // serveEvents is the shared body for /events and /contracts/{id}/events.
 func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter store.EventFilter, fields map[string]bool) {
 
@@ -943,8 +873,6 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		return
 
 	}
-
-
 
 	events, cursor, qerr := s.store.QueryEvents(r.Context(), filter)
 
@@ -975,6 +903,11 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	}
 	s.recordEventsServed(r.Context(), len(events))
 
+	// A missing page must serialize as [] rather than null so envelope
+	// consumers can iterate unconditionally.
+	if events == nil {
+		events = []store.Event{}
+	}
 
 	// Tag every event with its SEP-41 normalized envelope (if any) before
 	// rendering — the layer is additive and never destructive, so events
@@ -982,8 +915,6 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	for i := range events {
 		events[i].WithSEP41()
 	}
-
-
 
 	// Total matching count (ignoring pagination) as a response header.
 
@@ -1017,6 +948,26 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	envelope := r.URL.Query().Get("envelope") == "true"
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
 
+	// RFC 5988 pagination links: when the store reports a next-page
+	// cursor, hand clients ready-made URLs instead of making them
+	// reassemble one. All original query params are preserved so pages
+	// keep the caller's filter; a request that arrived mid-pagination
+	// also advertises the way back to the first page via rel="prev".
+	if cursor != "" {
+		var links []string
+		if r.URL.Query().Get("cursor") != "" {
+			first := r.URL.Query()
+			first.Del("cursor")
+			prev := url.URL{Path: r.URL.Path, RawQuery: first.Encode()}
+			links = append(links, fmt.Sprintf("<%s>; rel=\"prev\"", prev.String()))
+		}
+		q := r.URL.Query()
+		q.Set("cursor", cursor)
+		next := url.URL{Path: r.URL.Path, RawQuery: q.Encode()}
+		links = append(links, fmt.Sprintf("<%s>; rel=\"next\"", next.String()))
+		w.Header().Set("Link", strings.Join(links, ", "))
+	}
+
 	if decoded && s.enricher != nil {
 
 		enriched := s.enricher.EnrichEvents(r.Context(), events)
@@ -1033,7 +984,6 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 			writeJSON(w, http.StatusOK, enrichedEventsWithXDRResponse{
 				Events: items,
 				Cursor: cursor,
-
 			})
 
 			return
@@ -1060,7 +1010,6 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 		writeJSON(w, http.StatusOK, eventsWithXDRResponse{
 			Events: items,
 			Cursor: cursor,
-
 		})
 
 		return
@@ -1364,8 +1313,6 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 
 }
 
-
-
 func eventToXDRResponse(e store.Event) eventWithXDR {
 
 	var value *string
@@ -1378,17 +1325,14 @@ func eventToXDRResponse(e store.Event) eventWithXDR {
 
 	return eventWithXDR{
 
-		Event:     e,
+		Event: e,
 
 		TopicsXDR: e.RawTopicXDR,
 
-		ValueXDR:  value,
-
+		ValueXDR: value,
 	}
 
 }
-
-
 
 func eventsWithXDR(events []store.Event) []eventWithXDR {
 
@@ -1404,8 +1348,6 @@ func eventsWithXDR(events []store.Event) []eventWithXDR {
 
 }
 
-
-
 func enrichEventWithXDR(e store.EnrichedEvent) enrichedEventWithXDR {
 
 	return enrichedEventWithXDR{
@@ -1414,13 +1356,10 @@ func enrichEventWithXDR(e store.EnrichedEvent) enrichedEventWithXDR {
 
 		DecodedEvent: e.DecodedEvent,
 
-		Decoded:      e.Decoded,
-
+		Decoded: e.Decoded,
 	}
 
 }
-
-
 
 func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
 
@@ -1435,8 +1374,6 @@ func enrichEventsWithXDR(events []store.EnrichedEvent) []enrichedEventWithXDR {
 	return out
 
 }
-
-
 
 // Stats summarizes what the indexer has stored plus, when the auditor is
 
@@ -1615,20 +1552,19 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 		stats.Auditor = store.AuditStats{
 
-			PassesRun:             m.PassesRun,
+			PassesRun: m.PassesRun,
 
-			LedgersChecked:        m.LedgersChecked,
+			LedgersChecked: m.LedgersChecked,
 
-			FindingsOpened:        m.FindingsOpened,
+			FindingsOpened: m.FindingsOpened,
 
-			FindingsRepaired:      m.FindingsRepaired,
+			FindingsRepaired: m.FindingsRepaired,
 
-			FindingsUnverifiable:  m.FindingsUnverifiable,
+			FindingsUnverifiable: m.FindingsUnverifiable,
 
 			FindingsUnrecoverable: m.FindingsUnrecoverable,
 
-			RPCRequests:           m.RPCRequests,
-
+			RPCRequests: m.RPCRequests,
 		}
 
 	}
@@ -1647,14 +1583,13 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 		stats.RPCErrors = store.RPCErrorStats{
 
-			GetEvents:        snap.GetEvents,
+			GetEvents: snap.GetEvents,
 
-			GetLatestLedger:  snap.GetLatestLedger,
+			GetLatestLedger: snap.GetLatestLedger,
 
-			GetHealth:        snap.GetHealth,
+			GetHealth: snap.GetHealth,
 
 			GetLedgerEntries: snap.GetLedgerEntries,
-
 		}
 
 	}
@@ -1668,39 +1603,32 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 // Watched contracts types.
 
 type addWatchedRequest struct {
-
 	ContractID string `json:"contract_id"`
-
 }
 
 type addWatchedResponse struct {
+	ContractID string `json:"contract_id"`
 
-	ContractID        string `json:"contract_id"`
-
-	AddedAt           string `json:"added_at"`
+	AddedAt string `json:"added_at"`
 
 	HistoryFromLedger int64  `json:"history_from_ledger"`
 	ModeTransition    string `json:"mode_transition,omitempty"`
 }
 
 type removeWatchedResponse struct {
+	ContractID string `json:"contract_id"`
 
-	ContractID       string `json:"contract_id"`
+	RemovedAt string `json:"removed_at"`
 
-	RemovedAt        string `json:"removed_at"`
+	HistoryPreserved bool `json:"history_preserved"`
 
-	HistoryPreserved bool   `json:"history_preserved"`
-
-	ModeTransition   string `json:"mode_transition,omitempty"`
-
+	ModeTransition string `json:"mode_transition,omitempty"`
 }
 
 type watchedListResponse struct {
-
 	Contracts []store.WatchedContract `json:"contracts"`
 
-	Count     int                     `json:"count"`
-
+	Count int `json:"count"`
 }
 
 func (s *Server) handleListWatchedChains(w http.ResponseWriter, r *http.Request) {
@@ -1743,8 +1671,6 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-
-
 	current, err := s.store.ListWatchedContracts(r.Context())
 
 	if err != nil {
@@ -1756,8 +1682,6 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 		return
 
 	}
-
-
 
 	modeTransition := ""
 
@@ -1790,8 +1714,6 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-
-
 	if err := s.store.AddWatchedContract(r.Context(), req.ContractID); err != nil {
 
 		s.log.Error("adding watched contract", "contract_id", req.ContractID, "error", err)
@@ -1802,18 +1724,36 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-
+	// history_from_ledger tells the caller where ingestion for this
+	// contract will begin: an existing per-contract cursor wins (re-adding
+	// a contract resumes, never re-backfills); otherwise the cold-start
+	// retention window - latest minus RETENTION_LEDGERS, clamped to what
+	// the RPC still retains - is where the automatic backfill starts.
+	historyFrom := state.LastIngestedLedger
+	if cc, cerr := s.store.GetContractCursor(r.Context(), req.ContractID); cerr == nil {
+		historyFrom = cc.LastIngestedLedger
+	} else if errors.Is(cerr, store.ErrNotFound) {
+		if health, herr := s.rpc.GetHealth(r.Context()); herr == nil {
+			start := int64(health.LatestLedger) - int64(s.retentionWindow())
+			if oldest := int64(health.OldestLedger); start < oldest {
+				start = oldest
+			}
+			if start < 2 {
+				start = 2
+			}
+			historyFrom = start
+		}
+	}
 
 	writeJSON(w, http.StatusOK, addWatchedResponse{
 
-		ContractID:        req.ContractID,
+		ContractID: req.ContractID,
 
-		AddedAt:           time.Now().UTC().Format(time.RFC3339),
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
 
-		HistoryFromLedger: state.LastIngestedLedger,
+		HistoryFromLedger: historyFrom,
 
-		ModeTransition:    modeTransition,
-
+		ModeTransition: modeTransition,
 	})
 
 }
@@ -1832,8 +1772,6 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 	}
 
-
-
 	current, err := s.store.ListWatchedContracts(r.Context())
 
 	if err != nil {
@@ -1845,8 +1783,6 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 		return
 
 	}
-
-
 
 	modeTransition := ""
 
@@ -1868,8 +1804,6 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 	}
 
-
-
 	if err := s.store.RemoveWatchedContract(r.Context(), id); err != nil {
 
 		if errors.Is(err, store.ErrNotFound) {
@@ -1888,18 +1822,15 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 	}
 
-
-
 	writeJSON(w, http.StatusOK, removeWatchedResponse{
 
-		ContractID:       id,
+		ContractID: id,
 
-		RemovedAt:        time.Now().UTC().Format(time.RFC3339),
+		RemovedAt: time.Now().UTC().Format(time.RFC3339),
 
 		HistoryPreserved: true,
 
-		ModeTransition:   modeTransition,
-
+		ModeTransition: modeTransition,
 	})
 
 }
@@ -2006,8 +1937,6 @@ func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
 
 	defer cancel()
 
-
-
 	health, err := s.rpc.GetHealth(ctx)
 
 	if err != nil {
@@ -2027,8 +1956,6 @@ func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
 	stats.IngestLagLedgers = &lag
 
 }
-
-
 
 func ingestLagLedgers(chainHead, lastIngested int64) int64 {
 	if lastIngested <= 0 {
@@ -2082,43 +2009,42 @@ func (s *Server) lastIngestedLedger(ctx context.Context) (int64, error) {
 
 func listETag(f store.EventFilter) string {
 	key := struct {
+		ContractID string `json:"c"`
 
-		ContractID       string          `json:"c"`
+		ContractIDPrefix string   `json:"cp,omitempty"`
+		Types            []string `json:"t"`
 
-		ContractIDPrefix string          `json:"cp,omitempty"`
-		Types            []string        `json:"t"`
+		Topic json.RawMessage `json:"p,omitempty"`
 
-		Topic            json.RawMessage `json:"p,omitempty"`
+		Topic0 json.RawMessage `json:"p0,omitempty"`
 
-		Topic0           json.RawMessage `json:"p0,omitempty"`
+		Topic1 json.RawMessage `json:"p1,omitempty"`
 
-		Topic1           json.RawMessage `json:"p1,omitempty"`
+		Topic2 json.RawMessage `json:"p2,omitempty"`
 
-		Topic2           json.RawMessage `json:"p2,omitempty"`
+		Topic3 json.RawMessage `json:"p3,omitempty"`
 
-		Topic3           json.RawMessage `json:"p3,omitempty"`
+		TopicContains json.RawMessage `json:"pc,omitempty"`
 
-		TopicContains    json.RawMessage `json:"pc,omitempty"`
+		TxHash string `json:"th,omitempty"`
 
-		TxHash           string          `json:"th,omitempty"`
+		HasValue   *bool  `json:"hv,omitempty"`
+		TxIndex    *int32 `json:"txi,omitempty"`
+		OpIndex    *int32 `json:"opi,omitempty"`
+		FromLedger int64  `json:"fl"`
 
-		HasValue         *bool           `json:"hv,omitempty"`
-		TxIndex          *int32          `json:"txi,omitempty"`
-		OpIndex          *int32          `json:"opi,omitempty"`
-		FromLedger       int64           `json:"fl"`
+		ToLedger int64 `json:"tl"`
 
-		ToLedger      int64           `json:"tl"`
+		FromTime string `json:"ft,omitempty"`
 
-		FromTime      string          `json:"ft,omitempty"`
+		ToTime string `json:"tt,omitempty"`
 
-		ToTime        string          `json:"tt,omitempty"`
+		Cursor string `json:"cu,omitempty"`
 
-		Cursor        string          `json:"cu,omitempty"`
+		Limit int `json:"l"`
 
-		Limit         int             `json:"l"`
+		Order string `json:"o,omitempty"`
 
-		Order         string          `json:"o,omitempty"`
-		
 		// Scope makes the validator tenant-specific. Two tenants issuing
 		// the same request are asking for different representations of
 		// this URL, and without this component the second one's
@@ -2137,34 +2063,34 @@ func listETag(f store.EventFilter) string {
 
 		// serialize identically.
 
-		Topic0:        f.Topic0,
+		Topic0: f.Topic0,
 
-		Topic1:        f.Topic1,
+		Topic1: f.Topic1,
 
-		Topic2:        f.Topic2,
+		Topic2: f.Topic2,
 
-		Topic3:        f.Topic3,
+		Topic3: f.Topic3,
 
 		TopicContains: f.TopicContains,
 
-		TxHash:        f.TxHash,
+		TxHash: f.TxHash,
 
-		HasValue:      f.HasValue,
-		TxIndex:       f.TxIndex,
-		OpIndex:       f.OpIndex,
-		FromLedger:    f.FromLedger,
+		HasValue:   f.HasValue,
+		TxIndex:    f.TxIndex,
+		OpIndex:    f.OpIndex,
+		FromLedger: f.FromLedger,
 
-		ToLedger:      f.ToLedger,
+		ToLedger: f.ToLedger,
 
-		FromTime:      timeOrEmpty(f.FromTime),
+		FromTime: timeOrEmpty(f.FromTime),
 
-		ToTime:        timeOrEmpty(f.ToTime),
-		Cursor:        f.Cursor,
+		ToTime: timeOrEmpty(f.ToTime),
+		Cursor: f.Cursor,
 
-		Limit:         resolvedLimit(f.Limit),
+		Limit: resolvedLimit(f.Limit),
 
-		Order:         resolvedOrder(f.Order),
-		Scope:         f.Scope.Fingerprint(),
+		Order: resolvedOrder(f.Order),
+		Scope: f.Scope.Fingerprint(),
 	}
 
 	b, _ := json.Marshal(key)
@@ -2186,8 +2112,6 @@ func resolvedLimit(n int) int {
 	return n
 
 }
-
-
 
 func resolvedOrder(o string) string {
 
@@ -2320,8 +2244,6 @@ func writeVary(w http.ResponseWriter) {
 	}
 
 }
-
-
 
 // writeNotModified sends a 304 with the same cache-validation headers
 
@@ -2473,14 +2395,14 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 
 	// ?limit=N: explicit validation here so an explicit `?limit=0` (or
-	// any value outside [1,MaxQueryLimit]) is a 400. BuildingEventFilter
+	// any value outside [1,maxLimit]) is a 400. BuildingEventFilter
 	// treats args.Limit==0 as "use default" — we only invoke the
 	// default when the param is absent, not when the caller explicitly
 	// asked for an invalid value.
 	if raw := q.Get("limit"); raw != "" {
 		limit, lerr := strconv.Atoi(raw)
-		if lerr != nil || limit < 1 || limit > store.MaxQueryLimit {
-			return store.EventFilter{}, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
+		if lerr != nil || limit < 1 || limit > maxLimit {
+			return store.EventFilter{}, fmt.Errorf("limit must be an integer in [1,%d]", maxLimit)
 		}
 		args.Limit = limit
 	}
@@ -2547,9 +2469,9 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 
 		limit, err := strconv.Atoi(raw)
 
-		if err != nil || limit < 1 || limit > store.MaxQueryLimit {
+		if err != nil || limit < 1 || limit > maxLimit {
 
-			return f, fmt.Errorf("limit must be an integer in [1,%d]", store.MaxQueryLimit)
+			return f, fmt.Errorf("limit must be an integer in [1,%d]", maxLimit)
 		}
 
 		f.Limit = limit
@@ -2691,7 +2613,6 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 
 		InsecureSkipVerify: true,
-
 	})
 
 	if err != nil {
@@ -2704,17 +2625,11 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 
 	defer c.Close(websocket.StatusNormalClosure, "")
 
-
-
 	log := loggerFromContext(r.Context())
-
-
 
 	sub := s.bcast.Subscribe(filter)
 
 	defer sub.Close()
-
-
 
 	ctx := r.Context()
 	ctx = c.CloseRead(ctx)
@@ -2767,8 +2682,6 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 
 	}()
 
-
-
 	for {
 
 		select {
@@ -2806,7 +2719,6 @@ func (s *Server) handleEventStreamWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 }
-
 
 // prettyWriter is implemented by ResponseWriter wrappers that carry the
 // ?pretty flag so writeJSON can optionally indent the output.
@@ -2854,15 +2766,11 @@ func prettyMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
-
 func writeJSON(w http.ResponseWriter, status int, v any) {
 
 	w.Header().Set("Content-Type", "application/json")
 
 	w.WriteHeader(status)
-
-	_ = json.NewEncoder(w).Encode(v)
 
 	enc := json.NewEncoder(w)
 	if pw, ok := w.(prettyWriter); ok && pw.Pretty() {
@@ -2870,8 +2778,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	}
 	_ = enc.Encode(v)
 }
-
-
 
 func writeError(w http.ResponseWriter, status int, err error) {
 	writeCacheHeaders(w, cacheNoStore, 0, "")

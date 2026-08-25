@@ -33,6 +33,7 @@ func TestValidateAll_ValidConfig(t *testing.T) {
 		AuditMaxRepair:      3,
 		AuditFindingMaxLgrs: 100,
 		LogLevel:            "info",
+		LogFormat:           "text",
 	}
 	if err := cfg.ValidateAll(); err != nil {
 		t.Fatalf("unexpected error: %s", err)

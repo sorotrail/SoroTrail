@@ -37,7 +37,6 @@ const (
 )
 
 // Postgres implements Store on a pgx connection pool.
-//
 type Postgres struct {
 	pool          *pgxpool.Pool
 	partitionSpan int64
@@ -498,7 +497,6 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 	}
 	return out, next, nil
 }
-
 
 // GetContractSummary returns a single contract's summary row. It queries
 // the events table directly so it reflects the same data as ListContracts.
@@ -1223,7 +1221,7 @@ func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) er
 // contract, or ErrNotFound when the contract has no cursor row yet.
 func (p *Postgres) GetContractCursor(ctx context.Context, contractID string) (ContractCursor, error) {
 	var (
-		c ContractCursor
+		c  ContractCursor
 		ts time.Time
 	)
 	err := p.pool.QueryRow(ctx,
