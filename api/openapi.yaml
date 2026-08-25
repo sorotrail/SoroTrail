@@ -1,6 +1,6 @@
 openapi: "3.1.0"
 info:
-  title: SoroTrail
+  title: SoroTrail API
   description: |
     A contract event indexer for the Stellar/Soroban network. SoroTrail polls
     a Stellar RPC endpoint, stores contract events durably in Postgres, and
@@ -654,6 +654,120 @@ paths:
       responses:
         "200":
           description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /contracts/{id}:
+    get:
+      operationId: getContract
+      summary: Get a single contract's summary
+      description: >-
+        Aggregate row for one indexed contract: how many events it has, the
+        ledger range they span, and when it was last seen. Returns 404 for a
+        contract with no indexed events.
+      tags: [Operations]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Stellar contract ID (C-prefixed)
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Contract summary
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract_id, event_count, first_ledger, last_ledger, last_seen]
+                properties:
+                  contract_id:
+                    type: string
+                    description: Stellar contract ID (C-prefixed)
+                  event_count:
+                    type: integer
+                    format: int64
+                    description: Number of stored events for this contract
+                  first_ledger:
+                    type: integer
+                    format: int64
+                    description: Earliest ledger holding an event for this contract
+                  last_ledger:
+                    type: integer
+                    format: int64
+                    description: Most recent ledger holding an event for this contract
+                  last_seen:
+                    type: string
+                    format: date-time
+                    description: Timestamp of the most recent event
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /contracts/{id}/stats:
+    get:
+      operationId: contractStats
+      summary: Get per-contract statistics
+      description: >-
+        Event count for one contract, plus cached token metadata (name,
+        symbol, decimals) when the contract has been resolved as a token.
+        The metadata fields are omitted for contracts with no cached
+        metadata.
+      tags: [Operations]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Stellar contract ID (C-prefixed)
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Contract statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract_id, event_count]
+                properties:
+                  contract_id:
+                    type: string
+                    description: Stellar contract ID (C-prefixed)
+                  name:
+                    type: string
+                    description: Token name, when cached metadata is available
+                  symbol:
+                    type: string
+                    description: Token symbol, when cached metadata is available
+                  decimals:
+                    type: integer
+                    description: Token decimals, when cached metadata is available
+                  event_count:
+                    type: integer
+                    format: int64
+                    description: Number of stored events for this contract
+                  type_breakdown:
+                    type: array
+                    description: >-
+                      Per-type event counts for this contract. Omitted when
+                      the breakdown is unavailable.
+                    items:
+                      type: object
+                      required: [type, count]
+                      properties:
+                        type:
+                          type: string
+                          description: Event type, e.g. contract or diagnostic
+                        count:
+                          type: integer
+                          format: int64
+                          description: Number of events of this type
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
   /contracts/{id}/export:

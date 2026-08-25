@@ -662,6 +662,14 @@ type Store interface {
 	// matching f (ignoring pagination: cursor, order, and limit).
 	CountContracts(ctx context.Context, f ContractsFilter) (int64, error)
 
+	// GetContractSummary returns a single contract's summary row
+	// (event count, ledger range, last-seen timestamp), or ErrNotFound
+	// when the contract has no stored events.
+	GetContractSummary(ctx context.Context, contractID string) (ContractSummary, error)
+	// ContractEventTypeCounts returns per-type event counts for a single
+	// contract, newest-friendly ordering not guaranteed.
+	ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error)
+
 	// DeadLetterEvent records a single event the ingester could not
 	// persist (decode failure, constraint violation, etc.) along with
 	// the original RPC payload and the error that dropped it. Retry-safe:

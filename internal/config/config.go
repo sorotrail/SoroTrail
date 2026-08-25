@@ -23,12 +23,12 @@ type NetworkConfig struct {
 type Config struct {
 	// RPCURL is the single-provider RPC endpoint. When RPC_URLS is set the
 	// multi-provider failover client is used instead and RPC_URL is ignored.
-	RPCURL                string        `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
+	RPCURL string `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
 	// RPCURLS, when set, enables the multi-provider failover client
 	// (internal/rpc). List order is priority: index 0 is tried first.
 	// RPC_URL is ignored while it is set; leaving RPC_URLS unset keeps the
 	// single-provider behavior unchanged.
-	RPCURLS               []string      `env:"RPC_URLS"`
+	RPCURLS []string `env:"RPC_URLS"`
 	// RPCRateLimitRPS caps each provider's request rate (requests/second)
 	// when the failover client is in use. Only read by the failover client.
 	RPCRateLimitRPS       float64       `env:"RPC_RATE_LIMIT_RPS" envDefault:"10"`
@@ -119,7 +119,6 @@ type Config struct {
 	// Negative disables compression entirely; 0 uses api.CompressMinSize.
 	CompressMinSize int `env:"COMPRESS_MIN_SIZE" envDefault:"0"`
 
-
 	// EnableMetrics exposes the Prometheus /metrics endpoint.
 	EnableMetrics bool `env:"ENABLE_METRICS" envDefault:"false"`
 	// APIMaxLimit is the maximum page size accepted by the API for list
@@ -176,6 +175,15 @@ type Config struct {
 	// value only helps against private RPCs that allow more headroom.
 	// Anything below 1 is invalid.
 	SweepConcurrency int `env:"SWEEP_CONCURRENCY" envDefault:"1"`
+
+	// MaxEventsPerCycle caps how many events a single ingestion cycle may
+	// process, bounding per-cycle memory and latency on busy chains. When
+	// the cap is hit mid-window the sweep stops fetching and the ingest
+	// frontier stays put, so the next cycle resumes with idempotent
+	// upserts covering the overlap; in single-page mode the pagination
+	// limit is clamped down to the cap instead. Zero (the default)
+	// disables the cap — identical to the pre-cap behavior.
+	MaxEventsPerCycle uint `env:"MAX_EVENTS_PER_CYCLE"`
 
 	// ReorgConfirmationWindow is the number of ledgers behind the ingest
 	// frontier that get re-scanned on a periodic basis to detect and
@@ -408,6 +416,8 @@ func (c Config) Validate() error {
 	if c.SweepConcurrency < 1 {
 		return fmt.Errorf("SWEEP_CONCURRENCY must be positive, got %d", c.SweepConcurrency)
 	}
+	// MAX_EVENTS_PER_CYCLE needs no explicit rule: the env parser rejects
+	// negatives (uint), and zero is the documented "disabled" value.
 	if c.ReorgConfirmationWindow > 0 && c.ReorgRescanInterval <= 0 {
 		return fmt.Errorf("REORG_RESCAN_INTERVAL must be positive when REORG_CONFIRMATION_WINDOW is set")
 	}
@@ -576,6 +586,7 @@ func (c Config) LoggableFields() []any {
 		"http_read_header_timeout", c.HTTPReadHeaderTimeout,
 		"shutdown_timeout", c.ShutdownTimeout,
 		"sweep_concurrency", c.SweepConcurrency,
+		"max_events_per_cycle", c.MaxEventsPerCycle,
 		"reorg_confirmation_window", c.ReorgConfirmationWindow,
 		"reorg_rescan_interval", c.ReorgRescanInterval,
 		"export_max_range", c.ExportMaxRange,

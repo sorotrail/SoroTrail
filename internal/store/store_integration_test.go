@@ -61,8 +61,14 @@ func requireSchema(t *testing.T, pool *pgxpool.Pool) {
 			columns: []string{"id", "last_ingested_ledger", "last_cursor", "updated_at"},
 		},
 		{
+			// audit_state is keyed by network, not by the singleton id the
+			// table was created with: GetAuditState selects WHERE network = $1
+			// and SaveAuditState upserts ON CONFLICT (network). The original
+			// id column had CHECK (id = 1) and no default, so it would have
+			// rejected those inserts, and 0005_network_column drops it.
+			// sqlite.go still uses id = 1 against its own migration series.
 			table:   "audit_state",
-			columns: []string{"id", "verified_through_ledger", "updated_at"},
+			columns: []string{"network", "verified_through_ledger", "updated_at"},
 		},
 		{
 			table: "audit_findings",

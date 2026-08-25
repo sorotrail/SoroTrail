@@ -31,7 +31,7 @@ func (c *ClickHouse) ListContractIDs(context.Context) ([]string, error) { return
 func (c *ClickHouse) GetContractMeta(context.Context, string) (ContractMeta, error) {
 	return ContractMeta{}, ErrNotFound
 }
-func (c *ClickHouse) UpsertContractMeta(context.Context, ContractMeta) error { return nil }
+func (c *ClickHouse) UpsertContractMeta(context.Context, ContractMeta) error     { return nil }
 func (c *ClickHouse) CountContractEvents(context.Context, string) (int64, error) { return 0, nil }
 
 // GetContractSummary returns a single contract's summary from ClickHouse.
