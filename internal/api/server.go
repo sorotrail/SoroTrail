@@ -11,8 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	otelhttp "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
@@ -104,17 +103,18 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store         store.Store
-	rpc           rpc.Client
-	log           *slog.Logger
-	apiKey        string
-	limiter       *RateLimiter
-	bcast         *broadcast.Broadcaster
-	enricher      Enricher
-	enableMetrics bool
-	recoverer     *Recoverer
-	metrics       *metrics.HTTPMetrics
-	tracer        trace.Tracer
+	store            store.Store
+	rpc              rpc.Client
+	log              *slog.Logger
+	apiKey           string
+	limiter          *RateLimiter
+	bcast            *broadcast.Broadcaster
+	enricher         Enricher
+	enableMetrics    bool
+	recoverer        *Recoverer
+	metrics          *metrics.HTTPMetrics
+	tracer           trace.Tracer
+	retentionLedgers uint32
 
 	// GraphQL transport, injected by main after the server is built.
 	// internal/api/graphql imports this package for its ServerDeps, so
@@ -175,8 +175,7 @@ func SetMaxLimit(n int) {
 // apiKey gates the watched-contracts management endpoints; pass "" to
 // fail closed (every request gets a 503 with "API_KEY not configured").
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New(),
-		tracer: otel.GetTracerProvider().Tracer("sorotrail/api")}
+	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New()}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
@@ -251,6 +250,19 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 // analytical workloads without code changes.
 func (s *Server) SetExportMaxRange(n int64) { s.exportMaxRange = n }
 
+// SetRetentionLedgers records the cold-start reach-back (RETENTION_LEDGERS)
+// used to compute history_from_ledger when a new watched contract is added.
+// Zero falls back to the ingester's default of 17280 (~24h at 5s/ledger).
+func (s *Server) SetRetentionLedgers(n uint32) { s.retentionLedgers = n }
+
+// retentionLedgers reports the configured cold-start reach-back in ledgers.
+func (s *Server) retentionWindow() uint32 {
+	if s.retentionLedgers > 0 {
+		return s.retentionLedgers
+	}
+	return 17280
+}
+
 // SetCORSConfig wires the CORS middleware. The default (zero-valued
 // config) is deny-all: no cross-origin browser request receives CORS
 // headers, so the browser blocks the response. Pass the
@@ -261,7 +273,14 @@ func (s *Server) SetCORSConfig(cfg CORSConfig) { s.cors = cfg }
 
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
-	return s.router()
+	var h http.Handler = s.router()
+	// With a tracer attached, every request gets an otelhttp server span
+	// (named by method, e.g. "GET") that parents the store spans emitted
+	// by TracingStore, so a single trace covers HTTP → handler → SQL.
+	if s.tracer != nil {
+		h = otelhttp.NewHandler(h, "")
+	}
+	return h
 }
 
 // router builds the chi router with middleware and all routes. Returned
@@ -270,9 +289,13 @@ func (s *Server) Router() http.Handler {
 func (s *Server) router() chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	r.Use(s.otelMiddleware)
 	r.Use(s.requestLogger)
-	r.Use(s.metrics.Middleware)
+	// Metrics are optional: a hand-built Server (tests, embedded use)
+	// may carry no collector, in which case latency recording and the
+	// /metrics endpoint are simply absent.
+	if s.metrics != nil {
+		r.Use(s.metrics.Middleware)
+	}
 	// CORS runs before Recoverer/Timeout so a preflight never blocks
 	// nor panics inside the recovery middleware, and so the same-origin
 	// contract (no Origin header) is forwarded as-is. Mounted
@@ -306,15 +329,23 @@ func (s *Server) router() chi.Router {
 	// Registered as GET, not Handle: Handle advertises every method (the
 	// route-drift test then demands CONNECT/TRACE entries in the OpenAPI
 	// spec), and scraping is a GET.
-	r.Get("/metrics", s.metrics.Handler().ServeHTTP)
-	// The spec and its Swagger UI are served from the router but are
-	// deliberately absent from the spec itself; the route-drift tests
-	// exclude them on both sides.
-	r.Get("/openapi.json", s.handleOpenAPI)
-	r.Get("/docs", s.handleDocs)
+	// Always registered so the documented surface is stable; a nil
+	// collector (hand-built Server) answers 503 rather than 404.
+	r.Get("/metrics", func(w http.ResponseWriter, req *http.Request) {
+		if s.metrics == nil {
+			http.Error(w, "metrics not enabled", http.StatusServiceUnavailable)
+			return
+		}
+		s.metrics.Handler().ServeHTTP(w, req)
+	})
 	r.Get("/livez", s.handleLivez)
 	r.Get("/readyz", s.handleReadyz)
 	r.Get("/version", s.handleVersion)
+	// API documentation: embedded OpenAPI 3.1 spec + self-hosted
+	// Swagger UI (no CDN). Handlers serve compiled-in assets.
+	r.Get("/openapi.json", s.handleOpenAPI)
+	r.Get("/docs", s.handleDocs)
+
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/count", s.handleCountEvents)
 	r.Get("/events/aggregate", s.handleAggregateEvents)
@@ -447,21 +478,6 @@ func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(swaggerUI))
-}
-
-// otelMiddleware starts the server span for each request and extracts any
-// inbound W3C traceparent via the global propagator, so a client's trace
-// continues through the API and into the store spans.
-//
-// It is registered as chi middleware rather than wrapping the handler
-// Router() returns, because the route-drift tests type-assert that value
-// back to *chi.Mux to walk the route tree.
-func (s *Server) otelMiddleware(next http.Handler) http.Handler {
-	return otelhttp.NewHandler(next, "HTTP",
-		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
-			return r.Method
-		}),
-	)
 }
 
 // routePattern reports the chi route pattern for a request ("/events/{id}"),

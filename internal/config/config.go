@@ -176,6 +176,15 @@ type Config struct {
 	// Anything below 1 is invalid.
 	SweepConcurrency int `env:"SWEEP_CONCURRENCY" envDefault:"1"`
 
+	// MaxEventsPerCycle caps how many events a single ingestion cycle may
+	// process, bounding per-cycle memory and latency on busy chains. When
+	// the cap is hit mid-window the sweep stops fetching and the ingest
+	// frontier stays put, so the next cycle resumes with idempotent
+	// upserts covering the overlap; in single-page mode the pagination
+	// limit is clamped down to the cap instead. Zero (the default)
+	// disables the cap — identical to the pre-cap behavior.
+	MaxEventsPerCycle uint `env:"MAX_EVENTS_PER_CYCLE"`
+
 	// ReorgConfirmationWindow is the number of ledgers behind the ingest
 	// frontier that get re-scanned on a periodic basis to detect and
 	// repair RPC-side reorgs. Once a ledger is more than this many ledgers
@@ -407,6 +416,8 @@ func (c Config) Validate() error {
 	if c.SweepConcurrency < 1 {
 		return fmt.Errorf("SWEEP_CONCURRENCY must be positive, got %d", c.SweepConcurrency)
 	}
+	// MAX_EVENTS_PER_CYCLE needs no explicit rule: the env parser rejects
+	// negatives (uint), and zero is the documented "disabled" value.
 	if c.ReorgConfirmationWindow > 0 && c.ReorgRescanInterval <= 0 {
 		return fmt.Errorf("REORG_RESCAN_INTERVAL must be positive when REORG_CONFIRMATION_WINDOW is set")
 	}
@@ -575,6 +586,7 @@ func (c Config) LoggableFields() []any {
 		"http_read_header_timeout", c.HTTPReadHeaderTimeout,
 		"shutdown_timeout", c.ShutdownTimeout,
 		"sweep_concurrency", c.SweepConcurrency,
+		"max_events_per_cycle", c.MaxEventsPerCycle,
 		"reorg_confirmation_window", c.ReorgConfirmationWindow,
 		"reorg_rescan_interval", c.ReorgRescanInterval,
 		"export_max_range", c.ExportMaxRange,

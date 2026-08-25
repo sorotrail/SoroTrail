@@ -37,10 +37,10 @@ func TestNoRouteDrift(t *testing.T) {
 	}
 
 	for _, r := range routerRoutes {
-		// The routes that serve the spec and its Swagger UI are not part of
-		// the documented API surface; internal/api/openapi_test.go applies
-		// the same exclusion.
-		if r.Path == "/openapi.json" || r.Path == "/docs" {
+		// The routes that serve the spec itself (/openapi.json, /docs)
+		// are deliberately not documented within the spec — same
+		// exclusion as internal/api's drift test.
+		if r.Path == "/docs" || r.Path == "/openapi.json" {
 			continue
 		}
 		if !slices.ContainsFunc(specRoutes, func(sr routePair) bool {

@@ -12,10 +12,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	noop "go.opentelemetry.io/otel/trace/noop"
 
 	"golang.org/x/sync/errgroup"
 
@@ -77,6 +75,17 @@ type Options struct {
 	RetentionLedgers uint32
 	// PageLimit is the getEvents pagination limit per request. Default 1000.
 	PageLimit uint
+	// MaxEventsPerCycle caps the number of events a single runOnce cycle
+	// may process, bounding memory and per-cycle latency on busy chains.
+	// When the cap is hit mid-window the sweep stops issuing further
+	// requests and the ingest frontier is left where it was, so the next
+	// cycle re-scans the remainder of the window (idempotent upserts make
+	// the overlap harmless). In singlePage mode the pagination limit is
+	// clamped down to the cap so the page itself cannot exceed it.
+	//
+	// Zero (the default) disables the cap — behavior identical to builds
+	// before this option existed.
+	MaxEventsPerCycle uint
 	// MaxBackoff caps the error backoff. Default 1m.
 	MaxBackoff time.Duration
 	// SweepWindow bounds the ledger range scanned per pass when the watched
@@ -191,6 +200,9 @@ type Ingester struct {
 	decoder decode.Decoder
 	log     *slog.Logger
 	opts    Options
+	// tracer emits OpenTelemetry spans around each ingest cycle. It is
+	// always non-nil (noop by default) so call sites never need a guard.
+	tracer trace.Tracer
 
 	// lagging is the hysteresis state for the ingest-lag alarm. It is
 	// mutated only from the Run goroutine. Crossing the threshold flips
@@ -211,10 +223,6 @@ type Ingester struct {
 	// a poison event no longer stalls the loop. nil means no
 	// dead-lettering — the cycle aborts on the first error as before.
 	deadLetterStore DeadLetterSink
-	// tracer records the poll_cycle/fetch_page/persist_events spans. It
-	// defaults to the global provider so tracing activates once
-	// telemetry.Configure has run; WithTracer overrides it in tests.
-	tracer trace.Tracer
 }
 
 // New wires an Ingester.
@@ -226,19 +234,17 @@ func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger
 		decoder: dec,
 		log:     log,
 		opts:    opts,
-		tracer:  otel.GetTracerProvider().Tracer("sorotrail/ingester"),
+		tracer:  noop.NewTracerProvider().Tracer("github.com/sorotrail/sorotrail/internal/ingester"),
 	}
 }
 
-// WithTracer overrides the tracer used for the ingestion spans and returns
-// the receiver so it can be chained onto New. Passing nil leaves the
-// global-provider tracer set by New in place. Unlike the API server, the
-// ingester does not wrap its store here: the lag tests reach through
-// ing.store to the concrete mock, and the store boundary is already traced
-// where the store is constructed.
-func (ing *Ingester) WithTracer(tracer trace.Tracer) *Ingester {
-	if tracer != nil {
-		ing.tracer = tracer
+// WithTracer attaches an OpenTelemetry tracer. Each runOnce cycle emits
+// an ingester.poll_cycle span with ingester.fetch_page and
+// ingester.persist_events children; without a tracer the noop provider
+// makes every span a zero-cost no-op.
+func (ing *Ingester) WithTracer(t trace.Tracer) *Ingester {
+	if t != nil {
+		ing.tracer = t
 	}
 	return ing
 }
@@ -269,6 +275,25 @@ type DeadLetterSink interface {
 	DeadLetterEvent(ctx context.Context, ev store.DeadLetterInput) (store.DeadLetter, error)
 }
 
+// logAttrs renders the effective Options as structured log fields. It is
+// called after applyDefaults, so the values shown are what the ingester
+// will actually run with — an operator reading the startup line sees the
+// applied defaults (5s poll, 1000 page limit, …) rather than the raw env.
+func (o *Options) logAttrs() []any {
+	return []any{
+		"poll_interval", o.PollInterval,
+		"page_limit", o.PageLimit,
+		"max_events_per_cycle", o.MaxEventsPerCycle,
+		"start_ledger", o.StartLedger,
+		"retention_ledgers", o.RetentionLedgers,
+		"sweep_window", o.SweepWindow,
+		"sweep_concurrency", o.SweepConcurrency,
+		"max_backoff", o.MaxBackoff,
+		"lag_warn_ledgers", o.LagWarnLedgers,
+		"reorg_confirmation_window", o.ReorgConfirmationWindow,
+	}
+}
+
 // Run polls until ctx is canceled. Errors are logged and retried with
 // exponential backoff; the only terminal condition is context cancellation.
 //
@@ -286,7 +311,21 @@ type DeadLetterSink interface {
 // resumes from there with idempotent upserts covering any half-done
 // batch. There is no place in the loop where a partial state lands in
 // the store, so a tranquil Ctrl-C / SIGTERM never truncates a write.
-func (ing *Ingester) Run(ctx context.Context) error {
+// Startup/shutdown logging: Run emits one "ingester started" line carrying
+// the effective (post-defaults) configuration, and one "ingester stopped"
+// line on every exit path — clean cancellation, RPC failure backoff exit,
+// or error return — so an operator correlating logs can see exactly when
+// the loop was live and with what knobs, without grepping config dumps.
+func (ing *Ingester) Run(ctx context.Context) (err error) {
+	ing.log.Info("ingester started", ing.opts.logAttrs()...)
+	defer func() {
+		if err != nil {
+			ing.log.Info("ingester stopped", "reason", err.Error())
+			return
+		}
+		ing.log.Info("ingester stopped")
+	}()
+
 	backoff := time.Second
 	lastReorgRescanAt := time.Time{}
 	for {
@@ -389,14 +428,7 @@ func (ing *Ingester) rescanForReorg(ctx context.Context) error {
 // Watched mode uses per-contract cursors in the contract_cursors table.
 func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
 	ctx, span := ing.tracer.Start(ctx, "ingester.poll_cycle")
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+	defer span.End()
 	startLedger, cursor, err := ing.resolvePosition(ctx)
 	if err != nil {
 		return false, err
@@ -412,26 +444,20 @@ func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
 }
 
 func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor string, filters []rpc.EventFilter) (bool, error) {
-	ctx, span := ing.tracer.Start(ctx, "ingester.fetch_page")
-	defer span.End()
-	span.SetAttributes(
-		attribute.Int64("ingester.start_ledger", int64(startLedger)),
-		attribute.String("ingester.cursor", cursor),
-		attribute.Int("ingester.filter_count", len(filters)),
-	)
-
-	resp, err := ing.client.GetEvents(ctx, rpc.GetEventsRequest{
+	limit := ing.effectivePageLimit()
+	fetchCtx, fetchSpan := ing.tracer.Start(ctx, "ingester.fetch_page")
+	resp, err := ing.client.GetEvents(fetchCtx, rpc.GetEventsRequest{
 		StartLedger: startLedger,
 		Filters:     filters,
-		Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
+		Pagination:  &rpc.Pagination{Cursor: cursor, Limit: limit},
 	})
+	fetchSpan.End()
 	if rpc.IsFailoverReanchor(err) {
 		ing.log.Warn("failover re-anchor: discarding cursor, re-scanning from last ingested ledger")
 		ing.discardCursor(ctx)
 		return false, err
 	}
 	if rpc.IsLedgerOutOfRange(err) {
-		span.AddEvent("retention_clamp")
 		return false, ing.reclampToOldest(ctx, startLedger)
 	}
 	if err != nil {
@@ -442,7 +468,7 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 		return false, err
 	}
 
-	state, caughtUp := nextState(resp, ing.opts.PageLimit)
+	state, caughtUp := nextState(resp, limit)
 	if state.LastCursor == "" && state.LastIngestedLedger <= 0 {
 		state.LastIngestedLedger = int64(startLedger) - 1
 	}
@@ -533,6 +559,32 @@ func (ing *Ingester) BuildFilterBatches(ctx context.Context) ([][]rpc.EventFilte
 // PageLimit returns the getEvents pagination cap.
 func (ing *Ingester) PageLimit() uint { return ing.opts.PageLimit }
 
+// MaxEventsPerCycle returns the per-cycle event cap; 0 means disabled.
+func (ing *Ingester) MaxEventsPerCycle() uint { return ing.opts.MaxEventsPerCycle }
+
+// effectivePageLimit is the pagination limit for the first getEvents
+// request of a cycle: PageLimit clamped down to the per-cycle event cap
+// when one is set and smaller. Without a cap this is exactly PageLimit,
+// so behavior is unchanged for deployments that don't opt in.
+func (ing *Ingester) effectivePageLimit() uint {
+	if ing.opts.MaxEventsPerCycle > 0 && ing.opts.MaxEventsPerCycle < ing.opts.PageLimit {
+		return ing.opts.MaxEventsPerCycle
+	}
+	return ing.opts.PageLimit
+}
+
+// newCycleBudget allocates the shared per-cycle event budget used by the
+// window-sweep request chains. A nil return means no cap is configured
+// and every batch pages to completion as before.
+func (ing *Ingester) newCycleBudget() *atomic.Int64 {
+	if ing.opts.MaxEventsPerCycle == 0 {
+		return nil
+	}
+	var budget atomic.Int64
+	budget.Store(int64(ing.opts.MaxEventsPerCycle))
+	return &budget
+}
+
 // Network returns the network this ingester is responsible for.
 func (ing *Ingester) Network() string { return "" }
 
@@ -591,6 +643,11 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	}
 	end := min(start+ing.opts.SweepWindow-1, health.LatestLedger)
 
+	// Per-cycle event cap: all batches share one budget. capHit is set
+	// out-of-band (same pattern as ledgerOutOfRange) because errgroup
+	// cancellation can mask which batch observed the exhausted budget.
+	remaining := ing.newCycleBudget()
+	var capHit atomic.Bool
 	// When SweepConcurrency > 1, two batches run in parallel. If one
 	// returns IsLedgerOutOfRange, errgroup cancels the others and the
 	// first goroutine to surface an error to g.Wait() wins — which means
@@ -604,7 +661,7 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	for _, filters := range batches {
 		filters := filters
 		g.Go(func() error {
-			return ing.sweepBatch(gctx, &ledgerOutOfRange, start, end, filters)
+			return ing.sweepBatch(gctx, &ledgerOutOfRange, remaining, &capHit, start, end, filters)
 		})
 	}
 	if err := g.Wait(); err != nil {
@@ -612,6 +669,15 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 			return false, ing.reclampToOldest(ctx, start)
 		}
 		return false, err
+	}
+	if capHit.Load() {
+		// The event budget ran out mid-window. Leave the frontier where
+		// it was: events persisted so far are safe (idempotent upserts),
+		// and the next cycle re-scans [start,end] to cover the rest.
+		ing.log.Info("per-cycle event cap reached; window incomplete",
+			"window_start", start, "window_end", end,
+			"max_events_per_cycle", ing.opts.MaxEventsPerCycle)
+		return false, nil
 	}
 
 	lastIngested := int64(end)
@@ -638,17 +704,34 @@ func (ing *Ingester) windowSweepUnwatched(ctx context.Context, start uint32, bat
 // loop (GetEvents respects ctx) so a graceful shutdown doesn't strand
 // half-paged batches.
 //
+// remaining is the shared per-cycle event budget (nil = unlimited). Before
+// each request the batch claims min(PageLimit, remaining) events; when the
+// budget is exhausted it stops issuing requests and sets capHit so the
+// caller leaves the window incomplete rather than advancing the frontier
+// past data that was never fetched.
+//
 // ledgerOutOfRange is a side-channel for IsLedgerOutOfRange that survives
 // the errgroup canceling sibling goroutines — see windowSweep's comment.
-func (ing *Ingester) sweepBatch(ctx context.Context, ledgerOutOfRange *atomic.Bool, start, end uint32, filters []rpc.EventFilter) error {
+func (ing *Ingester) sweepBatch(ctx context.Context, ledgerOutOfRange *atomic.Bool, remaining *atomic.Int64, capHit *atomic.Bool, start, end uint32, filters []rpc.EventFilter) error {
 	cursor := ""
 	for {
-		resp, err := ing.client.GetEvents(ctx, rpc.GetEventsRequest{
+		limit := int64(ing.opts.PageLimit)
+		if remaining != nil {
+			r := remaining.Load()
+			if r <= 0 {
+				capHit.Store(true)
+				return nil
+			}
+			limit = min(limit, r)
+		}
+		fetchCtx, fetchSpan := ing.tracer.Start(ctx, "ingester.fetch_page")
+		resp, err := ing.client.GetEvents(fetchCtx, rpc.GetEventsRequest{
 			StartLedger: start,
 			EndLedger:   end + 1, // endLedger is exclusive
 			Filters:     filters,
-			Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
+			Pagination:  &rpc.Pagination{Cursor: cursor, Limit: uint(limit)},
 		})
+		fetchSpan.End()
 		if rpc.IsLedgerOutOfRange(err) {
 			ledgerOutOfRange.Store(true)
 			return err
@@ -664,7 +747,10 @@ func (ing *Ingester) sweepBatch(ctx context.Context, ledgerOutOfRange *atomic.Bo
 		if err := ing.persistEvents(ctx, resp.Events, resp.LatestLedger); err != nil {
 			return err
 		}
-		if uint(len(resp.Events)) < ing.opts.PageLimit {
+		if remaining != nil {
+			remaining.Add(-int64(len(resp.Events)))
+		}
+		if uint(len(resp.Events)) < uint(limit) {
 			return nil
 		}
 		// Cursor requests can't carry the ledger range, so enforce the
@@ -685,12 +771,6 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	if len(rpcEvents) == 0 {
 		return nil
 	}
-	ctx, span := ing.tracer.Start(ctx, "ingester.persist_events")
-	defer span.End()
-	span.SetAttributes(
-		attribute.Int("ingester.event_count", len(rpcEvents)),
-		attribute.Int64("ingester.latest_ledger", int64(latestLedger)),
-	)
 	events := make([]store.Event, 0, len(rpcEvents))
 	for _, re := range rpcEvents {
 		ev, err := ing.toStoreEvent(re)
@@ -722,9 +802,11 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		}
 		events = append(events, ev)
 	}
+	persistCtx, persistSpan := ing.tracer.Start(ctx, "ingester.persist_events")
 	timer := prometheus.NewTimer(metrics.DBWriteLatency)
-	inserted, err := ing.store.UpsertEvents(ctx, events)
+	inserted, err := ing.store.UpsertEvents(persistCtx, events)
 	timer.ObserveDuration()
+	persistSpan.End()
 	if err != nil {
 		return err
 	}

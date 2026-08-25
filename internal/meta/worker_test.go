@@ -99,6 +99,12 @@ func (s *stubStore) ListContracts(context.Context, store.ContractsFilter) ([]sto
 func (s *stubStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
 	return 0, nil
 }
+func (s *stubStore) GetContractSummary(context.Context, string) (store.ContractSummary, error) {
+	return store.ContractSummary{}, store.ErrNotFound
+}
+func (s *stubStore) ContractEventTypeCounts(context.Context, string) ([]store.ContractEventTypeCount, error) {
+	return nil, nil
+}
 func (s *stubStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
 	return store.DeadLetter{}, nil
 }
@@ -432,12 +438,4 @@ func TestDecodeContractID(t *testing.T) {
 	// Wrong prefix.
 	_, err = decodeContractID("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
 	assert.Error(t, err)
-}
-
-func (s *stubStore) GetContractSummary(_ context.Context, id string) (store.ContractSummary, error) {
-	return store.ContractSummary{ContractID: id}, nil
-}
-
-func (s *stubStore) ContractEventTypeCounts(context.Context, string) ([]store.ContractEventTypeCount, error) {
-	return nil, nil
 }

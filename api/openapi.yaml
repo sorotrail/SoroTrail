@@ -748,6 +748,22 @@ paths:
                     type: integer
                     format: int64
                     description: Number of stored events for this contract
+                  type_breakdown:
+                    type: array
+                    description: >-
+                      Per-type event counts for this contract. Omitted when
+                      the breakdown is unavailable.
+                    items:
+                      type: object
+                      required: [type, count]
+                      properties:
+                        type:
+                          type: string
+                          description: Event type, e.g. contract or diagnostic
+                        count:
+                          type: integer
+                          format: int64
+                          description: Number of events of this type
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":

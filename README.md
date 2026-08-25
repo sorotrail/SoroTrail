@@ -169,6 +169,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `COMPRESS_MIN_SIZE` | `1400` | Response body size (bytes) at or above which responses are gzip/deflate encoded for clients advertising support. Set negative to disable compression. See [Compression](#compression). |
 | `SHUTDOWN_TIMEOUT` | `15s` | Time the graceful shutdown may wait for in-flight requests and the current ingest cycle to wind down before the process is killed. Zero means wait indefinitely. |
 | `SWEEP_CONCURRENCY` | `1` | Number of filter batches fanned out in parallel during a windowSweep pass. The per-request RPC interval limiter still caps total request rate at ~10 req/s, so raising this helps only against private RPCs with more headroom. The single-batch path (`<=25` watched contracts) is unchanged. |
+| `MAX_EVENTS_PER_CYCLE` | unset | Cap on the number of events a single ingestion cycle may process, bounding per-cycle memory and latency on busy chains. When the cap is hit mid-window the sweep stops fetching and the ingest frontier stays put, so the next cycle resumes where it stopped (idempotent upserts make the overlap harmless); in single-page mode the pagination limit is clamped down to the cap instead. Unset/zero disables the cap — identical to the pre-cap behavior. |
 | `REORG_CONFIRMATION_WINDOW` | `64` | Number of ledgers behind the ingest frontier re-scanned on a schedule for RPC-side reorgs. Once a ledger is further behind the frontier than this, it is considered finalized and never rewritten. Zero disables reorg detection. |
 | `REORG_RESCAN_INTERVAL` | `1m` | Cadence of the periodic reorg re-scan over the recent finalized window. The re-scan shares the live RPC budget and runs after a successful ingest cycle. |
 | `EXPORT_MAX_RANGE` | `17280` | Maximum ledger span a single `/contracts/{id}/export` call may request (~24h at 5s/ledger). Returns `400` with the bound if exceeded. Raise for dedicated analytical deployments; lower for tighter abuse thresholds. |
@@ -755,6 +756,15 @@ memory usage stays bounded regardless of the ledger span.
   `REORG_CONFIRMATION_WINDOW` behind the ingest frontier the re-scan
   can no longer mutate its rows. Set `REORG_CONFIRMATION_WINDOW=0` to
   disable the re-scan entirely.
+- **Per-cycle event cap** (`MAX_EVENTS_PER_CYCLE`, default unset): caps
+  how many events a single ingestion cycle may process, bounding
+  per-cycle memory and latency on busy chains. In single-page mode the
+  getEvents pagination limit is clamped down to the cap; in window-sweep
+  mode all filter batches share one budget and the sweep stops issuing
+  requests once it is exhausted. A cap-truncated window is deliberately
+  left incomplete — the ingest frontier stays put and the next cycle
+  re-scans the remainder, with idempotent upserts absorbing the overlap.
+  Unset/zero disables the cap entirely (pre-cap behavior).
 
 ### Graceful shutdown
 

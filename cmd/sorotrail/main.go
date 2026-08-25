@@ -238,6 +238,7 @@ func run() error {
 		RetentionLedgers:        cfg.RetentionLedgers,
 		LagWarnLedgers:          cfg.LagWarnLedgers,
 		SweepConcurrency:        cfg.SweepConcurrency,
+		MaxEventsPerCycle:       cfg.MaxEventsPerCycle,
 		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
 	}).WithBroadcaster(bcast)

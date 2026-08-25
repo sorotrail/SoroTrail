@@ -170,15 +170,12 @@ func (s *stubStore) DeleteEventsBeforeLedger(context.Context, int64) (int64, err
 }
 
 func (s *stubStore) GetEvent(_ context.Context, id string, _ store.Scope) (store.Event, error) {
-	// eventByID lets a test script several events keyed by id; the single
-	// event/eventErr pair stays the default for the many tests that only
-	// need one canned response.
 	if s.eventByID != nil {
-		ev, ok := s.eventByID[id]
+		e, ok := s.eventByID[id]
 		if !ok {
 			return store.Event{}, store.ErrNotFound
 		}
-		return ev, nil
+		return e, nil
 	}
 	return s.event, s.eventErr
 }
@@ -407,9 +404,9 @@ func doGetWithHeader(t *testing.T, s *Server, path, key, value string) (*http.Re
 
 const testContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
-// testAddress is a well-formed 56-character G-strkey; isValidAddress
-// rejects anything shorter, so address routes need a full one.
-const testAddress = "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ"
+// testAddress is a well-formed 56-character account strkey (G...) for
+// endpoints that validate address shape.
+const testAddress = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 func TestListEvents_ParsesFilters(t *testing.T) {
 	st := &stubStore{}

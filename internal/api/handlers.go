@@ -747,7 +747,18 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 
 	}
 
+	// prevCursor tracks the last cursor fed back into the store so a
+	// backend that keeps returning the same page (a stuck or buggy
+	// driver, a misbehaving store) cannot spin this loop forever: no
+	// cursor progress means the stream is done.
+	prevCursor := filter.Cursor
+
 	for cursor != "" {
+
+		if cursor == prevCursor {
+			break
+		}
+		prevCursor = cursor
 
 		filter.Cursor = cursor
 
@@ -901,6 +912,12 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	}
 	s.recordEventsServed(r.Context(), len(events))
 
+	// A missing page must serialize as [] rather than null so envelope
+	// consumers can iterate unconditionally.
+	if events == nil {
+		events = []store.Event{}
+	}
+
 	setPaginationHeaders(w, r, cursor)
 
 	// Tag every event with its SEP-41 normalized envelope (if any) before
@@ -941,6 +958,26 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	decoded := r.URL.Query().Get("decoded") == "true"
 	envelope := r.URL.Query().Get("envelope") == "true"
 	writeCacheHeaders(w, policy, immutableMaxAge, etag)
+
+	// RFC 5988 pagination links: when the store reports a next-page
+	// cursor, hand clients ready-made URLs instead of making them
+	// reassemble one. All original query params are preserved so pages
+	// keep the caller's filter; a request that arrived mid-pagination
+	// also advertises the way back to the first page via rel="prev".
+	if cursor != "" {
+		var links []string
+		if r.URL.Query().Get("cursor") != "" {
+			first := r.URL.Query()
+			first.Del("cursor")
+			prev := url.URL{Path: r.URL.Path, RawQuery: first.Encode()}
+			links = append(links, fmt.Sprintf("<%s>; rel=\"prev\"", prev.String()))
+		}
+		q := r.URL.Query()
+		q.Set("cursor", cursor)
+		next := url.URL{Path: r.URL.Path, RawQuery: q.Encode()}
+		links = append(links, fmt.Sprintf("<%s>; rel=\"next\"", next.String()))
+		w.Header().Set("Link", strings.Join(links, ", "))
+	}
 
 	if decoded && s.enricher != nil {
 
@@ -1677,10 +1714,10 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	historyFrom, err := s.backfillPositionFor(r.Context(), req.ContractID)
-	if err != nil {
+	state, err := s.store.GetIngestionState(r.Context())
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
 
-		s.log.Error("resolving backfill position for add", "contract_id", req.ContractID, "error", err)
+		s.log.Error("loading ingestion state for add", "error", err)
 
 		writeError(w, http.StatusInternalServerError, errors.New("loading ingestion state failed"))
 
@@ -1698,6 +1735,27 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
+	// history_from_ledger tells the caller where ingestion for this
+	// contract will begin: an existing per-contract cursor wins (re-adding
+	// a contract resumes, never re-backfills); otherwise the cold-start
+	// retention window - latest minus RETENTION_LEDGERS, clamped to what
+	// the RPC still retains - is where the automatic backfill starts.
+	historyFrom := state.LastIngestedLedger
+	if cc, cerr := s.store.GetContractCursor(r.Context(), req.ContractID); cerr == nil {
+		historyFrom = cc.LastIngestedLedger
+	} else if errors.Is(cerr, store.ErrNotFound) {
+		if health, herr := s.rpc.GetHealth(r.Context()); herr == nil {
+			start := int64(health.LatestLedger) - int64(s.retentionWindow())
+			if oldest := int64(health.OldestLedger); start < oldest {
+				start = oldest
+			}
+			if start < 2 {
+				start = 2
+			}
+			historyFrom = start
+		}
+	}
+
 	writeJSON(w, http.StatusOK, addWatchedResponse{
 
 		ContractID: req.ContractID,
@@ -1709,51 +1767,6 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 		ModeTransition: modeTransition,
 	})
 
-}
-
-// defaultRetentionLedgers mirrors ingester.Options.RetentionLedgers' default
-// (~24h of ledgers). A contract added through the API backfills from the same
-// window the ingester would cold-start at, so the two agree on how much
-// history a fresh contract gets.
-const defaultRetentionLedgers = 17280
-
-// backfillPositionFor reports the ledger a newly watched contract should
-// backfill from.
-//
-// A contract that already has a cursor resumes from it, so re-adding one that
-// was removed does not re-scan history it has already ingested. A contract
-// with no cursor is a cold start: it begins at the retention window
-// (latest - retention, clamped to the oldest ledger the RPC still serves),
-// never at the global ingestion cursor — that cursor reflects how far the
-// other watched contracts have progressed and would silently skip this
-// contract's history.
-func (s *Server) backfillPositionFor(ctx context.Context, contractID string) (int64, error) {
-	cursor, err := s.store.GetContractCursor(ctx, contractID)
-	if err == nil {
-		return cursor.LastIngestedLedger, nil
-	}
-	if !errors.Is(err, store.ErrNotFound) {
-		return 0, fmt.Errorf("loading contract cursor: %w", err)
-	}
-
-	// Cold start needs RPC health to locate the retention window. With no
-	// RPC wired there is nothing to derive a position from, so report the
-	// genesis-adjacent floor rather than failing the add.
-	if s.rpc == nil {
-		return 2, nil
-	}
-	health, err := s.rpc.GetHealth(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("getHealth for backfill position: %w", err)
-	}
-	start := int64(health.LatestLedger) - int64(defaultRetentionLedgers)
-	if oldest := int64(health.OldestLedger); start < oldest {
-		start = oldest
-	}
-	if start < 2 {
-		start = 2
-	}
-	return start, nil
 }
 
 func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {
@@ -2440,7 +2453,7 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 	}
 
 	// ?limit=N: explicit validation here so an explicit `?limit=0` (or
-	// any value outside [1,MaxQueryLimit]) is a 400. BuildingEventFilter
+	// any value outside [1,maxLimit]) is a 400. BuildingEventFilter
 	// treats args.Limit==0 as "use default" — we only invoke the
 	// default when the param is absent, not when the caller explicitly
 	// asked for an invalid value.
