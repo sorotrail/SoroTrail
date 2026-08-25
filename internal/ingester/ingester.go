@@ -129,6 +129,10 @@ type Options struct {
 	// values mean replays-of-truth are caught faster at the cost of
 	// extra RPC requests per idle cycle.
 	ReorgRescanInterval time.Duration
+	// Network is the logical network name this ingester is responsible for
+	// (e.g. "mainnet", "testnet"). Empty means callers should treat it as
+	// the store default ("default").
+	Network string
 }
 
 // LagMetrics is the optional sink for ingest-lag signals. The Ingester
@@ -586,7 +590,7 @@ func (ing *Ingester) newCycleBudget() *atomic.Int64 {
 }
 
 // Network returns the network this ingester is responsible for.
-func (ing *Ingester) Network() string { return "" }
+func (ing *Ingester) Network() string { return ing.opts.Network }
 
 func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState, bool) {
 	caughtUp := uint(len(resp.Events)) < pageLimit

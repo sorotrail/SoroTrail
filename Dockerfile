@@ -1,6 +1,6 @@
 # Build stage runs on the build host's native platform and cross-compiles,
 # so multi-arch builds don't pay for QEMU-emulated Go compilation.
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
