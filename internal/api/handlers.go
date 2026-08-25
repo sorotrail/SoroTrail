@@ -1397,12 +1397,19 @@ type contractListResponse struct {
 	Cursor    string                  `json:"cursor,omitempty"`
 }
 
+// maxContractsListLimit caps ?limit= on GET /contracts. The listing is a
+// grouped scan over the events table (one row per contract), so its page
+// size is bounded tighter than the event endpoints — 1–200 with a default
+// of 50, matching the shared OpenAPI Limit parameter.
+const maxContractsListLimit = 200
+
 // handleListContracts returns one ContractSummary per indexed contract,
-// paginated, default-sorted by event_count desc (the most active
-// contracts first). The endpoint is intentionally READ-ONLY and
-// unauthenticated: a contract listing has no surface area for
-// cross-tenant data leakage (a contract_id is opaque), and gating it
-// behind API_KEY would force every browser dashboard to log in.
+// paginated, default-ordered by contract_id ascending (a stable
+// alphabetical walk; ?sort=count ranks by activity instead). The endpoint
+// is intentionally READ-ONLY and unauthenticated: a contract listing has
+// no surface area for cross-tenant data leakage (a contract_id is
+// opaque), and gating it behind API_KEY would force every browser
+// dashboard to log in.
 //
 // Cache-Control is no-cache: a brand-new contract can be ingested at
 // any time, and a stale cache would hide it from a freshly-launched
@@ -1416,10 +1423,11 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 	}
 	if !store.ValidContractsSortKey(f.SortKey) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf(
-			"invalid sort %q (want %s, %s, %s, or %s)",
+			"invalid sort %q (want %s, %s, %s, %s, or %s)",
 			f.SortKey,
-			store.SortByActivity, store.SortByFirstLedger,
-			store.SortByLastLedger, store.SortByLastSeen))
+			store.SortByContractID, store.SortByActivity,
+			store.SortByFirstLedger, store.SortByLastLedger,
+			store.SortByLastSeen))
 		return
 	}
 	if f.Order != "" && f.Order != "asc" && f.Order != "desc" {
@@ -1432,8 +1440,8 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 	}
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
-		if err != nil || n < 1 || n > maxLimit {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", maxLimit))
+		if err != nil || n < 1 || n > maxContractsListLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be an integer in [1,%d]", maxContractsListLimit))
 			return
 		}
 		f.Limit = n
@@ -1442,6 +1450,12 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 	}
 	items, cursor, err := s.store.ListContracts(r.Context(), f)
 	if err != nil {
+		// A cursor that passes the charset check but not the decode is
+		// bad client input (400), not a server fault (500).
+		if errors.Is(err, store.ErrInvalidContractsCursor) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid cursor %q", f.Cursor))
+			return
+		}
 		loggerFromContext(r.Context()).Error("listing contracts", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
 		return

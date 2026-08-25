@@ -303,10 +303,12 @@ type ContractSummary struct {
 
 // ContractsFilter narrows a ListContracts call.
 //
-// SortKey selects the column that names activity. Defaults to "count"
-// (so the most active contracts come first). Order still controls the
-// direction; the comparison pair (SortValue, ContractID) is total
-// because ContractID is unique, so keyset pagination stays stable.
+// SortKey selects the ordering column. Defaults to SortByContractID — a
+// stable alphabetical listing, which is what the /contracts endpoint
+// documents; pass an explicit key to rank by activity instead. Order
+// still controls the direction; the comparison pair (SortValue,
+// ContractID) is total because ContractID is unique, so keyset
+// pagination stays stable.
 //
 // ContractIDPrefix, when set, constrains the result to contracts whose
 // ID starts with the prefix. Indexed lookups (the contract_id index)
@@ -328,16 +330,18 @@ type ContractStats struct {
 
 type ContractsFilter struct {
 	ContractIDPrefix string
-	SortKey          string // "" | "count" | "first_ledger" | "last_ledger" | "last_seen"
-	Order            string // "asc" | "desc"; "" defaults to "desc"
+	SortKey          string // "" | "contract_id" | "count" | "first_ledger" | "last_ledger" | "last_seen"
+	Order            string // "asc" | "desc"; "" defaults to "asc" for contract_id and "desc" otherwise
 	Cursor           string
 	Limit            int
 }
 
 // SortKey constants for ContractsFilter.SortKey. The zero value
-// (empty string) is treated as SortByActivity; the API surface
-// exists to make a future "by first seen" view trivial to add.
+// (empty string) is treated as SortByContractID so the default listing
+// walks contracts in ascending ID order; the other keys exist to rank
+// by activity instead.
 const (
+	SortByContractID  = "contract_id"
 	SortByActivity    = "count"
 	SortByFirstLedger = "first_ledger"
 	SortByLastLedger  = "last_ledger"

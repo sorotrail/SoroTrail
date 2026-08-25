@@ -526,6 +526,97 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 	})
 }
 
+func TestListContracts(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// Three contracts with distinct activity footprints:
+	//   A: 3 events across ledgers 100–102
+	//   B: 1 event in ledger 200 (min == max)
+	//   C: 2 events across ledgers 300–301
+	events := []Event{
+		testEvent(eventID(1), 100, contractA),
+		testEvent(eventID(2), 101, contractA),
+		testEvent(eventID(3), 102, contractA),
+		testEvent(eventID(4), 200, contractB),
+		testEvent(eventID(5), 300, contractC),
+		testEvent(eventID(6), 301, contractC),
+	}
+	// UpsertEvents writes created_at as given (no DEFAULT now() kick-in),
+	// so stamp the fixtures or last_seen comes back as the zero time.
+	ingestedAt := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	for i := range events {
+		events[i].CreatedAt = ingestedAt
+	}
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	wantIDs := []string{contractA, contractB, contractC} // ascending
+
+	t.Run("groups counts and ledger ranges ordered by contract_id", func(t *testing.T) {
+		got, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 10})
+		require.NoError(t, err)
+		require.Len(t, got, len(wantIDs))
+		assert.Empty(t, cursor, "no next page when everything fits")
+
+		for i, c := range got {
+			assert.Equal(t, wantIDs[i], c.ContractID)
+			assert.True(t, c.LastSeen.Equal(ingestedAt), "last_seen = %v, want %v", c.LastSeen, ingestedAt)
+		}
+		assert.Equal(t, int64(3), got[0].EventCount)
+		assert.Equal(t, int64(100), got[0].FirstLedger)
+		assert.Equal(t, int64(102), got[0].LastLedger)
+
+		assert.Equal(t, int64(1), got[1].EventCount)
+		assert.Equal(t, int64(200), got[1].FirstLedger)
+		assert.Equal(t, int64(200), got[1].LastLedger)
+
+		assert.Equal(t, int64(2), got[2].EventCount)
+		assert.Equal(t, int64(300), got[2].FirstLedger)
+		assert.Equal(t, int64(301), got[2].LastLedger)
+	})
+
+	t.Run("keyset pagination walks every contract exactly once", func(t *testing.T) {
+		page1, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 2})
+		require.NoError(t, err)
+		require.Len(t, page1, 2)
+		require.NotEmpty(t, cursor, "a full page means more rows follow")
+		assert.Equal(t, wantIDs[:2], []string{page1[0].ContractID, page1[1].ContractID})
+
+		page2, cursor2, err := st.ListContracts(ctx, ContractsFilter{Limit: 2, Cursor: cursor})
+		require.NoError(t, err)
+		require.Len(t, page2, 1)
+		assert.Empty(t, cursor2, "cursor omitted on the last page")
+		assert.Equal(t, wantIDs[2], page2[0].ContractID)
+	})
+
+	t.Run("prefix filter narrows to matching contracts", func(t *testing.T) {
+		got, _, err := st.ListContracts(ctx, ContractsFilter{ContractIDPrefix: "CB", Limit: 10})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, contractB, got[0].ContractID)
+	})
+
+	t.Run("activity sort ranks busiest first", func(t *testing.T) {
+		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10})
+		require.NoError(t, err)
+		require.Len(t, got, len(wantIDs))
+		assert.Equal(t, contractA, got[0].ContractID) // 3 events
+		assert.Equal(t, contractC, got[1].ContractID) // 2 events
+		assert.Equal(t, contractB, got[2].ContractID) // 1 event
+	})
+
+	t.Run("count matches the listing and honors the prefix", func(t *testing.T) {
+		total, err := st.CountContracts(ctx, ContractsFilter{})
+		require.NoError(t, err)
+		assert.Equal(t, int64(len(wantIDs)), total)
+
+		narrowed, err := st.CountContracts(ctx, ContractsFilter{ContractIDPrefix: "CB"})
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), narrowed)
+	})
+}
+
 func TestQueryEvents_InSuccessfulCallFilter(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

@@ -649,23 +649,42 @@ Shell
 curl -s localhost:8080/events/0001099511627776-0000000001
 ### `GET /contracts`
 
-Lists every contract the indexer has seen, with cached token metadata
-(name, symbol, decimals) when available. Metadata is `null` for contracts
-that haven't been enriched yet or that don't implement the SEP-41 token
-interface.
+Lists every indexed contract with per-contract activity: total event
+count, the ledger range it was seen in (`first_ledger`–`last_ledger`),
+and the wall-clock time of its most recent event (`last_seen`). Ordered
+by `contract_id` ascending; pass `sort=count&order=desc` to rank by
+activity instead.
+
+Paginated like `/events`: opaque `cursor`, `limit` 1–200 (default 50),
+`cursor` omitted on the last page. Optional `contract_id=` narrows the
+listing to contracts whose ID starts with the given prefix.
 
 ```sh
-curl -s localhost:8080/contracts
+curl -s localhost:8080/contracts?limit=50
 ```
 
 ```json
 {
   "contracts": [
-    {"contract_id":"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"},
-    {"contract_id":"CCW67...","name":"USD Coin","symbol":"USDC","decimals":6}
-  ]
+    {
+      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "event_count": 1204,
+      "first_ledger": 250010,
+      "last_ledger": 260123,
+      "last_seen": "2026-08-01T12:34:56Z"
+    }
+  ],
+  "count": 1
 }
 ```
+
+| Param | Default | Notes |
+|---|---|---|
+| `limit` | `50` | Page size, 1–200. |
+| `cursor` | — | Opaque cursor from a previous response. |
+| `sort` | `contract_id` | One of `contract_id`, `count`, `first_ledger`, `last_ledger`, `last_seen`. |
+| `order` | `asc` for `contract_id`, else `desc` | Sort direction. |
+| `contract_id` | — | Prefix filter on the contract ID. |
 
 ### `GET /contracts/{id}/stats`
 

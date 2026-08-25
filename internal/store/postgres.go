@@ -422,11 +422,20 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 	}
 	orderDir := "DESC"
 	cursorOp := "<"
-	if strings.EqualFold(f.Order, "asc") {
+	sortCol, sortExpr, sortType := contractsSortParts(f.SortKey)
+	// contract_id is the documented default listing order and reads
+	// naturally ascending; activity-style keys keep their historical
+	// "busiest first" descending default.
+	if strings.EqualFold(f.Order, "asc") ||
+		(f.Order == "" && sortCol == "contract_id") {
 		orderDir = "ASC"
 		cursorOp = ">"
 	}
-	sortCol, sortExpr, sortType := contractsSortParts(f.SortKey)
+	orderBy := fmt.Sprintf("%s %s, contract_id %s", sortExpr, orderDir, orderDir)
+	if sortCol == "contract_id" {
+		// Sorting by the tiebreaker itself: a single term says it all.
+		orderBy = fmt.Sprintf("contract_id %s", orderDir)
+	}
 	args := []any{}
 	arg := func(v any) string {
 		args = append(args, v)
@@ -459,10 +468,10 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 		FROM events
 		%s
 		GROUP BY contract_id
-		ORDER BY %s %s, contract_id %s
+		ORDER BY %s
 		LIMIT %d`,
 		contractsWhere(where),
-		sortExpr, orderDir, orderDir,
+		orderBy,
 		limit+1,
 	)
 	var out []ContractSummary
@@ -572,7 +581,7 @@ func (p *Postgres) CountContracts(ctx context.Context, f ContractsFilter) (int64
 
 func ValidContractsSortKey(s string) bool {
 	switch s {
-	case "", SortByActivity, SortByFirstLedger, SortByLastLedger, SortByLastSeen:
+	case "", SortByContractID, SortByActivity, SortByFirstLedger, SortByLastLedger, SortByLastSeen:
 		return true
 	}
 	return false
@@ -580,6 +589,8 @@ func ValidContractsSortKey(s string) bool {
 
 func contractsSortParts(sortKey string) (col, expr, typ string) {
 	switch sortKey {
+	case "", SortByContractID:
+		return "contract_id", "contract_id", ""
 	case SortByFirstLedger:
 		return "min(ledger)", "min(ledger)", "bigint"
 	case SortByLastLedger:
@@ -593,6 +604,8 @@ func contractsSortParts(sortKey string) (col, expr, typ string) {
 
 func contractSortValue(c ContractSummary, sortKey string) string {
 	switch sortKey {
+	case "", SortByContractID:
+		return c.ContractID
 	case SortByFirstLedger:
 		return fmt.Sprint(c.FirstLedger)
 	case SortByLastLedger:

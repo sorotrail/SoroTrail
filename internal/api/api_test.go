@@ -85,6 +85,7 @@ type stubStore struct {
 	listContractsErr     error
 	countContractsResult int64
 	countContractsErr    error
+	lastContractsFilter  store.ContractsFilter
 
 	addressEvents    []store.Event
 	addressCursor    string
@@ -243,11 +244,14 @@ func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
 	return s.removeErr
 }
 
-func (s *stubStore) ListContracts(ctx context.Context, f store.ContractsFilter) ([]store.ContractSummary, string, error) {
+func (s *stubStore) ListContracts(_ context.Context, f store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastContractsFilter = f
 	return s.listContractsResult, s.listContractsCursor, s.listContractsErr
 }
 
-func (s *stubStore) CountContracts(ctx context.Context, f store.ContractsFilter) (int64, error) {
+func (s *stubStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
 	return s.countContractsResult, s.countContractsErr
 }
 
@@ -769,6 +773,95 @@ func TestListContracts(t *testing.T) {
 		resp, _ := doGet(t, s, "/contracts")
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		assert.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
+	})
+
+	// Issue #5 pins down the pagination contract: ordered by contract_id
+	// with the same cursor style as /events — opaque cursor in, opaque
+	// next-page cursor out (omitted on the last page), limit 1–200 with a
+	// default of 50.
+	t.Run("defaults to contract_id ordering and limit 50", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{},
+		}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Empty(t, st.lastContractsFilter.SortKey)
+		assert.Empty(t, st.lastContractsFilter.Order)
+		assert.Equal(t, store.DefaultQueryLimit, st.lastContractsFilter.Limit)
+	})
+
+	t.Run("forwards the opaque cursor and surfaces the next one", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{
+				{ContractID: testContract, EventCount: 1, FirstLedger: 1, LastLedger: 2},
+			},
+			listContractsCursor: "MTAwfENBQUFB",
+		}
+		s := newTestServer(st, nil)
+		resp, body := doGet(t, s, "/contracts?cursor=MTAwfENBQUFB")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		assert.Equal(t, "MTAwfENBQUFB", st.lastContractsFilter.Cursor)
+
+		var out contractListResponse
+		require.NoError(t, json.Unmarshal(body, &out))
+		assert.Equal(t, "MTAwfENBQUFB", out.Cursor)
+	})
+
+	t.Run("omits cursor on the last page", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{
+				{ContractID: testContract, EventCount: 1, FirstLedger: 1, LastLedger: 2},
+			},
+		}
+		s := newTestServer(st, nil)
+		resp, body := doGet(t, s, "/contracts")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.NotContains(t, string(body), `"cursor"`)
+	})
+
+	t.Run("accepts limit up to 200", func(t *testing.T) {
+		st := &stubStore{listContractsResult: []store.ContractSummary{}}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/contracts?limit=200")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, 200, st.lastContractsFilter.Limit)
+	})
+
+	t.Run("rejects limit outside [1,200]", func(t *testing.T) {
+		st := &stubStore{listContractsResult: []store.ContractSummary{}}
+		s := newTestServer(st, nil)
+		for _, bad := range []string{"0", "-5", "201", "500", "xyz"} {
+			resp, body := doGet(t, s, "/contracts?limit="+bad)
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "limit=%q", bad)
+			var errResp map[string]string
+			require.NoError(t, json.Unmarshal(body, &errResp))
+			assert.Contains(t, errResp["error"], "limit must be an integer in [1,200]")
+		}
+	})
+
+	t.Run("rejects unknown sort and order values", func(t *testing.T) {
+		st := &stubStore{listContractsResult: []store.ContractSummary{}}
+		s := newTestServer(st, nil)
+		resp, _ := doGet(t, s, "/contracts?sort=bogus")
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		resp, _ = doGet(t, s, "/contracts?order=sideways")
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Empty(t, st.lastContractsFilter.SortKey) // store never consulted
+	})
+
+	t.Run("malformed cursor is a 400, not a 500", func(t *testing.T) {
+		// The charset pre-check lets well-formed-but-undecodable strings
+		// through; the store rejects them with ErrInvalidContractsCursor,
+		// which the handler must map to 400 (client input), not 500.
+		st := &stubStore{listContractsErr: store.ErrInvalidContractsCursor}
+		s := newTestServer(st, nil)
+		resp, body := doGet(t, s, "/contracts?cursor=notarealcursor")
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var errResp map[string]string
+		require.NoError(t, json.Unmarshal(body, &errResp))
+		assert.Contains(t, errResp["error"], "invalid cursor")
 	})
 }
 
