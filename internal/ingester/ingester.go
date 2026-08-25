@@ -275,6 +275,25 @@ type DeadLetterSink interface {
 	DeadLetterEvent(ctx context.Context, ev store.DeadLetterInput) (store.DeadLetter, error)
 }
 
+// logAttrs renders the effective Options as structured log fields. It is
+// called after applyDefaults, so the values shown are what the ingester
+// will actually run with — an operator reading the startup line sees the
+// applied defaults (5s poll, 1000 page limit, …) rather than the raw env.
+func (o *Options) logAttrs() []any {
+	return []any{
+		"poll_interval", o.PollInterval,
+		"page_limit", o.PageLimit,
+		"max_events_per_cycle", o.MaxEventsPerCycle,
+		"start_ledger", o.StartLedger,
+		"retention_ledgers", o.RetentionLedgers,
+		"sweep_window", o.SweepWindow,
+		"sweep_concurrency", o.SweepConcurrency,
+		"max_backoff", o.MaxBackoff,
+		"lag_warn_ledgers", o.LagWarnLedgers,
+		"reorg_confirmation_window", o.ReorgConfirmationWindow,
+	}
+}
+
 // Run polls until ctx is canceled. Errors are logged and retried with
 // exponential backoff; the only terminal condition is context cancellation.
 //
@@ -292,7 +311,21 @@ type DeadLetterSink interface {
 // resumes from there with idempotent upserts covering any half-done
 // batch. There is no place in the loop where a partial state lands in
 // the store, so a tranquil Ctrl-C / SIGTERM never truncates a write.
-func (ing *Ingester) Run(ctx context.Context) error {
+// Startup/shutdown logging: Run emits one "ingester started" line carrying
+// the effective (post-defaults) configuration, and one "ingester stopped"
+// line on every exit path — clean cancellation, RPC failure backoff exit,
+// or error return — so an operator correlating logs can see exactly when
+// the loop was live and with what knobs, without grepping config dumps.
+func (ing *Ingester) Run(ctx context.Context) (err error) {
+	ing.log.Info("ingester started", ing.opts.logAttrs()...)
+	defer func() {
+		if err != nil {
+			ing.log.Info("ingester stopped", "reason", err.Error())
+			return
+		}
+		ing.log.Info("ingester stopped")
+	}()
+
 	backoff := time.Second
 	lastReorgRescanAt := time.Time{}
 	for {

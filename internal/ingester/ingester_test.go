@@ -1419,3 +1419,104 @@ func TestMaxEventsPerCycle_WindowSweepResumesNextCycle(t *testing.T) {
 	assert.Equal(t, int64(1_099), state.LastIngestedLedger,
 		"the completed window advances the frontier")
 }
+
+// --- Startup/shutdown logging with effective config ---
+
+// TestIngester_LogAttrsEffectiveConfig verifies the startup log fields
+// reflect post-default values: an operator must see what the ingester
+// will actually run with, not the raw (possibly zero) Options literal.
+func TestIngester_LogAttrsEffectiveConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		opts Options
+		want map[string]any // fields whose value is asserted
+	}{
+		{
+			name: "zero Options get the documented defaults",
+			opts: Options{},
+			want: map[string]any{
+				"poll_interval":     5 * time.Second,
+				"page_limit":        uint(1000),
+				"retention_ledgers": uint32(17280),
+				"sweep_window":      uint32(1000),
+				"sweep_concurrency": 1,
+				"max_backoff":       time.Minute,
+				// Not defaulted here by design (0 = the documented
+				// "disabled" sentinel); the env config layer supplies 64.
+				"reorg_confirmation_window": uint32(0),
+			},
+		},
+		{
+			name: "explicit overrides win over defaults",
+			opts: Options{
+				PollInterval:      2 * time.Second,
+				PageLimit:         250,
+				RetentionLedgers:  100,
+				SweepWindow:       50,
+				SweepConcurrency:  4,
+				MaxBackoff:        10 * time.Second,
+				MaxEventsPerCycle: 5000,
+				StartLedger:       42,
+				LagWarnLedgers:    7,
+			},
+			want: map[string]any{
+				"poll_interval":             2 * time.Second,
+				"page_limit":                uint(250),
+				"retention_ledgers":         uint32(100),
+				"sweep_window":              uint32(50),
+				"sweep_concurrency":         4,
+				"max_backoff":               10 * time.Second,
+				"max_events_per_cycle":      uint(5000),
+				"start_ledger":              uint32(42),
+				"lag_warn_ledgers":          uint32(7),
+				"reorg_confirmation_window": uint32(0),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.opts.applyDefaults()
+			got := tt.opts.logAttrs()
+
+			attrs := map[string]any{}
+			for i := 0; i+1 < len(got); i += 2 {
+				attrs[got[i].(string)] = got[i+1]
+			}
+			for k, want := range tt.want {
+				assert.Equal(t, want, attrs[k], "field %q", k)
+			}
+		})
+	}
+}
+
+// TestRun_EmitsStartedAndStoppedLogs proves both lifecycle lines fire
+// through the real Run loop: "ingester started" once on entry with the
+// config fields attached, "ingester stopped" once with the exit reason.
+func TestRun_EmitsStartedAndStoppedLogs(t *testing.T) {
+	log, buf := recordingLogger()
+	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{LatestLedger: 100}}}
+	ing := New(client, newMockStore(), passthroughDecoder{}, log,
+		Options{StartLedger: 50, PageLimit: 10})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := ing.Run(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+
+	started, stopped := 0, 0
+	for _, rec := range logRecords(t, buf, nil) {
+		switch rec["msg"] {
+		case "ingester started":
+			started++
+			assert.Equal(t, float64(10), rec["page_limit"],
+				"the started line carries effective config")
+			assert.Equal(t, float64(50), rec["start_ledger"])
+		case "ingester stopped":
+			stopped++
+			assert.Contains(t, rec["reason"], "context canceled",
+				"the stopped line names why the loop exited")
+		}
+	}
+	assert.Equal(t, 1, started, "exactly one started line")
+	assert.Equal(t, 1, stopped, "exactly one stopped line")
+}
