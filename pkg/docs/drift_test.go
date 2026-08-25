@@ -37,6 +37,12 @@ func TestNoRouteDrift(t *testing.T) {
 	}
 
 	for _, r := range routerRoutes {
+		// The routes that serve the spec itself (/openapi.json, /docs)
+		// are deliberately not documented within the spec — same
+		// exclusion as internal/api's drift test.
+		if r.Path == "/docs" || r.Path == "/openapi.json" {
+			continue
+		}
 		if !slices.ContainsFunc(specRoutes, func(sr routePair) bool {
 			return sr.Method == r.Method && sr.Path == r.Path
 		}) {

@@ -11,11 +11,11 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
-	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/pruner"
 	"github.com/sorotrail/sorotrail/internal/rpc"
@@ -95,27 +95,6 @@ func getRPCCounter() *rpc.CountingClient {
 	return rpcCounter
 }
 
-// SetIngester registers the Ingester so /stats can surface its
-// EventsIngestedTotal counter. Call this before ListenAndServe.
-// The setter is guarded by a RWMutex so concurrent /stats readers
-// never observe a torn pointer.
-var (
-	ingesterMu sync.RWMutex
-	ing        *ingester.Ingester
-)
-
-func SetIngester(i *ingester.Ingester) {
-	ingesterMu.Lock()
-	ing = i
-	ingesterMu.Unlock()
-}
-
-func getIngester() *ingester.Ingester {
-	ingesterMu.RLock()
-	defer ingesterMu.RUnlock()
-	return ing
-}
-
 // Enricher is the spec-based event enrichment interface used by the API.
 type Enricher interface {
 	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
@@ -123,17 +102,18 @@ type Enricher interface {
 
 // Server holds the API's dependencies.
 type Server struct {
-	store          store.Store
-	rpc            rpc.Client
-	log            *slog.Logger
-	apiKey         string
-	limiter        *RateLimiter
-	bcast          *broadcast.Broadcaster
-	enricher       Enricher
-	enableMetrics  bool
-	recoverer      *Recoverer
-	metrics        *metrics.HTTPMetrics
-	tracer         trace.Tracer
+	store            store.Store
+	rpc              rpc.Client
+	log              *slog.Logger
+	apiKey           string
+	limiter          *RateLimiter
+	bcast            *broadcast.Broadcaster
+	enricher         Enricher
+	enableMetrics    bool
+	recoverer        *Recoverer
+	metrics          *metrics.HTTPMetrics
+	tracer           trace.Tracer
+	retentionLedgers uint32
 
 	// GraphQL transport, injected by main after the server is built.
 	// internal/api/graphql imports this package for its ServerDeps, so
@@ -165,14 +145,11 @@ type Server struct {
 	cors CORSConfig
 }
 
-
 // SetCompressMinSize overrides the body size at which responses are
 // compressed. Pass a negative value to disable compression.
 func (s *Server) SetCompressMinSize(n int) {
 	s.compressMinSize = n
 }
-
-
 
 // SetMetricsEnabled enables or disables the /metrics endpoint.
 func (s *Server) SetMetricsEnabled(enabled bool) {
@@ -272,6 +249,19 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 // analytical workloads without code changes.
 func (s *Server) SetExportMaxRange(n int64) { s.exportMaxRange = n }
 
+// SetRetentionLedgers records the cold-start reach-back (RETENTION_LEDGERS)
+// used to compute history_from_ledger when a new watched contract is added.
+// Zero falls back to the ingester's default of 17280 (~24h at 5s/ledger).
+func (s *Server) SetRetentionLedgers(n uint32) { s.retentionLedgers = n }
+
+// retentionLedgers reports the configured cold-start reach-back in ledgers.
+func (s *Server) retentionWindow() uint32 {
+	if s.retentionLedgers > 0 {
+		return s.retentionLedgers
+	}
+	return 17280
+}
+
 // SetCORSConfig wires the CORS middleware. The default (zero-valued
 // config) is deny-all: no cross-origin browser request receives CORS
 // headers, so the browser blocks the response. Pass the
@@ -282,7 +272,14 @@ func (s *Server) SetCORSConfig(cfg CORSConfig) { s.cors = cfg }
 
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
-	return s.router()
+	var h http.Handler = s.router()
+	// With a tracer attached, every request gets an otelhttp server span
+	// (named by method, e.g. "GET") that parents the store spans emitted
+	// by TracingStore, so a single trace covers HTTP → handler → SQL.
+	if s.tracer != nil {
+		h = otelhttp.NewHandler(h, "")
+	}
+	return h
 }
 
 // router builds the chi router with middleware and all routes. Returned
@@ -292,7 +289,12 @@ func (s *Server) router() chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
-	r.Use(s.metrics.Middleware)
+	// Metrics are optional: a hand-built Server (tests, embedded use)
+	// may carry no collector, in which case latency recording and the
+	// /metrics endpoint are simply absent.
+	if s.metrics != nil {
+		r.Use(s.metrics.Middleware)
+	}
 	// CORS runs before Recoverer/Timeout so a preflight never blocks
 	// nor panics inside the recovery middleware, and so the same-origin
 	// contract (no Origin header) is forwarded as-is. Mounted
@@ -326,10 +328,23 @@ func (s *Server) router() chi.Router {
 	// Registered as GET, not Handle: Handle advertises every method (the
 	// route-drift test then demands CONNECT/TRACE entries in the OpenAPI
 	// spec), and scraping is a GET.
-	r.Get("/metrics", s.metrics.Handler().ServeHTTP)
+	// Always registered so the documented surface is stable; a nil
+	// collector (hand-built Server) answers 503 rather than 404.
+	r.Get("/metrics", func(w http.ResponseWriter, req *http.Request) {
+		if s.metrics == nil {
+			http.Error(w, "metrics not enabled", http.StatusServiceUnavailable)
+			return
+		}
+		s.metrics.Handler().ServeHTTP(w, req)
+	})
 	r.Get("/livez", s.handleLivez)
 	r.Get("/readyz", s.handleReadyz)
 	r.Get("/version", s.handleVersion)
+	// API documentation: embedded OpenAPI 3.1 spec + self-hosted
+	// Swagger UI (no CDN). Handlers serve compiled-in assets.
+	r.Get("/openapi.json", s.handleOpenAPI)
+	r.Get("/docs", s.handleDocs)
+
 	r.Get("/events", s.handleListEvents)
 	r.Get("/events/count", s.handleCountEvents)
 	r.Get("/events/aggregate", s.handleAggregateEvents)
@@ -403,7 +418,7 @@ func (s *Server) router() chi.Router {
 		r.Get("/events/{id}/raw", s.handleGetEventRaw)
 		r.Get("/events/{id}", s.handleGetEvent)
 		r.Get("/contracts/{id}", s.handleGetContract)
-	r.Get("/contracts/{id}/events", s.handleContractEvents)
+		r.Get("/contracts/{id}/events", s.handleContractEvents)
 		r.Get("/contracts/{id}/export", s.handleContractExport)
 		r.Get("/events.csv", s.handleEventsCSV)
 		r.Get("/subscriptions", s.handleListSubscriptions)

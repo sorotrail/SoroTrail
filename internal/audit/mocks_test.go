@@ -37,10 +37,8 @@ func mkEvents(ledger uint32, n int, contractID string) []rpc.Event {
 
 type mockRPC struct {
 	mu             sync.Mutex
-	muAudit        sync.Mutex
 	health         rpc.Health
 	extraResponses func(callIdx int) (rpc.GetEventsResponse, error)
-	eventsResps    []rpc.GetEventsResponse
 	eventsRequests []rpc.GetEventsRequest
 }
 
@@ -83,7 +81,7 @@ type mockStore struct {
 	events map[string]store.Event
 
 	ingress *store.IngestionState
-	audit   *store.AuditState
+	audit   store.AuditState
 	watched []store.WatchedContract
 
 	findings []store.AuditFinding

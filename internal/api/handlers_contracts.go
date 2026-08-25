@@ -8,15 +8,16 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // contractStatsResponse is the JSON shape for GET /contracts/{id}/stats.
 type contractStatsResponse struct {
-	ContractID    string                        `json:"contract_id"`
-	Name          *string                       `json:"name,omitempty"`
-	Symbol        *string                       `json:"symbol,omitempty"`
-	Decimals      *int                          `json:"decimals,omitempty"`
-	EventCount    int64                         `json:"event_count"`
+	ContractID    string                         `json:"contract_id"`
+	Name          *string                        `json:"name,omitempty"`
+	Symbol        *string                        `json:"symbol,omitempty"`
+	Decimals      *int                           `json:"decimals,omitempty"`
+	EventCount    int64                          `json:"event_count"`
 	TypeBreakdown []store.ContractEventTypeCount `json:"type_breakdown,omitempty"`
 }
 
