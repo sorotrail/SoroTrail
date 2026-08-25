@@ -1,6 +1,6 @@
 openapi: "3.1.0"
 info:
-  title: SoroTrail
+  title: SoroTrail API
   description: |
     A contract event indexer for the Stellar/Soroban network. SoroTrail polls
     a Stellar RPC endpoint, stores contract events durably in Postgres, and
@@ -654,6 +654,52 @@ paths:
       responses:
         "200":
           description: Success
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /contracts/{id}:
+    get:
+      operationId: getContract
+      summary: Get a single contract summary
+      description: >-
+        One row of the /contracts listing: event count, ledger range, and
+        last-seen timestamp for a single contract.
+      tags: [Operations]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Stellar contract ID (C-prefixed)
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          description: Contract not found
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /contracts/{id}/stats:
+    get:
+      operationId: contractStats
+      summary: Get per-contract statistics
+      description: >-
+        Per-type event counts and cached SEP-41 token metadata for one
+        contract.
+      tags: [Operations]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Stellar contract ID (C-prefixed)
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Success
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/InternalError"
   /contracts/{id}/export:

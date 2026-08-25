@@ -121,7 +121,6 @@ func TestGuardedStore_CountsQueryErrors(t *testing.T) {
 	}
 }
 
-
 func (m *errorStore) GetContractSummary(context.Context, string) (ContractSummary, error) {
 	return ContractSummary{}, nil
 }

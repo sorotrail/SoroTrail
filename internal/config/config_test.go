@@ -25,6 +25,7 @@ var envKeys = []string{
 	"HTTP_READ_HEADER_TIMEOUT",
 	"SHUTDOWN_TIMEOUT",
 	"INGESTION_LOCK_ENABLED",
+	"MAX_EVENTS_PER_CYCLE",
 	"MULTI_TENANT", "MULTI_TENANT_MAX_WATCHED", "MULTI_TENANT_USAGE_FLUSH",
 	"MULTI_TENANT_STREAM_SCOPE_SYNC", "MULTI_TENANT_BOOTSTRAP_KEY",
 }
@@ -465,6 +466,34 @@ func TestLoad(t *testing.T) {
 				"RPC_RATE_LIMIT_RPS": "0",
 			},
 			wantErr: "RPC_RATE_LIMIT_RPS must be positive",
+		},
+		{
+			name: "MAX_EVENTS_PER_CYCLE defaults to disabled",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint(0), c.MaxEventsPerCycle,
+					"zero is the documented 'cap disabled' default")
+			},
+		},
+		{
+			name: "MAX_EVENTS_PER_CYCLE parsed",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"MAX_EVENTS_PER_CYCLE": "50000",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint(50000), c.MaxEventsPerCycle)
+			},
+		},
+		{
+			name: "negative MAX_EVENTS_PER_CYCLE rejected",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"MAX_EVENTS_PER_CYCLE": "-1",
+			},
+			wantErr: "MaxEventsPerCycle",
 		},
 	}
 

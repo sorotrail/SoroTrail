@@ -1211,3 +1211,312 @@ func TestLagAlarm_ColdStartPublishesFalseWithoutLogging(t *testing.T) {
 	assert.Empty(t, logRecords(t, buf, nil),
 		"a fresh deploy must not warn about a chain head that is merely large")
 }
+
+// --- Per-cycle event cap (MAX_EVENTS_PER_CYCLE / Options.MaxEventsPerCycle) ---
+
+// TestMaxEventsPerCycle_SinglePage covers the singlePage path: the cap
+// clamps the getEvents pagination limit down, a page full at the clamped
+// limit reports not-caught-up so the cycle resumes from the cursor, and
+// zero (or a cap above PageLimit) leaves behavior unchanged.
+func TestMaxEventsPerCycle_SinglePage(t *testing.T) {
+	tests := []struct {
+		name         string
+		cap          uint
+		pageLimit    uint
+		pageEvents   int
+		wantReqLimit uint
+		wantCaughtUp bool
+		wantStored   int
+	}{
+		{
+			name: "cap below PageLimit clamps the request",
+			cap:  2, pageLimit: 100, pageEvents: 2,
+			wantReqLimit: 2, wantCaughtUp: false, wantStored: 2,
+		},
+		{
+			name: "cap above PageLimit leaves limit unchanged",
+			cap:  500, pageLimit: 100, pageEvents: 3,
+			wantReqLimit: 100, wantCaughtUp: true, wantStored: 3,
+		},
+		{
+			name: "zero disables the cap",
+			cap:  0, pageLimit: 100, pageEvents: 3,
+			wantReqLimit: 100, wantCaughtUp: true, wantStored: 3,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events := make([]rpc.Event, tt.pageEvents)
+			for i := range events {
+				events[i] = rpcEvent(fmt.Sprintf("e%d", i), 100)
+			}
+			client := &mockRPC{eventsResps: []rpc.GetEventsResponse{
+				{Events: events, LatestLedger: 500},
+			}}
+			st := newMockStore()
+			ing := newTestIngester(client, st, Options{
+				StartLedger:       100,
+				PageLimit:         tt.pageLimit,
+				MaxEventsPerCycle: tt.cap,
+			})
+
+			caughtUp, err := ing.runOnce(context.Background())
+			require.NoError(t, err)
+			require.Len(t, client.eventsRequests, 1)
+			require.NotNil(t, client.eventsRequests[0].Pagination)
+			assert.Equal(t, tt.wantReqLimit, client.eventsRequests[0].Pagination.Limit,
+				"the pagination limit must reflect the per-cycle cap")
+			assert.Equal(t, tt.wantCaughtUp, caughtUp)
+			assert.Len(t, st.events, tt.wantStored)
+
+			state, _ := st.GetIngestionState(context.Background())
+			if !tt.wantCaughtUp {
+				assert.NotEmpty(t, state.LastCursor,
+					"a cap-truncated cycle must persist its cursor so the next cycle resumes")
+			}
+		})
+	}
+}
+
+// TestMaxEventsPerCycle_WindowSweep covers the multi-batch sweep path with
+// SweepConcurrency=1 (batches run sequentially in submission order, so the
+// budget consumption is deterministic).
+func TestMaxEventsPerCycle_WindowSweep(t *testing.T) {
+	newWatched := func() []store.WatchedContract {
+		watched := make([]store.WatchedContract, 0, 27)
+		for i := 0; i < 27; i++ {
+			watched = append(watched, store.WatchedContract{ContractID: fmt.Sprintf("C%055d", i)})
+		}
+		return watched
+	}
+
+	tests := []struct {
+		name             string
+		cap              uint
+		resps            []rpc.GetEventsResponse
+		wantRequests     int
+		wantCaughtUp     bool
+		wantLastIngested int64 // expected state.LastIngestedLedger after the cycle
+		wantStateSet     bool  // whether ingestion_state was written at all
+		wantStored       []string
+	}{
+		{
+			name: "budget exhausts mid-window defers the frontier",
+			cap:  1,
+			resps: []rpc.GetEventsResponse{
+				{Events: []rpc.Event{rpcEvent("e1", 150)}, LatestLedger: 5_000},
+			},
+			wantRequests:     1,
+			wantCaughtUp:     false,
+			wantLastIngested: 0,
+			wantStateSet:     false,
+			wantStored:       []string{"e1"},
+		},
+		{
+			name: "budget spanning the whole window completes normally",
+			cap:  10,
+			resps: []rpc.GetEventsResponse{
+				{Events: []rpc.Event{rpcEvent("e1", 150)}, LatestLedger: 5_000},
+				{Events: []rpc.Event{rpcEvent("e2", 180)}, LatestLedger: 5_000},
+			},
+			wantRequests:     2,
+			wantCaughtUp:     false,
+			wantLastIngested: 1_099,
+			wantStateSet:     true,
+			wantStored:       []string{"e1", "e2"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newMockStore()
+			st.watched = newWatched()
+			client := &mockRPC{
+				health:      rpc.Health{Status: "healthy", LatestLedger: 5_000, OldestLedger: 10},
+				eventsResps: tt.resps,
+			}
+			ing := newTestIngester(client, st, Options{
+				StartLedger:       100,
+				SweepWindow:       1_000,
+				PageLimit:         100,
+				MaxEventsPerCycle: tt.cap,
+			})
+
+			caughtUp, err := ing.runOnce(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantCaughtUp, caughtUp)
+			assert.Len(t, client.eventsRequests, tt.wantRequests)
+			if tt.wantRequests > 0 {
+				assert.Equal(t, uint32(100), client.eventsRequests[0].StartLedger)
+			}
+
+			var got []string
+			for id := range st.events {
+				got = append(got, id)
+			}
+			assert.ElementsMatch(t, tt.wantStored, got)
+
+			state, _ := st.GetIngestionState(context.Background())
+			if !tt.wantStateSet {
+				assert.Zero(t, state.LastIngestedLedger,
+					"an incomplete window must NOT advance the ingest frontier")
+				assert.Empty(t, state.LastCursor)
+			} else {
+				assert.Equal(t, tt.wantLastIngested, state.LastIngestedLedger)
+			}
+		})
+	}
+}
+
+// TestMaxEventsPerCycle_WindowSweepResumesNextCycle proves the deferred
+// window is re-scanned: the next runOnce re-requests [start,end] from the
+// same position and, once the budget suffices, advances the frontier.
+func TestMaxEventsPerCycle_WindowSweepResumesNextCycle(t *testing.T) {
+	st := newMockStore()
+	for i := 0; i < 27; i++ {
+		st.watched = append(st.watched,
+			store.WatchedContract{ContractID: fmt.Sprintf("C%055d", i)})
+	}
+	client := &mockRPC{
+		health: rpc.Health{Status: "healthy", LatestLedger: 5_000, OldestLedger: 10},
+		eventsResps: []rpc.GetEventsResponse{
+			// Cycle 1: batch 1's page is full at the clamped limit of 2,
+			// exhausting the cap; batch 2 never issues a request.
+			{Events: []rpc.Event{rpcEvent("e1", 150), rpcEvent("e1b", 151)}, LatestLedger: 5_000},
+			// Cycle 2: fresh budget. Batch 1 gets a short page (1 < 2),
+			// leaving budget 1; batch 2 gets an empty page (0 < 1) and
+			// finishes, so the window completes and the frontier moves.
+			{Events: []rpc.Event{rpcEvent("e3", 160)}, LatestLedger: 5_000},
+			{Events: nil, LatestLedger: 5_000},
+		},
+	}
+	ing := newTestIngester(client, st, Options{
+		StartLedger:       100,
+		SweepWindow:       1_000,
+		PageLimit:         100,
+		MaxEventsPerCycle: 2,
+	})
+
+	caughtUp, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.False(t, caughtUp, "cycle 1 hits the cap mid-window")
+	require.Len(t, client.eventsRequests, 1)
+
+	state, _ := st.GetIngestionState(context.Background())
+	assert.Zero(t, state.LastIngestedLedger, "frontier must not advance past unfetched data")
+
+	caughtUp, err = ing.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.False(t, caughtUp, "window ends before the chain head")
+	require.Len(t, client.eventsRequests, 3, "cycle 2 re-scans the whole window")
+
+	assert.Equal(t, uint32(100), client.eventsRequests[1].StartLedger,
+		"the retry starts from the same unadvanced frontier")
+	for _, e := range []string{"e1", "e1b", "e3"} {
+		assert.Contains(t, st.events, e)
+	}
+
+	state, _ = st.GetIngestionState(context.Background())
+	assert.Equal(t, int64(1_099), state.LastIngestedLedger,
+		"the completed window advances the frontier")
+}
+
+// --- Startup/shutdown logging with effective config ---
+
+// TestIngester_LogAttrsEffectiveConfig verifies the startup log fields
+// reflect post-default values: an operator must see what the ingester
+// will actually run with, not the raw (possibly zero) Options literal.
+func TestIngester_LogAttrsEffectiveConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		opts Options
+		want map[string]any // fields whose value is asserted
+	}{
+		{
+			name: "zero Options get the documented defaults",
+			opts: Options{},
+			want: map[string]any{
+				"poll_interval":     5 * time.Second,
+				"page_limit":        uint(1000),
+				"retention_ledgers": uint32(17280),
+				"sweep_window":      uint32(1000),
+				"sweep_concurrency": 1,
+				"max_backoff":       time.Minute,
+				// Not defaulted here by design (0 = the documented
+				// "disabled" sentinel); the env config layer supplies 64.
+				"reorg_confirmation_window": uint32(0),
+			},
+		},
+		{
+			name: "explicit overrides win over defaults",
+			opts: Options{
+				PollInterval:      2 * time.Second,
+				PageLimit:         250,
+				RetentionLedgers:  100,
+				SweepWindow:       50,
+				SweepConcurrency:  4,
+				MaxBackoff:        10 * time.Second,
+				MaxEventsPerCycle: 5000,
+				StartLedger:       42,
+				LagWarnLedgers:    7,
+			},
+			want: map[string]any{
+				"poll_interval":             2 * time.Second,
+				"page_limit":                uint(250),
+				"retention_ledgers":         uint32(100),
+				"sweep_window":              uint32(50),
+				"sweep_concurrency":         4,
+				"max_backoff":               10 * time.Second,
+				"max_events_per_cycle":      uint(5000),
+				"start_ledger":              uint32(42),
+				"lag_warn_ledgers":          uint32(7),
+				"reorg_confirmation_window": uint32(0),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.opts.applyDefaults()
+			got := tt.opts.logAttrs()
+
+			attrs := map[string]any{}
+			for i := 0; i+1 < len(got); i += 2 {
+				attrs[got[i].(string)] = got[i+1]
+			}
+			for k, want := range tt.want {
+				assert.Equal(t, want, attrs[k], "field %q", k)
+			}
+		})
+	}
+}
+
+// TestRun_EmitsStartedAndStoppedLogs proves both lifecycle lines fire
+// through the real Run loop: "ingester started" once on entry with the
+// config fields attached, "ingester stopped" once with the exit reason.
+func TestRun_EmitsStartedAndStoppedLogs(t *testing.T) {
+	log, buf := recordingLogger()
+	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{LatestLedger: 100}}}
+	ing := New(client, newMockStore(), passthroughDecoder{}, log,
+		Options{StartLedger: 50, PageLimit: 10})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := ing.Run(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+
+	started, stopped := 0, 0
+	for _, rec := range logRecords(t, buf, nil) {
+		switch rec["msg"] {
+		case "ingester started":
+			started++
+			assert.Equal(t, float64(10), rec["page_limit"],
+				"the started line carries effective config")
+			assert.Equal(t, float64(50), rec["start_ledger"])
+		case "ingester stopped":
+			stopped++
+			assert.Contains(t, rec["reason"], "context canceled",
+				"the stopped line names why the loop exited")
+		}
+	}
+	assert.Equal(t, 1, started, "exactly one started line")
+	assert.Equal(t, 1, stopped, "exactly one stopped line")
+}

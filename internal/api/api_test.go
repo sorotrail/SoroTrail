@@ -86,9 +86,9 @@ type stubStore struct {
 	addressCount     int64
 	addressCountErr  error
 
-	deadLettersResult  []store.DeadLetter
-	deadLettersCursor  string
-	deadLettersErr     error
+	deadLettersResult []store.DeadLetter
+	deadLettersCursor string
+	deadLettersErr    error
 
 	contractCursors map[string]store.ContractCursor
 }
@@ -163,7 +163,14 @@ func (s *stubStore) DeleteEventsBeforeLedger(context.Context, int64) (int64, err
 	return 0, nil
 }
 
-func (s *stubStore) GetEvent(context.Context, string, store.Scope) (store.Event, error) {
+func (s *stubStore) GetEvent(_ context.Context, id string, _ store.Scope) (store.Event, error) {
+	if s.eventByID != nil {
+		e, ok := s.eventByID[id]
+		if !ok {
+			return store.Event{}, store.ErrNotFound
+		}
+		return e, nil
+	}
 	return s.event, s.eventErr
 }
 
@@ -236,6 +243,14 @@ func (s *stubStore) ListContracts(ctx context.Context, f store.ContractsFilter) 
 
 func (s *stubStore) CountContracts(ctx context.Context, f store.ContractsFilter) (int64, error) {
 	return s.countContractsResult, s.countContractsErr
+}
+
+func (s *stubStore) GetContractSummary(context.Context, string) (store.ContractSummary, error) {
+	return store.ContractSummary{}, store.ErrNotFound
+}
+
+func (s *stubStore) ContractEventTypeCounts(context.Context, string) ([]store.ContractEventTypeCount, error) {
+	return nil, nil
 }
 
 // Subscription stubs for the webhook feature.
@@ -376,6 +391,10 @@ func doGetWithHeader(t *testing.T, s *Server, path, key, value string) (*http.Re
 }
 
 const testContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+
+// testAddress is a well-formed 56-character account strkey (G...) for
+// endpoints that validate address shape.
+const testAddress = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 func TestListEvents_ParsesFilters(t *testing.T) {
 	st := &stubStore{}
@@ -1535,10 +1554,10 @@ func TestEnvelope(t *testing.T) {
 
 	t.Run("address events returns envelope with data and next_cursor", func(t *testing.T) {
 		st := &stubStore{
-			addressEvents:    []store.Event{{ID: "e1"}},
-			addressCursor:    "addr-cursor",
+			addressEvents: []store.Event{{ID: "e1"}},
+			addressCursor: "addr-cursor",
 		}
-		resp, body := doGet(t, newTestServer(st, nil), "/addresses/GABC/events?envelope=true")
+		resp, body := doGet(t, newTestServer(st, nil), "/addresses/"+testAddress+"/events?envelope=true")
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 
 		var out envelopeResponse
@@ -1552,7 +1571,7 @@ func TestEnvelope(t *testing.T) {
 			addressEvents: []store.Event{{ID: "e1"}},
 			addressCursor: "addr-cursor",
 		}
-		resp, body := doGet(t, newTestServer(st, nil), "/addresses/GABC/events")
+		resp, body := doGet(t, newTestServer(st, nil), "/addresses/"+testAddress+"/events")
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 
 		var out addressEventsResponse

@@ -103,8 +103,6 @@ flags:
 	return nil
 }
 
-
-
 func printReplaySummary(s replay.Summary, dryRun bool) {
 	mode := ""
 	if dryRun {
