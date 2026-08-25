@@ -5,6 +5,7 @@ services:
       POSTGRES_USER: sorotrail
       POSTGRES_PASSWORD: sorotrail
       POSTGRES_DB: sorotrail
+    # Keep in sync with the DATABASE_URL default in the Makefile.
     ports:
       - "5432:5432"
     volumes:

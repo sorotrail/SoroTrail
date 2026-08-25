@@ -1,5 +1,9 @@
 BINARY := bin/sorotrail
 MIGRATIONS := internal/store/migrations
+
+# Keep in sync with docker-compose.yml (services.postgres.ports and
+# services.postgres.environment). CI intentionally maps to host port
+# 5433 to avoid clashing with runner services, so CI overrides this.
 DATABASE_URL ?= postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "unknown")
