@@ -13,7 +13,7 @@ const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
 var envKeys = []string{
 	"RPC_URL", "RPC_URLS", "RPC_RATE_LIMIT_RPS", "RPC_RATE_LIMIT", "DATABASE_URL",
-	"POLL_INTERVAL", "HTTP_ADDR",
+	"POLL_INTERVAL", "POLL_INTERVAL_MIN", "POLL_INTERVAL_MAX", "HTTP_ADDR",
 	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL", "LOG_FORMAT",
 	"API_QUERY_TIMEOUT", "API_SLOW_QUERY_THRESHOLD",
 	"HORIZON_URL", "BACKFILL_RATE_RPS",
@@ -762,6 +762,43 @@ func TestLoad(t *testing.T) {
 				"SWEEP_CONCURRENCY": "-1",
 			},
 			wantErr: "SWEEP_CONCURRENCY",
+		},
+		{
+			name: "POLL_INTERVAL_MIN negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "-1s",
+			},
+			wantErr: "POLL_INTERVAL_MIN",
+		},
+		{
+			name: "POLL_INTERVAL_MAX negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MAX": "-1s",
+			},
+			wantErr: "POLL_INTERVAL_MAX",
+		},
+		{
+			name: "POLL_INTERVAL_MIN greater than POLL_INTERVAL_MAX rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "30s",
+				"POLL_INTERVAL_MAX": "5s",
+			},
+			wantErr: "POLL_INTERVAL_MIN",
+		},
+		{
+			name: "POLL_INTERVAL_MIN and POLL_INTERVAL_MAX accepted when ordered",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "1s",
+				"POLL_INTERVAL_MAX": "30s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, time.Second, c.PollIntervalMin)
+				assert.Equal(t, 30*time.Second, c.PollIntervalMax)
+			},
 		},
 		{
 			name: "REORG_CONFIRMATION_WINDOW with zero REORG_RESCAN_INTERVAL rejected",

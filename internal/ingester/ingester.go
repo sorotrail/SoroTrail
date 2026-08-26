@@ -66,8 +66,23 @@ type Options struct {
 	// RPC endpoint. Defaults to RealJitter; simulations inject a seeded
 	// generator for determinism.
 	Jitter JitterFunc
-	// PollInterval is how long to sleep once caught up. Default 5s.
+	// PollInterval is how long to sleep once caught up. Default 5s. It is
+	// also the starting point for the adaptive interval (see
+	// PollIntervalMin/PollIntervalMax) and the value the effective
+	// interval collapses to when those bounds are left unset.
 	PollInterval time.Duration
+	// PollIntervalMin and PollIntervalMax bound the adaptive poll interval
+	// (issue #146): once caught up, EffectivePollInterval() shrinks toward
+	// PollIntervalMin on a cycle that just observed backlog (runOnce
+	// returned caughtUp == false) and grows toward PollIntervalMax on an
+	// idle cycle (caughtUp == true), so a bursty chain gets polled sooner
+	// and a quiet one wastes fewer requests. Both default to PollInterval
+	// when <= 0, which collapses Min == Max == PollInterval — the
+	// adaptive logic then always clamps straight back to the fixed
+	// value, so a caller that only sets PollInterval keeps byte-for-byte
+	// the pre-#146 fixed-interval behavior.
+	PollIntervalMin time.Duration
+	PollIntervalMax time.Duration
 	// StartLedger, when non-zero, overrides the cold-start position.
 	StartLedger uint32
 	// RetentionLedgers is how far behind the latest ledger a cold start
@@ -156,6 +171,27 @@ func (o *Options) applyDefaults() {
 	if o.PollInterval <= 0 {
 		o.PollInterval = 5 * time.Second
 	}
+	// PollIntervalMin/Max default to PollInterval when unset, which
+	// collapses the adaptive range to a single fixed point — see the
+	// PollIntervalMin/PollIntervalMax doc comment for why that keeps
+	// existing callers' behavior unchanged. A misconfigured Min > Max
+	// (only reachable by hand-built Options; config.Validate rejects it
+	// at the env layer) is clamped rather than left inconsistent.
+	if o.PollIntervalMin <= 0 {
+		o.PollIntervalMin = o.PollInterval
+	}
+	if o.PollIntervalMax <= 0 {
+		o.PollIntervalMax = o.PollInterval
+	}
+	if o.PollIntervalMin > o.PollIntervalMax {
+		o.PollIntervalMax = o.PollIntervalMin
+	}
+	if o.PollInterval < o.PollIntervalMin {
+		o.PollInterval = o.PollIntervalMin
+	}
+	if o.PollInterval > o.PollIntervalMax {
+		o.PollInterval = o.PollIntervalMax
+	}
 	if o.RetentionLedgers == 0 {
 		o.RetentionLedgers = 17280
 	}
@@ -219,7 +255,14 @@ type Ingester struct {
 	// mutex/atomic or document that the new caller is also single-
 	// threaded relative to Run().
 	lagging bool
-	bcast   *broadcast.Broadcaster
+	// pollInterval is the current effective adaptive poll interval, in
+	// nanoseconds (time.Duration's underlying unit). It is initialized in
+	// New to the post-defaults Options.PollInterval and thereafter
+	// mutated only by adjustPollInterval from the Run goroutine; the
+	// atomic makes it safe for EffectivePollInterval to be read
+	// concurrently from the /stats HTTP handler goroutine.
+	pollInterval atomic.Int64
+	bcast        *broadcast.Broadcaster
 	// notifier fans ingested events out to subscribers; optional, nil
 	// means no notification.
 	notifier EventNotifier
@@ -232,7 +275,7 @@ type Ingester struct {
 // New wires an Ingester.
 func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, opts Options) *Ingester {
 	opts.applyDefaults()
-	return &Ingester{
+	ing := &Ingester{
 		client:  client,
 		store:   st,
 		decoder: dec,
@@ -240,6 +283,8 @@ func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger
 		opts:    opts,
 		tracer:  noop.NewTracerProvider().Tracer("github.com/sorotrail/sorotrail/internal/ingester"),
 	}
+	ing.pollInterval.Store(int64(opts.PollInterval))
+	return ing
 }
 
 // WithTracer attaches an OpenTelemetry tracer. Each runOnce cycle emits
@@ -286,6 +331,8 @@ type DeadLetterSink interface {
 func (o *Options) logAttrs() []any {
 	return []any{
 		"poll_interval", o.PollInterval,
+		"poll_interval_min", o.PollIntervalMin,
+		"poll_interval_max", o.PollIntervalMax,
 		"page_limit", o.PageLimit,
 		"max_events_per_cycle", o.MaxEventsPerCycle,
 		"start_ledger", o.StartLedger,
@@ -358,8 +405,12 @@ func (ing *Ingester) Run(ctx context.Context) (err error) {
 			// later.
 			ing.checkLag(ctx)
 			backoff = time.Second
+			// Adapt the poll interval before sleeping so the sleep below
+			// (and the value a concurrent /stats request observes) reflects
+			// this cycle's backlog/idle signal, not the previous one.
+			ing.adjustPollInterval(caughtUp)
 			if caughtUp {
-				if !ing.opts.Clock.SleepCtx(ctx, ing.opts.PollInterval) {
+				if !ing.opts.Clock.SleepCtx(ctx, ing.EffectivePollInterval()) {
 					return ctx.Err()
 				}
 			}
@@ -1122,6 +1173,71 @@ func (ing *Ingester) setIngestionLag(chainHead, lastIngested int64) {
 		return
 	}
 	metrics.IngestionLag.Set(float64(chainHead - lastIngested))
+}
+
+// pollSpeedupFactor and pollSlowdownFactor control how aggressively
+// adjustPollInterval reacts to a single cycle's backlog/idle signal.
+// Halving on backlog gets the ingester back to a low-latency cadence
+// within a couple of cycles; growing by 25% on an idle cycle is gentle
+// so a brief lull doesn't immediately push the interval out to
+// PollIntervalMax. Both are deliberately simple multiplicative factors
+// rather than a PID-style controller: deterministic, easy to reason
+// about, and easy to unit test bound-by-bound.
+const (
+	pollSpeedupFactor  = 0.5
+	pollSlowdownFactor = 1.25
+)
+
+// EffectivePollInterval returns the ingester's current adaptive poll
+// interval (issue #146). It is safe to call concurrently with Run — the
+// value is stored in an atomic and the /stats HTTP handler reads it via
+// this method while the Run goroutine mutates it every cycle.
+//
+// With PollIntervalMin == PollIntervalMax (the default when only
+// PollInterval is configured; see Options.PollIntervalMin/Max) this
+// always returns that fixed value, matching pre-#146 behavior exactly.
+func (ing *Ingester) EffectivePollInterval() time.Duration {
+	return time.Duration(ing.pollInterval.Load())
+}
+
+// adjustPollInterval adapts the effective poll interval based on whether
+// the runOnce cycle that just completed left the ingester caught up with
+// the chain head. caughtUp == false means there is backlog: more data
+// was available than one cycle could fetch (a full page, or a window
+// sweep that didn't reach the chain head), so the interval shrinks
+// toward PollIntervalMin for a faster follow-up. caughtUp == true means
+// the cycle drained everything currently available, so the interval
+// grows toward PollIntervalMax so an idle chain isn't polled needlessly
+// often. Run calls this once per successful cycle, before sleeping, so
+// the sleep duration and any concurrent /stats read reflect the latest
+// signal.
+//
+// Bounds are enforced on every call regardless of how many cycles run:
+// clampDuration always clips the computed value back into
+// [PollIntervalMin, PollIntervalMax], so the interval can never escape
+// its configured range no matter how long the process has been running.
+func (ing *Ingester) adjustPollInterval(caughtUp bool) {
+	current := time.Duration(ing.pollInterval.Load())
+	var next time.Duration
+	if caughtUp {
+		next = time.Duration(float64(current) * pollSlowdownFactor)
+	} else {
+		next = time.Duration(float64(current) * pollSpeedupFactor)
+	}
+	next = clampDuration(next, ing.opts.PollIntervalMin, ing.opts.PollIntervalMax)
+	ing.pollInterval.Store(int64(next))
+}
+
+// clampDuration clips d into [min, max]. min is assumed <= max — callers
+// (Options.applyDefaults) guarantee that invariant before it's used here.
+func clampDuration(d, min, max time.Duration) time.Duration {
+	if d < min {
+		return min
+	}
+	if d > max {
+		return max
+	}
+	return d
 }
 
 // sleepCtx sleeps for d or until ctx is done; it reports whether the full

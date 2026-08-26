@@ -247,6 +247,8 @@ func run() error {
 
 	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:            cfg.PollInterval,
+		PollIntervalMin:         cfg.PollIntervalMin,
+		PollIntervalMax:         cfg.PollIntervalMax,
 		StartLedger:             cfg.StartLedger,
 		RetentionLedgers:        cfg.RetentionLedgers,
 		LagWarnLedgers:          cfg.LagWarnLedgers,
@@ -260,6 +262,10 @@ func run() error {
 	// decode/persist land in the dead_letters table instead of
 	// stalling the cycle (issue #131).
 	ing.SetDeadLetterSink(st)
+	// Exposes the adaptive poll interval via /stats (issue #146). Always
+	// registered — there is exactly one Ingester per process even when
+	// INGESTION_LOCK_ENABLED causes its Run loop to be skipped.
+	api.SetIngester(ing)
 
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a

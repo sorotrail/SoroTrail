@@ -90,6 +90,16 @@ func (c Config) ValidateAll() error {
 		errs = append(errs, fmt.Sprintf("POLL_INTERVAL: %s must be a positive duration (e.g. 5s, 1m)",
 			c.PollInterval))
 	}
+	if c.PollIntervalMin < 0 {
+		errs = append(errs, fmt.Sprintf("POLL_INTERVAL_MIN: %s must be non-negative", c.PollIntervalMin))
+	}
+	if c.PollIntervalMax < 0 {
+		errs = append(errs, fmt.Sprintf("POLL_INTERVAL_MAX: %s must be non-negative", c.PollIntervalMax))
+	}
+	if c.PollIntervalMin > 0 && c.PollIntervalMax > 0 && c.PollIntervalMin > c.PollIntervalMax {
+		errs = append(errs, fmt.Sprintf("POLL_INTERVAL_MIN (%s) must be <= POLL_INTERVAL_MAX (%s)",
+			c.PollIntervalMin, c.PollIntervalMax))
+	}
 	if c.AuditPollInterval <= 0 {
 		errs = append(errs, fmt.Sprintf("AUDIT_POLL_INTERVAL: %s must be a positive duration (e.g. 30s)",
 			c.AuditPollInterval))

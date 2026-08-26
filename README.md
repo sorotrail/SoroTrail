@@ -148,7 +148,9 @@ All configuration comes from environment variables (see `.env.example`):
 | `HORIZON_URL` | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. |
 | `BACKFILL_RATE_RPS` | `10` | Pace against Horizon when backfilling. 10 req/s is the public-instance cap; private deployments can lift this. |
 | `DATABASE_URL` | — (required) | Postgres connection string. |
-| `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. |
+| `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. Also the adaptive-interval starting point; see `POLL_INTERVAL_MIN`/`POLL_INTERVAL_MAX`. |
+| `POLL_INTERVAL_MIN` | unset | Lower bound for the adaptive poll interval. Both this and `POLL_INTERVAL_MAX` unset (the default) disables adaptation entirely — the ingester always polls at exactly `POLL_INTERVAL`. See [Ingestion behavior additions](#ingestion-behavior-additions). |
+| `POLL_INTERVAL_MAX` | unset | Upper bound for the adaptive poll interval. See `POLL_INTERVAL_MIN`. |
 | `HTTP_ADDR` | `:8080` | API listen address. |
 | `WATCHED_CONTRACTS` | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract automatically triggers a backfill from `latest − RETENTION_LEDGERS` (clamped to RPC retention), independent of other contracts. |
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
@@ -773,6 +775,19 @@ memory usage stays bounded regardless of the ledger span.
 
 ### Ingestion behavior additions
 
+- **Adaptive polling** (`POLL_INTERVAL_MIN`/`POLL_INTERVAL_MAX`, both
+  unset by default): once caught up, a cycle that just observed backlog
+  (more data was available than one cycle fetched — a full page, or a
+  window sweep that didn't reach the chain head) halves the effective
+  poll interval toward `POLL_INTERVAL_MIN` so a burst gets followed up
+  on quickly; an idle cycle (fully caught up, nothing left to fetch)
+  grows it by 25% toward `POLL_INTERVAL_MAX` so a quiet chain isn't
+  polled needlessly often. The effective interval is always clamped into
+  `[POLL_INTERVAL_MIN, POLL_INTERVAL_MAX]` and is reported live at
+  `/stats` as `ingester.effective_poll_interval_ms`. Leaving both unset
+  collapses the range to a single point at `POLL_INTERVAL` — adaptation
+  becomes a no-op and the ingester behaves exactly as it did before this
+  existed.
 - **Parallel sweeps** (`SWEEP_CONCURRENCY`, default `1`): deployments
   watching more than the per-request 25 contracts split the filter set
   into multiple request chains paged through each `SweepWindow` ledger
@@ -1295,6 +1310,11 @@ the stored fields populated and the RPC-derived freshness fields
 events have been proven to match a fresh RPC fetch by the auditor. When
 AUDIT_ENABLED=false it stays at 0. See the Data integrity section
 below for the contract the field implies.
+
+`ingester.effective_poll_interval_ms` is the ingester's current adaptive
+poll interval (see [Adaptive polling](#ingestion-behavior-additions)),
+in milliseconds. With `POLL_INTERVAL_MIN`/`POLL_INTERVAL_MAX` unset it
+always equals `POLL_INTERVAL`.
 
 ### `GET /metrics`
 

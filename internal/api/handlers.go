@@ -1632,6 +1632,12 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	}
 
+	if ing := getIngester(); ing != nil {
+		stats.Ingester = store.IngesterStats{
+			EffectivePollIntervalMs: ing.EffectivePollInterval().Milliseconds(),
+		}
+	}
+
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 
 	writeJSON(w, http.StatusOK, stats)

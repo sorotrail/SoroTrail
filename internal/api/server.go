@@ -17,6 +17,7 @@ import (
 
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
+	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/pruner"
 	"github.com/sorotrail/sorotrail/internal/rpc"
@@ -94,6 +95,32 @@ func getRPCCounter() *rpc.CountingClient {
 	rpcCounterMu.RLock()
 	defer rpcCounterMu.RUnlock()
 	return rpcCounter
+}
+
+// SetIngester registers the binary's Ingester so /stats can surface its
+// adaptive poll interval (issue #146). There is exactly one Ingester per
+// process, always constructed (even when INGESTION_LOCK_ENABLED causes
+// Run to be skipped on this instance) — main.go calls this unconditionally
+// right after building it.
+//
+// Like SetPruner this MUST be called BEFORE the API starts serving
+// requests, so the first /stats request observes a stable value rather
+// than a nil ingester.
+var (
+	ingesterMu sync.RWMutex
+	ing        *ingester.Ingester
+)
+
+func SetIngester(i *ingester.Ingester) {
+	ingesterMu.Lock()
+	ing = i
+	ingesterMu.Unlock()
+}
+
+func getIngester() *ingester.Ingester {
+	ingesterMu.RLock()
+	defer ingesterMu.RUnlock()
+	return ing
 }
 
 // Enricher is the spec-based event enrichment interface used by the API.

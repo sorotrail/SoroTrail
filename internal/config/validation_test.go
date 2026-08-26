@@ -77,6 +77,32 @@ func TestValidateAll_Duration(t *testing.T) {
 	checkContains(t, err, "AUDIT_POLL_INTERVAL")
 }
 
+func TestValidateAll_PollIntervalBounds(t *testing.T) {
+	cfg := validBase()
+
+	cfg.PollIntervalMin = -1
+	err := cfg.ValidateAll()
+	checkContains(t, err, "POLL_INTERVAL_MIN")
+
+	cfg.PollIntervalMin = 0
+	cfg.PollIntervalMax = -1
+	err = cfg.ValidateAll()
+	checkContains(t, err, "POLL_INTERVAL_MAX")
+
+	cfg.PollIntervalMin = 30 * time.Second
+	cfg.PollIntervalMax = 5 * time.Second
+	err = cfg.ValidateAll()
+	checkContains(t, err, "POLL_INTERVAL_MIN")
+	checkContains(t, err, "POLL_INTERVAL_MAX")
+
+	cfg.PollIntervalMin = time.Second
+	cfg.PollIntervalMax = 30 * time.Second
+	cfg.LogFormat = "text" // validBase() leaves this empty; unrelated to what this test checks
+	if err := cfg.ValidateAll(); err != nil {
+		t.Fatalf("unexpected error with ordered bounds: %s", err)
+	}
+}
+
 func TestValidateAll_NumericRanges(t *testing.T) {
 	cfg := validBase()
 
