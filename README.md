@@ -818,6 +818,32 @@ This guarantees no panics and no truncated writes on `Ctrl-C` / `kill`,
 and the cursor is always persisted so the next process picks up exactly
 where the previous one stopped.
 
+### Config hot-reload (SIGHUP)
+
+Sending `SIGHUP` to the running indexer process re-reads the environment
+and applies a safe subset live, with no restart:
+
+- **`POLL_INTERVAL`** — takes effect on the ingester's next caught-up
+  sleep.
+- **`LOG_LEVEL`** — takes effect immediately for all subsequent log lines.
+
+The full environment is re-parsed and validated exactly as it is at
+startup (`config.Load`); if the result is invalid (e.g. a malformed
+`POLL_INTERVAL` or a `LOG_LEVEL` outside `debug|info|warn|error`) the
+reload is rejected, an error is logged, and the previously-running
+configuration stays active untouched.
+
+Everything else — `DATABASE_URL`, `RPC_URL`/`RPC_URLS`, `LOG_FORMAT`,
+`HTTP_ADDR`, and the rest of the topology — is topology, not a tunable:
+changing it live would mean reconstructing the store, RPC client, or log
+handler mid-flight, which the indexer only ever does at startup. If a
+`SIGHUP` reload observes one of those differing from the running value,
+it logs a warning naming the field and leaves it untouched rather than
+failing the whole reload — restart the process to pick up a topology
+change. `kill -HUP <pid>` (or `docker kill --signal=HUP <container>`)
+triggers a reload; the one-shot subcommands (`replay`, `backfill`,
+`index-addresses`) have no reload path since they exit on their own.
+
 ### GraphQL API
 
 Read-only GraphQL endpoint at `POST /graphql`, schema-first with
