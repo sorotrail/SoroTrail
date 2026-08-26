@@ -4,7 +4,7 @@
 // With no arguments it runs the indexer. Subcommands cover maintenance:
 //
 //	sorotrail replay --from-ledger N [--to-ledger M]
-//	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
+//	sorotrail backfill --contract C... --from N [--to M]
 package main
 
 import (
