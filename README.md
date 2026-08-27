@@ -155,6 +155,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `WATCHED_CONTRACTS` | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract automatically triggers a backfill from `latest − RETENTION_LEDGERS` (clamped to RPC retention), independent of other contracts. |
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
+| `PARTITION_LEDGER_SPAN` | `120960` | Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
 | `LOG_FORMAT` | `text` | `text` \| `json`. JSON emits one JSON object per line, compatible with Loki, CloudWatch, and ELK. |
 | `API_QUERY_TIMEOUT` | `25s` | Per-request database timeout for API-originated store reads. The timeout is enforced in-process and mirrored to Postgres via `statement_timeout`. |
@@ -168,6 +169,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
 | `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
 | `API_MAX_LIMIT` | `500` | Maximum page size accepted for list endpoints (`/events`, `/subscriptions/{id}/deliveries`). Values above this are rejected with 400. |
+| `STATS_CACHE_TTL` | `5s` | How long `GET /stats` results are served from the per-scope cache before being recomputed, short-circuiting the aggregation on busy endpoints. `0` disables caching. |
 | `API_KEY` | empty | Required to use the runtime `/watched-contracts` surface; empty means every request there is rejected with 503. This is a placeholder until #17 (real auth) lands — at that point `API_KEY` will be replaced. |
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
@@ -797,6 +799,11 @@ memory usage stays bounded regardless of the ledger span.
   total request rate at ~10 req/s regardless, so the parallelism only
   helps when the RPC has headroom past the public ceiling. The
   single-batch path (`<=25` watched contracts) is unchanged.
+  `SWEEP_CONCURRENCY` also bounds database backpressure: each fanned-out
+  goroutine writes its page before fetching its next one, so it never
+  runs more concurrent `UpsertEvents` calls than this limit — a slow
+  store lengthens each goroutine's cycle rather than piling up unbounded
+  concurrent writes.
 - **Reorg detection** (`REORG_CONFIRMATION_WINDOW`, default `64`): after
   every successful ingest cycle the Run loop re-fetches the range
   `[frontier - REORG_CONFIRMATION_WINDOW, frontier - 1]` and replaces

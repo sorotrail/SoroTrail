@@ -101,6 +101,36 @@ type Options struct {
 	// Zero (the default) disables the cap — behavior identical to builds
 	// before this option existed.
 	MaxEventsPerCycle uint
+	// BatchSize caps how many events a single store write (UpsertEvents
+	// call) may carry, splitting a fetched page into smaller chunks. This
+	// keeps high-volume chains from landing one giant batch on the DB at
+	// once: many small writes are kinder to Postgres than one huge one
+	// when events are dense.
+	//
+	// Zero (the default) disables splitting entirely — each page is
+	// persisted in a single write exactly as before this option existed
+	// (bit-for-bit backward compatible).
+	//
+	// When BatchSize > 0 AND BatchTargetLatency > 0 the controller becomes
+	// adaptive: it shrinks the chunk size below BatchSize and inserts
+	// backpressure sleeps whenever write latency exceeds the budget, then
+	// grows back once the store catches up. See BatchTargetLatency.
+	BatchSize uint
+	// BatchTargetLatency is the per-WRITE latency budget at the maximum
+	// batch size (BatchSize). The controller derives a per-event budget
+	// from it and compares against an EWMA of measured per-event write
+	// latency: when writes run over budget it halves the chunk size and
+	// sleeps between writes (backpressure); when they comfortably beat
+	// the budget it grows the chunk size back toward BatchSize.
+	//
+	// Zero disables the adaptive/backpressure machinery (the chunk size
+	// stays fixed at BatchSize). Only meaningful when BatchSize > 0.
+	BatchTargetLatency time.Duration
+	// BatchMaxBackoff caps the backpressure sleep the controller inserts
+	// between writes when the store is running over the latency budget,
+	// so a severely degraded database cannot stretch a single ingestion
+	// cycle for minutes. Default 1s when batching is enabled.
+	BatchMaxBackoff time.Duration
 	// MaxBackoff caps the error backoff. Default 1m.
 	MaxBackoff time.Duration
 	// SweepWindow bounds the ledger range scanned per pass when the watched
@@ -203,6 +233,13 @@ func (o *Options) applyDefaults() {
 	}
 	if o.SweepWindow == 0 {
 		o.SweepWindow = 1000
+	}
+	// BatchMaxBackoff is only meaningful when batching is on; the default
+	// (1s) caps how long a single backpressure sleep can stretch a cycle
+	// when the DB is badly behind. When batching is off the field is
+	// simply never read.
+	if o.BatchMaxBackoff <= 0 {
+		o.BatchMaxBackoff = time.Second
 	}
 	if o.LagMetrics == nil {
 		o.LagMetrics = noopLagMetrics{}
@@ -335,6 +372,9 @@ func (o *Options) logAttrs() []any {
 		"poll_interval_max", o.PollIntervalMax,
 		"page_limit", o.PageLimit,
 		"max_events_per_cycle", o.MaxEventsPerCycle,
+		"batch_size", o.BatchSize,
+		"batch_target_latency", o.BatchTargetLatency,
+		"batch_max_backoff", o.BatchMaxBackoff,
 		"start_ledger", o.StartLedger,
 		"retention_ledgers", o.RetentionLedgers,
 		"sweep_window", o.SweepWindow,
@@ -723,6 +763,14 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	// of which error races out first.
 	var ledgerOutOfRange atomic.Bool
 	g, gctx := errgroup.WithContext(ctx)
+	// SweepConcurrency also doubles as the DB backpressure knob: each
+	// sweepBatch goroutine calls persistEvents (a synchronous UpsertEvents)
+	// before fetching its next page, so this same SetLimit caps how many
+	// UpsertEvents calls can be in flight at once — a goroutine can't start
+	// a new RPC fetch (and so can't queue a new write) until its slot frees
+	// up, which requires its current write to finish. No separate DB
+	// semaphore is needed; a slow store just makes each goroutine's cycle
+	// take longer, which throttles the RPC fetch rate to match.
 	g.SetLimit(ing.opts.SweepConcurrency)
 	for _, filters := range batches {
 		filters := filters
@@ -896,14 +944,11 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		events = append(events, ev)
 	}
 	persistCtx, persistSpan := ing.tracer.Start(ctx, "ingester.persist_events")
-	timer := prometheus.NewTimer(metrics.DBWriteLatency)
-	inserted, err := ing.store.UpsertEvents(persistCtx, events)
-	timer.ObserveDuration()
+	inserted, err := ing.writeEventsPersist(persistCtx, events)
 	persistSpan.End()
 	if err != nil {
 		return err
 	}
-	metrics.EventsIngested.Add(float64(len(events)))
 
 	// Extract addresses from decoded event topics/values and persist the
 	// inverted index. Extraction operates on the decoded JSON (not XDR) and
@@ -930,6 +975,180 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		ing.notifier.NotifyEvents(ctx, events)
 	}
 	return nil
+}
+
+// writeEventsPersist flushes decoded events to the store. With batching
+// disabled (BatchSize == 0) it issues a single UpsertEvents for the whole
+// slice — the exact behavior the ingester has always had. With batching
+// enabled it walks the slice in chunks of up to the current adaptive batch
+// size, and under latency pressure shrinks the chunk size and sleeps
+// between chunks to give the DB room to drain.
+//
+// It returns the number of rows reported inserted (net-new) across all
+// writes; the caller handles the post-persist work (address indexing,
+// broadcast, notify, logging) that runs once regardless of how many writes
+// a page split into.
+func (ing *Ingester) writeEventsPersist(ctx context.Context, events []store.Event) (int64, error) {
+	if len(events) == 0 {
+		return 0, nil
+	}
+
+	// Batching disabled: single write of the whole page, exactly as the
+	// ingester has always done.
+	if ing.opts.BatchSize == 0 {
+		timer := prometheus.NewTimer(metrics.DBWriteLatency)
+		inserted, err := ing.store.UpsertEvents(ctx, events)
+		timer.ObserveDuration()
+		if err != nil {
+			return 0, err
+		}
+		metrics.EventsIngested.Add(float64(len(events)))
+		metrics.EventBatchWrites.Inc()
+		metrics.EventBatchSize.Set(float64(len(events)))
+		return inserted, nil
+	}
+
+	bc := ing.newBatchController()
+	metrics.EventBatchSize.Set(float64(bc.cur))
+	var inserted int64
+	for start := 0; start < len(events); {
+		// Chunk no larger than the controller's current (possibly
+		// shrunken) batch size.
+		n := bc.cur
+		end := start + n
+		if end > len(events) {
+			end = len(events)
+		}
+		chunk := events[start:end]
+		start = end
+
+		begin := ing.opts.Clock.Now()
+		timer := prometheus.NewTimer(metrics.DBWriteLatency)
+		got, err := ing.store.UpsertEvents(ctx, chunk)
+		timer.ObserveDuration()
+		latency := ing.opts.Clock.Now().Sub(begin)
+		if err != nil {
+			// A failed write aborts the page: the offending batch was not
+			// committed, and the caller surfaces the error so runOnce
+			// retries the whole page idempotently. Events already written
+			// by earlier chunks are safe (idempotent upserts cover them).
+			return inserted, err
+		}
+		inserted += got
+		metrics.EventsIngested.Add(float64(len(chunk)))
+		metrics.EventBatchWrites.Inc()
+
+		// Backpressure: if this write ran over the latency budget, sleep
+		// (and shrink the next chunk) before issuing the next write, so a
+		// slow store gets a moment to drain instead of being hammered.
+		backoff := bc.recordAndBackoff(len(chunk), latency)
+		if backoff > 0 && start < len(events) {
+			if !ing.opts.Clock.SleepCtx(ctx, backoff) {
+				return inserted, ctx.Err()
+			}
+			metrics.EventBackpressure.Inc()
+			metrics.EventBackpressureSeconds.Add(backoff.Seconds())
+		}
+	}
+	return inserted, nil
+}
+
+// newBatchController builds a fresh batch controller from Options. It is
+// created per persist call (never shared between goroutines) so concurrent
+// windowSweep batches under SweepConcurrency > 1 each adapt independently
+// of one another and no mutable state is written from two goroutines at
+// once (the -race suite depends on that). Adaptation therefore carries
+// across writes WITHIN a page — exactly the burst horizon the DB pressure
+// problem lives on — not across pages.
+func (ing *Ingester) newBatchController() *batchController {
+	bc := &batchController{
+		max:   int(ing.opts.BatchSize),
+		cur:   int(ing.opts.BatchSize),
+		maxBk: ing.opts.BatchMaxBackoff,
+	}
+	if ing.opts.BatchTargetLatency > 0 {
+		bc.adaptive = true
+		bc.targetPerEvent = ing.opts.BatchTargetLatency / time.Duration(ing.opts.BatchSize)
+		if bc.targetPerEvent <= 0 {
+			// Guard against a budget so small it rounds to zero: fall back
+			// to a microsecond so a legitimate (tiny) budget never collapses
+			// the controller into permanent immediate-backoff.
+			bc.targetPerEvent = time.Microsecond
+		}
+		bc.ewma = bc.targetPerEvent
+	}
+	return bc
+}
+
+// batchController sizes the UpsertEvents chunks written for one fetched
+// page and applies backpressure. Its state lives only for the duration of
+// a single writeEventsPersist call, so it is not safe for cross-goroutine
+// use by design — see newBatchController.
+//
+// Two knobs do different jobs:
+//   - recordAndBackoff shrinks bc.cur below the configured max when the
+//     EWMA of measured per-event write latency exceeds the derived budget,
+//     so subsequent writes carry fewer rows.
+//   - It returns a sleep duration so the caller can pause between writes
+//     (backpressure), giving a slow store time to drain before the next
+//     (already smaller) chunk.
+//
+// The controller grows bc.cur back toward max once writes are comfortably
+// inside budget, so a store that recovers first reclaims its throughput.
+type batchController struct {
+	// max is the configured maximum chunk size; cur is the current
+	// adaptive one (starts at max).
+	max   int
+	cur   int
+	maxBk time.Duration
+	// adaptive is true only when BatchTargetLatency > 0; when false the
+	// controller still chunks at a fixed BatchSize but never shrinks or
+	// sleeps.
+	adaptive       bool
+	targetPerEvent time.Duration
+	ewma           time.Duration
+}
+
+// recordAndBackoff feeds one write's measured latency into the controller
+// and returns how long to sleep before the next write (0 = none). With
+// adaptation disabled it returns 0 always and the chunk size stays fixed at
+// the configured maximum.
+func (bc *batchController) recordAndBackoff(rows int, latency time.Duration) time.Duration {
+	if !bc.adaptive || rows <= 0 || bc.cur <= 0 {
+		return 0
+	}
+
+	perEvent := latency / time.Duration(rows)
+	if bc.ewma <= 0 {
+		bc.ewma = perEvent
+	} else {
+		// A fast EWMA (alpha 0.5) so the controller reacts to a burst
+		// within a handful of writes instead of smoothing it away.
+		bc.ewma = time.Duration(float64(perEvent)*0.5 + float64(bc.ewma)*0.5)
+	}
+
+	overBudget := bc.ewma > bc.targetPerEvent
+	comfortablyUnder := bc.ewma < bc.targetPerEvent/2
+
+	switch {
+	case overBudget && bc.cur > 1:
+		bc.cur /= 2
+		metrics.EventBatchSize.Set(float64(bc.cur))
+		return bc.maxBk
+	case comfortablyUnder && bc.cur < bc.max:
+		bc.cur *= 2
+		if bc.cur > bc.max {
+			bc.cur = bc.max
+		}
+		metrics.EventBatchSize.Set(float64(bc.cur))
+		return 0
+	case overBudget:
+		// Already at the minimum chunk size: cannot shrink further, but
+		// still back off before the next write.
+		return bc.maxBk
+	default:
+		return 0
+	}
 }
 
 func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, cursor string, err error) {

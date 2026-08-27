@@ -142,6 +142,10 @@ The `events` table is **partitioned by ledger range** (default span:
 `ensure_event_partitions()` PL/pgSQL function, called before every batch
 insert.
 
+The indexes on `events` are chosen and documented for the query shapes the
+read endpoints issue — see [Indexing](indexes.md) for the index strategy and
+rationale.
+
 **Extension interface:** `store.Store` — implement the full interface to
 swap in an alternative storage backend.
 

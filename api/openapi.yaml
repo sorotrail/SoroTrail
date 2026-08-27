@@ -33,12 +33,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+                checks:
+                  database: ok
+                  rpc: ok
         "503":
           description: One or more dependencies degraded
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: degraded
+                checks:
+                  database: ok
+                  rpc: unavailable
   /events:
     get:
       operationId: listEvents
@@ -81,6 +91,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/EventsResponse"
+              example:
+                events:
+                  - id: "0001099511627776-0000000001"
+                    contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                    ledger: 256000
+                    type: contract
+                    tx_hash: "9f5c7a2b..."
+                    tx_index: 0
+                    op_index: 0
+                    in_successful_call: true
+                    topics:
+                      - {"symbol":"transfer"}
+                    value: {"address":"GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"}
+                    created_at: "2026-07-21T12:00:00Z"
+                cursor: "MjU2MDAwLTAwMDAwMDAwMDE="
         "304":
           $ref: "#/components/responses/NotModified"
         "400":
@@ -118,6 +143,16 @@ paths:
       responses:
         "200":
           description: Number of events deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: integer
+                    format: int64
+              example:
+                deleted: 42
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -156,6 +191,19 @@ paths:
                 oneOf:
                   - $ref: "#/components/schemas/Event"
                   - $ref: "#/components/schemas/EnrichedEvent"
+              example:
+                id: "0001099511627776-0000000001"
+                contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                ledger: 256000
+                type: contract
+                tx_hash: "9f5c7a2b..."
+                tx_index: 0
+                op_index: 0
+                in_successful_call: true
+                topics:
+                  - {"symbol":"transfer"}
+                value: {"address":"GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"}
+                created_at: "2026-07-21T12:00:00Z"
         "304":
           $ref: "#/components/responses/NotModified"
         "400":
@@ -214,6 +262,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/EventsResponse"
+              example:
+                events:
+                  - id: "0001099511627776-0000000001"
+                    contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                    ledger: 256000
+                    type: contract
+                    tx_hash: "9f5c7a2b..."
+                    tx_index: 0
+                    op_index: 0
+                    in_successful_call: true
+                    topics:
+                      - {"symbol":"transfer"}
+                    value: {"address":"GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"}
+                    created_at: "2026-07-21T12:00:00Z"
         "304":
           $ref: "#/components/responses/NotModified"
         "400":
@@ -266,6 +328,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/EventsResponse"
+              example:
+                events:
+                  - id: "0001099511627776-0000000001"
+                    contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                    ledger: 256000
+                    type: contract
+                    tx_hash: "9f5c7a2b..."
+                    tx_index: 0
+                    op_index: 0
+                    in_successful_call: true
+                    topics:
+                      - {"symbol":"transfer"}
+                    value: {"address":"GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"}
+                    created_at: "2026-07-21T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -300,6 +376,13 @@ paths:
             application/json:
               schema:
                 type: object
+              example:
+                address: "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"
+                first_ledger: 256000
+                last_ledger: 256050
+                event_count: 12
+                contracts:
+                  - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -333,6 +416,13 @@ paths:
             application/json:
               schema:
                 type: object
+              example:
+                tenants:
+                  - id: 1
+                    name: "acme-corp"
+                    enabled: true
+                    created_at: "2026-07-21T00:00:00Z"
+                count: 1
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -357,6 +447,11 @@ paths:
             application/json:
               schema:
                 type: object
+              example:
+                id: 1
+                name: "acme-corp"
+                enabled: true
+                created_at: "2026-07-21T00:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -398,6 +493,11 @@ paths:
             application/json:
               schema:
                 type: object
+              example:
+                id: 1
+                name: "acme-corp"
+                enabled: true
+                created_at: "2026-07-21T00:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -436,6 +536,11 @@ paths:
             application/json:
               schema:
                 type: object
+              example:
+                id: 1
+                name: "acme-corp"
+                enabled: true
+                created_at: "2026-07-21T00:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -524,6 +629,11 @@ paths:
             application/json:
               schema:
                 type: object
+              example:
+                tenant_id: 1
+                period_days: 7
+                requests: 12345
+                events_served: 67890
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -571,6 +681,10 @@ paths:
             application/json:
               schema:
                 type: object
+              example:
+                grants:
+                  - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                count: 1
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -611,6 +725,11 @@ paths:
             application/json:
               schema:
                 type: object
+              example:
+                grants:
+                  - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                  - "CAAAA..."
+                count: 2
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -656,6 +775,14 @@ paths:
           description: >-
             The tenant's refreshed grant list. Not a 204: the response carries
             the remaining grants.
+          content:
+            application/json:
+              schema:
+                type: object
+              example:
+                grants:
+                  - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                count: 1
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -703,6 +830,13 @@ paths:
             application/json:
               schema:
                 type: object
+              example:
+                keys:
+                  - id: 7
+                    prefix: "st_abc12"
+                    enabled: true
+                    created_at: "2026-07-21T00:00:00Z"
+                count: 1
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -741,6 +875,12 @@ paths:
             application/json:
               schema:
                 type: object
+              example:
+                id: 7
+                prefix: "st_abc12"
+                key: "st_abc12_xylophone12345678"
+                enabled: true
+                created_at: "2026-07-21T00:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -839,6 +979,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ContractsPage"
+              example:
+                contracts:
+                  - contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                    event_count: 42
+                    first_ledger: 256000
+                    last_ledger: 256050
+                    last_seen: "2026-07-21T12:00:00Z"
+                count: 1
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -864,6 +1012,9 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+                checks: {}
   /readyz:
     get:
       operationId: readyz
@@ -880,6 +1031,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+                checks:
+                  database: ok
+                  rpc: ok
+                  ingestion: current
         "503":
           description: >-
             A dependency is unusable or ingestion is lagging. The body names
@@ -890,6 +1047,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: degraded
+                checks:
+                  database: ok
+                  rpc: unavailable
+                  ingestion: lagging (150 ledgers behind)
   /version:
     get:
       operationId: version
@@ -900,6 +1063,21 @@ paths:
       responses:
         "200":
           description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: string
+                  commit:
+                    type: string
+                  build_date:
+                    type: string
+              example:
+                version: "0.1.0"
+                commit: "dc0ff0d"
+                build_date: "2026-07-21T00:00:00Z"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -958,6 +1136,16 @@ paths:
       responses:
         "200":
           description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                    format: int64
+              example:
+                count: 42
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1008,6 +1196,27 @@ paths:
       responses:
         "200":
           description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  buckets:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        key:
+                          type: string
+                        count:
+                          type: integer
+                          format: int64
+              example:
+                buckets:
+                  - key: "256000"
+                    count: 5
+                  - key: "256001"
+                    count: 3
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1073,6 +1282,22 @@ paths:
       responses:
         "200":
           description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  topics_xdr:
+                    type: array
+                    items:
+                      type: string
+                  value_xdr:
+                    type: string
+              example:
+                topics_xdr:
+                  - "AAAAA"
+                  - "BBBBB"
+                value_xdr: "CCCCC"
         "304":
           $ref: "#/components/responses/NotModified"
         "401":
@@ -1107,6 +1332,25 @@ paths:
       responses:
         "200":
           description: Success
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Event"
+              example:
+                - id: "0001099511627776-0000000002"
+                  contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                  ledger: 256000
+                  type: contract
+                  tx_hash: "9f5c7a2b..."
+                  tx_index: 0
+                  op_index: 1
+                  in_successful_call: true
+                  topics:
+                    - {"symbol":"transfer"}
+                  value: {"address":"GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"}
+                  created_at: "2026-07-21T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1163,6 +1407,12 @@ paths:
                     type: string
                     format: date-time
                     description: Timestamp of the most recent event
+              example:
+                contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                event_count: 42
+                first_ledger: 256000
+                last_ledger: 256050
+                last_seen: "2026-07-21T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1233,6 +1483,17 @@ paths:
                           type: integer
                           format: int64
                           description: Number of events of this type
+              example:
+                contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                name: "Soroban Token"
+                symbol: "STOK"
+                decimals: 7
+                event_count: 42
+                type_breakdown:
+                  - type: contract
+                    count: 38
+                  - type: diagnostic
+                    count: 4
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1315,6 +1576,16 @@ paths:
       responses:
         "200":
           description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+              example:
+                id: 1
+                name: "acme-corp"
+                enabled: true
+                grants:
+                  - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1347,6 +1618,15 @@ paths:
       responses:
         "200":
           description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+              example:
+                tenant_id: 1
+                period_days: 7
+                requests: 12345
+                events_served: 67890
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1377,6 +1657,14 @@ paths:
               schema:
                 type: integer
                 minimum: 0
+          content:
+            application/json:
+              schema:
+                type: object
+              example:
+                contracts:
+                  - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                count: 1
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1398,6 +1686,15 @@ paths:
           description: >-
             The tenant's refreshed watch list. Not a 201: the response is the
             whole list, not the created row.
+          content:
+            application/json:
+              schema:
+                type: object
+              example:
+                contracts:
+                  - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                  - "CAAAA..."
+                count: 2
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1431,6 +1728,14 @@ paths:
           description: >-
             The tenant's refreshed watch list. Not a 204: the response carries
             the remaining contracts.
+          content:
+            application/json:
+              schema:
+                type: object
+              example:
+                contracts:
+                  - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                count: 1
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1461,6 +1766,15 @@ paths:
               schema:
                 type: integer
                 minimum: 0
+          content:
+            application/json:
+              schema:
+                type: object
+              example:
+                contracts:
+                  - contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                    start_ledger: 256000
+                count: 1
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -1483,6 +1797,17 @@ paths:
             The refreshed watch list, plus the ledger ingestion for the new
             contract will start from. Not a 201: the response is the whole
             list, not the created row.
+          content:
+            application/json:
+              schema:
+                type: object
+              example:
+                contracts:
+                  - contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                    start_ledger: 256000
+                  - contract_id: "CAAAA..."
+                    start_ledger: 256000
+                count: 2
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1525,6 +1850,15 @@ paths:
           description: >-
             The refreshed watch list. Not a 204: the response carries the
             remaining contracts.
+          content:
+            application/json:
+              schema:
+                type: object
+              example:
+                contracts:
+                  - contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                    start_ledger: 256000
+                count: 1
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1570,6 +1904,18 @@ paths:
               schema:
                 type: integer
                 minimum: 0
+          content:
+            application/json:
+              schema:
+                type: object
+              example:
+                dead_letters:
+                  - id: 42
+                    contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                    ledger: 256000
+                    error: "unexpected end of JSON input"
+                    created_at: "2026-07-21T12:00:00Z"
+                count: 1
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1626,6 +1972,13 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Stats"
+              example:
+                total_events: 12345
+                last_ingested_ledger: 256050
+                verified_through_ledger: 256000
+                contract_count: 3
+                watched_contracts: 1
+                auditor: null
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -1679,6 +2032,13 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/CreateSubscriptionRequest"
+            example:
+              url: "https://example.com/webhook"
+              secret: "whsec_z8eP5qL3vR2xK9yB4w"
+              filters:
+                contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                type: contract
+              enabled: true
       responses:
         "201":
           description: Subscription created
@@ -1686,6 +2046,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Subscription"
+              example:
+                id: 1
+                url: "https://example.com/webhook"
+                filters:
+                  contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                  type: contract
+                secret: "whsec_z8eP5qL3vR2xK9yB4w"
+                enabled: true
+                failure_count: 0
+                created_at: "2026-07-21T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1715,6 +2085,15 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Subscription"
+              example:
+                - id: 1
+                  url: "https://example.com/webhook"
+                  filters:
+                    contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                  secret: "whsec_z8eP5qL3vR2xK9yB4w"
+                  enabled: true
+                  failure_count: 0
+                  created_at: "2026-07-21T12:00:00Z"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -1743,6 +2122,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Subscription"
+              example:
+                id: 1
+                url: "https://example.com/webhook"
+                filters:
+                  contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                secret: "whsec_z8eP5qL3vR2xK9yB4w"
+                enabled: true
+                failure_count: 0
+                created_at: "2026-07-21T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1774,6 +2162,9 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/UpdateSubscriptionRequest"
+            example:
+              url: "https://new.example.com/webhook"
+              enabled: true
       responses:
         "200":
           description: The updated subscription
@@ -1781,6 +2172,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Subscription"
+              example:
+                id: 1
+                url: "https://new.example.com/webhook"
+                filters:
+                  contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                secret: "whsec_z8eP5qL3vR2xK9yB4w"
+                enabled: true
+                failure_count: 0
+                created_at: "2026-07-21T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1852,6 +2252,14 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/DeliveryAttempt"
+              example:
+                - id: 1
+                  subscription_id: 1
+                  event_id: "0001099511627776-0000000001"
+                  status: delivered
+                  response_code: 200
+                  duration_ms: 142
+                  created_at: "2026-07-21T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":

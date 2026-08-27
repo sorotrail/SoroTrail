@@ -254,6 +254,9 @@ func run() error {
 		LagWarnLedgers:          cfg.LagWarnLedgers,
 		SweepConcurrency:        cfg.SweepConcurrency,
 		MaxEventsPerCycle:       cfg.MaxEventsPerCycle,
+		BatchSize:               cfg.BatchSize,
+		BatchTargetLatency:      cfg.BatchTargetLatency,
+		BatchMaxBackoff:         cfg.BatchMaxBackoff,
 		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
 	}).WithBroadcaster(bcast)
@@ -327,6 +330,7 @@ func run() error {
 	api.SetMaxLimit(cfg.APIMaxLimit)
 
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
+	apiServer.SetStatsTTL(cfg.StatsCacheTTL)
 	apiServer.SetRateLimiter(limiter)
 	apiServer.SetMetricsEnabled(cfg.MetricsEnabled)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
@@ -517,14 +521,7 @@ func bootstrapAdminKey(ctx context.Context, ts store.TenantStore, key string, lo
 
 func newLogger(level, format string) *slog.Logger {
 	opts := &slog.HandlerOptions{Level: config.ParseLogLevel(level)}
-	var h slog.Handler
-	switch strings.ToLower(format) {
-	case "json":
-		h = slog.NewJSONHandler(os.Stdout, opts)
-	default:
-		h = slog.NewTextHandler(os.Stdout, opts)
-	}
-	return slog.New(h)
+	return slog.New(config.NewLogHandler(os.Stdout, format, opts))
 }
 
 // graphqlServerDeps wraps the live store + enricher into the typed

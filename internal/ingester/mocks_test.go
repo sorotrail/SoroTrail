@@ -145,6 +145,10 @@ type mockStore struct {
 	ingestErr error
 	// upsertErr, when set, is returned by UpsertEvents.
 	upsertErr error
+	// upsertDelay, when > 0, makes UpsertEvents take that long, simulating
+	// a slow database so tests can drive the ingester's latency-based
+	// backpressure against a real (short) sleep rather than mocking time.
+	upsertDelay time.Duration
 	// contractCursors backs the per-contract cursor methods.
 	contractCursors []store.ContractCursor
 }
@@ -153,7 +157,19 @@ func newMockStore() *mockStore {
 	return &mockStore{events: map[string]store.Event{}}
 }
 
-func (m *mockStore) UpsertEvents(_ context.Context, events []store.Event) (int64, error) {
+func (m *mockStore) UpsertEvents(ctx context.Context, events []store.Event) (int64, error) {
+	if m.upsertDelay > 0 {
+		// Simulate a slow store write WITHOUT holding the store mutex, so
+		// tests asserting on other fields (upserted, events) don't block
+		// until the delay elapses.
+		timer := time.NewTimer(m.upsertDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-timer.C:
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.upsertErr != nil {

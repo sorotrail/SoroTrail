@@ -67,6 +67,51 @@ var (
 		Name: "sorotrail_ingestion_lag_ledgers",
 		Help: "Number of ledgers the indexer is behind the chain head.",
 	})
+
+	// ---- Batch / backpressure instrumentation ----
+	// The batch controller that splits a fetch page into many UpsertEvents
+	// calls (see ingester.batchController) exposes its heartbeat here so
+	// operators can tell at a glance whether ingestion is shaving its
+	// batches down or throttling to protect the database at peak.
+
+	// EventBatchWrites counts every UpsertEvents call issued by the
+	// ingester with at least one row. When batching is disabled this is
+	// exactly one per non-empty page; with batching enabled it reflects
+	// how many chunks the adaptive controller split a page into.
+	EventBatchWrites = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "sorotrail_event_batch_writes_total",
+		Help: "Total number of event store writes (UpsertEvents calls) issued by the ingester.",
+	})
+
+	// EventBatchSize is the current batch size the controller feeds the
+	// store per write. It stays at the configured maximum while writes are
+	// comfortably inside the latency budget and steps down under latency
+	// pressure, so a falling gauge is the earliest signal the store is
+	// starting to strain.
+	EventBatchSize = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "sorotrail_event_batch_size",
+		Help: "Current adaptive event batch size used for each store write.",
+	})
+
+	// EventBackpressure counts how many times the ingester inserted a
+	// deliberate sleep between writes because the store fell behind the
+	// latency budget. A non-zero value proves backpressure is firing;
+	// paired with EventBackpressureSeconds it explains how much time was
+	// spent between the initial surge and the DB catching up.
+	EventBackpressure = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "sorotrail_event_backpressure_total",
+		Help: "Total number of throttle sleeps inserted between event batch writes.",
+	})
+
+	// EventBackpressureSeconds is the cumulative wall-clock time spent
+	// sleeping under backpressure. The monetary impact of a surge is
+	// best priced in seconds: a long tail here means the DB was slow
+	// for a sustained stretch, not just a burst.
+	EventBackpressureSeconds = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "sorotrail_event_backpressure_seconds_total",
+		Help: "Total seconds spent throttling event writes under backpressure.",
+	})
+	// ---- End batch instrumentation ----
 )
 
 func init() {
@@ -77,6 +122,10 @@ func init() {
 		DBWriteLatency,
 		DBQueryDuration,
 		IngestionLag,
+		EventBatchWrites,
+		EventBatchSize,
+		EventBackpressure,
+		EventBackpressureSeconds,
 	)
 }
 

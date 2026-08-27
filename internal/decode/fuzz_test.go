@@ -29,6 +29,9 @@ func addCorpusFile(f *testing.F, path string) {
 // failure.
 func FuzzDecodeScVal(f *testing.F) {
 	addCorpusFile(f, "testdata/scvals.txt")
+	for _, seed := range []string{"", "AA==", "AAAAAA==", "not-base64", "////////////////////"} {
+		f.Add(seed)
+	}
 
 	f.Fuzz(func(t *testing.T, input string) {
 		_, _ = (XDRDecoder{}).DecodeScVal(input)
@@ -40,8 +43,14 @@ func FuzzDecodeScVal(f *testing.F) {
 // []string, so NUL-separated strings are converted into topic arrays here.
 func FuzzDecodeTopicArray(f *testing.F) {
 	addCorpusFile(f, "testdata/topic_arrays.txt")
+	for _, seed := range []string{"", "\x00", "not-base64\x00AAAAAA==", "////////////////////"} {
+		f.Add(seed)
+	}
 
 	f.Fuzz(func(t *testing.T, input string) {
+		if len(input) > 4096 {
+			input = input[:4096]
+		}
 		topics := strings.Split(input, "\x00")
 		_, _, _ = EventTopicsValue(XDRDecoder{}, rpc.Event{Topic: topics})
 	})

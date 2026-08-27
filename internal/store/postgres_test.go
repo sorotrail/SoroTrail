@@ -149,9 +149,10 @@ func TestUpsertEvents_CreatesPartitionsAndIsIdempotent(t *testing.T) {
 	assert.NotContains(t, plan, "events_20_29")
 }
 
-// TestPartialIndexForSuccessfulCalls covers migration
-// 0011_partial_index_successful_calls: the partial index over
-// (contract_id, ledger) restricted to in_successful_call = true.
+// TestPartialIndexForSuccessfulCalls covers the partial index over
+// (contract_id, ledger, id) restricted to in_successful_call = true,
+// originally introduced as (contract_id, ledger) by migration 0019 and
+// widened to include the id tiebreaker by 0022.
 //
 // It asserts two things. First, that the index exists with the expected
 // shape — indexed columns and partial predicate — by reading its
@@ -172,7 +173,7 @@ func TestPartialIndexForSuccessfulCalls(t *testing.T) {
 	var indexDef string
 	err := st.pool.QueryRow(ctx,
 		`SELECT indexdef FROM pg_indexes WHERE indexname = $1`,
-		"idx_events_contract_ledger_successful",
+		"idx_events_contract_ledger_id_successful",
 	).Scan(&indexDef)
 	require.NoError(t, err, "partial index should exist after migration")
 
@@ -181,7 +182,7 @@ func TestPartialIndexForSuccessfulCalls(t *testing.T) {
 		want string
 	}{
 		{"indexed on events", " ON "},
-		{"covers contract_id and ledger in order", "(contract_id, ledger)"},
+		{"covers contract_id and ledger in order", "(contract_id, ledger, id)"},
 		{"partial predicate scopes to successful calls", "WHERE (in_successful_call = true)"},
 	}
 	for _, tc := range defWantSubstrings {
@@ -200,7 +201,7 @@ func TestPartialIndexForSuccessfulCalls(t *testing.T) {
 		FROM pg_index i
 		JOIN pg_class c ON c.oid = i.indexrelid
 		WHERE c.relname = $1`,
-		"idx_events_contract_ledger_successful",
+		"idx_events_contract_ledger_id_successful",
 	).Scan(&isValid, &isPartial)
 	require.NoError(t, err)
 	assert.True(t, isValid, "index should be valid")
