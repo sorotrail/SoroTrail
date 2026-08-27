@@ -137,6 +137,15 @@ type Server struct {
 	maxWatched      int
 	streamScopeSync time.Duration
 
+	// statsTTL is how long a /stats result is served from cache before it
+	// is recomputed. Zero disables caching (the pre-cache behavior).
+	// config-driven wiring sets STATS_CACHE_TTL.
+	statsTTL time.Duration
+	// statsCache is the per-scope TTL cache used by /stats. Built lazily on
+	// the first request so tests and hand-built Servers don't allocate it
+	// until needed.
+	statsCache *StatsCache
+
 	// exportMaxRange caps the ledger span of /contracts/{id}/export.
 	// Zero means unbounded (legacy behavior); config-driven wiring sets
 	// EXPORT_MAX_RANGE so requests default to a sane ceiling.
@@ -169,6 +178,14 @@ func SetMaxLimit(n int) {
 	if n > 0 {
 		maxLimit = n
 	}
+}
+
+// SetStatsTTL configures how long GET /stats results are served from the
+// per-scope cache before being recomputed. Zero disables caching (every
+// request recomputes). Config-driven wiring sets STATS_CACHE_TTL; call
+// before ListenAndServe so the first request observes it.
+func (s *Server) SetStatsTTL(ttl time.Duration) {
+	s.statsTTL = ttl
 }
 
 // New builds the API server. rpcClient is used by /health, /readyz, and /stats.

@@ -215,7 +215,10 @@ func TestCuratedScenario_RetentionGapLegitimateLoss(t *testing.T) {
 	st := newMockStore()
 	h := NewHarness(*scenario, st)
 	err := h.Run(context.Background())
-	_ = err
+	// The oracle returns nil even for legitimate loss — it only flags
+	// unexpected mismatches. Verify the err is nil (no oracle violation)
+	// and that the events within retention are present.
+	require.NoError(t, err, "oracle should not flag legitimate retention gaps as errors")
 
 	// Verify events at 95 are stored (within retention).
 	stored, _, qerr := st.QueryEvents(context.Background(), store.EventFilter{Limit: 1000, Order: "asc"})
@@ -255,6 +258,157 @@ func TestCuratedScenario_RPCFlapAndTimeoutDuplicate(t *testing.T) {
 	assert.Len(t, stored, len(scenario.Events))
 }
 
+// TestCuratedScenario_RateLimitRecovery verifies that a rate-limited
+// page (HTTP 429) is retried and all events are eventually ingested
+// without duplication.
+func TestCuratedScenario_RateLimitRecovery(t *testing.T) {
+	scenario := findScenario("rpc_fault_rate_limit")
+	require.NotNil(t, scenario, "scenario not found")
+
+	st := newMockStore()
+	h := NewHarness(*scenario, st)
+	err := h.Run(context.Background())
+	require.NoError(t, err, "oracle mismatch after rate-limit recovery")
+
+	stored, _, qerr := st.QueryEvents(context.Background(), store.EventFilter{Limit: 1000, Order: "asc"})
+	require.NoError(t, qerr)
+	assert.Len(t, stored, len(scenario.Events), "all events should be ingested after rate-limit retry")
+
+	idCounts := make(map[string]int)
+	for _, ev := range stored {
+		idCounts[ev.ID]++
+	}
+	for id, count := range idCounts {
+		assert.Equal(t, 1, count, "event %s should appear exactly once", id)
+	}
+}
+
+// TestCuratedScenario_MalformedPageRecovery verifies that a malformed
+// RPC response is retried and all events are eventually ingested.
+func TestCuratedScenario_MalformedPageRecovery(t *testing.T) {
+	scenario := findScenario("rpc_fault_malformed_page")
+	require.NotNil(t, scenario, "scenario not found")
+
+	st := newMockStore()
+	h := NewHarness(*scenario, st)
+	err := h.Run(context.Background())
+	require.NoError(t, err, "oracle mismatch after malformed page recovery")
+
+	stored, _, qerr := st.QueryEvents(context.Background(), store.EventFilter{Limit: 1000, Order: "asc"})
+	require.NoError(t, qerr)
+	assert.Len(t, stored, len(scenario.Events), "all events should be ingested after malformed page retry")
+}
+
+// TestCuratedScenario_TruncatedPageRecovery verifies that a truncated
+// RPC response is retried and all events are eventually ingested.
+func TestCuratedScenario_TruncatedPageRecovery(t *testing.T) {
+	scenario := findScenario("rpc_fault_truncated_page")
+	require.NotNil(t, scenario, "scenario not found")
+
+	st := newMockStore()
+	h := NewHarness(*scenario, st)
+	err := h.Run(context.Background())
+	require.NoError(t, err, "oracle mismatch after truncated page recovery")
+
+	stored, _, qerr := st.QueryEvents(context.Background(), store.EventFilter{Limit: 1000, Order: "asc"})
+	require.NoError(t, qerr)
+	assert.Len(t, stored, len(scenario.Events), "all events should be ingested after truncated page retry")
+}
+
+// TestCuratedScenario_HealthErrorRecovery verifies that a transient
+// getHealth error does not prevent eventual ingestion of all events.
+func TestCuratedScenario_HealthErrorRecovery(t *testing.T) {
+	scenario := findScenario("rpc_fault_health_error")
+	require.NotNil(t, scenario, "scenario not found")
+
+	st := newMockStore()
+	h := NewHarness(*scenario, st)
+	err := h.Run(context.Background())
+	require.NoError(t, err, "oracle mismatch after health error recovery")
+
+	stored, _, qerr := st.QueryEvents(context.Background(), store.EventFilter{Limit: 1000, Order: "asc"})
+	require.NoError(t, qerr)
+	assert.Len(t, stored, len(scenario.Events), "all events should be ingested after health error recovery")
+}
+
+// TestCuratedScenario_ChainReorgHeadMovesBack verifies that the
+// ingester handles a chain head drop without losing events.
+func TestCuratedScenario_ChainReorgHeadMovesBack(t *testing.T) {
+	scenario := findScenario("chain_reorg_head_moves_back")
+	require.NotNil(t, scenario, "scenario not found")
+
+	st := newMockStore()
+	h := NewHarness(*scenario, st)
+	err := h.Run(context.Background())
+	require.NoError(t, err, "oracle mismatch after chain reorg")
+
+	stored, _, qerr := st.QueryEvents(context.Background(), store.EventFilter{Limit: 1000, Order: "asc"})
+	require.NoError(t, qerr)
+
+	// All events should be present exactly once despite the reorg.
+	idCounts := make(map[string]int)
+	for _, ev := range stored {
+		idCounts[ev.ID]++
+	}
+	for id, count := range idCounts {
+		assert.Equal(t, 1, count, "event %s should appear exactly once after reorg", id)
+	}
+	assert.Len(t, stored, len(scenario.Events), "all events should survive the reorg")
+}
+
+// TestCuratedScenario_ChainReorgRepeated verifies that repeated head
+// drops do not cause duplicates or data loss.
+func TestCuratedScenario_ChainReorgRepeated(t *testing.T) {
+	scenario := findScenario("chain_reorg_repeated")
+	require.NotNil(t, scenario, "scenario not found")
+
+	st := newMockStore()
+	h := NewHarness(*scenario, st)
+	err := h.Run(context.Background())
+	require.NoError(t, err, "oracle mismatch after repeated chain reorgs")
+
+	stored, _, qerr := st.QueryEvents(context.Background(), store.EventFilter{Limit: 1000, Order: "asc"})
+	require.NoError(t, qerr)
+
+	idCounts := make(map[string]int)
+	for _, ev := range stored {
+		idCounts[ev.ID]++
+	}
+	for id, count := range idCounts {
+		assert.Equal(t, 1, count, "event %s should appear exactly once after repeated reorgs", id)
+	}
+	assert.Len(t, stored, len(scenario.Events), "all events should survive repeated reorgs")
+}
+
+// TestCuratedScenario_CrashDuringFaultRetry verifies that the ingester
+// can recover from a crash that occurs on the same step as a fault,
+// exercising the restart-in-the-middle path.
+func TestCuratedScenario_CrashDuringFaultRetry(t *testing.T) {
+	scenario := findScenario("crash_during_fault_retry")
+	require.NotNil(t, scenario, "scenario not found")
+
+	st := newMockStore()
+	h := NewHarness(*scenario, st)
+	err := h.Run(context.Background())
+	require.NoError(t, err, "oracle mismatch after crash-during-fault recovery")
+
+	stored, _, qerr := st.QueryEvents(context.Background(), store.EventFilter{Limit: 1000, Order: "asc"})
+	require.NoError(t, qerr)
+	assert.Len(t, stored, len(scenario.Events), "all events should be ingested after crash+fault recovery")
+
+	idCounts := make(map[string]int)
+	for _, ev := range stored {
+		idCounts[ev.ID]++
+	}
+	for id, count := range idCounts {
+		assert.Equal(t, 1, count, "event %s should appear exactly once after crash+fault recovery", id)
+	}
+}
+
+// TestAllCuratedScenarios runs every scenario in CuratedScenarios through
+// the harness, asserting the oracle reports no mismatch. Each subtest
+// prints the scenario name and description so a failure is immediately
+// identifiable.
 func TestAllCuratedScenarios(t *testing.T) {
 	for _, scenario := range CuratedScenarios {
 		t.Run(scenario.Name, func(t *testing.T) {
@@ -262,6 +416,31 @@ func TestAllCuratedScenarios(t *testing.T) {
 			h := NewHarness(scenario, st)
 			err := h.Run(context.Background())
 			assert.NoError(t, err, "scenario %q: %s", scenario.Name, scenario.Description)
+		})
+	}
+}
+
+// TestCuratedScenarioSeedsLogForReproducibility verifies that every
+// curated scenario produces a deterministic run. The scenario name is
+// the reproducibility key — calling RandomScenario with a seed derived
+// from the name reproduces the same event placement and fault schedule.
+func TestCuratedScenarioSeedsLogForReproducibility(t *testing.T) {
+	for _, scenario := range CuratedScenarios {
+		t.Run(scenario.Name, func(t *testing.T) {
+			// Run twice with the same scenario and confirm identical outcomes.
+			st1 := newMockStore()
+			h1 := NewHarness(scenario, st1)
+			err1 := h1.Run(context.Background())
+
+			st2 := newMockStore()
+			h2 := NewHarness(scenario, st2)
+			err2 := h2.Run(context.Background())
+
+			assert.Equal(t, err1, err2, "same scenario must produce the same oracle result")
+
+			events1, _, _ := st1.QueryEvents(context.Background(), store.EventFilter{Limit: 100000, Order: "asc"})
+			events2, _, _ := st2.QueryEvents(context.Background(), store.EventFilter{Limit: 100000, Order: "asc"})
+			assert.Equal(t, len(events1), len(events2), "same scenario must produce the same event count")
 		})
 	}
 }

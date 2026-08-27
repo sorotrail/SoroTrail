@@ -49,6 +49,9 @@ type scopedStore struct {
 	// assert the boundary was propagated and not merely that the answer
 	// happened to look right.
 	seenScopes []store.Scope
+	// statsCalls counts Store.Stats calls so a test can observe the /stats
+	// cache short-circuiting the aggregation on repeat hits.
+	statsCalls int
 }
 
 func (s *scopedStore) record(sc store.Scope) { s.seenScopes = append(s.seenScopes, sc) }
@@ -116,6 +119,7 @@ func (s *scopedStore) EventExists(_ context.Context, id string, sc store.Scope) 
 
 func (s *scopedStore) Stats(_ context.Context, sc store.Scope) (store.Stats, error) {
 	s.record(sc)
+	s.statsCalls++
 	visible := s.visible(sc)
 	contracts := map[string]struct{}{}
 	for _, e := range visible {
@@ -258,9 +262,19 @@ type tenantFixture struct {
 	keyNone string // authenticated, granted nothing
 	keyAdmin,
 	keyWildcard string
+	// statsTTL, when > 0, enables the /stats per-scope cache on the served
+	// router (0 keeps the default no-cache behavior for the bulk of tests).
+	statsTTL time.Duration
 }
 
 func newTenantFixture(t *testing.T) *tenantFixture {
+	t.Helper()
+	return newTenantFixtureWithStatsTTL(t, 0)
+}
+
+// newTenantFixtureWithStatsTTL builds the fixture and, when ttl > 0, enables
+// the /stats per-scope cache so a test can exercise caching end to end.
+func newTenantFixtureWithStatsTTL(t *testing.T, ttl time.Duration) *tenantFixture {
 	t.Helper()
 	// Package-level caching flags are process-wide; reset so tests do not
 	// leak state into one another.
@@ -275,7 +289,7 @@ func newTenantFixture(t *testing.T) *tenantFixture {
 	}}
 	tenants := newFakeTenants()
 
-	f := &tenantFixture{st: st, tenants: tenants}
+	f := &tenantFixture{st: st, tenants: tenants, statsTTL: ttl}
 	f.keyA = tenants.addTenant(t, store.Tenant{ID: 1, Name: "a", Enabled: true}, contractA)
 	f.keyB = tenants.addTenant(t, store.Tenant{ID: 2, Name: "b", Enabled: true}, contractB)
 	f.keyNone = tenants.addTenant(t, store.Tenant{ID: 3, Name: "none", Enabled: true})
@@ -285,6 +299,7 @@ func newTenantFixture(t *testing.T) *tenantFixture {
 	srv := New(st, &stubRPC{health: rpc.Health{Status: "healthy"}},
 		slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key").
 		WithMultiTenancy(tenants, MultiTenantOptions{MaxWatchedContracts: 10})
+	srv.SetStatsTTL(ttl)
 	f.srv = srv.Router()
 	return f
 }
@@ -486,6 +501,33 @@ func TestStatsIsScoped(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &statsWild))
 	assert.Equal(t, int64(4), statsWild.TotalEvents, "a wildcard tenant still sees the whole store")
+}
+
+// TestStatsCache_ScopeIsolated verifies the /stats cache keys by tenant scope
+// so one tenant's cached numbers can never be served to another, while repeat
+// calls from the same tenant do hit the cache.
+func TestStatsCache_ScopeIsolated(t *testing.T) {
+	f := newTenantFixtureWithStatsTTL(t, time.Minute)
+
+	asStats := func(key string) store.Stats {
+		rec := f.get(t, key, "/stats")
+		require.Equal(t, http.StatusOK, rec.Code)
+		var s store.Stats
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &s))
+		return s
+	}
+
+	// Tenant A's second call hits the cache: the store is consulted once for A.
+	statsA1 := asStats(f.keyA)
+	statsA2 := asStats(f.keyA)
+	require.Equal(t, 1, f.st.statsCalls, "tenant A's repeat calls within TTL must be served from cache")
+	assert.Equal(t, statsA1, statsA2)
+
+	// Tenant B is cache-isolated: its aggregate is counted separately.
+	statsB := asStats(f.keyB)
+	require.Equal(t, 2, f.st.statsCalls, "tenant B must trigger its own store aggregation")
+	assert.Equal(t, int64(1), statsB.TotalEvents, "B sees only its own contract")
+	assert.NotEqual(t, statsA1, statsB, "A and B must never share a cached response")
 }
 
 // A tenant with no grants is authenticated but entitled to nothing.

@@ -147,4 +147,177 @@ var CuratedScenarios = []Scenario{
 		},
 		ExpectNoLoss: true,
 	},
+
+	//
+	// Scenario 7: Rate limit on first RPC page is retried
+	//
+	// The RPC returns HTTP 429 on the first GetEvents call. The ingester
+	// must treat this as a transient error, back off, and retry the same
+	// page without losing or duplicating any events.
+	{
+		Name:             "rpc_fault_rate_limit",
+		Description:      "A rate-limited page is retried without loss or duplication.",
+		RetentionLedgers: 200,
+		ChainLedgers:     30,
+		PageLimit:        4,
+		Events: []EventPlacement{
+			{Ledger: 5, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 6, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 7, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 8, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+		},
+		Faults: []FaultDescriptor{
+			{Kind: FaultRateLimit, CallIndex: 1},
+		},
+		ExpectNoLoss: true,
+	},
+
+	//
+	// Scenario 8: Malformed page on first RPC call is retried
+	//
+	// The RPC returns an undecodable JSON response. The ingester must
+	// retry and eventually ingest all events once the RPC returns a
+	// valid page.
+	{
+		Name:             "rpc_fault_malformed_page",
+		Description:      "A malformed page is retried without loss or duplication.",
+		RetentionLedgers: 200,
+		ChainLedgers:     30,
+		PageLimit:        4,
+		Events: []EventPlacement{
+			{Ledger: 5, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 6, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 7, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 8, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+		},
+		Faults: []FaultDescriptor{
+			{Kind: FaultMalformedPage, CallIndex: 1},
+		},
+		ExpectNoLoss: true,
+	},
+
+	//
+	// Scenario 9: Truncated page on first RPC call is retried
+	//
+	// The RPC returns a truncated response. The ingester must handle the
+	// error gracefully and retry until a complete page is received.
+	{
+		Name:             "rpc_fault_truncated_page",
+		Description:      "A truncated page is retried without loss or duplication.",
+		RetentionLedgers: 200,
+		ChainLedgers:     30,
+		PageLimit:        4,
+		Events: []EventPlacement{
+			{Ledger: 5, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 6, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 7, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 8, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+		},
+		Faults: []FaultDescriptor{
+			{Kind: FaultTruncatedPage, CallIndex: 1},
+		},
+		ExpectNoLoss: true,
+	},
+
+	//
+	// Scenario 10: Health check error does not block ingestion
+	//
+	// getHealth returns a transient error during one step. The ingester
+	// must continue and eventually ingest all events once health clears.
+	{
+		Name:             "rpc_fault_health_error",
+		Description:      "A health failure does not prevent a later ingest step from recovering.",
+		RetentionLedgers: 200,
+		ChainLedgers:     30,
+		PageLimit:        4,
+		Steps:            3,
+		Events: []EventPlacement{
+			{Ledger: 5, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 6, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+		},
+		Faults: []FaultDescriptor{
+			{Kind: FaultGetHealthError, AfterStep: 1},
+		},
+		ExpectNoLoss: true,
+	},
+
+	//
+	// Scenario 11: Chain reorganisation — head moves back then forward
+	//
+	// The chain head briefly drops (e.g. a fork is reverted). The ingester
+	// must not skip events it already fetched, and must still ingest events
+	// that appear after the chain recovers.
+	{
+		Name:             "chain_reorg_head_moves_back",
+		Description:      "Chain head drops then recovers; events at the reorg boundary are not lost.",
+		RetentionLedgers: 200,
+		ChainLedgers:     40,
+		PageLimit:        5,
+		Events: []EventPlacement{
+			{Ledger: 10, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 15, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 20, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 30, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+		},
+		Faults: []FaultDescriptor{
+			{Kind: FaultRPCMovingBack, AfterStep: 0, Ledger: 15},
+		},
+		ExpectNoLoss: true,
+	},
+
+	//
+	// Scenario 12: Multiple chain reorgs in sequence
+	//
+	// The chain head moves back twice in quick succession, simulating a
+	// turbulent provider. The ingester must handle repeated head drops
+	// without duplicating or losing events.
+	{
+		Name:             "chain_reorg_repeated",
+		Description:      "Repeated head drops cause the ingester to re-fetch pages; no duplicates or loss.",
+		RetentionLedgers: 200,
+		ChainLedgers:     50,
+		PageLimit:        5,
+		Events: []EventPlacement{
+			{Ledger: 10, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 15, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 20, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 25, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 30, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 40, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 45, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+		},
+		Faults: []FaultDescriptor{
+			{Kind: FaultRPCMovingBack, AfterStep: 0, Ledger: 15},
+			{Kind: FaultRPCMovingBack, AfterStep: 1, Ledger: 10},
+		},
+		ExpectNoLoss: true,
+	},
+
+	//
+	// Scenario 13: Crash during fault recovery — restart-in-the-middle
+	//
+	// A timeout fault fires on the first RPC call, and the ingester
+	// crashes at the same step. On restart the ingester must re-fetch
+	// the page (the fault is already consumed) and ingest every event.
+	// This exercises the restart-in-the-middle path for the fault
+	// recovery code.
+	{
+		Name:             "crash_during_fault_retry",
+		Description:      "Crash on the same step as a timeout fault; restart must recover all events.",
+		RetentionLedgers: 200,
+		ChainLedgers:     30,
+		PageLimit:        4,
+		Events: []EventPlacement{
+			{Ledger: 5, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 6, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 7, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 8, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 9, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+		},
+		Faults: []FaultDescriptor{
+			{Kind: FaultTimeout, CallIndex: 1},
+			{Kind: FaultCrash, AfterStep: 1},
+		},
+		ExpectNoLoss: true,
+	},
 }
