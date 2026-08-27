@@ -4,6 +4,27 @@ This document describes the methodology, benchmark results, identified bottlenec
 
 ---
 
+## Synthetic RPC load and soak test
+
+For a repeatable local load test, call `ingester.RunLoadTest` with an implementation of `StoreForLoadTest` backed by an in-memory or disposable database. `NewSyntheticRPC` emits a configurable number of deterministic contract events per ledger and supports the same pagination interface as Stellar RPC.
+
+The returned `LoadTestReport` includes total events, elapsed duration, events/second, maximum ledger lag, and final ledger lag. Set `LoadTestConfig.Duration` for a bounded soak run; leave it zero to run until the synthetic chain is caught up. The harness is network-free and does not modify production configuration.
+
+Example configuration:
+
+```go
+report, err := ingester.RunLoadTest(ctx, store, decode.XDRDecoder{}, ingester.LoadTestConfig{
+    EventsPerLedger: 100,
+    Ledgers:         10000,
+    PageLimit:       1000,
+    Duration:        10 * time.Minute,
+})
+```
+
+Print `report.EventsPerSecond`, `report.MaxLagLedgers`, and `report.FinalLagLedgers` from the calling benchmark or soak-test command. A sustained run should complete without increasing lag or unbounded memory; repeat with increasing `EventsPerLedger` and `PageLimit` to find the deployment's saturation point.
+
+---
+
 ## 1. Methodology
 
 All performance benchmarks are reproducible using the included benchmark suite and database seeding tool.

@@ -1,7 +1,12 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +31,7 @@ var envKeys = []string{
 	"SHUTDOWN_TIMEOUT",
 	"INGESTION_LOCK_ENABLED",
 	"MAX_EVENTS_PER_CYCLE",
+	"BATCH_SIZE", "BATCH_TARGET_LATENCY", "BATCH_MAX_BACKOFF",
 	"MULTI_TENANT", "MULTI_TENANT_MAX_WATCHED", "MULTI_TENANT_USAGE_FLUSH",
 	"MULTI_TENANT_STREAM_SCOPE_SYNC", "MULTI_TENANT_BOOTSTRAP_KEY",
 	"RETENTION_MAX_AGE", "RETENTION_MIN_LEDGER", "RETENTION_BATCH_SIZE",
@@ -34,6 +40,7 @@ var envKeys = []string{
 	"METRICS_ENABLED", "ENABLE_METRICS", "CACHE_PRIVATE", "COMPRESS_MIN_SIZE",
 	"EXPORT_MAX_RANGE", "REORG_CONFIRMATION_WINDOW", "REORG_RESCAN_INTERVAL",
 	"SWEEP_CONCURRENCY", "API_MAX_LIMIT",
+	"STATS_CACHE_TTL",
 	"CORS_ALLOWED_ORIGINS", "CORS_ALLOWED_METHODS", "CORS_ALLOWED_HEADERS",
 	"CORS_EXPOSED_HEADERS", "GRAPHQL_PLAYGROUND",
 }
@@ -56,6 +63,8 @@ func TestLoad(t *testing.T) {
 				assert.Empty(t, c.WatchedContracts)
 				assert.Equal(t, uint32(100), c.LagWarnLedgers,
 					"LagWarnLedgers default lets the lag alarm work out of the box")
+				assert.Equal(t, 5*time.Second, c.StatsCacheTTL,
+					"StatsCacheTTL defaults to 5s")
 			},
 		},
 		{
@@ -540,6 +549,43 @@ func TestLoad(t *testing.T) {
 			wantErr: "MaxEventsPerCycle",
 		},
 
+		// --- event batch sizing / backpressure -------------------------------------
+		{
+			name: "BATCH_SIZE defaults to disabled",
+			env: map[string]string{
+				"DATABASE_URL": "postgres://localhost/db",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint(0), c.BatchSize,
+					"zero is the documented 'batching disabled' default")
+				assert.Equal(t, time.Duration(0), c.BatchTargetLatency)
+				assert.Equal(t, time.Second, c.BatchMaxBackoff,
+					"BatchMaxBackoff has a 1s default")
+			},
+		},
+		{
+			name: "BATCH_SIZE parsed with target latency and backoff",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"BATCH_SIZE":           "500",
+				"BATCH_TARGET_LATENCY": "50ms",
+				"BATCH_MAX_BACKOFF":    "2s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, uint(500), c.BatchSize)
+				assert.Equal(t, 50*time.Millisecond, c.BatchTargetLatency)
+				assert.Equal(t, 2*time.Second, c.BatchMaxBackoff)
+			},
+		},
+		{
+			name: "negative BATCH_MAX_BACKOFF rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"BATCH_MAX_BACKOFF": "-1s",
+			},
+			wantErr: "BATCH_MAX_BACKOFF must be non-negative",
+		},
+
 		// --- missing/invalid env combinations (gap coverage) -----------------------
 
 		{
@@ -746,6 +792,16 @@ func TestLoad(t *testing.T) {
 				"API_MAX_LIMIT": "-1",
 			},
 			wantErr: "API_MAX_LIMIT",
+		},
+		{
+			name: "STATS_CACHE_TTL configurable",
+			env: map[string]string{
+				"DATABASE_URL":    "postgres://localhost/db",
+				"STATS_CACHE_TTL": "30s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, 30*time.Second, c.StatsCacheTTL)
+			},
 		},
 		{
 			name: "SWEEP_CONCURRENCY zero rejected",
@@ -1089,6 +1145,56 @@ func TestLoad(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewLogHandler(t *testing.T) {
+	tests := []struct {
+		name     string
+		format   string
+		wantJSON bool
+	}{
+		{name: "json selects the JSON handler", format: "json", wantJSON: true},
+		{name: "JSON is accepted case-insensitively", format: "JSON", wantJSON: true},
+		{name: "surrounding whitespace is trimmed", format: " json ", wantJSON: true},
+		{name: "text selects the text handler", format: "text"},
+		{name: "TEXT is accepted case-insensitively", format: "TEXT"},
+		{name: "empty format falls back to text", format: ""},
+		{name: "unknown format falls back to text", format: "xml"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := NewLogHandler(io.Discard, tt.format, nil)
+			_, isJSON := h.(*slog.JSONHandler)
+			_, isText := h.(*slog.TextHandler)
+			if tt.wantJSON {
+				assert.True(t, isJSON, "expected a *slog.JSONHandler for format %q", tt.format)
+				assert.False(t, isText, "expected no *slog.TextHandler for format %q", tt.format)
+			} else {
+				assert.True(t, isText, "expected a *slog.TextHandler for format %q", tt.format)
+				assert.False(t, isJSON, "expected no *slog.JSONHandler for format %q", tt.format)
+			}
+		})
+	}
+}
+
+func TestNewLogHandlerHonorsOptions(t *testing.T) {
+	var buf bytes.Buffer
+	h := NewLogHandler(&buf, "json", &slog.HandlerOptions{Level: slog.LevelWarn})
+	logger := slog.New(h)
+	logger.Info("dropped")
+	logger.Warn("kept")
+
+	var lines []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var parsed map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &parsed))
+		lines = append(lines, parsed)
+	}
+	require.Len(t, lines, 1, "level filter must be honored by the selected handler")
+	assert.Equal(t, "kept", lines[0]["msg"])
 }
 
 func TestValidOrigin(t *testing.T) {

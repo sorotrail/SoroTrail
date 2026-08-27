@@ -589,3 +589,130 @@ func TestCompress_ListEndpointDeflate(t *testing.T) {
 	require.NoError(t, json.Unmarshal(out, &evs))
 	assert.Len(t, evs.Events, 30)
 }
+
+func TestWeakenETag(t *testing.T) {
+	tests := []struct {
+		name     string
+		setup    func(http.Header)
+		expected string
+	}{
+		{
+			name: "strong ETag gains W/ prefix",
+			setup: func(h http.Header) {
+				h.Set("ETag", `"v1"`)
+			},
+			expected: `W/"v1"`,
+		},
+		{
+			name: "already-weak ETag is left alone",
+			setup: func(h http.Header) {
+				h.Set("ETag", `W/"v1"`)
+			},
+			expected: `W/"v1"`,
+		},
+		{
+			name:     "missing ETag header is a no-op",
+			setup:    func(h http.Header) {},
+			expected: "",
+		},
+		{
+			name: "empty ETag value is a no-op",
+			setup: func(h http.Header) {
+				h.Set("ETag", "")
+			},
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := make(http.Header)
+			tt.setup(h)
+			weakenETag(h)
+			assert.Equal(t, tt.expected, h.Get("ETag"))
+		})
+	}
+}
+
+func TestCompressWriter_ShouldCompress(t *testing.T) {
+	tests := []struct {
+		name            string
+		contentType     string
+		contentEncoding string
+		status          int
+		expected        bool
+	}{
+		{
+			name:        "a JSON content type is compressed",
+			contentType: "application/json",
+			expected:    true,
+		},
+		{
+			name:        "an already-compressed type such as image/png is not",
+			contentType: "image/png",
+			expected:    false,
+		},
+		{
+			name:        "an already-compressed type such as application/gzip is not",
+			contentType: "application/gzip",
+			expected:    false,
+		},
+		{
+			name:        "an empty content type is handled without panicking",
+			contentType: "",
+			expected:    false,
+		},
+		{
+			name:        "unrecognized content type is not compressed",
+			contentType: "application/octet-stream",
+			expected:    false,
+		},
+		{
+			name:        "content type with parameters is compressed (JSON with charset)",
+			contentType: "application/json; charset=utf-8",
+			expected:    true,
+		},
+		{
+			name:        "capitalized content type is compressed",
+			contentType: "APPLICATION/JSON",
+			expected:    true,
+		},
+		{
+			name:            "handler that encoded its own body is not compressed",
+			contentType:     "application/json",
+			contentEncoding: "gzip",
+			expected:        false,
+		},
+		{
+			name:        "StatusNoContent (204) is not compressed",
+			contentType: "application/json",
+			status:      http.StatusNoContent,
+			expected:    false,
+		},
+		{
+			name:        "StatusNotModified (304) is not compressed",
+			contentType: "application/json",
+			status:      http.StatusNotModified,
+			expected:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			if tt.contentType != "" {
+				rec.Header().Set("Content-Type", tt.contentType)
+			}
+			if tt.contentEncoding != "" {
+				rec.Header().Set("Content-Encoding", tt.contentEncoding)
+			}
+
+			w := &compressWriter{
+				ResponseWriter: rec,
+				status:         tt.status,
+			}
+
+			assert.Equal(t, tt.expected, w.shouldCompress())
+		})
+	}
+}

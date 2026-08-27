@@ -364,3 +364,89 @@ func TestRetryClient_DebugLogNotesSource(t *testing.T) {
 	assert.False(t, strings.Contains(out, "source=backoff"),
 		"only one retry happened and it came from the hint")
 }
+
+// containsStr is the byte-exact substring scan behind isTransientHTTP's
+// fragment list. The contract worth pinning down: an empty needle matches
+// anything, a non-empty needle must appear verbatim — case-sensitively and
+// in full, with no prefix or token matching — and an empty haystack (the
+// string analog of an empty slice) can only match an empty needle. The
+// table below locks in that boundary so a future rewrite cannot silently
+// drift into case-insensitive or partial matching, which would
+// misclassify errors as transient.
+func TestContainsStr(t *testing.T) {
+	tests := []struct {
+		name     string
+		haystack string
+		needle   string
+		want     bool
+	}{
+		{
+			// The everyday case: the fragment the caller is looking for
+			// appears inside a longer message, like "connection refused"
+			// inside a dial error.
+			name:     "a present value is found",
+			haystack: "dial tcp: connection refused",
+			needle:   "connection refused",
+			want:     true,
+		},
+		{
+			// A fragment may sit anywhere in the message, not just at a
+			// word boundary — isTransientHTTP matches on substrings.
+			name:     "a fragment inside a message is found",
+			haystack: "i/o timeout after 30s",
+			needle:   "timeout",
+			want:     true,
+		},
+		{
+			// The mirror case: a fragment that is not present must report
+			// false, so an unrelated error is never misclassified as
+			// transient.
+			name:     "an absent value is not found",
+			haystack: "no such host",
+			needle:   "connection reset",
+			want:     false,
+		},
+		{
+			// An empty haystack (the string analog of an empty slice) can
+			// contain nothing, so any non-empty needle is absent.
+			name:     "an empty haystack holds no non-empty needle",
+			haystack: "",
+			needle:   "EOF",
+			want:     false,
+		},
+		{
+			// The documented degenerate case: an empty needle matches
+			// anything — a fragment isTransientHTTP never passes, but the
+			// behavior is pinned down anyway.
+			name:     "an empty needle matches any haystack",
+			haystack: "anything at all",
+			needle:   "",
+			want:     true,
+		},
+		{
+			// Matching is exact and case-sensitive: a differently-cased
+			// fragment must not match, or a capitalized "Connection
+			// refused" would be classified as transient when the code
+			// looks for the lowercase form.
+			name:     "matching is exact, not case-insensitive",
+			haystack: "Connection refused",
+			needle:   "connection refused",
+			want:     false,
+		},
+		{
+			// The needle must appear in full — a shared prefix is not a
+			// match ("timed out" is not "timeout").
+			name:     "the full needle must appear, not a fragment of it",
+			haystack: "timed out",
+			needle:   "timeout",
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := containsStr(tt.haystack, tt.needle)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}

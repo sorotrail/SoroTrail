@@ -52,9 +52,10 @@ func requireSchema(t *testing.T, pool *pgxpool.Pool) {
 				"raw_topic_xdr", "raw_value_xdr",
 			},
 			indexes: []string{
-				"idx_events_contract_id",
 				"idx_events_ledger",
 				"idx_events_tx_hash",
+				"idx_events_contract_ledger_id",
+				"idx_events_contract_id_id",
 			},
 		},
 		{

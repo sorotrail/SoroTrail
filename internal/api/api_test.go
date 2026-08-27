@@ -117,6 +117,7 @@ type stubStore struct {
 	lastExcludeID string
 
 	stats            store.Stats
+	statsCalls       int // number of Stats calls (to observe caching)
 	pingErr          error
 	watchedList      []store.WatchedContract
 	watchedListErr   error
@@ -296,8 +297,13 @@ func (s *stubStore) MigrationVersion(context.Context) (int, bool, error) {
 	return v, s.migrationDirty, nil
 }
 
-func (s *stubStore) Stats(context.Context, store.Scope) (store.Stats, error) { return s.stats, nil }
-func (s *stubStore) Ping(context.Context) error                              { return s.pingErr }
+func (s *stubStore) Stats(_ context.Context, _ store.Scope) (store.Stats, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statsCalls++
+	return s.stats, nil
+}
+func (s *stubStore) Ping(context.Context) error { return s.pingErr }
 func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return s.watchedList, s.watchedListErr
 }
@@ -1431,6 +1437,69 @@ func TestStats(t *testing.T) {
 		assert.Contains(t, raw, "ingest_lag_ledgers")
 		assert.Nil(t, raw["ingest_lag_ledgers"])
 		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
+	})
+}
+
+// TestStats_Cache verifies the /stats TTL cache end-to-end: repeated calls
+// within the window hit the cache (the store is consulted once), and the value
+// refreshes after the TTL expires.
+func TestStats_Cache(t *testing.T) {
+	t.Run("repeated calls within TTL hit the cache", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999}}
+		s := newTestServer(st, nil)
+		s.SetStatsTTL(30 * time.Second)
+
+		resp1, body1 := doGet(t, s, "/stats")
+		require.Equal(t, http.StatusOK, resp1.StatusCode, string(body1))
+		resp2, body2 := doGet(t, s, "/stats")
+		require.Equal(t, http.StatusOK, resp2.StatusCode, string(body2))
+
+		require.Equal(t, 1, st.statsCalls,
+			"both requests inside the TTL must be served from cache, so the store is hit once")
+		assert.Equal(t, string(body1), string(body2), "cached responses must be identical")
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body2, &got))
+		assert.Equal(t, int64(42), got.TotalEvents)
+	})
+
+	t.Run("values refresh after expiry", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999}}
+		s := newTestServer(st, nil)
+		s.SetStatsTTL(30 * time.Millisecond)
+
+		_, _ = doGet(t, s, "/stats")
+		_, _ = doGet(t, s, "/stats")
+		require.Equal(t, 1, st.statsCalls, "first two calls within TTL cache")
+
+		// Let the TTL elapse, then the next call must recompute.
+		time.Sleep(50 * time.Millisecond)
+		_, body := doGet(t, s, "/stats")
+		require.Equal(t, 2, st.statsCalls, "after expiry the store is consulted again")
+
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, int64(42), got.TotalEvents, "refreshed value is present")
+	})
+
+	t.Run("zero TTL disables caching", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{TotalEvents: 1}}
+		s := newTestServer(st, nil) // default TTL 0 disables caching
+
+		_, _ = doGet(t, s, "/stats")
+		_, _ = doGet(t, s, "/stats")
+		require.Equal(t, 2, st.statsCalls, "without a configured TTL every request recomputes")
+	})
+
+	t.Run("no-store header retained on cached hits", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{TotalEvents: 1}}
+		s := newTestServer(st, nil)
+		s.SetStatsTTL(30 * time.Second)
+
+		resp1, _ := doGet(t, s, "/stats")
+		resp2, _ := doGet(t, s, "/stats")
+		require.Equal(t, http.StatusOK, resp1.StatusCode)
+		require.Equal(t, "no-store", resp1.Header.Get("Cache-Control"))
+		require.Equal(t, "no-store", resp2.Header.Get("Cache-Control"), "cached /stats must stay no-store")
 	})
 }
 

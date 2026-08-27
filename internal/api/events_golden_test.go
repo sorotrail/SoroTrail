@@ -14,6 +14,9 @@ package api
 //	go test ./internal/api -run TestEventsGolden -update-golden
 //
 // and review the resulting diff in internal/api/testdata/golden/.
+//
+// The test also validates that every checked-in snapshot is valid JSON and
+// that no snapshot is silently omitted from the table.
 
 import (
 	"bytes"
@@ -136,7 +139,12 @@ func TestEventsGolden(t *testing.T) {
 		},
 	}
 
+	seen := make(map[string]struct{}, len(tests))
 	for _, tt := range tests {
+		if _, exists := seen[tt.name]; exists {
+			t.Fatalf("duplicate golden test name %q", tt.name)
+		}
+		seen[tt.name] = struct{}{}
 		t.Run(tt.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodGet, tt.query, nil)
@@ -147,6 +155,19 @@ func TestEventsGolden(t *testing.T) {
 
 			compareGolden(t, tt.name, rec.Body.Bytes())
 		})
+	}
+}
+
+func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
+	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
+	require.NoError(t, err)
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join("testdata", "golden", entry.Name()))
+		require.NoError(t, err, entry.Name())
+		require.True(t, json.Valid(body), "golden file %s must contain valid JSON", entry.Name())
 	}
 }
 
