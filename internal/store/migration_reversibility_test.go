@@ -189,6 +189,9 @@ func dbSnapshot(t *testing.T, url string) []byte {
 	var parts []string
 
 	// Tables and columns, ordered deterministically.
+	// schema_migrations is golang-migrate's internal bookkeeping and is
+	// excluded because it persists across up/down cycles (version 0 after
+	// rollback) even though resetDatabase drops it, producing false diffs.
 	tblRows, err := pool.Query(context.Background(), `
 		SELECT c.table_name, c.column_name, c.is_nullable,
 		       c.column_default, c.character_maximum_length
@@ -196,6 +199,7 @@ func dbSnapshot(t *testing.T, url string) []byte {
 		JOIN information_schema.tables t
 		  ON c.table_schema = t.table_schema AND c.table_name = t.table_name
 		WHERE c.table_schema = 'public'
+		  AND c.table_name != 'schema_migrations'
 		ORDER BY c.table_name, c.ordinal_position`)
 	require.NoError(t, err)
 	for tblRows.Next() {
@@ -216,6 +220,7 @@ func dbSnapshot(t *testing.T, url string) []byte {
 		  ON tc.constraint_name = kcu.constraint_name
 		  AND tc.table_schema = kcu.table_schema
 		WHERE tc.table_schema = 'public'
+		  AND tc.table_name != 'schema_migrations'
 		ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`)
 	require.NoError(t, err)
 	for conRows.Next() {
@@ -230,6 +235,7 @@ func dbSnapshot(t *testing.T, url string) []byte {
 		SELECT tablename, indexname, indexdef
 		FROM pg_indexes
 		WHERE schemaname = 'public'
+		  AND tablename != 'schema_migrations'
 		ORDER BY tablename, indexname`)
 	require.NoError(t, err)
 	for idxRows.Next() {
