@@ -190,7 +190,7 @@ func dbSnapshot(t *testing.T, url string) []byte {
 
 	// Tables and columns, ordered deterministically.
 	tblRows, err := pool.Query(context.Background(), `
-		SELECT c.table_name, c.column_name, c.data_nullable,
+		SELECT c.table_name, c.column_name, c.is_nullable,
 		       c.column_default, c.character_maximum_length
 		FROM information_schema.columns c
 		JOIN information_schema.tables t
