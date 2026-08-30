@@ -117,6 +117,8 @@ type Server struct {
 	tracer           trace.Tracer
 	retentionLedgers uint32
 
+	httpRequestBodyLimit int64 // max accepted request body size, in bytes
+
 	// GraphQL transport, injected by main after the server is built.
 	// internal/api/graphql imports this package for its ServerDeps, so
 	// the dependency has to run in this direction to avoid an import
@@ -154,6 +156,11 @@ type Server struct {
 	// cors is the CORS middleware config. Wired via SetCORS from main so
 	// the API does not import the config package.
 	cors CORSConfig
+}
+
+// SetHTTPRequestBodyLimit sets the request body size limit, in bytes, for all handlers accepting a body.
+func (s *Server) SetHTTPRequestBodyLimit(n int64) {
+	s.httpRequestBodyLimit = n
 }
 
 // SetCompressMinSize overrides the body size at which responses are
@@ -323,6 +330,12 @@ func (s *Server) router() chi.Router {
 	// unconditionally so an operator can flip the config on without
 	// restarts; CORS() is a no-op when the allowlist is empty.
 	r.Use(CORS(s.cors))
+	// Limit request body size to prevent resource exhaustion.
+	// Applied after CORS so preflight requests (OPTIONS) pass through
+	// without body size restrictions.
+	if s.httpRequestBodyLimit > 0 {
+		r.Use(s.bodyLimitMiddleware)
+	}
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 	if s.limiter != nil {
@@ -486,17 +499,23 @@ func (s *Server) router() chi.Router {
 }
 
 // handleOpenAPI serves the embedded OpenAPI 3.1 specification.
+// The spec is a compiled-in static asset, so it is cacheable and
+// immutable for an hour. In multi-tenant mode the shared helper marks
+// it private — conservative but harmless: the document contains no
+// tenant data, and losing CDN pooling on a docs route is a fair price
+// for a single cache policy.
 func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
+	writeCacheHeaders(w, cacheImmutable, time.Hour, "")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(openapiSpec)
 }
 
 // handleDocs serves the Swagger UI page that renders /openapi.json.
+// Same cacheability as the spec it renders: a compiled-in static asset.
 func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
+	writeCacheHeaders(w, cacheImmutable, time.Hour, "")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(swaggerUI))
 }
@@ -537,6 +556,19 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 			"status", ww.Status(),
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
+	})
+}
+
+// bodyLimitMiddleware wraps the request body with http.MaxBytesReader to
+// enforce a maximum request body size. This prevents resource exhaustion
+// from clients sending excessively large request bodies. A limit <= 0 means
+// no limit is enforced.
+func (s *Server) bodyLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.httpRequestBodyLimit > 0 {
+			r.Body = http.MaxBytesReader(w, r.Body, s.httpRequestBodyLimit)
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 

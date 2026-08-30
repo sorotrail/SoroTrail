@@ -179,6 +179,17 @@ func WithRateLimitRPS(rps float64) Option {
 	}
 }
 
+// WithHTTPTimeout sets the timeout on the underlying HTTP client used for
+// RPC requests. Values ≤ 0 keep the client's default (30s).
+func WithHTTPTimeout(d time.Duration) Option {
+	return func(c *HTTPClient) {
+		if d <= 0 {
+			return
+		}
+		c.httpClient.Timeout = d
+	}
+}
+
 // WithRequestObserver sets an observer that is called after every RPC call
 // with the JSON-RPC method name and any error that occurred.
 func WithRequestObserver(obs RequestObserver) Option {

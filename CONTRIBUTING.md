@@ -194,6 +194,54 @@ make bench-ci         # benchmark smoke run
 make lint             # golangci-lint run
 ```
 
+## Migration safety
+
+Migrations are the riskiest change applied to a running database. The CI gate
+runs several static checks without a Postgres connection so a broken migration
+is caught at build time:
+
+- **Version uniqueness** — no two .up.sql files share a version number
+  (`TestMigrate_VersionNumbersAreUnique`).
+- **Paired up/down** — every .up.sql has a matching .down.sql and vice versa
+  (`TestMigrate_FilesAreWellFormed`).
+- **No drop-after-create** — a migration cannot drop a table that a later
+  migration depends on (`TestMigrate_NoUpDropsTableDependency`).
+- **No rebuild-after-alter** — a migration cannot rebuild a table (rename +
+  create) that a later migration alters, because the rebuild silently discards
+  columns added before it (`TestMigrate_NoUpRebuildsTableDependency`).
+
+The integration suite (`go test -tags=integration`) exercises the full
+up-from-empty → down-to-zero → up-again round-trip against a real Postgres
+(`TestMigrate_UpDownUpRoundTrip`), and verifies that each down migration
+reverses its up exactly (`TestMigrate_EachDownReversesItsUp`).
+
+Run `sorotrail migrate-status` to report pending migrations without applying
+them — useful for pre-deploy checks.
+
+### Dirty version recovery
+
+If a migration partially applies and then fails, the database enters a
+dirty state (the `dirty` flag in `schema_migrations` is set to `1`).
+Recovery steps:
+
+1. Inspect the current state:
+   ```sql
+   SELECT version, dirty FROM schema_migrations;
+   ```
+2. If the version number is correct but dirty, mark it clean:
+   ```sql
+   UPDATE schema_migrations SET dirty = false;
+   ```
+3. If the version number is wrong, set it to the correct value:
+   ```sql
+   UPDATE schema_migrations SET version = <N>, dirty = false;
+   ```
+4. Re-run `sorotrail` to verify it starts cleanly.
+
+Never manually modify migration SQL files after they have been applied to
+any environment. If a migration is broken, write a new forward migration
+to fix it.
+
 ## Pull requests
 
 - `make ci` must pass before pushing.

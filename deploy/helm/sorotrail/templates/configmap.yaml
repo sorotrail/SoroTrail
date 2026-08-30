@@ -25,3 +25,6 @@ data:
   {{- if .Values.config.rateLimitTrustedProxy }}
   RATE_LIMIT_TRUSTED_PROXY: {{ .Values.config.rateLimitTrustedProxy | quote }}
   {{- end }}
+  {{- if .Values.config.enableMetrics }}
+  ENABLE_METRICS: {{ .Values.config.enableMetrics | quote }}
+  {{- end }}

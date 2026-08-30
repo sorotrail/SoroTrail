@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -67,7 +68,16 @@ type Config struct {
 	// RPC_URLS is set (the failover path uses RPC_RATE_LIMIT_RPS).
 	RPCRateLimit          float64       `env:"RPC_RATE_LIMIT" envDefault:"10"`
 	DatabaseURL           string        `env:"DATABASE_URL"`
+	// DB pool sizing. Zero means "use the pgx default". These let an operator
+	// bound the Postgres connection pool without a code redeploy.
+	DBMaxConns        int32         `env:"DB_MAX_CONNS" envDefault:"0"`
+	DBMinConns        int32         `env:"DB_MIN_CONNS" envDefault:"0"`
+	DBMaxConnLifetime time.Duration `env:"DB_MAX_CONN_LIFETIME" envDefault:"0"`
+	DBMaxConnIdleTime time.Duration `env:"DB_MAX_CONN_IDLE_TIME" envDefault:"0"`
 	PollInterval          time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
+	// HTTPAddr is the address the HTTP server listens on (host:port), e.g.
+	// ":8080" or "0.0.0.0:9090". See HTTP_ADDR in .env.example. It must be a
+	// valid host:port pair.
 	HTTPAddr              string        `env:"HTTP_ADDR" envDefault:":8080"`
 	WatchedContracts      []string      `env:"WATCHED_CONTRACTS"`
 	StartLedger           uint32        `env:"START_LEDGER"`
@@ -113,6 +123,14 @@ type Config struct {
 	// many ledgers behind the chain head. Zero disables the alarm.
 	LagWarnLedgers uint32 `env:"LAG_WARN_LEDGERS" envDefault:"100"`
 
+	// Ingester retry backoff. A zero jitter max preserves the ingester's
+	// proportional jitter behavior; non-zero bounds make the random range
+	// explicit.
+	IngesterMinBackoff time.Duration `env:"INGESTER_MIN_BACKOFF" envDefault:"1s"`
+	IngesterMaxBackoff time.Duration `env:"INGESTER_MAX_BACKOFF" envDefault:"1m"`
+	IngesterJitterMin  time.Duration `env:"INGESTER_JITTER_MIN" envDefault:"0"`
+	IngesterJitterMax  time.Duration `env:"INGESTER_JITTER_MAX" envDefault:"0"`
+
 	// GraphQLPlayground gates the dev-mode GraphiQL UI at /graphiql.
 	GraphQLPlayground bool `env:"GRAPHQL_PLAYGROUND"`
 
@@ -137,6 +155,10 @@ type Config struct {
 	RPCBaseBackoff time.Duration `env:"RPC_BASE_BACKOFF" envDefault:"500ms"`
 	RPCMaxBackoff  time.Duration `env:"RPC_MAX_BACKOFF" envDefault:"30s"`
 	RPCJitter      bool          `env:"RPC_JITTER" envDefault:"true"`
+	// RPCHTTPTimeout is the timeout on the underlying HTTP client's RPC
+	// requests (e.g. "30s"). Zero (default) keeps the client's 30s timeout;
+	// operators can raise it for a slow private RPC endpoint.
+	RPCHTTPTimeout time.Duration `env:"RPC_HTTP_TIMEOUT" envDefault:"30s"`
 
 	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
 	// entirely; the binary behaves exactly like the pre-audit build.
@@ -157,6 +179,9 @@ type Config struct {
 	HTTPWriteTimeout      time.Duration `env:"HTTP_WRITE_TIMEOUT" envDefault:"30s"`
 	HTTPIdleTimeout       time.Duration `env:"HTTP_IDLE_TIMEOUT" envDefault:"60s"`
 	HTTPReadHeaderTimeout time.Duration `env:"HTTP_READ_HEADER_TIMEOUT" envDefault:"10s"`
+	// HTTPRequestBodyLimit caps the max size accepted for any request body (all endpoints).
+	// Default 1048576 (1 MiB) protects against memory/resource exhaustion. Set higher if needed when trusting clients.
+	HTTPRequestBodyLimit int64 `env:"HTTP_REQUEST_BODY_LIMIT" envDefault:"1048576"`
 
 	// APIKey, when set, gates the watched-contracts management endpoints
 	// via a constant-time comparison against the X-API-Key request header.
@@ -168,6 +193,8 @@ type Config struct {
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
+	HourlyQuota           int64   `env:"HOURLY_QUOTA"`
+	DailyQuota            int64   `env:"DAILY_QUOTA"`
 
 	// CompressMinSize is the response body size, in bytes, at or above which
 	// responses are gzip/deflate encoded for clients that advertise support.
@@ -313,12 +340,15 @@ type Config struct {
 	// response headers. X-Request-ID is set on every response by the API's
 	// request logger (#29), so it is the default; an operator can extend
 	// the list or empty it to suppress the header entirely.
-	CORSExposedHeaders []string `env:"CORS_EXPOSED_HEADERS" envDefault:"X-Request-ID"`
+	CORSExposedHeaders []string `env:"CORS_EXPOSED_HEADERS" envDefault:"X-Request-ID,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset"`
 }
 
 // Load reads configuration from the environment and validates it.
 // All validation failures are aggregated into a single error.
 func Load() (Config, error) {
+	if err := resolveFileEnv(); err != nil {
+		return Config{}, fmt.Errorf("resolving *_FILE environment values: %w", err)
+	}
 	var cfg Config
 	if err := env.Parse(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parsing environment: %w", err)
@@ -349,6 +379,31 @@ func Load() (Config, error) {
 }
 
 // IsSQLite reports whether the database URL points to a SQLite database.
+func resolveFileEnv() error {
+	for _, kv := range os.Environ() {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		name, filePath := parts[0], parts[1]
+		if !strings.HasSuffix(name, "_FILE") {
+			continue
+		}
+		baseName := strings.TrimSuffix(name, "_FILE")
+		if _, set := os.LookupEnv(baseName); set {
+			continue
+		}
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return fmt.Errorf("%s: reading %q: %w", name, filePath, err)
+		}
+		if err := os.Setenv(baseName, strings.TrimRight(string(data), "\r\n")); err != nil {
+			return fmt.Errorf("%s: setting %s: %w", name, baseName, err)
+		}
+	}
+	return nil
+}
+
 func IsSQLite(databaseURL string) bool {
 	return strings.HasPrefix(databaseURL, "sqlite:")
 }
@@ -408,11 +463,29 @@ func (c Config) Validate() error {
 			return fmt.Errorf("sqlite DATABASE_URL %q must be an absolute or relative path (or :memory:)", c.DatabaseURL)
 		}
 	}
+	if c.DBMaxConns < 0 {
+		return fmt.Errorf("DB_MAX_CONNS must be non-negative, got %d", c.DBMaxConns)
+	}
+	if c.DBMinConns < 0 {
+		return fmt.Errorf("DB_MIN_CONNS must be non-negative, got %d", c.DBMinConns)
+	}
+	if c.DBMaxConnLifetime < 0 {
+		return fmt.Errorf("DB_MAX_CONN_LIFETIME must be non-negative, got %s", c.DBMaxConnLifetime)
+	}
+	if c.DBMaxConnIdleTime < 0 {
+		return fmt.Errorf("DB_MAX_CONN_IDLE_TIME must be non-negative, got %s", c.DBMaxConnIdleTime)
+	}
 	// Empty means "unused": HORIZON_URL is only read by `sorotrail backfill`
 	// and Load supplies a default, so an unset value is not a misconfigured
 	// indexer. Validate the shape only when someone actually set one.
 	if u, err := url.Parse(c.HorizonURL); c.HorizonURL != "" && (err != nil || u.Scheme == "" || u.Host == "") {
 		return fmt.Errorf("HORIZON_URL %q is not a valid URL", c.HorizonURL)
+	}
+
+	if c.HTTPAddr != "" {
+		if _, _, err := net.SplitHostPort(c.HTTPAddr); err != nil {
+			return fmt.Errorf("HTTP_ADDR %q is not a valid host:port (e.g. :8080)", c.HTTPAddr)
+		}
 	}
 
 	if c.PollInterval <= 0 {
@@ -426,6 +499,12 @@ func (c Config) Validate() error {
 	}
 	if c.RetentionLedgers == 0 {
 		return fmt.Errorf("RETENTION_LEDGERS must be positive")
+	}
+	if c.RetentionAge < 0 {
+		return fmt.Errorf("RETENTION_AGE must be non-negative")
+	}
+	if c.RetentionPoll <= 0 {
+		return fmt.Errorf("RETENTION_POLL_INTERVAL must be positive")
 	}
 	if c.PartitionLedgerSpan == 0 {
 		return fmt.Errorf("PARTITION_LEDGER_SPAN must be positive")
@@ -502,6 +581,9 @@ func (c Config) Validate() error {
 	if c.RPCMaxBackoff <= 0 {
 		return fmt.Errorf("RPC_MAX_BACKOFF must be positive, got %s", c.RPCMaxBackoff)
 	}
+	if c.RPCHTTPTimeout < 0 {
+		return fmt.Errorf("RPC_HTTP_TIMEOUT must be non-negative, got %s", c.RPCHTTPTimeout)
+	}
 	if c.RateLimitRPS < 0 {
 		return fmt.Errorf("RATE_LIMIT_RPS must be non-negative")
 	}
@@ -519,6 +601,9 @@ func (c Config) Validate() error {
 	}
 	if c.HTTPReadHeaderTimeout < 0 {
 		return fmt.Errorf("HTTP_READ_HEADER_TIMEOUT must be non-negative, got %s", c.HTTPReadHeaderTimeout)
+	}
+	if c.HTTPRequestBodyLimit < 0 {
+		return fmt.Errorf("HTTP_REQUEST_BODY_LIMIT must be non-negative, got %d", c.HTTPRequestBodyLimit)
 	}
 	if c.APIMaxLimit < 1 {
 		return fmt.Errorf("API_MAX_LIMIT must be positive, got %d", c.APIMaxLimit)
@@ -748,6 +833,10 @@ func (c Config) LoggableFields() []any {
 		"rpc_base_backoff", c.RPCBaseBackoff,
 		"rpc_max_backoff", c.RPCMaxBackoff,
 		"rpc_jitter", c.RPCJitter,
+		"ingester_min_backoff", c.IngesterMinBackoff,
+		"ingester_max_backoff", c.IngesterMaxBackoff,
+		"ingester_jitter_min", c.IngesterJitterMin,
+		"ingester_jitter_max", c.IngesterJitterMax,
 		"rpc_rate_limit", c.RPCRateLimit,
 		"database_url", dbURL,
 		"poll_interval", c.PollInterval,

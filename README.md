@@ -131,6 +131,77 @@ data in events.topics_xdr and events.value_xdr; budget extra event-table
 storage for deployments that retain large event histories.
 Decoder replay
 Decoders improve over time. sorotrail replay re-runs the current decoder
+## Supported versions
+
+SoroTrail is tested in CI against the following Postgres major versions:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `RPC_URL` | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet. |
+| `RPC_RATE_LIMIT` | `10` | Request rate limit (`requests/second`) for the single-provider client. The default of 10 matches the public endpoint limit — raising it against the public RPC will get you throttled; set it higher only for paid provider plans or self-hosted RPCs whose allowance permits it. On HTTP 429 the client honors the provider's `Retry-After` header (delta-seconds or HTTP-date, capped at 60s) before falling back to exponential backoff. Ignored when `RPC_URLS` is set. |
+| `RPC_MAX_ATTEMPTS` | `3` | Maximum attempts (including the first) per failing RPC call before the error surfaces. |
+| `RPC_BASE_BACKOFF` | `500ms` | Initial retry backoff duration; doubles on each subsequent retry. |
+| `RPC_MAX_BACKOFF` | `30s` | Upper bound on the computed retry backoff. |
+| `RPC_JITTER` | `true` | Randomize each computed backoff to [0.5×, 1.5×) so concurrent retries don't thundering-herd the endpoint. Never applied to a provider's `Retry-After` hint. |
+| `INGESTER_MIN_BACKOFF` | `1s` | Initial error backoff for the ingester. |
+| `INGESTER_MAX_BACKOFF` | `1m` | Maximum error backoff for the ingester. |
+| `INGESTER_JITTER_MIN` | `0` | Minimum additive jitter for ingester errors. |
+| `INGESTER_JITTER_MAX` | `0` | Exclusive maximum additive jitter. Zero preserves proportional jitter up to half the current backoff. |
+| `RPC_URLS` | unset | Comma-separated, priority-ordered list of Stellar RPC endpoints. When set, `RPC_URL` is ignored and the multi-provider failover client is used. List order is priority: index 0 is tried first. |
+| `RPC_RATE_LIMIT_RPS` | `10` | Per-provider request rate limit (`requests/second`) applied to each RPC endpoint independently. Only used when `RPC_URLS` is set. |
+| `HORIZON_URL` | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. |
+| `BACKFILL_RATE_RPS` | `10` | Pace against Horizon when backfilling. 10 req/s is the public-instance cap; private deployments can lift this. |
+| `DATABASE_URL` | — (required) | Postgres connection string. |
+| `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. |
+| `HTTP_ADDR` | `:8080` | API listen address. |
+| `WATCHED_CONTRACTS` | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract automatically triggers a backfill from `latest − RETENTION_LEDGERS` (clamped to RPC retention), independent of other contracts. |
+| `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
+| `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
+| `PARTITION_LEDGER_SPAN` | `120960` | Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. |
+| `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
+| `LOG_FORMAT` | `text` | `text` \| `json`. JSON emits one JSON object per line, compatible with Loki, CloudWatch, and ELK. |
+| `API_QUERY_TIMEOUT` | `25s` | Per-request database timeout for API-originated store reads. The timeout is enforced in-process and mirrored to Postgres via `statement_timeout`. |
+| `API_SLOW_QUERY_THRESHOLD` | `2s` | Warn when an API-originated store query takes longer than this threshold; logs include the query name and elapsed duration. |
+| `AUDIT_ENABLED` | `false` | Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build. |
+| `AUDIT_POLL_INTERVAL` | `30s` | Sleep between audit passes. |
+| `AUDIT_BATCH_LEDGERS` | `100` | Ledger range covered by one audit pass. |
+| `AUDIT_LAG_THRESHOLD` | `200` | Auditor sleeps until ingest is at least this many ledgers past the verified mark. |
+| `AUDIT_BUDGET_SHARE` | `0.10` | Fraction of the request budget the audit pool gets (rest goes to ingest). |
+| `AUDIT_MAX_RPS` | `10` | Total request budget (split between ingest and audit). |
+| `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
+| `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
+| `API_MAX_LIMIT` | `500` | Maximum page size accepted for list endpoints (`/events`, `/subscriptions/{id}/deliveries`). Values above this are rejected with 400. |
+| `STATS_CACHE_TTL` | `5s` | How long `GET /stats` results are served from the per-scope cache before being recomputed, short-circuiting the aggregation on busy endpoints. `0` disables caching. |
+| `API_KEY` | empty | Required to use the runtime `/watched-contracts` surface; empty means every request there is rejected with 503. This is a placeholder until #17 (real auth) lands — at that point `API_KEY` will be replaced. |
+| `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
+| `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
+| `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
+| `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
+| `CORS_ALLOWED_ORIGINS` | unset | Comma-separated browser origins allowed to call the API. `*` allows any origin; otherwise each entry is an explicit origin (`scheme://host`). Unset = CORS disabled, no CORS headers emitted. Preflight `OPTIONS` is answered automatically; invalid entries (e.g. `null`, origins with a path) fail startup. |
+| `CORS_EXPOSED_HEADERS` | `X-Request-ID` | Response headers browser JavaScript may read on allowed origins via `Access-Control-Expose-Headers`. The API stamps every response with `X-Request-ID`; empty suppresses the header entirely. |
+| `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
+| `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
+| `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
+| `COMPRESS_MIN_SIZE` | `1400` | Response body size (bytes) at or above which responses are gzip/deflate encoded for clients advertising support. Set negative to disable compression. See [Compression](#compression). |
+| `SHUTDOWN_TIMEOUT` | `15s` | Time the graceful shutdown may wait for in-flight requests and the current ingest cycle to wind down before the process is killed. Zero means wait indefinitely. |
+| `SWEEP_CONCURRENCY` | `1` | Number of filter batches fanned out in parallel during a windowSweep pass. The per-request RPC interval limiter still caps total request rate at ~10 req/s, so raising this helps only against private RPCs with more headroom. The single-batch path (`<=25` watched contracts) is unchanged. |
+| `MAX_EVENTS_PER_CYCLE` | unset | Cap on the number of events a single ingestion cycle may process, bounding per-cycle memory and latency on busy chains. When the cap is hit mid-window the sweep stops fetching and the ingest frontier stays put, so the next cycle resumes where it stopped (idempotent upserts make the overlap harmless); in single-page mode the pagination limit is clamped down to the cap instead. Unset/zero disables the cap — identical to the pre-cap behavior. |
+| `REORG_CONFIRMATION_WINDOW` | `64` | Number of ledgers behind the ingest frontier re-scanned on a schedule for RPC-side reorgs. Once a ledger is further behind the frontier than this, it is considered finalized and never rewritten. Zero disables reorg detection. |
+| `REORG_RESCAN_INTERVAL` | `1m` | Cadence of the periodic reorg re-scan over the recent finalized window. The re-scan shares the live RPC budget and runs after a successful ingest cycle. |
+| `EXPORT_MAX_RANGE` | `17280` | Maximum ledger span a single `/contracts/{id}/export` call may request (~24h at 5s/ledger). Returns `400` with the bound if exceeded. Raise for dedicated analytical deployments; lower for tighter abuse thresholds. |
+| `MULTI_TENANT` | `false` | Serve several consumers from one deployment, each scoped to its own contracts. Off means no authentication and no tenant boundary — identical to the pre-multi-tenancy build. See [Multi-tenancy](docs/multi-tenancy.md). |
+| `MULTI_TENANT_MAX_WATCHED` | `250` | Cap on the union of all tenants' watch lists, bounding the ingester's RPC cost. `0` disables the cap. |
+| `MULTI_TENANT_USAGE_FLUSH` | `10s` | How often accumulated per-tenant usage counters are persisted. |
+| `MULTI_TENANT_STREAM_SCOPE_SYNC` | `30s` | How often an open stream re-resolves its tenant's grants, bounding how long a revoked grant keeps being served. |
+| `MULTI_TENANT_BOOTSTRAP_KEY` | unset | Installs an admin API key for the seeded `default` tenant at startup, so a fresh multi-tenant install can mint its first keys. Rejected unless `MULTI_TENANT=true`. |
+| Version | Status |
+| --- | --- |
+| PostgreSQL 15 | Supported |
+| PostgreSQL 16 | Supported |
+
+Any Postgres 15+ release should work; only the above versions are exercised in
+the test matrix.
+
 ## Configuration
 
 All configuration comes from environment variables (see `.env.example`).
@@ -150,12 +221,17 @@ the struct tags in `internal/config/config.go` to prevent drift.
 | `RPC_BASE_BACKOFF` | duration | `500ms` | Initial retry backoff duration; doubles on each subsequent retry. |
 | `RPC_MAX_BACKOFF` | duration | `30s` | Upper bound on the computed retry backoff. |
 | `RPC_JITTER` | bool | `true` | Randomize each computed backoff to [0.5×, 1.5×) so concurrent retries don't thundering-herd the endpoint. Never applied to a provider's `Retry-After` hint. |
+| `RPC_HTTP_TIMEOUT` | duration | `30s` | Timeout on the underlying HTTP client's RPC requests. Raise for a slow private RPC endpoint. |
 
 ### Database
 
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
 | `DATABASE_URL` | string | — (required) | Postgres or SQLite connection string. Use `postgres://…` for production or `sqlite:./sorotrail.db` for a zero-dependency single-binary setup. |
+| `DB_MAX_CONNS` | int | `0` | Max connections in the Postgres pool. `0` (default) uses pgx's default. |
+| `DB_MIN_CONNS` | int | `0` | Min connections kept warm in the pool (`0` = pgx default). |
+| `DB_MAX_CONN_LIFETIME` | duration | `0` | Max lifetime of a DB connection (`0` = no limit, e.g. `30m`). |
+| `DB_MAX_CONN_IDLE_TIME` | duration | `0` | Max idle time of a DB connection (`0` = no limit, e.g. `5m`). |
 
 ### Ingestion
 
@@ -217,7 +293,7 @@ the struct tags in `internal/config/config.go` to prevent drift.
 | `CORS_ALLOWED_ORIGINS` | CSV | empty | Browser origins allowed to call the API cross-origin. `*` allows any origin; otherwise each entry must be an explicit `scheme://host`. Empty = CORS disabled. Invalid entries (e.g. `null`, origins with a path) fail startup. |
 | `CORS_ALLOWED_METHODS` | CSV | `GET,POST,PUT,DELETE,OPTIONS` | Methods returned on preflight (`OPTIONS`) responses. |
 | `CORS_ALLOWED_HEADERS` | CSV | `Content-Type,X-API-Key,Accept` | Headers returned on preflight responses. |
-| `CORS_EXPOSED_HEADERS` | CSV | `X-Request-ID` | Response headers browser JavaScript may read via `Access-Control-Expose-Headers`. Empty suppresses the header entirely. |
+| `CORS_EXPOSED_HEADERS` | CSV | `X-Request-ID,X-RateLimit-Remaining` | Response headers browser JavaScript may read via `Access-Control-Expose-Headers`. Empty suppresses the header entirely. |
 
 ### Rate limiting
 
@@ -226,6 +302,8 @@ the struct tags in `internal/config/config.go` to prevent drift.
 | `RATE_LIMIT_RPS` | float | `0` (disabled) | Per-client HTTP request rate limit (`requests/second`). Must be set together with `RATE_LIMIT_BURST`; setting only one fails startup. |
 | `RATE_LIMIT_BURST` | int | `0` (disabled) | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | bool | `false` | Honor `X-Forwarded-For` for client IP detection. Only enable behind a trusted proxy that strips/rewrites the header. |
+| `HOURLY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a rolling 1-hour window. `0` disables the quota. |
+| `DAILY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a rolling 24-hour window. `0` disables the quota. |
 
 ### Audit
 
@@ -954,6 +1032,32 @@ A SIGINT or SIGTERM cancels the root context, which propagates into:
 This guarantees no panics and no truncated writes on `Ctrl-C` / `kill`,
 and the cursor is always persisted so the next process picks up exactly
 where the previous one stopped.
+
+### Config hot-reload (SIGHUP)
+
+Sending `SIGHUP` to the running indexer process re-reads the environment
+and applies a safe subset live, with no restart:
+
+- **`POLL_INTERVAL`** — takes effect on the ingester's next caught-up
+  sleep.
+- **`LOG_LEVEL`** — takes effect immediately for all subsequent log lines.
+
+The full environment is re-parsed and validated exactly as it is at
+startup (`config.Load`); if the result is invalid (e.g. a malformed
+`POLL_INTERVAL` or a `LOG_LEVEL` outside `debug|info|warn|error`) the
+reload is rejected, an error is logged, and the previously-running
+configuration stays active untouched.
+
+Everything else — `DATABASE_URL`, `RPC_URL`/`RPC_URLS`, `LOG_FORMAT`,
+`HTTP_ADDR`, and the rest of the topology — is topology, not a tunable:
+changing it live would mean reconstructing the store, RPC client, or log
+handler mid-flight, which the indexer only ever does at startup. If a
+`SIGHUP` reload observes one of those differing from the running value,
+it logs a warning naming the field and leaves it untouched rather than
+failing the whole reload — restart the process to pick up a topology
+change. `kill -HUP <pid>` (or `docker kill --signal=HUP <container>`)
+triggers a reload; the one-shot subcommands (`replay`, `backfill`,
+`index-addresses`) have no reload path since they exit on their own.
 
 ### GraphQL API
 

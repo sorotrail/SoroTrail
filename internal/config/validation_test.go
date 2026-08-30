@@ -32,6 +32,8 @@ func TestValidateAll_ValidConfig(t *testing.T) {
 		AuditMaxRPS:         10,
 		AuditMaxRepair:      3,
 		AuditFindingMaxLgrs: 100,
+		IngesterMinBackoff:  time.Second,
+		IngesterMaxBackoff:  time.Minute,
 		LogLevel:            "info",
 		LogFormat:           "text",
 	}
@@ -90,6 +92,24 @@ func TestValidateAll_NumericRanges(t *testing.T) {
 	checkContains(t, err, "PARTITION_LEDGER_SPAN")
 
 	cfg.PartitionLedgerSpan = 120960
+	cfg.LogFormat = "text"
+	cfg.IngesterMinBackoff = 0
+	err = cfg.ValidateAll()
+	checkContains(t, err, "INGESTER_MIN_BACKOFF")
+
+	cfg.IngesterMinBackoff = 2 * time.Second
+	cfg.IngesterMaxBackoff = time.Second
+	err = cfg.ValidateAll()
+	checkContains(t, err, "INGESTER_MIN_BACKOFF")
+
+	cfg.IngesterMaxBackoff = time.Minute
+	cfg.IngesterJitterMin = 2 * time.Second
+	cfg.IngesterJitterMax = time.Second
+	err = cfg.ValidateAll()
+	checkContains(t, err, "INGESTER_JITTER_MIN")
+
+	cfg.IngesterJitterMin = 0
+	cfg.IngesterJitterMax = 0
 	cfg.AuditBatchLedgers = 0
 	err = cfg.ValidateAll()
 	checkContains(t, err, "AUDIT_BATCH_LEDGERS")
@@ -278,6 +298,8 @@ func validBase() Config {
 		AuditMaxRPS:         10,
 		AuditMaxRepair:      3,
 		AuditFindingMaxLgrs: 100,
+		IngesterMinBackoff:  time.Second,
+		IngesterMaxBackoff:  time.Minute,
 		LogLevel:            "info",
 		LogFormat:           "text",
 	}

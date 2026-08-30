@@ -78,6 +78,8 @@ func dispatch(args []string) error {
 		return nil
 	case "schema-inspect":
 		return runSchemaInspect(args[1:])
+	case "migrate-status":
+		return runMigrateStatus(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -103,6 +105,8 @@ subcommands:
                (sorotrail healthcheck --help)
   schema-inspect  report migration state, partitions, and table sizes
                (sorotrail schema-inspect --help)
+  migrate-status report pending migrations without applying them
+               (sorotrail migrate-status --help)
 `)
 }
 
@@ -111,7 +115,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log := newLogger(cfg.LogLevel, cfg.LogFormat)
+	log, logLevel := newLoggerWithLevel(cfg.LogLevel, cfg.LogFormat)
 
 	log.Info("startup configuration", cfg.LoggableFields()...)
 
@@ -141,7 +145,7 @@ func run() error {
 			return err
 		}
 	} else {
-		pool, err = pgxpool.New(ctx, cfg.DatabaseURL)
+		pool, err = store.NewPool(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns, cfg.DBMaxConnLifetime, cfg.DBMaxConnIdleTime)
 		if err != nil {
 			return fmt.Errorf("connecting to postgres: %w", err)
 		}
@@ -201,7 +205,11 @@ func run() error {
 	// the retry wrapper applies the configured backoff, honoring any
 	// Retry-After hint a rate-limiting provider sends (issue #58).
 	rpcClient := rpc.NewRetryClient(
-		rpc.NewHTTPClient(cfg.RPCURL, rpc.WithRateLimitRPS(cfg.RPCRateLimit)),
+		rpc.NewHTTPClient(
+			cfg.RPCURL,
+			rpc.WithRateLimitRPS(cfg.RPCRateLimit),
+			rpc.WithHTTPTimeout(cfg.RPCHTTPTimeout),
+		),
 		rpc.RetryConfig{
 			MaxAttempts: cfg.RPCMaxAttempts,
 			BaseBackoff: cfg.RPCBaseBackoff,
@@ -273,6 +281,36 @@ func run() error {
 	// stalling the cycle (issue #131).
 	ing.SetDeadLetterSink(st)
 
+	// SIGHUP config hot-reload (issue #148): re-reads and validates the
+	// full environment on every SIGHUP, then applies only the safe subset
+	// (poll interval, log level) to the already-running ingester/logger.
+	// Topology (DATABASE_URL, RPC_URL(S), LOG_FORMAT) never changes live —
+	// a differing value there is logged and ignored rather than failing
+	// the reload, since it can't be applied to the already-constructed
+	// store/RPC client/log handler without a restart. A validation failure
+	// in the new config rejects the whole reload and leaves the running
+	// configuration untouched. This only applies to the long-running
+	// indexer; the one-shot subcommands have no reload path.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	defer signal.Stop(hupCh)
+	go func() {
+		activeCfg := cfg
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hupCh:
+				reloaded, err := applyReload(activeCfg, log, ing, logLevel)
+				if err != nil {
+					log.Error("config reload via SIGHUP rejected; keeping previous configuration", "error", err)
+					continue
+				}
+				activeCfg = reloaded
+			}
+		}
+	}()
+
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a
 	// pre-audit build, so we skip every allocation.
@@ -293,6 +331,13 @@ func run() error {
 		// Expose the auditor's counters via /stats so operators don't need
 		// to parse logs to see pass/finding rates.
 		api.SetAuditor(aud)
+	}
+	var pruner *store.RetentionPruner
+	if cfg.RetentionAge > 0 {
+		pruner = store.NewRetentionPruner(st, log, store.RetentionOptions{
+			Age:          cfg.RetentionAge,
+			PollInterval: cfg.RetentionPoll,
+		})
 	}
 
 	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
@@ -343,7 +388,10 @@ func run() error {
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
 	// its cleanup goroutine is never started.
-	limiterOpts := []api.LimiterOption{}
+	limiterOpts := []api.LimiterOption{
+		api.WithHourlyQuota(cfg.HourlyQuota),
+		api.WithDailyQuota(cfg.DailyQuota),
+	}
 	if cfg.MultiTenant {
 		// Key buckets on the authenticated tenant rather than the source
 		// IP, so a tenant's quota follows its identity across however many
@@ -368,6 +416,7 @@ func run() error {
 	apiServer.SetRateLimiter(limiter)
 	apiServer.SetMetricsEnabled(cfg.MetricsEnabled)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
+	apiServer.SetHTTPRequestBodyLimit(cfg.HTTPRequestBodyLimit)
 	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
 	apiServer.SetCORSConfig(api.CORSConfig{
 		AllowedOrigins: cfg.CORSAllowedOrigins,
@@ -430,7 +479,7 @@ func run() error {
 		log.Info("cors enabled", "origins", strings.Join(cfg.CORSAllowedOrigins, ","))
 	}
 
-	errCh := make(chan error, 4)
+	errCh := make(chan error, 5)
 	go func() {
 		go wh.Run(ctx)
 	}()
@@ -471,6 +520,16 @@ func run() error {
 				"max_repair_attempts", cfg.AuditMaxRepair)
 			if err := aud.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- fmt.Errorf("auditor: %w", err)
+			} else {
+				errCh <- nil
+			}
+		}()
+	}
+	if pruner != nil {
+		go func() {
+			log.Info("event retention pruning starting", "age", cfg.RetentionAge, "poll_interval", cfg.RetentionPoll)
+			if err := pruner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("retention pruner: %w", err)
 			} else {
 				errCh <- nil
 			}
@@ -554,6 +613,30 @@ func bootstrapAdminKey(ctx context.Context, ts store.TenantStore, key string, lo
 }
 
 func newLogger(level, format string) *slog.Logger {
+	log, _ := newLoggerWithLevel(level, format)
+	return log
+}
+
+// newLoggerWithLevel builds a logger exactly like newLogger, but also
+// returns the slog.LevelVar backing its handler. slog handlers don't
+// support swapping their level after construction, so a caller that needs
+// to adjust the effective log level in place at runtime — the long-running
+// indexer's SIGHUP config-reload handler — holds onto the returned
+// LevelVar and calls Set on it instead of rebuilding the logger/handler.
+// The one-shot subcommands (replay/backfill/index-addresses) have no
+// reload path, so they keep using the simpler newLogger.
+func newLoggerWithLevel(level, format string) (*slog.Logger, *slog.LevelVar) {
+	var levelVar slog.LevelVar
+	levelVar.Set(config.ParseLogLevel(level))
+	opts := &slog.HandlerOptions{Level: &levelVar}
+	var h slog.Handler
+	switch strings.ToLower(format) {
+	case "json":
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	default:
+		h = slog.NewTextHandler(os.Stdout, opts)
+	}
+	return slog.New(h), &levelVar
 	opts := &slog.HandlerOptions{Level: config.ParseLogLevel(level)}
 	return slog.New(config.NewLogHandler(os.Stdout, format, opts))
 }
