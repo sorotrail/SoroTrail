@@ -191,7 +191,12 @@ func compareGolden(t *testing.T, name string, body []byte) {
 	require.NoError(t, err,
 		"golden file %s missing; run: go test ./internal/api -run TestEventsGolden -update-golden", path)
 
-	if !bytes.Equal(golden, body) {
+	// Normalize CRLF to LF so the comparison works across platforms;
+	// git's autocrlf may check files out with \r\n on Windows.
+	golden = bytes.ReplaceAll(golden, []byte("\r\n"), []byte("\n"))
+	normalized := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+
+	if !bytes.Equal(golden, normalized) {
 		var want, got bytes.Buffer
 		_ = json.Indent(&want, golden, "", "  ")
 		_ = json.Indent(&got, body, "", "  ")

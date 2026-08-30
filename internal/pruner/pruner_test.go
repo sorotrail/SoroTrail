@@ -379,3 +379,62 @@ func TestPrunerEmptyStore(t *testing.T) {
 func (m *mockStore) CountContracts(context.Context, store.ContractsFilter) (int64, error) {
 	return 0, nil
 }
+
+func (m *mockStore) CountEventsBefore(_ context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var count int64
+	for _, e := range m.events {
+		if e.Ledger < maxLedger {
+			if !beforeTime.IsZero() && !e.CreatedAt.Before(beforeTime) {
+				continue
+			}
+			count++
+			if count >= int64(limit) {
+				break
+			}
+		}
+	}
+	return count, nil
+}
+
+func TestPrunerDryRun(t *testing.T) {
+	st := newMockStore()
+	st.setIngestionState(100)
+	st.addEvent("e1", 50, time.Now().Add(-24*time.Hour))
+	st.addEvent("e2", 90, time.Now().Add(-24*time.Hour))
+
+	prn := New(st, slog.New(slog.NewTextHandler(nopWriter{}, nil)), Options{
+		MinLedger: 80,
+		BatchSize: 10,
+		DryRun:    true,
+	})
+	require.True(t, prn.Enabled())
+
+	total, err := prn.pruneOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), total)
+	assert.Equal(t, 2, st.eventCount(), "dry-run must not delete any events")
+}
+
+func TestPrunerDryRunMetrics(t *testing.T) {
+	st := newMockStore()
+	st.setIngestionState(100)
+	for i := 0; i < 5; i++ {
+		st.addEvent(string(rune('a'+i)), int64(50+i), time.Now().Add(-24*time.Hour))
+	}
+
+	prn := New(st, slog.New(slog.NewTextHandler(nopWriter{}, nil)), Options{
+		MinLedger: 55,
+		BatchSize: 10,
+		DryRun:    true,
+	})
+
+	total, err := prn.pruneOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, int64(5), total)
+
+	m := prn.Metrics()
+	assert.Equal(t, int64(0), m.TotalRowsPurged, "dry-run must not count as purged")
+	assert.Equal(t, int64(5), m.DryRunEligibleRows, "dry-run must report eligible rows")
+}

@@ -1,0 +1,40 @@
+# Representative override set for the golden render tests: every value
+# here switches a different template branch — resources, an existing
+# database Secret, a ServiceMonitor, a custom ServiceAccount name and
+# pod annotations.
+replicaCount: 2
+
+serviceAccount:
+  create: true
+  name: sorotrail-runner
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+database:
+  existingSecret: existing-db-secret
+  existingSecretKey: DATABASE_URL
+
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  scrapeTimeout: 10s
+  path: /metrics
+  additionalLabels:
+    release: prometheus
+
+config:
+  rpcUrl: "https://horizon-mainnet.example.com"
+  pollInterval: "10s"
+  watchedContracts: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+  rateLimitRps: "10"
+  rateLimitBurst: "20"
+  corsAllowedOrigins: "https://app.example.com"

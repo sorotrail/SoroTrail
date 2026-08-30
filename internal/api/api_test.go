@@ -166,6 +166,8 @@ type stubStore struct {
 
 	subscriptions []store.Subscription
 
+	subscriptions []store.Subscription
+
 	contractCursors map[string]store.ContractCursor
 }
 
@@ -617,6 +619,10 @@ func TestListEvents_BadParams(t *testing.T) {
 		"/events?cursor=e1%3BDROP",
 		"/events?cursor=%3Cscript%3E",
 		"/events?cursor=cursor%27OR%271%3D%271",
+		"/events?topic={\"symbol\":\"transfer\"",
+		"/events?topic=[1,2",
+		"/events?from_ledger=0",
+		"/events?to_ledger=0",
 		"/events?topic_contains=not-valid-json",
 		"/events?has_value=maybe",
 	} {
@@ -1024,6 +1030,110 @@ func TestContractEvents_EmitsPaginationLinks(t *testing.T) {
 	assert.NotContains(t, linkHeader, `cursor=prev-cursor`)
 }
 
+// TestPaginatedListEndpoints_EmitsPaginationLinks covers the RFC 5988
+// Link header on the remaining cursor-paginated list endpoints: contracts,
+// dead letters, and address events. Each must advertise rel="next" when a
+// continuation cursor exists, rel="prev" when the caller supplied a
+// cursor, and preserve every other query parameter in the links.
+func TestPaginatedListEndpoints_EmitsPaginationLinks(t *testing.T) {
+	t.Run("contracts emits next and preserves filters", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{
+				{ContractID: testContract, EventCount: 10},
+			},
+			listContractsCursor: "c1",
+		}
+		resp, _ := doGet(t, newTestServer(st, nil), "/contracts?limit=2&sort=count")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		linkHeader := resp.Header.Get("Link")
+		assert.Contains(t, linkHeader, `rel="next"`)
+		assert.Contains(t, linkHeader, `cursor=c1`)
+		assert.Contains(t, linkHeader, `limit=2`)
+		assert.Contains(t, linkHeader, `sort=count`)
+		assert.NotContains(t, linkHeader, `rel="prev"`,
+			"no caller cursor was supplied, so no prev link")
+	})
+
+	t.Run("contracts emits prev when the caller supplied a cursor", func(t *testing.T) {
+		st := &stubStore{
+			listContractsResult: []store.ContractSummary{
+				{ContractID: testContract, EventCount: 10},
+			},
+			listContractsCursor: "c2",
+		}
+		resp, _ := doGet(t, newTestServer(st, nil), "/contracts?cursor=prev-c&limit=2")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		linkHeader := resp.Header.Get("Link")
+		assert.Contains(t, linkHeader, `rel="prev"`)
+		assert.Contains(t, linkHeader, `rel="next"`)
+		assert.NotContains(t, linkHeader, `cursor=prev-c`)
+	})
+
+	t.Run("dead-letters emits next and preserves filters", func(t *testing.T) {
+		st := &stubStore{
+			deadLettersResult: []store.DeadLetter{{ID: 1}},
+			deadLettersCursor: "dl-c1",
+		}
+		resp, _ := doGetWithAuth(t, newTestServer(st, nil),
+			"/dead-letters?contract_id="+testContract+"&limit=2", "test-key")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		linkHeader := resp.Header.Get("Link")
+		assert.Contains(t, linkHeader, `rel="next"`)
+		assert.Contains(t, linkHeader, `cursor=dl-c1`)
+		assert.Contains(t, linkHeader, `contract_id=`+testContract)
+		assert.Contains(t, linkHeader, `limit=2`)
+	})
+
+	t.Run("dead-letters emits prev when the caller supplied a cursor", func(t *testing.T) {
+		st := &stubStore{
+			deadLettersResult: []store.DeadLetter{{ID: 1}},
+			deadLettersCursor: "dl-c2",
+		}
+		resp, _ := doGetWithAuth(t, newTestServer(st, nil),
+			"/dead-letters?cursor=dl-prev&limit=2", "test-key")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		linkHeader := resp.Header.Get("Link")
+		assert.Contains(t, linkHeader, `rel="prev"`)
+		assert.Contains(t, linkHeader, `rel="next"`)
+		assert.NotContains(t, linkHeader, `cursor=dl-prev`)
+	})
+
+	t.Run("address events emits next and preserves filters", func(t *testing.T) {
+		st := &stubStore{
+			addressEvents: []store.Event{{ID: "e1"}},
+			addressCursor: "a-c1",
+		}
+		resp, _ := doGet(t, newTestServer(st, nil),
+			"/addresses/"+testAddress+"/events?from_ledger=100&limit=2")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		linkHeader := resp.Header.Get("Link")
+		assert.Contains(t, linkHeader, `rel="next"`)
+		assert.Contains(t, linkHeader, `cursor=a-c1`)
+		assert.Contains(t, linkHeader, `from_ledger=100`)
+		assert.Contains(t, linkHeader, `limit=2`)
+	})
+
+	t.Run("address events emits prev when the caller supplied a cursor", func(t *testing.T) {
+		st := &stubStore{
+			addressEvents: []store.Event{{ID: "e1"}},
+			addressCursor: "a-c2",
+		}
+		resp, _ := doGet(t, newTestServer(st, nil),
+			"/addresses/"+testAddress+"/events?cursor=a-prev&limit=2")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		linkHeader := resp.Header.Get("Link")
+		assert.Contains(t, linkHeader, `rel="prev"`)
+		assert.Contains(t, linkHeader, `rel="next"`)
+		assert.NotContains(t, linkHeader, `cursor=a-prev`)
+	})
+}
+
 func TestListEvents_IncludeXDR(t *testing.T) {
 	event := store.Event{
 		ID:          "e1",
@@ -1291,8 +1401,13 @@ func TestLivez(t *testing.T) {
 
 func TestReadyz(t *testing.T) {
 	t.Run("all healthy", func(t *testing.T) {
-		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/readyz")
+		resp, body := doGet(t, newTestServer(&stubStore{}, nil), "/readyz")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		var h healthResponse
+		require.NoError(t, json.Unmarshal(body, &h))
+		assert.Equal(t, "ok", h.Status)
+		assert.Equal(t, "ok", h.Checks["database"])
+		assert.Equal(t, "ok", h.Checks["rpc"])
 	})
 
 	t.Run("db down returns 503 with reason", func(t *testing.T) {
@@ -2643,6 +2758,20 @@ func TestListEvents_ConfigurableMaxLimit(t *testing.T) {
 	}
 }
 
+// The API's default page cap must stay aligned with the store's hard
+// clamp: both default to 500, and raising API_MAX_LIMIT above
+// store.MaxQueryLimit would let the API accept a limit the store then
+// silently clamps, so a caller would get a short page with no error.
+// See the comments on store.MaxQueryLimit and maxLimit in server.go.
+func TestMaxLimitAlignsWithStoreClamp(t *testing.T) {
+	SetMaxLimit(500) // restore the default; other tests may have changed it
+	t.Cleanup(func() { SetMaxLimit(500) })
+
+	assert.Equal(t, store.MaxQueryLimit, maxLimit,
+		"API default maxLimit and store.MaxQueryLimit must stay in lockstep; "+
+			"an API_MAX_LIMIT above store.MaxQueryLimit is silently clamped by the store")
+}
+
 func TestGetEventTransaction_Success(t *testing.T) {
 	st := &stubStore{
 		event: store.Event{ID: "0001-0001", TxHash: "abc123"},
@@ -2770,4 +2899,8 @@ func (m *stubStore) CountDeadLetters(context.Context, string) (int64, error) {
 }
 func (m *stubStore) CountDeliveryAttempts(context.Context, int64, store.SubscriptionOwner) (int64, error) {
 	return m.deliveryAttemptsCount, m.deliveryAttemptsCountErr
+}
+
+func (s *stubStore) CountEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
 }

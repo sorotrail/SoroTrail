@@ -202,9 +202,10 @@ alongside the ingester / auditor / webhook dispatcher:
    primary-key on `ledger_start` makes a second archiver instance a
    no-op on the same chunk; an existing `failed` row whose
    `attempts < ARCHIVE_MAX_ATTEMPTS` is reused in-place.
-3. **Stream rows.** Reuse the bounded cursor-pagination pattern from
-   the store (`MaxQueryLimit = 200`); stream into the Parquet writer,
-   never materialise the chunk in memory.
+3. **Stream rows.**Reuse the bounded cursor-pagination pattern
+   from the store (`ArchiveBatchSize = 500`, at the `MaxQueryLimit`
+   ceiling); stream into the Parquet writer, never materialise the chunk
+   in memory.
 4. **Upload to temp key.** Write the chunk to
    `…/ledger_start=$N/.tmp/<uuid>/data-…parquet` and `manifest.json`.
 5. **Read back & verify.** `GetObject` the temp Parquet, re-count rows,

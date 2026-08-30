@@ -131,9 +131,9 @@ data in events.topics_xdr and events.value_xdr; budget extra event-table
 storage for deployments that retain large event histories.
 Decoder replay
 Decoders improve over time. sorotrail replay re-runs the current decoder
-## Configuration
+## Supported versions
 
-All configuration comes from environment variables (see `.env.example`):
+SoroTrail is tested in CI against the following Postgres major versions:
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -143,6 +143,10 @@ All configuration comes from environment variables (see `.env.example`):
 | `RPC_BASE_BACKOFF` | `500ms` | Initial retry backoff duration; doubles on each subsequent retry. |
 | `RPC_MAX_BACKOFF` | `30s` | Upper bound on the computed retry backoff. |
 | `RPC_JITTER` | `true` | Randomize each computed backoff to [0.5×, 1.5×) so concurrent retries don't thundering-herd the endpoint. Never applied to a provider's `Retry-After` hint. |
+| `INGESTER_MIN_BACKOFF` | `1s` | Initial error backoff for the ingester. |
+| `INGESTER_MAX_BACKOFF` | `1m` | Maximum error backoff for the ingester. |
+| `INGESTER_JITTER_MIN` | `0` | Minimum additive jitter for ingester errors. |
+| `INGESTER_JITTER_MAX` | `0` | Exclusive maximum additive jitter. Zero preserves proportional jitter up to half the current backoff. |
 | `RPC_URLS` | unset | Comma-separated, priority-ordered list of Stellar RPC endpoints. When set, `RPC_URL` is ignored and the multi-provider failover client is used. List order is priority: index 0 is tried first. |
 | `RPC_RATE_LIMIT_RPS` | `10` | Per-provider request rate limit (`requests/second`) applied to each RPC endpoint independently. Only used when `RPC_URLS` is set. |
 | `HORIZON_URL` | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. |
@@ -190,6 +194,210 @@ All configuration comes from environment variables (see `.env.example`):
 | `MULTI_TENANT_USAGE_FLUSH` | `10s` | How often accumulated per-tenant usage counters are persisted. |
 | `MULTI_TENANT_STREAM_SCOPE_SYNC` | `30s` | How often an open stream re-resolves its tenant's grants, bounding how long a revoked grant keeps being served. |
 | `MULTI_TENANT_BOOTSTRAP_KEY` | unset | Installs an admin API key for the seeded `default` tenant at startup, so a fresh multi-tenant install can mint its first keys. Rejected unless `MULTI_TENANT=true`. |
+| Version | Status |
+| --- | --- |
+| PostgreSQL 15 | Supported |
+| PostgreSQL 16 | Supported |
+
+Any Postgres 15+ release should work; only the above versions are exercised in
+the test matrix.
+
+## Configuration
+
+All configuration comes from environment variables (see `.env.example`).
+Every variable the code reads is listed here — the table is generated from
+the struct tags in `internal/config/config.go` to prevent drift.
+
+### Network and RPC
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `NETWORK` | string | `testnet` | Stellar network to index. Must be one of `testnet`, `mainnet`, `futurenet`. Determines the default `RPC_URL` and passphrase when `RPC_URL` is unset. |
+| `RPC_URL` | URL | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint (JSON-RPC 2.0). Ignored when `RPC_URLS` is set. Point at a provider URL for mainnet. |
+| `RPC_URLS` | CSV | unset | Comma-separated, priority-ordered list of Stellar RPC endpoints. When set, enables the multi-provider failover client (see [Multi-provider failover](#multi-provider-failover)) and `RPC_URL` is ignored. Index 0 is tried first. |
+| `RPC_RATE_LIMIT` | float | `10` | Single-provider request rate limit (`requests/second`). The default matches the public endpoint limit — raising it against the public RPC will get you throttled. On HTTP 429 the client honors `Retry-After` (delta-seconds or HTTP-date, capped at 60s) before exponential backoff. Ignored when `RPC_URLS` is set (use `RPC_RATE_LIMIT_RPS` instead). |
+| `RPC_RATE_LIMIT_RPS` | float | `10` | Per-provider request rate limit (`requests/second`) for the failover client. Only read when `RPC_URLS` is set. |
+| `RPC_MAX_ATTEMPTS` | int | `3` | Maximum attempts (including the first) per failing RPC call before the error surfaces. |
+| `RPC_BASE_BACKOFF` | duration | `500ms` | Initial retry backoff duration; doubles on each subsequent retry. |
+| `RPC_MAX_BACKOFF` | duration | `30s` | Upper bound on the computed retry backoff. |
+| `RPC_JITTER` | bool | `true` | Randomize each computed backoff to [0.5×, 1.5×) so concurrent retries don't thundering-herd the endpoint. Never applied to a provider's `Retry-After` hint. |
+| `RPC_HTTP_TIMEOUT` | duration | `30s` | Timeout on the underlying HTTP client's RPC requests. Raise for a slow private RPC endpoint. |
+
+### Database
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | string | — (required) | Postgres or SQLite connection string. Use `postgres://…` for production or `sqlite:./sorotrail.db` for a zero-dependency single-binary setup. |
+| `DB_MAX_CONNS` | int | `0` | Max connections in the Postgres pool. `0` (default) uses pgx's default. |
+| `DB_MIN_CONNS` | int | `0` | Min connections kept warm in the pool (`0` = pgx default). |
+| `DB_MAX_CONN_LIFETIME` | duration | `0` | Max lifetime of a DB connection (`0` = no limit, e.g. `30m`). |
+| `DB_MAX_CONN_IDLE_TIME` | duration | `0` | Max idle time of a DB connection (`0` = no limit, e.g. `5m`). |
+
+### Ingestion
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `POLL_INTERVAL` | duration | `5s` | Sleep between polls once caught up with the chain head. |
+| `WATCHED_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract triggers a backfill from `latest − RETENTION_LEDGERS`. |
+| `START_LEDGER` | string | unset | Force cold-start ingestion from this ledger. Accepts an absolute number (≥ 2) or a relative offset like `latest-1000`. |
+| `START_LEDGER_RAW` | string | unset | Raw form of `START_LEDGER` before parsing. Used internally; operators should set `START_LEDGER` instead. |
+| `RETENTION_LEDGERS` | uint32 | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). Clamped to the RPC's oldest retained ledger. |
+| `INGEST_PAGE_SIZE` | uint | `1000` | Maximum number of events per `getEvents` RPC page. |
+| `INGEST_BATCH_SIZE` | uint | `1000` | Number of events per upsert batch during ingestion. |
+| `PARTITION_LEDGER_SPAN` | uint32 | `120960` | Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. |
+| `SWEEP_CONCURRENCY` | int | `1` | Maximum number of filter batches fetched concurrently during a windowSweep pass. The RPC interval limiter still caps total request rate, so raising this helps only against private RPCs with more headroom. |
+| `MAX_EVENTS_PER_CYCLE` | uint | `0` (disabled) | Cap on events a single ingestion cycle may process, bounding per-cycle memory and latency. When hit, the sweep stops and the next cycle resumes with idempotent upserts. `0` disables the cap. |
+| `BATCH_SIZE` | uint | `0` (disabled) | Maximum events per store write (`UpsertEvents`), splitting a fetched page into smaller chunks. `0` keeps the historical single-write-per-page behavior. |
+| `BATCH_TARGET_LATENCY` | duration | `0` (disabled) | Per-write latency budget when `BATCH_SIZE` is set. Writes exceeding this cause adaptive chunk-size reduction and backpressure sleeps. `0` disables adaptation. |
+| `BATCH_MAX_BACKOFF` | duration | `1s` | Maximum backpressure sleep between batch writes. Only effective when both `BATCH_SIZE` and `BATCH_TARGET_LATENCY` are set. |
+| `INGESTION_LOCK_ENABLED` | bool | `false` | Acquire a Postgres advisory lock keyed by the RPC URL before starting ingestion. A second instance skips ingestion (but keeps serving the API), preventing double-processing. |
+
+### Reorg detection
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `REORG_CONFIRMATION_WINDOW` | uint32 | `64` | Ledgers behind the ingest frontier re-scanned on a schedule for RPC-side reorgs. Once a ledger is further behind than this, it is considered finalized and never rewritten. `0` disables reorg detection. |
+| `REORG_RESCAN_INTERVAL` | duration | `1m` | Cadence of the periodic reorg re-scan. The re-scan shares the live RPC budget and runs after a successful ingest cycle. |
+
+### Logging
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `LOG_LEVEL` | string | `info` | `debug` \| `info` \| `warn` \| `error`. |
+| `LOG_FORMAT` | string | `text` | `text` \| `json`. JSON emits one JSON object per line, compatible with Loki, CloudWatch, and ELK. |
+| `LAG_WARN_LEDGERS` | uint32 | `100` | Ingest-lag alarm threshold in ledgers. When the gap between chain head and last ingested ledger exceeds this, a WARN is logged; an INFO fires once the gap closes. `0` disables the alarm. |
+
+### API server
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `HTTP_ADDR` | string | `:8080` | API listen address. |
+| `HTTP_READ_TIMEOUT` | duration | `30s` | Maximum time to read the full request including body. `0` disables. |
+| `HTTP_WRITE_TIMEOUT` | duration | `30s` | Maximum time to write the full response. `0` disables. |
+| `HTTP_IDLE_TIMEOUT` | duration | `60s` | Maximum time a keep-alive connection may idle before being closed. `0` disables. |
+| `HTTP_READ_HEADER_TIMEOUT` | duration | `10s` | Maximum time to read request headers. The most important defence against slow-client attacks. `0` disables. |
+| `API_QUERY_TIMEOUT` | duration | `25s` | Per-request database timeout for API-originated store reads. Enforced in-process and mirrored to Postgres via `statement_timeout`. |
+| `API_SLOW_QUERY_THRESHOLD` | duration | `2s` | Warn when an API-originated store query exceeds this duration; logs include the query name and elapsed time. |
+| `API_MAX_LIMIT` | int | `500` | Maximum page size accepted for list endpoints (`/events`, etc.). Values above this are rejected with 400. |
+| `API_KEY` | string | empty | Gates the `/watched-contracts` management endpoints via constant-time header comparison. Empty means every write request is rejected with 503. |
+| `STATS_CACHE_TTL` | duration | `5s` | How long `GET /stats` results are served from the per-scope cache before recomputation. `0` disables caching. |
+| `CACHE_PRIVATE` | bool | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set when serving per-user data behind an auth layer. |
+| `COMPRESS_MIN_SIZE` | int | `0` | Response body size (bytes) at or above which gzip/deflate encoding is applied. Negative disables compression entirely; `0` uses the built-in default. |
+| `ENABLE_METRICS` | bool | `false` | Expose the Prometheus `/metrics` endpoint. |
+| `SHUTDOWN_TIMEOUT` | duration | `15s` | Maximum time for graceful HTTP server drain and component shutdown before the process is killed. `0` waits indefinitely. |
+
+### CORS
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `CORS_ALLOWED_ORIGINS` | CSV | empty | Browser origins allowed to call the API cross-origin. `*` allows any origin; otherwise each entry must be an explicit `scheme://host`. Empty = CORS disabled. Invalid entries (e.g. `null`, origins with a path) fail startup. |
+| `CORS_ALLOWED_METHODS` | CSV | `GET,POST,PUT,DELETE,OPTIONS` | Methods returned on preflight (`OPTIONS`) responses. |
+| `CORS_ALLOWED_HEADERS` | CSV | `Content-Type,X-API-Key,Accept` | Headers returned on preflight responses. |
+| `CORS_EXPOSED_HEADERS` | CSV | `X-Request-ID,X-RateLimit-Remaining` | Response headers browser JavaScript may read via `Access-Control-Expose-Headers`. Empty suppresses the header entirely. |
+
+### Rate limiting
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `RATE_LIMIT_RPS` | float | `0` (disabled) | Per-client HTTP request rate limit (`requests/second`). Must be set together with `RATE_LIMIT_BURST`; setting only one fails startup. |
+| `RATE_LIMIT_BURST` | int | `0` (disabled) | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
+| `RATE_LIMIT_TRUSTED_PROXY` | bool | `false` | Honor `X-Forwarded-For` for client IP detection. Only enable behind a trusted proxy that strips/rewrites the header. |
+| `HOURLY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a rolling 1-hour window. `0` disables the quota. |
+| `DAILY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a rolling 24-hour window. `0` disables the quota. |
+
+### Audit
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `AUDIT_ENABLED` | bool | `false` | Enable the background auditor. When `false` the binary behaves exactly like the pre-audit build. |
+| `AUDIT_POLL_INTERVAL` | duration | `30s` | Sleep between audit passes. |
+| `AUDIT_BATCH_LEDGERS` | uint32 | `100` | Ledger range covered by one audit pass. |
+| `AUDIT_LAG_THRESHOLD` | uint32 | `200` | Auditor sleeps until ingest is at least this many ledgers past the verified mark. |
+| `AUDIT_BUDGET_SHARE` | float | `0.10` | Fraction of the request budget the audit pool gets (rest goes to ingest). Must be in [0, 1]. |
+| `AUDIT_MAX_RPS` | float | `10` | Total request budget (`requests/second`) split between ingest and audit pools. |
+| `AUDIT_MAX_REPAIR_ATTEMPTS` | int | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
+| `AUDIT_FINDING_MAX_LEDGERS` | uint32 | `100` | Largest range a single finding is allowed to span. |
+
+### Retention pruning
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `RETENTION_MAX_AGE` | duration | `0` (disabled) | Delete events older than this duration. `0` with `RETENTION_MIN_LEDGER` unset disables the pruner entirely. |
+| `RETENTION_MIN_LEDGER` | uint64 | `0` (disabled) | Delete events with ledger below this value. `0` with `RETENTION_MAX_AGE` unset disables the pruner. |
+| `RETENTION_BATCH_SIZE` | int | `5000` | Maximum events deleted per pruner transaction. |
+| `RETENTION_PAUSE` | duration | `100ms` | Sleep between pruner batches to avoid holding a long lock. |
+| `RETENTION_INTERVAL` | duration | `1h` | How often the pruner runs. |
+| `RETENTION_DRY_RUN` | bool | `false` | Report what the pruner would delete without removing any rows. |
+
+### Archive
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `ARCHIVE_BUCKET` | string | empty | S3-compatible bucket for exporting pruned events as compressed NDJSON before deletion. Master switch — when set, `ARCHIVE_ENDPOINT` is also required. Empty disables archiving. |
+| `ARCHIVE_PREFIX` | string | empty | Key prefix for archived objects. |
+| `ARCHIVE_ENDPOINT` | string | empty | S3-compatible endpoint URL (e.g. `localhost:9000`). **Required** when `ARCHIVE_BUCKET` is set. |
+| `ARCHIVE_REGION` | string | empty | S3 region. |
+| `ARCHIVE_ACCESS_KEY_ID` | string | empty | **Secret.** S3 access key ID. |
+| `ARCHIVE_SECRET_ACCESS_KEY` | string | empty | **Secret.** S3 secret access key. |
+| `ARCHIVE_USE_SSL` | bool | `false` | Use TLS when connecting to the archive endpoint. |
+| `ARCHIVE_BEFORE_PRUNE` | bool | `false` | Export events to the archive before the pruner deletes them. |
+| `ARCHIVE_MAX_RETRIES` | int | `3` | Maximum upload retry attempts per event batch. |
+
+### Export
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `EXPORT_MAX_RANGE` | int64 | `17280` | Maximum ledger span a single `/contracts/{id}/export` call may request (~24h at 5s/ledger). Returns 400 if exceeded. |
+
+### Multi-tenancy
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `MULTI_TENANT` | bool | `false` | Serve several consumers from one deployment, each scoped to its own contracts. Off = no authentication, no tenant boundary. See [Multi-tenancy](docs/multi-tenancy.md). |
+| `MULTI_TENANT_MAX_WATCHED` | int | `250` | Cap on the union of all tenants' watch lists, bounding the ingester's RPC cost. `0` disables the cap. |
+| `MULTI_TENANT_USAGE_FLUSH` | duration | `10s` | How often accumulated per-tenant usage counters are persisted. |
+| `MULTI_TENANT_STREAM_SCOPE_SYNC` | duration | `30s` | How often an open stream re-resolves its tenant's grants, bounding how long a revoked grant keeps being served. |
+| `MULTI_TENANT_BOOTSTRAP_KEY` | string | empty | **Secret.** Admin API key installed for the seeded `default` tenant at startup. Solves the chicken-and-egg of a fresh install. Rejected unless `MULTI_TENANT=true`. Rotate by revoking through `/admin` once real keys exist. |
+
+### Horizon backfill
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `HORIZON_URL` | URL | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. |
+| `BACKFILL_RATE_RPS` | float | `10` | Pace against Horizon when backfilling. 10 req/s matches the public-instance cap; private deployments can lift this. |
+
+### GraphQL
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `GRAPHQL_PLAYGROUND` | bool | `false` | Enable the GraphiQL UI at `/graphiql`. |
+
+### Metrics
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `METRICS_ENABLED` | bool | `false` | Enable metrics collection. |
+| `ENABLE_METRICS` | bool | `false` | Expose the Prometheus `/metrics` endpoint. See also `METRICS_ENABLED`. |
+
+With `ENABLE_METRICS=true`, the Prometheus `/metrics` endpoint exposes the
+pipeline metrics (`sorotrail_*`) in addition to the per-server HTTP
+histogram. The RPC metrics answer the first question when ingestion falls
+behind — is the upstream slow, failing, or being throttled by our own
+breaker:
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `sorotrail_rpc_call_duration_seconds` | histogram | `method`, `outcome` (`success` \| `error`) | Latency of one JSON-RPC call. `method` is a fixed enum (`getEvents`, `getLatestLedger`, `getHealth`, `getLedgerEntries`, `simulateTransaction`); the histogram's `_count` for a `(method, outcome)` pair is the call total. |
+| `sorotrail_rpc_retries_total` | counter | `method`, `reason` (`backoff` \| `retry_after`) | Retry attempts after the first; `reason` says whether the wait came from the computed exponential backoff or a provider `Retry-After` hint. |
+| `sorotrail_rpc_backoff_seconds_total` | counter | `method` | Cumulative seconds slept between retries — a long tail means the provider is throttling. |
+| `sorotrail_rpc_failovers_total` | counter | `reason` (`switch` \| `reanchor`) | Multi-provider failover events: traffic moved to another provider (`switch`), or a cursor request hit the re-anchor path (`reanchor`). |
+| `sorotrail_rpc_circuit_breaker_state` | gauge (0/1) | `state` (`closed` \| `open` \| `half-open`) | Current circuit-breaker state; alert on `{state="open"} == 1`. |
+| `sorotrail_rpc_provider_state` | gauge (0/1) | `provider`, `state` (`active` \| `degraded` \| `down`) | Health of each failover provider. Only present in multi-provider mode (`RPC_URLS`). |
+
+Endpoint-derived labels never carry credentials: `provider` labels are
+stripped to the URL hostname (scheme, userinfo/basic-auth, path, and query
+are removed), and `method`/`reason`/`state`/`outcome` come from fixed
+enums, so label cardinality is bounded.
 
 ## Multi-provider failover
 
@@ -1334,10 +1542,12 @@ below for the contract the field implies.
 Serves `http_request_duration_seconds`, a Prometheus histogram of HTTP
 request latency labeled by `route` (the matched chi route pattern, e.g.
 `/events/{id}` — never the raw path, so path parameters don't blow up
-cardinality), `method`, and `status`.
+cardinality), `method`, and `status` — plus the `sorotrail_*` pipeline
+and RPC metrics (see the [Metrics](#metrics) section).
 
 ```sh
 curl -s localhost:8080/metrics | grep http_request_duration_seconds
+curl -s localhost:8080/metrics | grep sorotrail_rpc_
 ```
 
 Exempt from the rate limiter for the same reason `/health` is: a
@@ -1616,6 +1826,12 @@ make lint         # golangci-lint
 make migrate-up   # apply migrations manually (needs the migrate CLI)
 ```
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture notes and extension
+points, and [docs/architecture.md](docs/architecture.md) for a full
+architecture document describing the system's components, data flow, and
+design decisions.
+
+## Roadmap / future work
 See [docs/architecture.md](docs/architecture.md) for the full system architecture
 diagram and component descriptions. [CONTRIBUTING.md](CONTRIBUTING.md) covers extension
 points and development conventions.
@@ -1705,6 +1921,114 @@ the handler to accept the boundary value and reject the one immediately
 outside it. Companion tests check that each enum is exactly the set the
 parsing code allows, that required parameters really are refused when absent,
 and that no parameter is documented which the handler discards.
+
+## Operational Monitoring
+
+SoroTrail exports Prometheus metrics at `GET /metrics` that cover the
+entire ingestion pipeline, RPC health, database latency, and webhook
+delivery. This section documents the key metrics and provides pre-built
+Grafana dashboards and Prometheus alerting rules so operators don't have
+to reinvent the same panels.
+
+### Available metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `sorotrail_events_ingested_total` | Counter | Total events persisted (including idempotent upserts). |
+| `sorotrail_ingest_errors_total` | Counter | Terminal ingestion pass failures (RPC, decode, DB). |
+| `sorotrail_rpc_call_duration_seconds` | Histogram | RPC call latency (HTTP round trip + parse). |
+| `sorotrail_db_write_duration_seconds` | Histogram | Database write latency (upsert, replace-in-range). |
+| `sorotrail_db_query_duration_seconds` | HistogramVec | Database query latency, labelled by `operation`. |
+| `sorotrail_ingestion_lag_ledgers` | Gauge | Ledgers behind the chain head. |
+| `sorotrail_event_batch_writes_total` | Counter | UpsertEvents calls issued by the ingester. |
+| `sorotrail_event_batch_size` | Gauge | Current adaptive batch size per write. |
+| `sorotrail_event_backpressure_total` | Counter | Throttle sleeps between batch writes. |
+| `sorotrail_event_backpressure_seconds_total` | Counter | Cumulative seconds spent under backpressure. |
+| `http_request_duration_seconds` | HistogramVec | HTTP request duration, labelled by `route`, `method`, `status`. |
+
+### Grafana dashboard
+
+A pre-built Grafana dashboard is provided at
+[`deploy/grafana/sorotrail-dashboard.json`](deploy/grafana/sorotrail-dashboard.json).
+It contains four rows:
+
+1. **Ingestion** — lag gauge, lag trend, events/sec, errors/sec.
+2. **RPC & Network** — RPC latency percentiles, RPC calls/sec.
+3. **Store / Database** — DB write latency percentiles, query latency by operation.
+4. **Backpressure & Batch Health** — batch size, batch writes/sec, backpressure rate, backpressure duration.
+
+#### Import via UI
+
+1. Open Grafana → **Dashboards → Import**.
+2. Click **Upload JSON file** and select `deploy/grafana/sorotrail-dashboard.json`.
+3. Select your Prometheus datasource when prompted.
+4. Click **Import**.
+
+#### Import via provisioning
+
+Add to your Grafana provisioning config:
+
+```yaml
+apiVersion: 1
+providers:
+  - name: SoroTrail
+    orgId: 1
+    folder: SoroTrail
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards/sorotrail
+      foldersFromFilesStructure: false
+```
+
+Copy `deploy/grafana/sorotrail-dashboard.json` to the provisioning path.
+
+### Prometheus alerting rules
+
+Pre-built recording and alerting rules are at
+[`deploy/prometheus/sorotrail-rules.yml`](deploy/prometheus/sorotrail-rules.yml).
+They cover six alerts across the four operational concerns:
+
+| Alert | Metric | Threshold | Duration | Severity |
+|---|---|---|---|---|
+| `IngestionLagHigh` | `sorotrail_ingestion_lag_ledgers` | > 200 | 5m | warning |
+| `IngestionErrorsBurst` | `rate(sorotrail_ingest_errors_total[5m])` | > 0 | 10m | warning |
+| `RPCP99LatencyHigh` | P99 RPC call duration | > 5 s | 10m | warning |
+| `StoreWriteLatencyHigh` | P99 DB write duration | > 10 s | 10m | warning |
+| `BackpressureActive` | `rate(sorotrail_event_backpressure_total[5m])` | > 0 | 15m | warning |
+| `EventBatchSizeCritical` | `sorotrail_event_batch_size` | < 10 | 10m | critical |
+
+Each alert includes a `runbook_url` annotation pointing to this section
+and a detailed `description` explaining what it means and what to check.
+Thresholds are justified in the rules file comments.
+
+#### Loading rules into Prometheus
+
+Add to your `prometheus.yml`:
+
+```yaml
+rule_files:
+  - "deploy/prometheus/sorotrail-rules.yml"
+```
+
+Then reload Prometheus (`kill -HUP <pid>` or `POST /-/reload` if enabled).
+
+#### Verifying rules load
+
+```sh
+promtool check rules deploy/prometheus/sorotrail-rules.yml
+```
+
+### Key environment variables affecting alerts
+
+| Variable | Default | Alert it affects | Why |
+|---|---|---|---|
+| `LAG_WARN_LEDGERS` | `100` | `IngestionLagHigh` | The log-level alarm; the Prometheus alert uses 200 for a wider safety margin. |
+| `RPC_RATE_LIMIT` | `10` | `RPCP99LatencyHigh` | Lower values may cause HTTP 429s that look like latency. |
+| `RPC_MAX_ATTEMPTS` | `3` | `IngestionErrorsBurst` | More retries mask transient errors but delay the alert. |
+| `POLL_INTERVAL` | `5s` | `RPCP99LatencyHigh` | The 5 s P99 threshold is derived from this default. |
+| `WATCHED_CONTRACTS` | empty | `IngestionLagHigh`, `RPCP99LatencyHigh` | More contracts = more RPC calls = higher latency risk. |
 
 ## License
 

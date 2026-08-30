@@ -391,6 +391,23 @@ func (s *guardedStore) DeleteEventsBeforeLedger(ctx context.Context, beforeLedge
 	return n, err
 }
 
+func (s *guardedStore) DeleteEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.DeleteEventsBefore")
+	defer cancel()
+	start := time.Now()
+	n, err := s.Store.DeleteEventsBefore(ctx, maxLedger, beforeTime, limit)
+	s.logSlowQuery("store.DeleteEventsBefore", start, err)
+	return n, err
+}
+
+func (s *guardedStore) CountEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.CountEventsBefore")
+	defer cancel()
+	start := time.Now()
+	n, err := s.Store.CountEventsBefore(ctx, maxLedger, beforeTime, limit)
+	s.logSlowQuery("store.CountEventsBefore", start, err)
+	return n, err
+}
 func (s *guardedStore) MigrationVersion(ctx context.Context) (int, bool, error) {
 	// Migration version queries are cheap — no timeout needed.
 	return s.Store.MigrationVersion(ctx)

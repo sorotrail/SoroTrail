@@ -133,7 +133,10 @@ func TestSpecCopiesAreIdentical(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading embedded openapi spec: %v", err)
 	}
-	if string(got) != string(want) {
+	// Normalize CRLF to LF so the comparison works across platforms;
+	// git's autocrlf may check files out with \r\n on Windows.
+	normalizedGot := strings.ReplaceAll(string(got), "\r\n", "\n")
+	if normalizedGot != string(want) {
 		t.Fatalf("%s is stale relative to %s; regenerate it with `make spec`",
 			jsonSpecPath, yamlSpecPath)
 	}

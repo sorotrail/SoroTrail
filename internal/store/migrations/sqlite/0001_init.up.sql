@@ -1,5 +1,6 @@
 CREATE TABLE IF NOT EXISTS events (
-    id                 TEXT NOT NULL PRIMARY KEY,
+    network            TEXT NOT NULL DEFAULT 'default',
+    id                 TEXT NOT NULL,
     contract_id        TEXT NOT NULL,
     ledger             INTEGER NOT NULL,
     type               TEXT NOT NULL,
@@ -11,7 +12,8 @@ CREATE TABLE IF NOT EXISTS events (
     value              TEXT,
     created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     topics_xdr         TEXT,
-    value_xdr          TEXT
+    value_xdr          TEXT,
+    PRIMARY KEY (network, id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_id ON events (id);
@@ -21,7 +23,7 @@ CREATE INDEX IF NOT EXISTS idx_events_contract_ledger ON events (contract_id, le
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events (created_at);
 
 CREATE TABLE IF NOT EXISTS ingestion_state (
-    id                   INTEGER PRIMARY KEY CHECK (id = 1),
+    network              TEXT PRIMARY KEY,
     last_ingested_ledger INTEGER NOT NULL DEFAULT 0,
     last_cursor          TEXT NOT NULL DEFAULT '',
     updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))

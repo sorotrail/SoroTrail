@@ -46,11 +46,12 @@ flags:
 		fs.PrintDefaults()
 	}
 	var (
-		fromLedger = fs.Int64("from-ledger", 0, "first ledger to index (inclusive; 0 = oldest stored)")
-		toLedger   = fs.Int64("to-ledger", 0, "last ledger to index (inclusive; 0 = latest stored)")
-		batchSize  = fs.Int("batch-size", 500, "events per page")
-		restart    = fs.Bool("restart", false, "discard saved progress and start from --from-ledger")
-		dryRun     = fs.Bool("dry-run", false, "report what would be indexed without writing anything")
+		fromLedger       = fs.Int64("from-ledger", 0, "first ledger to index (inclusive; 0 = oldest stored)")
+		toLedger         = fs.Int64("to-ledger", 0, "last ledger to index (inclusive; 0 = latest stored)")
+		batchSize        = fs.Int("batch-size", 500, "events per page")
+		restart          = fs.Bool("restart", false, "discard saved progress and start from --from-ledger")
+		dryRun           = fs.Bool("dry-run", false, "report what would be indexed without writing anything")
+		progressInterval = fs.Duration("progress-interval", 0, "emit periodic progress to stderr (e.g. 30s, 1m); 0 disables")
 	)
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -115,6 +116,11 @@ flags:
 		"batch_size", *batchSize,
 		"dry_run", *dryRun)
 
+	var prog *Progress
+	if *progressInterval > 0 {
+		prog = NewProgress("index-addresses", *progressInterval)
+	}
+
 	indexer := &addressIndexer{
 		store:     st,
 		batchSize: *batchSize,
@@ -122,8 +128,12 @@ flags:
 		to:        *toLedger,
 		dryRun:    *dryRun,
 		log:       log,
+		progress:  prog,
 	}
 	summary, err := indexer.Run(ctx)
+	if prog != nil {
+		prog.Report(summary.completed)
+	}
 	if err != nil {
 		return err
 	}
@@ -151,6 +161,7 @@ type addressIndexer struct {
 	to        int64
 	dryRun    bool
 	log       loggerLike
+	progress  *Progress
 }
 
 func (a *addressIndexer) Run(ctx context.Context) (addressIndexSummary, error) {
@@ -180,6 +191,9 @@ func (a *addressIndexer) Run(ctx context.Context) (addressIndexSummary, error) {
 		}
 		summary.pagesProcessed++
 		summary.eventsScanned += int64(len(events))
+		if a.progress != nil {
+			a.progress.Tick(int64(len(events)))
+		}
 
 		if !a.dryRun {
 			var refs []store.AddressRef

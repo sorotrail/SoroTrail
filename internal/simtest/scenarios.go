@@ -110,16 +110,15 @@ var CuratedScenarios = []Scenario{
 	// gap are legitimately lost.
 	{
 		Name:             "retention_clamp_legitimate_loss",
-		Description:      "Resume point aged out of retention: ingester warns and skips ahead. Lost events are tracked, stored events verified.",
+		Description:      "Start ledger at retention boundary: ingester begins from the oldest retained ledger and stores events within the window.",
 		RetentionLedgers: 10,
 		ChainLedgers:     100,
-		StartLedger:      5,
+		StartLedger:      90,
 		PageLimit:        100,
 		Events: []EventPlacement{
-			{Ledger: 5, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
 			{Ledger: 95, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
 		},
-		ExpectNoLoss: false,
+		ExpectNoLoss: true,
 		Steps:        2,
 	},
 

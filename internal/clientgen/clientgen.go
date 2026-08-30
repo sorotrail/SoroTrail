@@ -1,0 +1,650 @@
+// Package clientgen generates the versioned API client in pkg/client
+// from api/openapi.yaml — the source of truth for the HTTP API (the
+// same file internal/specgen renders into the served openapi.json).
+//
+// Run it through `make client` (cmd/clientgen) after editing the spec.
+// pkg/client's drift test regenerates from the committed spec and
+// compares byte-for-byte against the committed client, so the generated
+// surface can never silently drift from the spec: the build fails until
+// `make client` is run.
+package clientgen
+
+import (
+	"bytes"
+	"fmt"
+	"go/format"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"unicode"
+
+	"gopkg.in/yaml.v3"
+)
+
+// GenerateFromFile reads the OpenAPI YAML at path and renders the Go
+// client source for it.
+func GenerateFromFile(path string) ([]byte, error) {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+	return Generate(src)
+}
+
+// Generate renders the client source for an OpenAPI YAML document.
+func Generate(src []byte) ([]byte, error) {
+	var spec rawSpec
+	if err := yaml.Unmarshal(src, &spec); err != nil {
+		return nil, fmt.Errorf("parsing spec: %w", err)
+	}
+	if spec.Info.Version == "" {
+		return nil, fmt.Errorf("spec has no info.version; cannot version the client")
+	}
+	return render(&spec)
+}
+
+// rawSpec mirrors the parts of the OpenAPI document the client needs.
+// Fields the client does not care about (descriptions, examples,
+// headers) are dropped at parse time, keeping the generator's surface
+// small and the diff loud when the spec gains something unhandled.
+type rawSpec struct {
+	OpenAPI string `yaml:"openapi"`
+	Info    struct {
+		Title   string `yaml:"title"`
+		Version string `yaml:"version"`
+	} `yaml:"info"`
+	Paths      map[string]map[string]*rawOperation `yaml:"paths"`
+	Components struct {
+		Schemas    map[string]*rawSchema    `yaml:"schemas"`
+		Parameters map[string]*rawParameter `yaml:"parameters"`
+	} `yaml:"components"`
+}
+
+type rawOperation struct {
+	OperationID string          `yaml:"operationId"`
+	Summary     string          `yaml:"summary"`
+	Parameters  []*rawParameter `yaml:"parameters"`
+	RequestBody *struct {
+		Content map[string]struct {
+			Schema *rawSchema `yaml:"schema"`
+		} `yaml:"content"`
+	} `yaml:"requestBody"`
+	Responses map[string]struct {
+		Content map[string]struct {
+			Schema *rawSchema `yaml:"schema"`
+		} `yaml:"content"`
+	} `yaml:"responses"`
+}
+
+type rawParameter struct {
+	Ref    string     `yaml:"$ref"`
+	Name   string     `yaml:"name"`
+	In     string     `yaml:"in"`
+	Schema *rawSchema `yaml:"schema"`
+}
+
+type rawSchema struct {
+	Type                 string                `yaml:"type"`
+	Format               string                `yaml:"format"`
+	Ref                  string                `yaml:"$ref"`
+	Nullable             bool                  `yaml:"nullable"`
+	Properties           map[string]*rawSchema `yaml:"properties"`
+	Items                *rawSchema            `yaml:"items"`
+	AllOf                []*rawSchema          `yaml:"allOf"`
+	OneOf                []*rawSchema          `yaml:"oneOf"`
+	Required             []string              `yaml:"required"`
+	AdditionalProperties any                   `yaml:"additionalProperties"`
+}
+
+type queryParam struct {
+	Name string // wire name, e.g. "contract_id"
+	Go   string // exported field name, e.g. "ContractID"
+	Type string // "string" | "int64" | "bool"
+}
+
+type genOperation struct {
+	GoName   string
+	Method   string
+	Path     string
+	Summary  string
+	PathArgs []queryParam // positional args (ctx first, then these)
+	Query    []queryParam
+	HasBody  bool
+	BodyType string // schema name or synthesized name
+	// Response handling: exactly one of the shapes below is set.
+	RespRef   string // named schema (pointer return) or ""
+	RespArray string // element type for `[]T` returns or ""
+	RespRaw   bool   // non-JSON body: return []byte
+	RespVoid  bool   // 204 / no content: return error only
+	RespSynth string // synthesized response type name or ""
+}
+
+// generator holds the parsed spec and the state accumulated while
+// emitting types (synthesized names for inline response bodies).
+type generator struct {
+	spec       *rawSpec
+	schemas    map[string]*rawSchema
+	params     map[string]*rawParameter
+	synthNames map[string]*rawSchema
+}
+
+// render produces the whole client file for the parsed spec.
+func render(spec *rawSpec) ([]byte, error) {
+	g := &generator{
+		spec:       spec,
+		schemas:    spec.Components.Schemas,
+		params:     spec.Components.Parameters,
+		synthNames: map[string]*rawSchema{},
+	}
+
+	// Operations must be built before types are emitted: building them
+	// populates the synthesized response/request type names.
+	ops := g.buildOperations()
+
+	var body bytes.Buffer
+	g.emitSchemaTypes(&body)
+	for _, op := range ops {
+		g.emitOperation(&body, op)
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString(`// Code generated by cmd/clientgen from api/openapi.yaml; DO NOT EDIT.
+//
+// The generated surface (types, per-operation methods, SpecRoutes and
+// SpecVersion) is verified against api/openapi.yaml by
+// pkg/client/drift_test.go. Regenerate with ` + "`make client`" + ` after
+// changing the spec.
+package client
+
+`)
+	// Import only what the generated body references, so a spec that
+	// stops using a construct does not leave a stale import behind.
+	imports := []string{"context"}
+	if strings.Contains(body.String(), "url.Values") {
+		imports = append(imports, "net/url")
+	}
+	if strings.Contains(body.String(), "strconv.") {
+		imports = append(imports, "strconv")
+	}
+	if strings.Contains(body.String(), "json.RawMessage") {
+		imports = append(imports, "encoding/json")
+	}
+	buf.WriteString("import (\n")
+	for _, imp := range imports {
+		fmt.Fprintf(&buf, "\t%q\n", imp)
+	}
+	buf.WriteString(")\n\n")
+
+	buf.WriteString("// SpecVersion is the api/openapi.yaml info.version this client was\n// generated from. A client built against a different spec version may\n// not be wire-compatible with a running server.\nconst SpecVersion = " + strconv.Quote(spec.Info.Version) + "\n\n")
+
+	g.emitSpecRoutes(&buf, spec)
+	buf.Write(body.Bytes())
+
+	formatted, err := format.Source(buf.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("formatting generated client: %w\n%s", err, buf.String())
+	}
+	return formatted, nil
+}
+
+// emitSpecRoutes writes the SpecRoutes table the drift test compares
+// against the spec, so a route added to (or removed from) the spec fails
+// the build until `make client` regenerates.
+func (g *generator) emitSpecRoutes(buf *bytes.Buffer, spec *rawSpec) {
+	buf.WriteString("// SpecRoute is one (method, path) pair documented in the spec.\ntype SpecRoute struct {\n\tMethod string\n\tPath   string\n}\n\n")
+	buf.WriteString("// SpecRoutes lists every (method, path) pair in api/openapi.yaml at\n// generation time. pkg/client/drift_test.go compares it against the live\n// spec so the client can never silently drift from the documented API.\nvar SpecRoutes = []SpecRoute{\n")
+	paths := sortedKeys(spec.Paths)
+	for _, path := range paths {
+		methods := sortedKeys(spec.Paths[path])
+		for _, method := range methods {
+			fmt.Fprintf(buf, "\t{Method: %q, Path: %q},\n", strings.ToUpper(method), path)
+		}
+	}
+	buf.WriteString("}\n\n")
+}
+
+// emitSchemaTypes writes one Go type per component schema, plus any
+// synthesized types for inline response bodies.
+func (g *generator) emitSchemaTypes(buf *bytes.Buffer) {
+	for _, name := range sortedKeys(g.schemas) {
+		g.emitNamedType(buf, name, g.schemas[name])
+	}
+	for _, name := range sortedKeys(g.synthNames) {
+		g.emitNamedType(buf, name, g.synthNames[name])
+	}
+}
+
+func (g *generator) emitNamedType(buf *bytes.Buffer, name string, s *rawSchema) {
+	switch {
+	case s.Ref != "":
+		fmt.Fprintf(buf, "type %s = %s\n\n", name, schemaBase(s.Ref))
+	case s.Type == "array":
+		fmt.Fprintf(buf, "type %s []%s\n\n", name, g.goType(s.Items, name+"Item", 0))
+	case s.Type == "object" && len(s.Properties) > 0:
+		buf.WriteString("type " + name + " struct {\n")
+		for _, f := range g.structFields(name, s, 0) {
+			buf.WriteString("\t" + f + "\n")
+		}
+		buf.WriteString("}\n\n")
+	case s.Type == "object":
+		fmt.Fprintf(buf, "type %s map[string]any\n\n", name)
+	case s.Type == "string":
+		fmt.Fprintf(buf, "type %s string\n\n", name)
+	case s.Type == "integer":
+		fmt.Fprintf(buf, "type %s int64\n\n", name)
+	case s.Type == "boolean":
+		fmt.Fprintf(buf, "type %s bool\n\n", name)
+	case s.OneOf != nil:
+		// oneOf payloads are resolved to their first referenced variant:
+		// the API's event oneOf (Event | EnrichedEvent) decodes as the
+		// base Event shape, which is what a plain listing returns.
+		if ref := firstOneOfRef(s); ref != "" {
+			fmt.Fprintf(buf, "type %s = %s\n\n", name, ref)
+		} else {
+			fmt.Fprintf(buf, "type %s = json.RawMessage\n\n", name)
+		}
+	default:
+		fmt.Fprintf(buf, "type %s map[string]any\n\n", name)
+	}
+}
+
+// structFields renders the fields of a struct schema. allOf members that
+// are $refs become embedded fields; inline object members and the
+// schema's own properties are expanded in place. Depth guards against
+// pathological recursion through synthesized names.
+func (g *generator) structFields(owner string, s *rawSchema, depth int) []string {
+	if depth > 8 {
+		return nil
+	}
+	var out []string
+	for _, member := range s.AllOf {
+		switch {
+		case member.Ref != "":
+			out = append(out, schemaBase(member.Ref))
+		case member.Type == "object":
+			out = append(out, g.structFields(owner, member, depth+1)...)
+		}
+	}
+	// Properties are emitted in sorted order so regeneration is
+	// byte-identical run to run (map iteration order is random).
+	for _, name := range sortedKeys(s.Properties) {
+		prop := s.Properties[name]
+		field := goFieldName(name)
+		ftype := g.goType(prop, owner+field, depth+1)
+		if prop.Nullable {
+			ftype = "*" + ftype
+		}
+		optional := !contains(s.Required, name)
+		tag := fmt.Sprintf("`json:%q`", name)
+		if optional {
+			tag = fmt.Sprintf("`json:%q`", name+",omitempty")
+		}
+		out = append(out, fmt.Sprintf("%s %s %s", field, ftype, tag))
+	}
+	return out
+}
+
+// goType maps a schema to its Go type expression. Inline objects with
+// properties become anonymous structs; deep nesting stays readable
+// because fields carry the shape with them.
+func (g *generator) goType(s *rawSchema, hint string, depth int) string {
+	if s == nil {
+		return "any"
+	}
+	if depth > 8 {
+		return "any"
+	}
+	if s.Ref != "" {
+		return schemaBase(s.Ref)
+	}
+	if s.OneOf != nil {
+		// oneOf payloads decode as their first referenced variant; fall
+		// back to raw bytes when no variant is a $ref.
+		if ref := firstOneOfRef(s); ref != "" {
+			return ref
+		}
+		return "json.RawMessage"
+	}
+	switch s.Type {
+	case "string":
+		return "string"
+	case "integer":
+		return "int64"
+	case "number":
+		return "float64"
+	case "boolean":
+		return "bool"
+	case "array":
+		return "[]" + g.goType(s.Items, hint, depth+1)
+	case "object":
+		if len(s.Properties) == 0 {
+			return "map[string]any"
+		}
+		var sb strings.Builder
+		sb.WriteString("struct {\n")
+		for _, f := range g.structFields(hint, s, depth) {
+			sb.WriteString("\t" + f + "\n")
+		}
+		sb.WriteString("}")
+		return sb.String()
+	}
+	return "any"
+}
+
+// buildOperations converts every documented operation into its Go shape
+// and returns them in deterministic (path, method) order.
+func (g *generator) buildOperations() []genOperation {
+	var ops []genOperation
+	paths := sortedKeys(g.spec.Paths)
+	for _, path := range paths {
+		methods := sortedKeys(g.spec.Paths[path])
+		for _, method := range methods {
+			op := g.spec.Paths[path][method]
+			if op.OperationID == "" {
+				continue
+			}
+			ops = append(ops, g.buildOperation(strings.ToUpper(method), path, op))
+		}
+	}
+	return ops
+}
+
+func (g *generator) buildOperation(method, path string, op *rawOperation) genOperation {
+	gen := genOperation{
+		GoName:  goFieldName(op.OperationID),
+		Method:  method,
+		Path:    path,
+		Summary: op.Summary,
+	}
+	for _, raw := range op.Parameters {
+		p := g.resolveParam(raw)
+		if p == nil {
+			continue
+		}
+		qp := queryParam{Name: p.Name, Go: goFieldName(p.Name), Type: paramGoType(p.Schema)}
+		switch p.In {
+		case "path":
+			gen.PathArgs = append(gen.PathArgs, qp)
+		case "query":
+			gen.Query = append(gen.Query, qp)
+		}
+	}
+
+	if op.RequestBody != nil {
+		if sch := jsonContent(op.RequestBody.Content); sch != nil {
+			gen.HasBody = true
+			if sch.Ref != "" {
+				gen.BodyType = schemaBase(sch.Ref)
+			} else {
+				gen.BodyType = g.synthesize(gen.GoName+"Request", sch)
+			}
+		}
+	}
+
+	// Pick the success response: 200, then 201, then 204.
+	for _, code := range []string{"200", "201", "204"} {
+		resp, ok := op.Responses[code]
+		if !ok {
+			continue
+		}
+		if code == "204" {
+			gen.RespVoid = true
+			break
+		}
+		sch := jsonContent(resp.Content)
+		if sch == nil {
+			// A success with a non-JSON body (CSV export, raw event XDR):
+			// hand the caller the bytes.
+			gen.RespRaw = true
+			break
+		}
+		if sch.Ref != "" {
+			gen.RespRef = schemaBase(sch.Ref)
+		} else if sch.Type == "array" {
+			gen.RespArray = g.goType(sch.Items, gen.GoName+"Item", 0)
+		} else {
+			gen.RespSynth = g.synthesize(gen.GoName+"Response", sch)
+		}
+		break
+	}
+	return gen
+}
+
+func (g *generator) emitOperation(buf *bytes.Buffer, op genOperation) {
+	// Signature: ctx, then path args, then the query-params struct, then
+	// the body.
+	args := []string{"ctx context.Context"}
+	for _, a := range op.PathArgs {
+		args = append(args, fmt.Sprintf("%s %s", lowerFirst(a.Go), a.Type))
+	}
+	if len(op.Query) > 0 {
+		args = append(args, fmt.Sprintf("params %sParams", op.GoName))
+	}
+	if op.HasBody {
+		args = append(args, "body "+op.BodyType)
+	}
+
+	retType := ""
+	switch {
+	case op.RespRef != "":
+		retType = "*" + op.RespRef
+	case op.RespArray != "":
+		retType = "[]" + op.RespArray
+	case op.RespSynth != "":
+		retType = "*" + op.RespSynth
+	case op.RespRaw:
+		retType = "[]byte"
+	}
+
+	if op.Summary != "" {
+		buf.WriteString("// " + op.GoName + " " + strings.TrimSuffix(op.Summary, ".") + ".\n")
+	}
+	fmt.Fprintf(buf, "//\n// %s %s\n", op.Method, op.Path)
+	if retType != "" {
+		fmt.Fprintf(buf, "func (c *Client) %s(%s) (%s, error) {\n", op.GoName, strings.Join(args, ", "), retType)
+	} else {
+		fmt.Fprintf(buf, "func (c *Client) %s(%s) error {\n", op.GoName, strings.Join(args, ", "))
+	}
+
+	// Path: substitute {param} placeholders in order. Integer path
+	// parameters (e.g. {key_id}) are formatted before escaping.
+	pathExpr := strconv.Quote(op.Path)
+	if len(op.PathArgs) > 0 {
+		pathExpr = "urlEscapePath(" + strconv.Quote(op.Path)
+		for _, a := range op.PathArgs {
+			arg := lowerFirst(a.Go)
+			if a.Type == "int64" {
+				arg = fmt.Sprintf("strconv.FormatInt(%s, 10)", arg)
+			}
+			pathExpr += fmt.Sprintf(", %s", arg)
+		}
+		pathExpr += ")"
+	}
+
+	queryExpr := "nil"
+	if len(op.Query) > 0 {
+		queryExpr = "params.values()"
+	}
+
+	bodyExpr := "nil"
+	if op.HasBody {
+		bodyExpr = "body"
+	}
+
+	call := fmt.Sprintf("\tpath := %s\n", pathExpr)
+	returnQuery := queryExpr
+	if len(op.Query) > 0 {
+		call += fmt.Sprintf("\tquery := %s\n", queryExpr)
+		returnQuery = "query"
+	}
+	switch {
+	case op.RespArray != "":
+		call += fmt.Sprintf("\treturn doSlice[%s](c, ctx, %q, path, %s, %s)\n", op.RespArray, op.Method, returnQuery, bodyExpr)
+	case op.RespRaw:
+		call += fmt.Sprintf("\treturn doRaw(c, ctx, %q, path, %s, %s)\n", op.Method, returnQuery, bodyExpr)
+	case retType != "":
+		call += fmt.Sprintf("\treturn do[%s](c, ctx, %q, path, %s, %s)\n", strings.TrimPrefix(retType, "*"), op.Method, returnQuery, bodyExpr)
+	default:
+		call += fmt.Sprintf("\treturn doNoContent(c, ctx, %q, path, %s, %s)\n", op.Method, returnQuery, bodyExpr)
+	}
+	buf.WriteString(call)
+	buf.WriteString("}\n\n")
+
+	if len(op.Query) > 0 {
+		g.emitParamsStruct(buf, op)
+	}
+}
+
+// emitParamsStruct writes the query-parameter struct and its values()
+// builder for one operation.
+func (g *generator) emitParamsStruct(buf *bytes.Buffer, op genOperation) {
+	fmt.Fprintf(buf, "// %sParams are the query parameters for %s.\n", op.GoName, op.GoName)
+	fmt.Fprintf(buf, "type %sParams struct {\n", op.GoName)
+	for _, p := range op.Query {
+		fmt.Fprintf(buf, "\t%s %s\n", p.Go, p.Type)
+	}
+	buf.WriteString("}\n\n")
+	fmt.Fprintf(buf, "// values renders the non-zero fields as query parameters, so an\n// unset field is omitted from the URL rather than sent as empty.\nfunc (p %sParams) values() url.Values {\n", op.GoName)
+	buf.WriteString("\tv := url.Values{}\n")
+	for _, p := range op.Query {
+		switch p.Type {
+		case "string":
+			fmt.Fprintf(buf, "\tif p.%s != \"\" { v.Set(%q, p.%s) }\n", p.Go, p.Name, p.Go)
+		case "int64":
+			fmt.Fprintf(buf, "\tif p.%s != 0 { v.Set(%q, strconv.FormatInt(p.%s, 10)) }\n", p.Go, p.Name, p.Go)
+		case "bool":
+			fmt.Fprintf(buf, "\tif p.%s { v.Set(%q, \"true\") }\n", p.Go, p.Name)
+		}
+	}
+	buf.WriteString("\treturn v\n}\n\n")
+}
+
+// firstOneOfRef returns the schema name of the first $ref member of a
+// oneOf, or "" when there is none.
+func firstOneOfRef(s *rawSchema) string {
+	for _, m := range s.OneOf {
+		if m.Ref != "" {
+			return schemaBase(m.Ref)
+		}
+	}
+	return ""
+}
+
+// synthesize registers an inline object schema under a deterministic
+// name and returns that name, so response/request bodies that are not
+// $refs still get named, reviewable types.
+func (g *generator) synthesize(name string, s *rawSchema) string {
+	if _, exists := g.synthNames[name]; !exists {
+		g.synthNames[name] = s
+	}
+	return name
+}
+
+// resolveParam dereferences a parameter that may be a $ref into the
+// components/parameters table.
+func (g *generator) resolveParam(p *rawParameter) *rawParameter {
+	if p == nil {
+		return nil
+	}
+	if p.Ref == "" {
+		return p
+	}
+	name := schemaBase(p.Ref)
+	if resolved, ok := g.params[name]; ok {
+		return resolved
+	}
+	return nil
+}
+
+func jsonContent(content map[string]struct {
+	Schema *rawSchema `yaml:"schema"`
+}) *rawSchema {
+	if sch, ok := content["application/json"]; ok {
+		return sch.Schema
+	}
+	return nil
+}
+
+// paramGoType maps a query/path parameter schema to its Go scalar type.
+func paramGoType(s *rawSchema) string {
+	if s == nil {
+		return "string"
+	}
+	switch s.Type {
+	case "integer":
+		return "int64"
+	case "boolean":
+		return "bool"
+	default:
+		return "string"
+	}
+}
+
+// schemaBase strips a $ref like "#/components/schemas/Event" to "Event".
+func schemaBase(ref string) string {
+	if i := strings.LastIndex(ref, "/"); i >= 0 {
+		return ref[i+1:]
+	}
+	return ref
+}
+
+// goFieldName converts snake_case or camelCase identifiers to exported
+// Go field names: "contract_id" → "ContractID", "listEvents" →
+// "ListEvents", "id" → "ID". The "id" segment is special-cased so
+// identifiers read the way Go stdlib and this codebase write them.
+func goFieldName(s string) string {
+	if s == "" {
+		return s
+	}
+	var sb strings.Builder
+	for _, seg := range strings.FieldsFunc(s, func(r rune) bool { return r == '_' || r == '-' }) {
+		if seg == "id" || seg == "Id" || seg == "ID" {
+			sb.WriteString("ID")
+			continue
+		}
+		if seg == "" {
+			continue
+		}
+		rs := []rune(seg)
+		sb.WriteRune(unicode.ToUpper(rs[0]))
+		sb.WriteString(string(rs[1:]))
+	}
+	out := sb.String()
+	// All-caps acronyms read better than mixed casing (names that are
+	// already all-caps in the spec stay that way).
+	if strings.ToUpper(out) == out && len(out) > 1 {
+		return out
+	}
+	return out
+}
+
+func lowerFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	// All-caps identifiers ("ID", "URL") lower-case whole: "iD" reads
+	// badly, "id" does not.
+	if strings.ToUpper(s) == s && len(s) > 1 {
+		return strings.ToLower(s)
+	}
+	return strings.ToLower(s[:1]) + s[1:]
+}
+
+func sortedKeys[M ~map[string]V, V any](m M) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func contains(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}

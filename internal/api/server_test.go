@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -89,6 +92,91 @@ func TestServer_routePattern(t *testing.T) {
 			}
 
 			assert.Equal(t, tt.expected, s.routePattern(req))
+		})
+	}
+}
+
+func TestBodyLimitMiddleware(t *testing.T) {
+	tests := []struct {
+		name        string
+		bodyLimit   int64
+		requestBody string
+		// When body exceeds limit and is read, the handler gets an error.
+		// The existing handlers return 400 for oversized bodies.
+		expectBodyReadError bool
+	}{
+		{
+			name:                "body under limit is accepted",
+			bodyLimit:           1024,
+			requestBody:         `{"name": "test"}`,
+			expectBodyReadError: false,
+		},
+		{
+			name:                "body exactly at limit is accepted",
+			bodyLimit:           1024,
+			requestBody:         string(bytes.Repeat([]byte("x"), 1024)),
+			expectBodyReadError: false,
+		},
+		{
+			name:                "body over limit returns error when read",
+			bodyLimit:           1024,
+			requestBody:         string(bytes.Repeat([]byte("x"), 1025)),
+			expectBodyReadError: true,
+		},
+		{
+			name:                "empty body is accepted",
+			bodyLimit:           1024,
+			requestBody:         "",
+			expectBodyReadError: false,
+		},
+		{
+			name:                "zero limit means no limit (default behavior)",
+			bodyLimit:           0,
+			requestBody:         string(bytes.Repeat([]byte("x"), 10000)),
+			expectBodyReadError: false,
+		},
+		{
+			name:                "negative limit means no limit",
+			bodyLimit:           -1,
+			requestBody:         string(bytes.Repeat([]byte("x"), 10000)),
+			expectBodyReadError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a test server with the body limit middleware
+			s := newTestServer(&stubStore{}, nil)
+			s.SetHTTPRequestBodyLimit(tt.bodyLimit)
+
+			// Use a simple handler that reads the body
+			var readErr error
+			testHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, readErr = io.ReadAll(r.Body)
+				if readErr == nil {
+					w.WriteHeader(http.StatusOK)
+				}
+			})
+
+			// Wrap with the body limit middleware
+			handler := s.bodyLimitMiddleware(testHandler)
+
+			// Create a POST request with the test body
+			req := httptest.NewRequest(http.MethodPost, "/test", bytes.NewBufferString(tt.requestBody))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			handler.ServeHTTP(rec, req)
+
+			if tt.expectBodyReadError {
+				// When body exceeds limit, reading returns a MaxBytesError
+				require.Error(t, readErr)
+				var maxBytesErr *http.MaxBytesError
+				assert.ErrorAs(t, readErr, &maxBytesErr, "expected MaxBytesError when body exceeds limit")
+			} else {
+				assert.NoError(t, readErr)
+				assert.Equal(t, http.StatusOK, rec.Code)
+			}
 		})
 	}
 }

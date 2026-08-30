@@ -410,3 +410,7 @@ func (m *mockStore) CountAddressEvents(context.Context, string) (int64, error) {
 func (m *mockStore) GetAddressSummary(context.Context, string) (store.AddressSummary, error) {
 	return store.AddressSummary{}, nil
 }
+
+func (m *mockStore) CountEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}

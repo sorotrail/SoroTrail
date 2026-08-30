@@ -1,0 +1,23 @@
+name: Labeler
+
+# Applies area/* labels to pull requests by path, keeping the taxonomy in
+# docs/triage.md in sync with what maintainers see on every PR. type/* and
+# priority labels are set by humans during triage.
+#
+# Minimal token scope: only needs to write PR labels.
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v6
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          sync-labels: true

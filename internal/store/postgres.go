@@ -20,7 +20,12 @@ import (
 	"github.com/sorotrail/sorotrail/internal/metrics"
 )
 
-// ErrNotFound is returned when a lookup matches no rows.
+// ErrNotFound is returned by [Store] lookup methods when no matching row
+// exists. Callers should use errors.Is to check for it.
+//
+// Returned by: [Store.GetEvent], [Store.GetIngestionState],
+// [Store.GetAuditState], [Store.ListOpenFindingsByRange],
+// [Postgres.GetReplayState].
 var ErrNotFound = errors.New("not found")
 
 // ErrInvalidCursor is returned when a pagination cursor is malformed for the
@@ -36,7 +41,34 @@ const (
 	poolReconnectMaxBackoff  = 30 * time.Second
 )
 
-// Postgres implements Store on a pgx connection pool.
+// NewPool creates a pgx pool for databaseURL, applying optional sizing knobs
+// (zero means "leave pgx's default"). Use this instead of pgxpool.New so the
+// DB connection pool size is configurable from the environment.
+func NewPool(ctx context.Context, databaseURL string, maxConns, minConns int32, maxConnLifetime, maxConnIdleTime time.Duration) (*pgxpool.Pool, error) {
+	poolConfig, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if maxConns > 0 {
+		poolConfig.MaxConns = maxConns
+	}
+	if minConns > 0 {
+		poolConfig.MinConns = minConns
+	}
+	if maxConnLifetime > 0 {
+		poolConfig.MaxConnLifetime = maxConnLifetime
+	}
+	if maxConnIdleTime > 0 {
+		poolConfig.MaxConnIdleTime = maxConnIdleTime
+	}
+	return pgxpool.NewWithConfig(ctx, poolConfig)
+}
+
+// Postgres implements [Store] on a pgx connection pool. It is the only
+// production implementation of the [Store] interface.
+//
+// Create an instance with [NewPostgres]. The caller owns the pool's
+// lifecycle and must close it when done.
 type Postgres struct {
 	pool          *pgxpool.Pool
 	partitionSpan int64
@@ -49,6 +81,7 @@ type Postgres struct {
 	stopHealthCk  context.CancelFunc
 }
 
+// Compile-time assertion that *Postgres implements Store.
 var _ Store = (*Postgres)(nil)
 
 // NewPostgres wraps an existing pool. The caller owns the pool's lifecycle.
@@ -204,6 +237,14 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 	return p.upsertEvents(ctx, events, false)
 }
 
+func (p *Postgres) PruneEventsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM events WHERE created_at < $1`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("pruning events before %s: %w", cutoff.Format(time.RFC3339Nano), err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
 // ingest, DO NOTHING) and ReplaceEventsInRange (auditor repair, DO UPDATE).
 // Both paths write the full events row so raw XDR is never silently dropped
@@ -211,9 +252,9 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 // stored via the coalesce() clauses in the UPDATE branch (`sorotrail replay`
 // relies on that).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
-	conflict := `ON CONFLICT (ledger, id) DO NOTHING`
+	conflict := `ON CONFLICT (network, ledger, id) DO NOTHING`
 	if onUpdate {
-		conflict = `ON CONFLICT (ledger, id) DO UPDATE SET
+		conflict = `ON CONFLICT (network, ledger, id) DO UPDATE SET
 			contract_id        = EXCLUDED.contract_id,
 			ledger             = EXCLUDED.ledger,
 			type               = EXCLUDED.type,
@@ -229,18 +270,18 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	}
 	stmt := `
 		INSERT INTO events
-			(id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+			(id, network, contract_id, ledger, type, tx_hash, tx_index, op_index,
 			 in_successful_call, topics, value, created_at,
 			 raw_topic_xdr, raw_value_xdr)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		` + conflict
 	batch := &pgx.Batch{}
 	for _, e := range events {
-		// 13 placeholders → 13 args. nullable helpers turn empty raw XDR
+		// 14 placeholders → 14 args. nullable helpers turn empty raw XDR
 		// into SQL NULL so the column has one representation of "absent"
 		// rather than two.
 		batch.Queue(stmt,
-			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+			e.ID, defaultNetwork(e.Network), e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, e.CreatedAt,
 			nullableStringSlice(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
@@ -782,6 +823,9 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
+	if f.Network != "" {
+		where = append(where, "network = "+arg(defaultNetwork(f.Network)))
+	}
 	// Scope is appended first so it is present in every generated
 	// statement, including ones where a later filter returns early. It is
 	// ANDed with the caller's filters, never ORed, so widening the request
@@ -1070,11 +1114,16 @@ func (p *Postgres) CountEvents(ctx context.Context, f EventFilter) (int64, error
 }
 
 func (p *Postgres) GetIngestionState(ctx context.Context) (IngestionState, error) {
+	return p.GetIngestionStateForNetwork(ctx, "default")
+}
+
+func (p *Postgres) GetIngestionStateForNetwork(ctx context.Context, network string) (IngestionState, error) {
 	var s IngestionState
+	network = defaultNetwork(network)
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx,
-			`SELECT last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state WHERE id = 1`,
-		).Scan(&s.LastIngestedLedger, &s.LastCursor, &s.LastSuccessfulPoll, &s.UpdatedAt)
+			`SELECT network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state WHERE network = $1`, network,
+		).Scan(&s.Network, &s.LastIngestedLedger, &s.LastCursor, &s.LastSuccessfulPoll, &s.UpdatedAt)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return IngestionState{}, ErrNotFound
@@ -1090,14 +1139,14 @@ func (p *Postgres) SaveIngestionState(ctx context.Context, s IngestionState) err
 		s.Network = "default"
 	}
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO ingestion_state (id, last_ingested_ledger, last_cursor, last_successful_poll, updated_at)
-		VALUES (1, $1, $2, $3, now())
-		ON CONFLICT (id) DO UPDATE SET
+		INSERT INTO ingestion_state (network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at)
+		VALUES ($1, $2, $3, $4, now())
+		ON CONFLICT (network) DO UPDATE SET
 			last_ingested_ledger = EXCLUDED.last_ingested_ledger,
 			last_cursor          = EXCLUDED.last_cursor,
 			last_successful_poll = EXCLUDED.last_successful_poll,
 			updated_at           = now()`,
-		s.LastIngestedLedger, s.LastCursor, s.LastSuccessfulPoll,
+		s.Network, s.LastIngestedLedger, s.LastCursor, s.LastSuccessfulPoll,
 	)
 	if err != nil {
 		return fmt.Errorf("saving ingestion state for network %q: %w", s.Network, err)
@@ -1408,6 +1457,32 @@ func (p *Postgres) frontierStats(ctx context.Context) (Stats, error) {
 		return Stats{}, fmt.Errorf("loading stats: %w", err)
 	}
 	return s, nil
+}
+
+// CountEventsBefore counts events strictly below maxLedger and (if
+// beforeTime is non-zero) older than beforeTime. The count is limited
+// by limit, matching DeleteEventsBefore's batching contract.
+func (p *Postgres) CountEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	var where string
+	var args []any
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	where = "ledger < " + arg(maxLedger)
+	if !beforeTime.IsZero() {
+		where += " AND created_at < " + arg(beforeTime)
+	}
+	q := fmt.Sprintf(`SELECT count(*) FROM (SELECT 1 FROM events WHERE %s LIMIT %d) sub`, where, limit)
+	var total int64
+	err := p.pool.QueryRow(ctx, q, args...).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("counting events before ledger %d: %w", maxLedger, err)
+	}
+	return total, nil
 }
 
 // DeleteEventsBefore deletes up to limit events that are strictly below
@@ -1896,6 +1971,13 @@ func (p *Postgres) UpsertAddressRefs(ctx context.Context, refs []AddressRef) err
 // filter params as the main events listing (contract_id, type, ledger range
 // via from_ledger/to_ledger).
 func (p *Postgres) QueryAddressEvents(ctx context.Context, address string, f EventFilter) ([]Event, string, error) {
+	// The tenant boundary is evaluated before anything else, and an empty
+	// scope returns an empty page without issuing SQL — same contract as
+	// QueryEvents.
+	if f.Scope.DeniesAll() {
+		return nil, "", nil
+	}
+
 	limit := f.Limit
 	if limit <= 0 {
 		limit = DefaultQueryLimit
@@ -1916,6 +1998,11 @@ func (p *Postgres) QueryAddressEvents(ctx context.Context, address string, f Eve
 	// Join with event_addresses to find events for this address.
 	where = append(where, "ea.address = "+arg(address))
 	where = append(where, "e.id = ea.event_id")
+
+	// Scope is applied before any other filter, exactly like QueryEvents.
+	if !f.Scope.IsWildcard() {
+		where = append(where, "e.contract_id = ANY("+arg(f.Scope.Contracts())+")")
+	}
 
 	if f.ContractID != "" {
 		where = append(where, "e.contract_id = "+arg(f.ContractID))

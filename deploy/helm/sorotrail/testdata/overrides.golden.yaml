@@ -1,0 +1,156 @@
+---
+# Source: sorotrail/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sorotrail-runner
+  labels:
+    helm.sh/chart: sorotrail-0.1.0
+    app.kubernetes.io/name: sorotrail
+    app.kubernetes.io/instance: sorotrail
+    app.kubernetes.io/version: "latest"
+    app.kubernetes.io/managed-by: Helm
+---
+# Source: sorotrail/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sorotrail
+  labels:
+    helm.sh/chart: sorotrail-0.1.0
+    app.kubernetes.io/name: sorotrail
+    app.kubernetes.io/instance: sorotrail
+    app.kubernetes.io/version: "latest"
+    app.kubernetes.io/managed-by: Helm
+data:
+  RPC_URL: "https://horizon-mainnet.example.com"
+  POLL_INTERVAL: "10s"
+  HTTP_ADDR: ":8080"
+  WATCHED_CONTRACTS: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+  START_LEDGER: ""
+  RETENTION_LEDGERS: "17280"
+  PARTITION_LEDGER_SPAN: "120960"
+  LOG_LEVEL: "info"
+  CORS_ALLOWED_ORIGINS: "https://app.example.com"
+  RATE_LIMIT_RPS: "10"
+  RATE_LIMIT_BURST: "20"
+---
+# Source: sorotrail/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: sorotrail
+  labels:
+    helm.sh/chart: sorotrail-0.1.0
+    app.kubernetes.io/name: sorotrail
+    app.kubernetes.io/instance: sorotrail
+    app.kubernetes.io/version: "latest"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: sorotrail
+    app.kubernetes.io/instance: sorotrail
+---
+# Source: sorotrail/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sorotrail
+  labels:
+    helm.sh/chart: sorotrail-0.1.0
+    app.kubernetes.io/name: sorotrail
+    app.kubernetes.io/instance: sorotrail
+    app.kubernetes.io/version: "latest"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sorotrail
+      app.kubernetes.io/instance: sorotrail
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+      labels:
+        app.kubernetes.io/name: sorotrail
+        app.kubernetes.io/instance: sorotrail
+    spec:
+      serviceAccountName: sorotrail-runner
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: sorotrail
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          image: "ghcr.io/sorotrail/sorotrail:latest"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: sorotrail
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: existing-db-secret
+                  key: DATABASE_URL
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+---
+# Source: sorotrail/templates/servicemonitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sorotrail
+  namespace: sorotrail-test
+  labels:
+    helm.sh/chart: sorotrail-0.1.0
+    app.kubernetes.io/name: sorotrail
+    app.kubernetes.io/instance: sorotrail
+    app.kubernetes.io/version: "latest"
+    app.kubernetes.io/managed-by: Helm
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sorotrail
+      app.kubernetes.io/instance: sorotrail
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s

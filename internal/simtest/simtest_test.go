@@ -568,3 +568,7 @@ func TestVirtualChain_GetEvents_OutOfRange(t *testing.T) {
 	require.True(t, errors.As(err, &rpcErr))
 	assert.Contains(t, rpcErr.Message, "ledger range")
 }
+
+func (m *mockStore) CountEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}

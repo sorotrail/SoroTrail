@@ -443,3 +443,7 @@ func TestDecodeContractID(t *testing.T) {
 	_, err = decodeContractID("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
 	assert.Error(t, err)
 }
+
+func (s *stubStore) CountEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}

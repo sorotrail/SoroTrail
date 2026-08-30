@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/sorotrail/sorotrail/internal/metrics"
 )
 
 // BreakerState represents the state of a circuit breaker.
@@ -72,11 +74,15 @@ func NewCircuitBreaker(config CircuitBreakerConfig, log *slog.Logger) *CircuitBr
 	if log == nil {
 		log = slog.Default()
 	}
-	return &CircuitBreaker{
+	cb := &CircuitBreaker{
 		config: config,
 		log:    log,
 		state:  BreakerClosed,
 	}
+	// Seed the gauge so a freshly-constructed breaker is immediately
+	// visible as closed before the first request decides anything.
+	metrics.RPCCircuitBreakerState.WithLabelValues(BreakerClosed.String()).Set(1)
+	return cb
 }
 
 // Allow reports whether a request should be attempted. When the breaker is
@@ -208,7 +214,9 @@ func (cb *CircuitBreaker) Stats() BreakerStats {
 	}
 }
 
-// setState transitions the breaker and records when open began.
+// setState transitions the breaker and records when open began. Every
+// transition also republishes the state gauge (1 on the new state, 0 on
+// the old), so /metrics always reflects the live breaker.
 func (cb *CircuitBreaker) setState(s BreakerState) {
 	if cb.state != s {
 		old := cb.state
@@ -216,6 +224,8 @@ func (cb *CircuitBreaker) setState(s BreakerState) {
 		if s == BreakerOpen {
 			cb.lastOpenTime = time.Now()
 		}
+		metrics.RPCCircuitBreakerState.WithLabelValues(old.String()).Set(0)
+		metrics.RPCCircuitBreakerState.WithLabelValues(s.String()).Set(1)
 		cb.log.Debug("circuit breaker state transition",
 			"from", old, "to", s,
 			"consecutive_failures", cb.consecutiveFail)

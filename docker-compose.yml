@@ -5,6 +5,8 @@ services:
       POSTGRES_USER: sorotrail
       POSTGRES_PASSWORD: sorotrail
       POSTGRES_DB: sorotrail
+    # The host port here must match DATABASE_URL in the Makefile so that
+    # `make test-db` works out of the box after `make docker-up`.
     ports:
       - "5432:5432"
     volumes:
@@ -26,10 +28,13 @@ services:
         condition: service_healthy
     environment:
       RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
+      # Keep user/password/db in sync with DATABASE_URL in the Makefile.
       DATABASE_URL: postgres://sorotrail:sorotrail@postgres:5432/sorotrail?sslmode=disable
       POLL_INTERVAL: ${POLL_INTERVAL:-5s}
       HTTP_ADDR: ":8080"
       WATCHED_CONTRACTS: ${WATCHED_CONTRACTS:-}
+      RETENTION_AGE: ${RETENTION_AGE:-}
+      RETENTION_POLL_INTERVAL: ${RETENTION_POLL_INTERVAL:-1h}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
       - "8080:8080"

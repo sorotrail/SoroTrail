@@ -24,6 +24,7 @@ import (
 
 	"github.com/sorotrail/sorotrail/internal/api"
 	"github.com/sorotrail/sorotrail/internal/api/graphql"
+	"github.com/sorotrail/sorotrail/internal/archive"
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/config"
@@ -75,6 +76,10 @@ func dispatch(args []string) error {
 			os.Exit(code)
 		}
 		return nil
+	case "schema-inspect":
+		return runSchemaInspect(args[1:])
+	case "migrate-status":
+		return runMigrateStatus(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -98,6 +103,10 @@ subcommands:
                (sorotrail index-addresses --help)
   healthcheck  probe /health and exit (used by docker HEALTHCHECK)
                (sorotrail healthcheck --help)
+  schema-inspect  report migration state, partitions, and table sizes
+               (sorotrail schema-inspect --help)
+  migrate-status report pending migrations without applying them
+               (sorotrail migrate-status --help)
 `)
 }
 
@@ -136,7 +145,7 @@ func run() error {
 			return err
 		}
 	} else {
-		pool, err = pgxpool.New(ctx, cfg.DatabaseURL)
+		pool, err = store.NewPool(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns, cfg.DBMaxConnLifetime, cfg.DBMaxConnIdleTime)
 		if err != nil {
 			return fmt.Errorf("connecting to postgres: %w", err)
 		}
@@ -196,7 +205,11 @@ func run() error {
 	// the retry wrapper applies the configured backoff, honoring any
 	// Retry-After hint a rate-limiting provider sends (issue #58).
 	rpcClient := rpc.NewRetryClient(
-		rpc.NewHTTPClient(cfg.RPCURL, rpc.WithRateLimitRPS(cfg.RPCRateLimit)),
+		rpc.NewHTTPClient(
+			cfg.RPCURL,
+			rpc.WithRateLimitRPS(cfg.RPCRateLimit),
+			rpc.WithHTTPTimeout(cfg.RPCHTTPTimeout),
+		),
 		rpc.RetryConfig{
 			MaxAttempts: cfg.RPCMaxAttempts,
 			BaseBackoff: cfg.RPCBaseBackoff,
@@ -248,7 +261,10 @@ func run() error {
 	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:            cfg.PollInterval,
 		StartLedger:             cfg.StartLedger,
+		StartLedgerRaw:          cfg.StartLedgerRaw,
 		RetentionLedgers:        cfg.RetentionLedgers,
+		PageLimit:               cfg.IngestPageSize,
+		WriteBatchSize:          cfg.IngestBatchSize,
 		LagWarnLedgers:          cfg.LagWarnLedgers,
 		SweepConcurrency:        cfg.SweepConcurrency,
 		MaxEventsPerCycle:       cfg.MaxEventsPerCycle,
@@ -257,6 +273,7 @@ func run() error {
 		BatchMaxBackoff:         cfg.BatchMaxBackoff,
 		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
+		Network:                 cfg.Network,
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
 	// Wire the same store as the dead-letter sink: events that fail to
@@ -315,25 +332,66 @@ func run() error {
 		// to parse logs to see pass/finding rates.
 		api.SetAuditor(aud)
 	}
+	var pruner *store.RetentionPruner
+	if cfg.RetentionAge > 0 {
+		pruner = store.NewRetentionPruner(st, log, store.RetentionOptions{
+			Age:          cfg.RetentionAge,
+			PollInterval: cfg.RetentionPoll,
+		})
+	}
 
 	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
 	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
 	// returns immediately. Only when at least one retention policy is
 	// configured does it allocate a goroutine and a metrics struct.
-	prn := pruner.New(st, log, pruner.Options{
-		MaxAge:    cfg.RetentionMaxAge,
-		MinLedger: cfg.RetentionMinLedger,
-		BatchSize: cfg.RetentionBatchSize,
-		Pause:     cfg.RetentionPause,
-		Interval:  cfg.RetentionInterval,
-	})
+	//
+	// When ARCHIVE_BUCKET is set, an archiver is created to export events
+	// to S3-compatible storage before pruning. Archival is optional and
+	// idempotent: without ARCHIVE_* vars, the binary behaves identically
+	// to the pre-archive build.
+	var arch *archive.Archiver
+	if cfg.ArchiveEnabled() {
+		var err error
+		aArchiverOpts := archive.Options{
+			Bucket:          cfg.ArchiveBucket,
+			Prefix:          cfg.ArchivePrefix,
+			Endpoint:        cfg.ArchiveEndpoint,
+			Region:          cfg.ArchiveRegion,
+			AccessKeyID:     cfg.ArchiveAccessKeyID,
+			SecretAccessKey: cfg.ArchiveSecretAccessKey,
+			UseSSL:          cfg.ArchiveUseSSL,
+			MaxRetries:      cfg.ArchiveMaxRetries,
+			Logger:          log,
+		}
+		arch, err = archive.New(st, aArchiverOpts)
+		if err != nil {
+			return fmt.Errorf("initializing archive: %w", err)
+		}
+		log.Info("archive enabled",
+			"bucket", cfg.ArchiveBucket,
+			"prefix", cfg.ArchivePrefix,
+			"before_prune", cfg.ArchiveBeforePrune,
+		)
+	}
+
+	prn := pruner.NewWithArchiver(st, log, pruner.Options{
+		MaxAge:             cfg.RetentionMaxAge,
+		MinLedger:          cfg.RetentionMinLedger,
+		BatchSize:          cfg.RetentionBatchSize,
+		Pause:              cfg.RetentionPause,
+		Interval:           cfg.RetentionInterval,
+		ArchiveBeforePrune: cfg.ArchiveBeforePrune,
+	}, arch)
 	if cfg.RetentionEnabled() {
 		api.SetPruner(prn)
 	}
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
 	// its cleanup goroutine is never started.
-	limiterOpts := []api.LimiterOption{}
+	limiterOpts := []api.LimiterOption{
+		api.WithHourlyQuota(cfg.HourlyQuota),
+		api.WithDailyQuota(cfg.DailyQuota),
+	}
 	if cfg.MultiTenant {
 		// Key buckets on the authenticated tenant rather than the source
 		// IP, so a tenant's quota follows its identity across however many
@@ -358,6 +416,7 @@ func run() error {
 	apiServer.SetRateLimiter(limiter)
 	apiServer.SetMetricsEnabled(cfg.MetricsEnabled)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
+	apiServer.SetHTTPRequestBodyLimit(cfg.HTTPRequestBodyLimit)
 	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
 	apiServer.SetCORSConfig(api.CORSConfig{
 		AllowedOrigins: cfg.CORSAllowedOrigins,
@@ -420,7 +479,7 @@ func run() error {
 		log.Info("cors enabled", "origins", strings.Join(cfg.CORSAllowedOrigins, ","))
 	}
 
-	errCh := make(chan error, 4)
+	errCh := make(chan error, 5)
 	go func() {
 		go wh.Run(ctx)
 	}()
@@ -461,6 +520,16 @@ func run() error {
 				"max_repair_attempts", cfg.AuditMaxRepair)
 			if err := aud.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- fmt.Errorf("auditor: %w", err)
+			} else {
+				errCh <- nil
+			}
+		}()
+	}
+	if pruner != nil {
+		go func() {
+			log.Info("event retention pruning starting", "age", cfg.RetentionAge, "poll_interval", cfg.RetentionPoll)
+			if err := pruner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("retention pruner: %w", err)
 			} else {
 				errCh <- nil
 			}
