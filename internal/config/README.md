@@ -1,6 +1,13 @@
 # Configuration Constraints
 
-Every runtime parameter is loaded from environment variables at boot via `Load()`.
+Every runtime parameter is loaded from the process environment at boot via
+`Load()`. `Load()` does not read a `.env` file itself. A `.env` file can be
+provided to the process by the shell, Docker Compose, or another orchestrator;
+the resulting process environment is what SoroTrail reads. When using a shell,
+source `.env` before exporting any values that should override it. Docker
+Compose uses its documented variable-interpolation precedence, with explicitly
+exported shell variables taking precedence over values from the local `.env`.
+
 All checks run collectively through `Config.MustValidate()` so no single missing
 field halts the process mid-flight; every problem is printed before `os.Exit(1)`.
 

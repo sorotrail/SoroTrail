@@ -487,6 +487,12 @@ func TestRedact_DatabaseURLInvalidFormat(t *testing.T) {
 	assert.Equal(t, "<redacted>", got, "unparseable sensitive URL should become <redacted>")
 }
 
+func TestRedact_SecretValueRedacted(t *testing.T) {
+	assert.Equal(t, "***", redact("API_KEY", "st_ABCDEFGHIJKLMNOP_secret"))
+	assert.Equal(t, "***", redact("MULTI_TENANT_BOOTSTRAP_KEY", "st_ABCDEFGHIJKLMNOP_secret"))
+	assert.Equal(t, "***", redact("ARCHIVE_SECRET_ACCESS_KEY", "super-secret"))
+}
+
 // ---------- Validate(): errors from the legacy validation path ----------
 // Validate() returns the first error only, so each test must start from
 // a fully valid config and flip exactly one field.

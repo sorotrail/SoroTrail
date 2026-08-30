@@ -41,6 +41,29 @@ const (
 	poolReconnectMaxBackoff  = 30 * time.Second
 )
 
+// NewPool creates a pgx pool for databaseURL, applying optional sizing knobs
+// (zero means "leave pgx's default"). Use this instead of pgxpool.New so the
+// DB connection pool size is configurable from the environment.
+func NewPool(ctx context.Context, databaseURL string, maxConns, minConns int32, maxConnLifetime, maxConnIdleTime time.Duration) (*pgxpool.Pool, error) {
+	poolConfig, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if maxConns > 0 {
+		poolConfig.MaxConns = maxConns
+	}
+	if minConns > 0 {
+		poolConfig.MinConns = minConns
+	}
+	if maxConnLifetime > 0 {
+		poolConfig.MaxConnLifetime = maxConnLifetime
+	}
+	if maxConnIdleTime > 0 {
+		poolConfig.MaxConnIdleTime = maxConnIdleTime
+	}
+	return pgxpool.NewWithConfig(ctx, poolConfig)
+}
+
 // Postgres implements [Store] on a pgx connection pool. It is the only
 // production implementation of the [Store] interface.
 //
@@ -212,6 +235,14 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 		return 0, nil
 	}
 	return p.upsertEvents(ctx, events, false)
+}
+
+func (p *Postgres) PruneEventsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM events WHERE created_at < $1`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("pruning events before %s: %w", cutoff.Format(time.RFC3339Nano), err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent

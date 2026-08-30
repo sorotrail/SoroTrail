@@ -186,6 +186,10 @@ func (m *mockStore) UpsertEvents(ctx context.Context, events []store.Event) (int
 	return inserted, nil
 }
 
+func (m *mockStore) PruneEventsBefore(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
+
 func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event, fromLedger, toLedger int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
