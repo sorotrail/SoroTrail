@@ -315,6 +315,14 @@ type Ingester struct {
 	// a poison event no longer stalls the loop. nil means no
 	// dead-lettering — the cycle aborts on the first error as before.
 	deadLetterStore DeadLetterSink
+	// pollInterval is the live-adjustable poll interval, stored as
+	// nanoseconds so SetPollInterval can update it from any goroutine
+	// (e.g. a SIGHUP config-reload handler) without a lock, while Run's
+	// idle sleep reads the current value fresh on every cycle via
+	// PollInterval. Seeded from opts.PollInterval in New; opts.PollInterval
+	// itself is left untouched and only reflects the value the Ingester
+	// was constructed with.
+	pollInterval atomic.Int64
 }
 
 type networkStateStore interface {
@@ -331,7 +339,7 @@ func (ing *Ingester) getIngestionState(ctx context.Context) (store.IngestionStat
 // New wires an Ingester.
 func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, opts Options) *Ingester {
 	opts.applyDefaults()
-	return &Ingester{
+	ing := &Ingester{
 		client:  client,
 		store:   st,
 		decoder: dec,
@@ -339,6 +347,29 @@ func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger
 		opts:    opts,
 		tracer:  noop.NewTracerProvider().Tracer("github.com/sorotrail/sorotrail/internal/ingester"),
 	}
+	ing.pollInterval.Store(int64(opts.PollInterval))
+	return ing
+}
+
+// PollInterval returns the poll interval Run currently sleeps for between
+// caught-up cycles. It reflects the live value: the construction-time
+// default until SetPollInterval is called, and the most recently applied
+// value afterward.
+func (ing *Ingester) PollInterval() time.Duration {
+	return time.Duration(ing.pollInterval.Load())
+}
+
+// SetPollInterval updates the poll interval Run uses for its idle sleep,
+// effective on the next cycle boundary — no restart required. It validates
+// d and leaves the current interval unchanged if d is not positive, so a
+// rejected config-reload attempt (e.g. via SIGHUP) never puts the ingester
+// into a busy-loop or a permanently-stalled state.
+func (ing *Ingester) SetPollInterval(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("poll interval must be positive, got %s", d)
+	}
+	ing.pollInterval.Store(int64(d))
+	return nil
 }
 
 // WithTracer attaches an OpenTelemetry tracer. Each runOnce cycle emits
@@ -476,7 +507,10 @@ func (ing *Ingester) Run(ctx context.Context) (err error) {
 			ing.checkLag(ctx)
 			backoff = ing.opts.MinBackoff
 			if caughtUp {
-				if !ing.opts.Clock.SleepCtx(ctx, ing.opts.PollInterval) {
+				// PollInterval (not opts.PollInterval) so a live update via
+				// SetPollInterval — e.g. a SIGHUP config reload — takes
+				// effect starting with this sleep, no restart required.
+				if !ing.opts.Clock.SleepCtx(ctx, ing.PollInterval()) {
 					return ctx.Err()
 				}
 			}

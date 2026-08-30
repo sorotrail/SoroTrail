@@ -115,7 +115,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log := newLogger(cfg.LogLevel, cfg.LogFormat)
+	log, logLevel := newLoggerWithLevel(cfg.LogLevel, cfg.LogFormat)
 
 	log.Info("startup configuration", cfg.LoggableFields()...)
 
@@ -280,6 +280,36 @@ func run() error {
 	// decode/persist land in the dead_letters table instead of
 	// stalling the cycle (issue #131).
 	ing.SetDeadLetterSink(st)
+
+	// SIGHUP config hot-reload (issue #148): re-reads and validates the
+	// full environment on every SIGHUP, then applies only the safe subset
+	// (poll interval, log level) to the already-running ingester/logger.
+	// Topology (DATABASE_URL, RPC_URL(S), LOG_FORMAT) never changes live —
+	// a differing value there is logged and ignored rather than failing
+	// the reload, since it can't be applied to the already-constructed
+	// store/RPC client/log handler without a restart. A validation failure
+	// in the new config rejects the whole reload and leaves the running
+	// configuration untouched. This only applies to the long-running
+	// indexer; the one-shot subcommands have no reload path.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	defer signal.Stop(hupCh)
+	go func() {
+		activeCfg := cfg
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hupCh:
+				reloaded, err := applyReload(activeCfg, log, ing, logLevel)
+				if err != nil {
+					log.Error("config reload via SIGHUP rejected; keeping previous configuration", "error", err)
+					continue
+				}
+				activeCfg = reloaded
+			}
+		}
+	}()
 
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a
@@ -583,6 +613,30 @@ func bootstrapAdminKey(ctx context.Context, ts store.TenantStore, key string, lo
 }
 
 func newLogger(level, format string) *slog.Logger {
+	log, _ := newLoggerWithLevel(level, format)
+	return log
+}
+
+// newLoggerWithLevel builds a logger exactly like newLogger, but also
+// returns the slog.LevelVar backing its handler. slog handlers don't
+// support swapping their level after construction, so a caller that needs
+// to adjust the effective log level in place at runtime — the long-running
+// indexer's SIGHUP config-reload handler — holds onto the returned
+// LevelVar and calls Set on it instead of rebuilding the logger/handler.
+// The one-shot subcommands (replay/backfill/index-addresses) have no
+// reload path, so they keep using the simpler newLogger.
+func newLoggerWithLevel(level, format string) (*slog.Logger, *slog.LevelVar) {
+	var levelVar slog.LevelVar
+	levelVar.Set(config.ParseLogLevel(level))
+	opts := &slog.HandlerOptions{Level: &levelVar}
+	var h slog.Handler
+	switch strings.ToLower(format) {
+	case "json":
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	default:
+		h = slog.NewTextHandler(os.Stdout, opts)
+	}
+	return slog.New(h), &levelVar
 	opts := &slog.HandlerOptions{Level: config.ParseLogLevel(level)}
 	return slog.New(config.NewLogHandler(os.Stdout, format, opts))
 }
