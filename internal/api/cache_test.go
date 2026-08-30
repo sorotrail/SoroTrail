@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -586,4 +587,66 @@ func TestGetEvent_DecodedWithXDR_Immutable(t *testing.T) {
 	resp, _ := doGet(t, s, "/events/"+id+"?decoded=true&include_xdr=true")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assertImmutable(t, resp, `"`+id+`"`)
+}
+
+// TestCacheabilityClassPerEndpoint pins the deliberate cacheability
+// choice of every endpoint that previously set cache headers ad hoc or
+// not at all: mutable and secret-bearing data is always no-store, and
+// only the compiled-in static docs assets are cacheable (immutable,
+// one hour). All of them must route through writeCacheHeaders, which is
+// what emits the Vary header and the tenant-scoped downgrade.
+func TestCacheabilityClassPerEndpoint(t *testing.T) {
+	t.Run("watched-contracts list is no-store", func(t *testing.T) {
+		st := &stubStore{watchedList: []store.WatchedContract{{ContractID: testContract}}}
+		resp, _ := doGetWithAuth(t, newTestServer(st, nil), "/watched-contracts", "test-key")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	})
+
+	t.Run("subscriptions list is no-store", func(t *testing.T) {
+		st := &stubStore{subscriptions: []store.Subscription{{ID: 1}}}
+		resp, _ := doGet(t, newTestServer(st, nil), "/subscriptions")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	})
+
+	t.Run("single subscription is no-store", func(t *testing.T) {
+		st := newSubErrorStub()
+		resp, _ := doAPIRequest(t, newServerFromStub(st), http.MethodGet, "/subscriptions/1", "")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	})
+
+	t.Run("deliveries list is no-store", func(t *testing.T) {
+		st := newSubErrorStub()
+		resp, _ := doAPIRequest(t, newServerFromStub(st), http.MethodGet, "/subscriptions/1/deliveries", "")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	})
+
+	t.Run("bulk event delete is no-store", func(t *testing.T) {
+		srv := httptest.NewServer(newTestServer(&stubStore{}, nil).Router())
+		defer srv.Close()
+		req, err := http.NewRequest(http.MethodDelete, srv.URL+"/events?before_ledger=100", nil)
+		require.NoError(t, err)
+		req.Header.Set("X-API-Key", "test-key")
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		_, _ = io.ReadAll(resp.Body)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	})
+
+	t.Run("openapi spec is immutable for an hour", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/openapi.json")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "public, max-age=3600, immutable", resp.Header.Get("Cache-Control"))
+	})
+
+	t.Run("docs page is immutable for an hour", func(t *testing.T) {
+		resp, _ := doGet(t, newTestServer(&stubStore{}, nil), "/docs")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "public, max-age=3600, immutable", resp.Header.Get("Cache-Control"))
+	})
 }

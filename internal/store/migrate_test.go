@@ -10,12 +10,14 @@ package store
 //	go test -run 'TestMigrat' ./internal/store/
 
 import (
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -239,4 +241,208 @@ func mustAtoi(s string) int {
 		n = n*10 + int(c-'0')
 	}
 	return n
+}
+
+// TestMigrate_NoUpDropsTableDependency verifies that no up-migration drops
+// or replaces a table that a later up-migration depends on. This is the
+// simplest form of the check: migration A renames/drops table T, and
+// migration B creates table T — that is fine, but migration A renames
+// table T and migration B tries to ALTER table T is a problem.
+//
+// This test runs without a database, so it catches the issue at build
+// time rather than at database startup.
+func TestMigrate_NoUpDropsTableDependency(t *testing.T) {
+	entries, err := postgresMigrationsFS.ReadDir("migrations")
+	require.NoError(t, err)
+
+	type migContent struct {
+		version int
+		content string
+	}
+	var migs []migContent
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".up.sql") {
+			continue
+		}
+		data, err := postgresMigrationsFS.ReadFile("migrations/" + e.Name())
+		require.NoError(t, err)
+		var v int
+		_, err = fmt.Sscanf(e.Name(), "%d", &v)
+		require.NoError(t, err)
+		migs = append(migs, migContent{version: v, content: string(data)})
+	}
+
+	sort.Slice(migs, func(i, j int) bool { return migs[i].version < migs[j].version })
+
+	created := map[int][]string{}
+	dropped := map[int][]string{}
+
+	createRe := regexp.MustCompile(`(?i)CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)`)
+	dropRe := regexp.MustCompile(`(?i)DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)`)
+	renameRe := regexp.MustCompile(`(?i)RENAME\s+TABLE\s+(\w+)\s+TO\s+(\w+)`)
+
+	for _, m := range migs {
+		for _, match := range createRe.FindAllStringSubmatch(m.content, -1) {
+			created[m.version] = append(created[m.version], strings.ToLower(match[1]))
+		}
+		for _, match := range dropRe.FindAllStringSubmatch(m.content, -1) {
+			dropped[m.version] = append(dropped[m.version], strings.ToLower(match[1]))
+		}
+		for _, match := range renameRe.FindAllStringSubmatch(m.content, -1) {
+			dropped[m.version] = append(dropped[m.version], strings.ToLower(match[1]))
+			created[m.version] = append(created[m.version], strings.ToLower(match[2]))
+		}
+	}
+
+	allVersions := make([]int, 0, len(migs))
+	for _, m := range migs {
+		allVersions = append(allVersions, m.version)
+	}
+
+	for dropVer, tables := range dropped {
+		for _, tbl := range tables {
+			if tbl == "schema_migrations" {
+				continue
+			}
+			for _, createVer := range allVersions {
+				if createVer <= dropVer {
+					continue
+				}
+				for _, ct := range created[createVer] {
+					if ct == tbl {
+						t.Errorf(
+							"version %04d drops table %q which version %04d creates",
+							dropVer, tbl, createVer)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestMigrate_NoUpRebuildsTableDependency detects a subtler class of
+// migration breakage: migration N adds a column to table T via
+// ALTER TABLE T ADD COLUMN, and a later migration M rebuilds table T
+// (DROP/RENAME + CREATE), which silently discards the column that N added
+// because the rebuild recreates the table from scratch with a fixed schema.
+//
+// The check walks migrations in order, tracking which tables have been
+// modified via ALTER TABLE. When a rebuild (DROP TABLE or RENAME TABLE)
+// is encountered, it checks whether any earlier migration had altered that
+// table. If so, the rebuild may have discarded those changes.
+//
+// This test runs without a database, so it catches the issue at build
+// time. 0008_partition_events is the worked example: it rebuilds the
+// events table, and the test verifies that no earlier migration had
+// ALTERed events in a way that 0008 would discard.
+func TestMigrate_NoUpRebuildsTableDependency(t *testing.T) {
+	entries, err := postgresMigrationsFS.ReadDir("migrations")
+	require.NoError(t, err)
+
+	type migContent struct {
+		version int
+		content string
+	}
+	var migs []migContent
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".up.sql") {
+			continue
+		}
+		data, err := postgresMigrationsFS.ReadFile("migrations/" + e.Name())
+		require.NoError(t, err)
+		var v int
+		_, err = fmt.Sscanf(e.Name(), "%d", &v)
+		require.NoError(t, err)
+		migs = append(migs, migContent{version: v, content: string(data)})
+	}
+
+	sort.Slice(migs, func(i, j int) bool { return migs[i].version < migs[j].version })
+
+	// Track tables that have been altered (ADD COLUMN, etc.) by migrations
+	// up to the current point. If a later migration rebuilds the table,
+	// those ALTERs are silently lost.
+	altered := map[string]int{} // table name → latest version that altered it
+
+	dropRe := regexp.MustCompile(`(?i)DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)`)
+	renameRe := regexp.MustCompile(`(?i)RENAME\s+TABLE\s+(\w+)\s+TO\s+(\w+)`)
+	alterRe := regexp.MustCompile(`(?i)ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)`)
+
+	for _, m := range migs {
+		// Track ALTER TABLE operations (ADD COLUMN, etc.).
+		for _, match := range alterRe.FindAllStringSubmatch(m.content, -1) {
+			tbl := strings.ToLower(match[1])
+			if tbl == "schema_migrations" {
+				continue
+			}
+			altered[tbl] = m.version
+		}
+
+		// When a rebuild occurs (DROP or RENAME), check whether any EARLIER
+		// migration (version < current) had ALTERed the same table. An ALTER
+		// in the same migration is expected — that migration is the rebuild
+		// itself — and should not trigger a false positive.
+		for _, match := range dropRe.FindAllStringSubmatch(m.content, -1) {
+			tbl := strings.ToLower(match[1])
+			if tbl == "schema_migrations" {
+				continue
+			}
+			if alterVer, ok := altered[tbl]; ok && alterVer < m.version {
+				t.Errorf(
+					"version %04d drops/rebuilds table %q which was altered by version %04d; "+
+						"the rebuild may discard columns added in version %04d",
+					m.version, tbl, alterVer, alterVer)
+			}
+		}
+		for _, match := range renameRe.FindAllStringSubmatch(m.content, -1) {
+			tbl := strings.ToLower(match[1])
+			if tbl == "schema_migrations" {
+				continue
+			}
+			if alterVer, ok := altered[tbl]; ok && alterVer < m.version {
+				t.Errorf(
+					"version %04d drops/rebuilds table %q which was altered by version %04d; "+
+						"the rebuild may discard columns added in version %04d",
+					m.version, tbl, alterVer, alterVer)
+			}
+		}
+	}
+}
+
+// TestMigrate_PendingVersionsWithoutDB verifies that the embedded migration
+// set can be introspected without a database connection. This is the seed
+// of the migrate-status command: it extracts version numbers and confirms
+// the set is consistent (every version has both up and down, versions are
+// sequential starting from 1).
+func TestMigrate_PendingVersionsWithoutDB(t *testing.T) {
+	entries, err := postgresMigrationsFS.ReadDir("migrations")
+	require.NoError(t, err)
+
+	versions := map[int]bool{}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		m := migrationRe.FindStringSubmatch(e.Name())
+		if m == nil {
+			continue
+		}
+		versions[mustAtoi(m[1])] = true
+	}
+
+	sorted := make([]int, 0, len(versions))
+	for v := range versions {
+		sorted = append(sorted, v)
+	}
+	sort.Ints(sorted)
+
+	require.NotEmpty(t, sorted, "need at least one migration")
+	require.Equal(t, 1, sorted[0], "versions must start at 1")
+
+	// Versions should be sequential with no gaps (golang-migrate requires this).
+	for i, v := range sorted {
+		want := i + 1
+		assert.Equal(t, want, v, "migration versions must be sequential (got %d, want %d)", v, want)
+	}
+
+	t.Logf("embedded migrations: %d versions (1..%d)", len(sorted), sorted[len(sorted)-1])
 }

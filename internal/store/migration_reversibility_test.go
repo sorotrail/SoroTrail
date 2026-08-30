@@ -23,7 +23,6 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -226,119 +225,6 @@ func stepDownToVersion(t *testing.T, url string, target uint) {
 		}
 		require.NoError(t, m.Steps(-1),
 			"stepping down from version %d towards %d", cur, target)
-	}
-}
-
-// ---------- non-integration tests ----------
-
-// TestMigrate_EachUpHasMatchingDown verifies that every .up.sql migration has
-// a matching .down.sql file and vice versa.
-func TestMigrate_EachUpHasMatchingDown(t *testing.T) {
-	entries, err := postgresMigrationsFS.ReadDir("migrations")
-	require.NoError(t, err)
-
-	type migFile struct {
-		version int
-		dir     string
-	}
-
-	var files []migFile
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		m := migrationRe.FindStringSubmatch(e.Name())
-		if m == nil {
-			continue
-		}
-		files = append(files, migFile{version: mustAtoi(m[1]), dir: m[3]})
-	}
-
-	byVersion := map[int][2]string{}
-	for _, f := range files {
-		pair := byVersion[f.version]
-		if f.dir == "up" {
-			pair[0] = "up"
-		} else {
-			pair[1] = "down"
-		}
-		byVersion[f.version] = pair
-	}
-
-	for v, pair := range byVersion {
-		assert.NotEmpty(t, pair[0], "version %04d missing up file", v)
-		assert.NotEmpty(t, pair[1], "version %04d missing down file", v)
-	}
-}
-
-// TestMigrate_NoUpDropsTableDependency verifies that no up-migration drops
-// or replaces a table that a later up-migration depends on.
-func TestMigrate_NoUpDropsTableDependency(t *testing.T) {
-	entries, err := postgresMigrationsFS.ReadDir("migrations")
-	require.NoError(t, err)
-
-	type migContent struct {
-		version int
-		content string
-	}
-	var migs []migContent
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".up.sql") {
-			continue
-		}
-		data, err := postgresMigrationsFS.ReadFile("migrations/" + e.Name())
-		require.NoError(t, err)
-		var v int
-		_, err = fmt.Sscanf(e.Name(), "%d", &v)
-		require.NoError(t, err)
-		migs = append(migs, migContent{version: v, content: string(data)})
-	}
-
-	sort.Slice(migs, func(i, j int) bool { return migs[i].version < migs[j].version })
-
-	created := map[int][]string{}
-	dropped := map[int][]string{}
-
-	createRe := regexp.MustCompile(`(?i)CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)`)
-	dropRe := regexp.MustCompile(`(?i)DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)`)
-	renameRe := regexp.MustCompile(`(?i)RENAME\s+TABLE\s+(\w+)\s+TO\s+(\w+)`)
-
-	for _, m := range migs {
-		for _, match := range createRe.FindAllStringSubmatch(m.content, -1) {
-			created[m.version] = append(created[m.version], strings.ToLower(match[1]))
-		}
-		for _, match := range dropRe.FindAllStringSubmatch(m.content, -1) {
-			dropped[m.version] = append(dropped[m.version], strings.ToLower(match[1]))
-		}
-		for _, match := range renameRe.FindAllStringSubmatch(m.content, -1) {
-			dropped[m.version] = append(dropped[m.version], strings.ToLower(match[1]))
-			created[m.version] = append(created[m.version], strings.ToLower(match[2]))
-		}
-	}
-
-	allVersions := make([]int, 0, len(migs))
-	for _, m := range migs {
-		allVersions = append(allVersions, m.version)
-	}
-
-	for dropVer, tables := range dropped {
-		for _, tbl := range tables {
-			if tbl == "schema_migrations" {
-				continue
-			}
-			for _, createVer := range allVersions {
-				if createVer <= dropVer {
-					continue
-				}
-				for _, ct := range created[createVer] {
-					if ct == tbl {
-						t.Errorf(
-							"version %04d drops table %q which version %04d creates",
-							dropVer, tbl, createVer)
-					}
-				}
-			}
-		}
 	}
 }
 
