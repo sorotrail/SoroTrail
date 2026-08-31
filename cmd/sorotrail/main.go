@@ -276,6 +276,8 @@ func run() error {
 		BatchSize:               cfg.BatchSize,
 		BatchTargetLatency:      cfg.BatchTargetLatency,
 		BatchMaxBackoff:         cfg.BatchMaxBackoff,
+		MinBackoff:              cfg.IngesterMinBackoff,
+		MaxBackoff:              cfg.IngesterMaxBackoff,
 		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
 		Network:                 cfg.Network,
@@ -337,14 +339,6 @@ func run() error {
 		// to parse logs to see pass/finding rates.
 		api.SetAuditor(aud)
 	}
-	var pruner *store.RetentionPruner
-	if cfg.RetentionAge > 0 {
-		pruner = store.NewRetentionPruner(st, log, store.RetentionOptions{
-			Age:          cfg.RetentionAge,
-			PollInterval: cfg.RetentionPoll,
-		})
-	}
-
 	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
 	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
 	// returns immediately. Only when at least one retention policy is
@@ -533,17 +527,6 @@ func run() error {
 			}
 		}()
 	}
-	if pruner != nil {
-		go func() {
-			log.Info("event retention pruning starting", "age", cfg.RetentionAge, "poll_interval", cfg.RetentionPoll)
-			if err := pruner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				errCh <- fmt.Errorf("retention pruner: %w", err)
-			} else {
-				errCh <- nil
-			}
-		}()
-	}
-
 	// The pruner goroutine always runs; without a retention policy it
 	// returns immediately and reports nil so shutdown accounting holds.
 	remaining++ // + pruner
@@ -645,8 +628,6 @@ func newLoggerWithLevel(level, format string) (*slog.Logger, *slog.LevelVar) {
 		h = slog.NewTextHandler(os.Stdout, opts)
 	}
 	return slog.New(h), &levelVar
-	opts := &slog.HandlerOptions{Level: config.ParseLogLevel(level)}
-	return slog.New(config.NewLogHandler(os.Stdout, format, opts))
 }
 
 // graphqlServerDeps wraps the live store + enricher into the typed

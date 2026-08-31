@@ -645,8 +645,14 @@ type Stats struct {
 	OldestStoredLedger    int64  `json:"oldest_stored_ledger"`
 	ChainHeadLedger       *int64 `json:"chain_head_ledger"`
 	IngestLagLedgers      *int64 `json:"ingest_lag_ledgers"`
-	ContractCount         int64  `json:"contract_count"`
-	WatchedContracts      int64  `json:"watched_contracts"`
+	// LastSuccessfulPoll is the wall-clock time of the most recent poll
+	// cycle that completed without error, as recorded by the ingester and
+	// persisted in ingestion_state. Absent (omitted) until the ingester has
+	// finished its first successful pass, so a fresh instance reports
+	// "never polled" rather than a fake zero timestamp.
+	LastSuccessfulPoll *time.Time `json:"last_successful_poll,omitempty"`
+	ContractCount      int64      `json:"contract_count"`
+	WatchedContracts   int64      `json:"watched_contracts"`
 	// TableSizeBytes is the approximate on-disk size of the events table
 	// (including partitions, indexes, and TOAST). 0 when the backend does
 	// not report it.

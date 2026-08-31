@@ -49,45 +49,56 @@ func (m *mockRPCClient) SimulateTransaction(ctx context.Context, req rpc.Simulat
 	return rpc.SimulateTransactionResponse{}, nil
 }
 
-func TestExtractWasmHashFromInstance(t *testing.T)
-{
+// GetEvents is required by rpc.Client but unused by the spec fetcher, which
+// only reads the on-chain contract instance via GetLedgerEntries.
+func (m *mockRPCClient) GetEvents(context.Context, rpc.GetEventsRequest) (rpc.GetEventsResponse, error) {
+	return rpc.GetEventsResponse{}, nil
+}
+
+func TestExtractWasmHashFromInstance(t *testing.T) {
 	wasmBytes := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
+	wasmScBytes := xdr.ScBytes(wasmBytes)
+	shortBytes := xdr.ScBytes([]byte{1, 2, 3})
 	expectedBase64 := base64.StdEncoding.EncodeToString(wasmBytes)
 
-	symWasmHash := xdr.ScString("wasm_hash")
-	symOther := xdr.ScString("other")
+	symWasmHash := xdr.ScSymbol("wasm_hash")
+	symOther := xdr.ScSymbol("other")
 
-	mapEntries := []xdr.MapEntry{
+	mapEntries := []xdr.ScMapEntry{
 		{
 			Key: xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &symWasmHash},
-			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmBytes},
+			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmScBytes},
 		},
 	}
 	mapVal := xdr.ScMap(mapEntries)
+	mapPtr := &mapVal
 
-	mapEntriesOther := []xdr.MapEntry{
+	mapEntriesOther := []xdr.ScMapEntry{
 		{
 			Key: xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &symOther},
-			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmBytes},
+			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmScBytes},
 		},
 	}
 	mapValOther := xdr.ScMap(mapEntriesOther)
+	mapOtherPtr := &mapValOther
 
 	vecItems := []xdr.ScVal{
 		{
 			Type:  xdr.ScValTypeScvBytes,
-			Bytes: &wasmBytes,
+			Bytes: &wasmScBytes,
 		},
 	}
 	vecVal := xdr.ScVec(vecItems)
+	vecPtr := &vecVal
 
 	vecItemsWrongLen := []xdr.ScVal{
 		{
 			Type:  xdr.ScValTypeScvBytes,
-			Bytes: &[]byte{1, 2, 3},
+			Bytes: &shortBytes,
 		},
 	}
 	vecValWrongLen := xdr.ScVec(vecItemsWrongLen)
+	vecWrongPtr := &vecValWrongLen
 
 	tests := []struct {
 		name    string
@@ -99,7 +110,7 @@ func TestExtractWasmHashFromInstance(t *testing.T)
 			name: "map with wasm_hash key yields correct hash",
 			val: xdr.ScVal{
 				Type: xdr.ScValTypeScvMap,
-				Map:  &mapVal,
+				Map:  &mapPtr,
 			},
 			want:    expectedBase64,
 			wantErr: false,
@@ -108,7 +119,7 @@ func TestExtractWasmHashFromInstance(t *testing.T)
 			name: "map without wasm_hash key returns error",
 			val: xdr.ScVal{
 				Type: xdr.ScValTypeScvMap,
-				Map:  &mapValOther,
+				Map:  &mapOtherPtr,
 			},
 			want:    "",
 			wantErr: true,
@@ -117,7 +128,7 @@ func TestExtractWasmHashFromInstance(t *testing.T)
 			name: "vec with 32-byte bytes yields correct hash",
 			val: xdr.ScVal{
 				Type: xdr.ScValTypeScvVec,
-				Vec:  &vecVal,
+				Vec:  &vecPtr,
 			},
 			want:    expectedBase64,
 			wantErr: false,
@@ -126,7 +137,7 @@ func TestExtractWasmHashFromInstance(t *testing.T)
 			name: "vec with non-32-byte bytes returns error",
 			val: xdr.ScVal{
 				Type: xdr.ScValTypeScvVec,
-				Vec:  &vecValWrongLen,
+				Vec:  &vecWrongPtr,
 			},
 			want:    "",
 			wantErr: true,
@@ -157,24 +168,40 @@ func TestExtractWasmHashFromInstance(t *testing.T)
 func TestFetchWasmHash(t *testing.T) {
 	validContractID := "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 	wasmBytes := []byte{5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8}
+	wasmScBytes := xdr.ScBytes(wasmBytes)
 	expectedBase64 := base64.StdEncoding.EncodeToString(wasmBytes)
 
-	symWasmHash := xdr.ScString("wasm_hash")
-	mapEntries := []xdr.MapEntry{
+	symWasmHash := xdr.ScSymbol("wasm_hash")
+	mapEntries := []xdr.ScMapEntry{
 		{
 			Key: xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &symWasmHash},
-			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmBytes},
+			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmScBytes},
 		},
 	}
 	mapVal := xdr.ScMap(mapEntries)
+	mapPtr := &mapVal
+
+	// The ContractDataEntry must carry a valid contract address or XDR
+	// encoding panics; the real fetcher builds it from the contract ID
+	// hash, so mirror that here.
+	var contractHash xdr.Hash
+	copy(contractHash[:], wasmBytes[:32])
+	scAddress := xdr.ScAddress{
+		Type:       xdr.ScAddressTypeScAddressTypeContract,
+		ContractId: (*xdr.ContractId)(&contractHash),
+	}
 
 	validLedgerEntry := xdr.LedgerEntry{
 		Data: xdr.LedgerEntryData{
 			Type: xdr.LedgerEntryTypeContractData,
 			ContractData: &xdr.ContractDataEntry{
+				Contract: scAddress,
+				// The contract-instance key is a marker SCVal with no payload;
+				// it is what the fetcher probes for when reading the spec.
+				Key: xdr.ScVal{Type: xdr.ScValTypeScvLedgerKeyContractInstance},
 				Val: xdr.ScVal{
 					Type: xdr.ScValTypeScvMap,
-					Map:  &mapVal,
+					Map:  &mapPtr,
 				},
 			},
 		},

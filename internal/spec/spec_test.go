@@ -13,13 +13,12 @@ func TestParseScSpecEntriesRawAndParseSpecEntries(t *testing.T) {
 	// We construct valid/invalid raw xdr/json byte streams or use package structures
 	// to exercise parseScSpecEntriesRaw and parseSpecEntries.
 	// Since ScSpecEntry is defined via stellar/go or internal packages, let's test via JSON/XDR or mock helpers where applicable.
-	
+
 	t.Run("empty section yields empty spec", func(t *testing.T) {
 		// An empty or zero-length raw slice should return an empty spec/entries without error.
-		spec, err := parseSpecEntries([]byte{}, "dummy-hash", "dummy-id")
+		spec, err := parseSpecEntries([]byte{})
 		require.NoError(t, err)
-		assert.Equal(t, "dummy-hash", spec.WasmHash)
-		assert.Equal(t, "dummy-id", spec.ContractID)
+		require.NotNil(t, spec)
 		assert.Empty(t, spec.Events)
 	})
 
@@ -39,15 +38,17 @@ func TestParseScSpecEntriesRawAndParseSpecEntries(t *testing.T) {
 
 func TestScalarValueAndParseTypeFromTag(t *testing.T) {
 	t.Run("scalar value extraction", func(t *testing.T) {
-		val, err := ScalarValue([]byte(`{"symbol":"transfer"}`))">
+		val, err := ScalarValue([]byte(`{"symbol":"transfer"}`))
 		require.NoError(t, err)
 		assert.Equal(t, "transfer", val)
 	})
 
 	t.Run("parse type from tag", func(t *testing.T) {
-		typ := ParseTypeFromTag([]byte(`{"i128":"1000"}`))">
+		typ := ParseTypeFromTag([]byte(`{"i128":"1000"}`))
 		assert.Equal(t, "i128", typ)
 	})
+}
+
 func TestScalarValue(t *testing.T) {
 	tests := []struct {
 		name    string

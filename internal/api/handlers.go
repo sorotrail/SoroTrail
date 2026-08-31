@@ -1609,6 +1609,12 @@ func (s *Server) assembleStats(ctx context.Context) (store.Stats, error) {
 
 	s.addStatsFreshness(ctx, &stats)
 
+	// Surface the ingester's last-successful-poll timestamp. Absent until
+	// the first successful cycle, so a fresh instance omits the field.
+	if state, err := s.store.GetIngestionState(ctx); err == nil && state.LastSuccessfulPoll != nil {
+		stats.LastSuccessfulPoll = state.LastSuccessfulPoll
+	}
+
 	stats.PanicsRecovered = s.recoverer.PanicsRecovered()
 
 	if a := getAuditor(); a != nil {
