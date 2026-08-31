@@ -220,8 +220,13 @@ func run() error {
 	wh := webhook.NewNotifier(st, log)
 
 	// Wire the spec cache and enricher for spec-decoded event views.
-	specCache := spec.NewCache(st)
+	// The cache is keyed by wasm hash with a TTL; the fetcher doubles as
+	// the wasm-hash resolver so contract upgrades (a changed hash)
+	// invalidate the previously cached spec automatically.
 	specFetcher := spec.NewFetcher(rpcClient)
+	specCache := spec.NewCache(st,
+		spec.WithWasmHashResolver(specFetcher),
+	)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
 	// Wrap the raw RPC client so per-method error totals are tracked and
@@ -340,40 +345,6 @@ func run() error {
 		})
 	}
 
-	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
-	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
-	// returns immediately. Only when at least one retention policy is
-	// configured does it allocate a goroutine and a metrics struct.
-	//
-	// When ARCHIVE_BUCKET is set, an archiver is created to export events
-	// to S3-compatible storage before pruning. Archival is optional and
-	// idempotent: without ARCHIVE_* vars, the binary behaves identically
-	// to the pre-archive build.
-	var arch *archive.Archiver
-	if cfg.ArchiveEnabled() {
-		var err error
-		aArchiverOpts := archive.Options{
-			Bucket:          cfg.ArchiveBucket,
-			Prefix:          cfg.ArchivePrefix,
-			Endpoint:        cfg.ArchiveEndpoint,
-			Region:          cfg.ArchiveRegion,
-			AccessKeyID:     cfg.ArchiveAccessKeyID,
-			SecretAccessKey: cfg.ArchiveSecretAccessKey,
-			UseSSL:          cfg.ArchiveUseSSL,
-			MaxRetries:      cfg.ArchiveMaxRetries,
-			Logger:          log,
-		}
-		arch, err = archive.New(st, aArchiverOpts)
-		if err != nil {
-			return fmt.Errorf("initializing archive: %w", err)
-		}
-		log.Info("archive enabled",
-			"bucket", cfg.ArchiveBucket,
-			"prefix", cfg.ArchivePrefix,
-			"before_prune", cfg.ArchiveBeforePrune,
-		)
-	}
-
 	prn := pruner.NewWithArchiver(st, log, pruner.Options{
 		MaxAge:             cfg.RetentionMaxAge,
 		MinLedger:          cfg.RetentionMinLedger,
@@ -385,6 +356,10 @@ func run() error {
 	if cfg.RetentionEnabled() {
 		api.SetPruner(prn)
 	}
+
+	// Expose spec-cache hit/miss metrics via /stats.
+	api.SetSpecCache(specCache)
+
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
 	// its cleanup goroutine is never started.

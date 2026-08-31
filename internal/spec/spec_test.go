@@ -37,17 +37,6 @@ func TestParseScSpecEntriesRawAndParseSpecEntries(t *testing.T) {
 	})
 }
 
-func TestScalarValueAndParseTypeFromTag(t *testing.T) {
-	t.Run("scalar value extraction", func(t *testing.T) {
-		val, err := ScalarValue([]byte(`{"symbol":"transfer"}`))">
-		require.NoError(t, err)
-		assert.Equal(t, "transfer", val)
-	})
-
-	t.Run("parse type from tag", func(t *testing.T) {
-		typ := ParseTypeFromTag([]byte(`{"i128":"1000"}`))">
-		assert.Equal(t, "i128", typ)
-	})
 func TestScalarValue(t *testing.T) {
 	tests := []struct {
 		name    string

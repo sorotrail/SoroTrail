@@ -667,6 +667,20 @@ type Stats struct {
 	// Pruner counters are populated only when retention is configured;
 	// omitted from JSON when the pruner is a no-op.
 	Pruner PrunerStats `json:"pruner,omitempty"`
+	// Spec-cache counters are populated only when the API layer is given
+	// a spec cache; omitted from JSON otherwise.
+	SpecCache SpecCacheStats `json:"spec_cache,omitempty"`
+}
+
+// SpecCacheStats is a JSON-friendly view of spec.CacheStats. Defined here
+// so json.Marshal sees concrete field tags (same pattern as AuditStats).
+type SpecCacheStats struct {
+	CachedSpecs   int    `json:"cached_specs"`
+	Hits          uint64 `json:"hits"`
+	Misses        uint64 `json:"misses"`
+	Fetches       uint64 `json:"fetches"`
+	Expiries      uint64 `json:"expiries"`
+	Invalidations uint64 `json:"invalidations"`
 }
 
 // PrunerStats is a JSON-friendly view of pruner.Metrics.
