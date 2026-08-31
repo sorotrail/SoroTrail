@@ -92,11 +92,13 @@ func (e *Enricher) enrichOne(ctx context.Context, ev store.Event) store.Enriched
 }
 
 // getSpec returns the spec for a contract, trying cache first and
-// falling back to fetching if a fetcher is configured.
+// falling back to fetching if a fetcher is configured. Cache lookups go
+// through GetForContract, which re-verifies the contract's wasm hash so
+// a contract upgrade invalidates the previously cached spec.
 func (e *Enricher) getSpec(ctx context.Context, contractID string) *ContractSpec {
-	// Try the cache first, by contract ID (specs are keyed by wasm hash,
-	// so this is a reverse lookup).
-	if s := e.cache.GetByContractID(contractID); s != nil {
+	// Try the cache first; this also re-resolves the wasm hash when the
+	// mapping is due for re-verification and invalidates stale specs.
+	if s := e.cache.GetForContract(ctx, contractID); s != nil {
 		return s
 	}
 
