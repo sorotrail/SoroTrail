@@ -36,6 +36,10 @@ services:
       RETENTION_AGE: ${RETENTION_AGE:-}
       RETENTION_POLL_INTERVAL: ${RETENTION_POLL_INTERVAL:-1h}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Forwarded from the shell so traces reach the profile-gated Jaeger
+      # (e.g. OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318) without
+      # editing this file. Unset = tracing is a no-op.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     ports:
       - "8080:8080"
     # Probe `/health` using the same binary already shipped in the
@@ -60,6 +64,24 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    restart: unless-stopped
+
+  # Jaeger all-in-one for viewing OpenTelemetry traces locally. Gated
+  # behind the `jaeger` profile so a plain `docker compose up` stays lean;
+  # opt in with `docker compose --profile jaeger up`. SoroTrail's OTLP
+  # exporter (OTEL_EXPORTER_OTLP_ENDPOINT) sends spans here, and the UI
+  # is served from http://localhost:16686.
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    profiles:
+      - jaeger
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4318:4318" # OTLP over HTTP
+    environment:
+      # Enable the OTLP HTTP receiver so SoroTrail's otlptracehttp exporter
+      # (which talks plain HTTP, not gRPC) can reach it on port 4318.
+      COLLECTOR_OTLP_ENABLED: "true"
     restart: unless-stopped
 
 volumes:

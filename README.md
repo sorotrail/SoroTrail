@@ -1925,6 +1925,80 @@ outside it. Companion tests check that each enum is exactly the set the
 parsing code allows, that required parameters really are refused when absent,
 and that no parameter is documented which the handler discards.
 
+## Monitoring
+
+SoroTrail emits OpenTelemetry traces over OTLP, so any OTLP-compatible
+backend can collect them. This section is the end-to-end guide to viewing
+traces **locally** with Jaeger; Prometheus metrics for the ingestion
+pipeline are documented separately under
+[Operational Monitoring](#operational-monitoring).
+
+Tracing is opt-in: unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set, the
+exporter is a no-op and spans are discarded in-process at zero overhead,
+so shipping the default build costs nothing.
+
+### Run Jaeger locally with Docker Compose
+
+The simplest way to view traces is the Jaeger all-in-one image, which
+bundles a collector, a storage backend, and the UI into one container and
+enables an OTLP HTTP receiver out of the box. Run it with Docker Compose (a
+standalone snippet you can paste anywhere, not tied to SoroTrail's stack):
+
+```yaml
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4318:4318" # OTLP over HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+```
+
+SoroTrail's own [`docker-compose.yml`](docker-compose.yml) also ships this
+exact service behind the `jaeger` profile, and forwards
+`OTEL_EXPORTER_OTLP_ENDPOINT` from the shell into the container. So if
+you're already using the repo's Compose stack, run:
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile jaeger up
+```
+
+This starts Jaeger and the full stack together on one Compose network,
+where the indexer reaches the collector by its service name (`jaeger`, not
+`localhost`). The UI is then available at http://localhost:16686.
+
+### Point SoroTrail at the collector
+
+Jaeger's OTLP HTTP receiver listens on port `4318`. The exact value of
+`OTEL_EXPORTER_OTLP_ENDPOINT` depends on where SoroTrail runs relative to
+the collector:
+
+```sh
+# Bare-metal SoroTrail, dockerized Jaeger
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+
+# SoroTrail + Jaeger on the same Compose network
+OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+```
+
+Inside a container, `localhost` refers to the container itself, so only
+reach the collector by `localhost` when both run on the host (or map the
+port through).
+
+Then open the Jaeger UI, pick the `sorotrail` service, and search for
+traces by operation; spans cover the RPC calls, ingestion sweeps, and HTTP
+API requests that carry OpenTelemetry context.
+
+### Notes
+
+- Only the OTLP “traces” signal is configured. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
+  is honored as an alternate way to set just the traces endpoint, and
+  `OTEL_TRACES_SAMPLER` controls sampling (default: always sample).
+- Service metadata (name and version) is attached to every exported span
+  under `service.name=sorotrail`, so you can filter the UI to SoroTrail's
+  spans even when other services share the same collector.
+
 ## Operational Monitoring
 
 SoroTrail exports Prometheus metrics at `GET /metrics` that cover the
