@@ -438,10 +438,14 @@ func TestMigrate_PendingVersionsWithoutDB(t *testing.T) {
 	require.NotEmpty(t, sorted, "need at least one migration")
 	require.Equal(t, 1, sorted[0], "versions must start at 1")
 
-	// Versions should be sequential with no gaps (golang-migrate requires this).
-	for i, v := range sorted {
-		want := i + 1
-		assert.Equal(t, want, v, "migration versions must be sequential (got %d, want %d)", v, want)
+	// Versions must be strictly ascending and unique. golang-migrate v4.19
+	// tolerates gaps (a deliberate renumber can leave a slot empty), so we
+	// assert ordering and uniqueness — which still catches the duplicate
+	// version numbers that break every integration test at once — rather
+	// than perfect contiguity.
+	for i := 1; i < len(sorted); i++ {
+		assert.Greater(t, sorted[i], sorted[i-1],
+			"migration versions must be strictly increasing and unique (got %d after %d)", sorted[i], sorted[i-1])
 	}
 
 	t.Logf("embedded migrations: %d versions (1..%d)", len(sorted), sorted[len(sorted)-1])

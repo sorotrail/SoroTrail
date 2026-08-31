@@ -1,3 +1,4 @@
+DROP TABLE IF EXISTS contract_spec_overrides;
 DROP TABLE IF EXISTS contract_specs;
 DROP TABLE IF EXISTS delivery_attempts;
 DROP TABLE IF EXISTS subscriptions;

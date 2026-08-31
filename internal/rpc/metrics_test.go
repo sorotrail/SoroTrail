@@ -7,32 +7,31 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
-// mockClient satisfies rpc.Client for testing CountingClient.
-type mockClient struct {
+// countingMockClient satisfies rpc.Client for testing CountingClient.
+type countingMockClient struct {
 	errorToReturn error
 }
 
-func (m *mockClient) GetEvents(context.Context, GetEventsRequest) (GetEventsResponse, error) {
+func (m *countingMockClient) GetEvents(context.Context, GetEventsRequest) (GetEventsResponse, error) {
 	return GetEventsResponse{}, m.errorToReturn
 }
-func (m *mockClient) GetLatestLedger(context.Context) (LatestLedger, error) {
+func (m *countingMockClient) GetLatestLedger(context.Context) (LatestLedger, error) {
 	return LatestLedger{}, m.errorToReturn
 }
-func (m *mockClient) GetHealth(context.Context) (Health, error) {
+func (m *countingMockClient) GetHealth(context.Context) (Health, error) {
 	return Health{}, m.errorToReturn
 }
-func (m *mockClient) GetLedgerEntries(context.Context, GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
+func (m *countingMockClient) GetLedgerEntries(context.Context, GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
 	return GetLedgerEntriesResponse{}, m.errorToReturn
 }
-func (m *mockClient) SimulateTransaction(context.Context, SimulateTransactionRequest) (SimulateTransactionResponse, error) {
+func (m *countingMockClient) SimulateTransaction(context.Context, SimulateTransactionRequest) (SimulateTransactionResponse, error) {
 	return SimulateTransactionResponse{}, m.errorToReturn
 }
 
 func TestCountingClient_Accounting(t *testing.T) {
-	m := &mockClient{}
+	m := &countingMockClient{}
 	c := NewCountingClient(m)
 	ctx := context.Background()
 
@@ -57,7 +56,7 @@ func TestCountingClient_Accounting(t *testing.T) {
 }
 
 func TestCountingClient_ConcurrentRace(t *testing.T) {
-	m := &mockClient{errorToReturn: errors.New("fail")}
+	m := &countingMockClient{errorToReturn: errors.New("fail")}
 	c := NewCountingClient(m)
 	ctx := context.Background()
 
