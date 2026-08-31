@@ -821,6 +821,67 @@ func TestPersistEvents_RetainsRawXDR(t *testing.T) {
 	assert.Empty(t, st.events["e2"].RawValueXDR)
 }
 
+func TestPersistEvents_DeduplicatesEventIDs(t *testing.T) {
+	tests := []struct {
+		name         string
+		rpcEvents    []rpc.Event
+		wantEventIDs []string
+	}{
+		{
+			name: "no duplicates, all events pass through",
+			rpcEvents: []rpc.Event{
+				rpcEvent("e1", 100),
+				rpcEvent("e2", 101),
+				rpcEvent("e3", 102),
+			},
+			wantEventIDs: []string{"e1", "e2", "e3"},
+		},
+		{
+			name: "duplicate ID removed, first occurrence kept",
+			rpcEvents: []rpc.Event{
+				rpcEvent("e1", 100),
+				rpcEvent("e2", 101),
+				rpcEvent("e1", 102), // duplicate of e1
+			},
+			wantEventIDs: []string{"e1", "e2"},
+		},
+		{
+			name: "multiple duplicate IDs, only first of each kept",
+			rpcEvents: []rpc.Event{
+				rpcEvent("e1", 100),
+				rpcEvent("e2", 101),
+				rpcEvent("e1", 102), // duplicate of e1
+				rpcEvent("e2", 103), // duplicate of e2
+				rpcEvent("e3", 104),
+			},
+			wantEventIDs: []string{"e1", "e2", "e3"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{
+				Events: tt.rpcEvents,
+				LatestLedger: 500,
+			}}}
+			st := newMockStore()
+			ing := newTestIngester(client, st, Options{StartLedger: 100})
+
+			_, err := ing.runOnce(context.Background())
+			require.NoError(t, err)
+
+			// Check that only the expected event IDs were persisted (no duplicates)
+			var persistedIDs []string
+			for id := range st.events {
+				persistedIDs = append(persistedIDs, id)
+			}
+			sort.Strings(persistedIDs)
+			sort.Strings(tt.wantEventIDs)
+			assert.Equal(t, tt.wantEventIDs, persistedIDs,
+				"event IDs after deduplication should match expected set")
+		})
+	}
+}
+
 func TestFilterBatching(t *testing.T) {
 	watch := func(n int) []store.WatchedContract {
 		out := make([]store.WatchedContract, n)
