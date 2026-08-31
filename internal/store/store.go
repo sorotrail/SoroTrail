@@ -278,6 +278,27 @@ type Subscription struct {
 	CreatedAt    time.Time          `json:"created_at"`
 }
 
+// APIKey is a stored API key. Only the bcrypt hash of the secret token
+// is persisted (KeyHash, never serialized); Prefix identifies the key in
+// the full token and is the indexed lookup key. RevokedAt is non-nil
+// once the key has been revoked — revoked keys fail validation
+// immediately.
+type APIKey struct {
+	ID        int64      `json:"id"`
+	Name      string     `json:"name"`
+	Prefix    string     `json:"prefix"`
+	CreatedAt time.Time  `json:"created_at"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+
+	// KeyHash is the bcrypt hash of the secret part of the key. It is
+	// write-only: it is set on create and compared on validation, but
+	// never returned to callers.
+	KeyHash string `json:"-"`
+}
+
+// Revoked reports whether the key has been revoked.
+func (k APIKey) Revoked() bool { return k.RevokedAt != nil }
+
 // DeliveryAttempt records one attempt to POST an event to a subscriber's
 // callback URL.
 type DeliveryAttempt struct {
@@ -437,6 +458,24 @@ type Store interface {
 
 	// ListEnabledSubscriptions returns all subscriptions with enabled=true.
 	ListEnabledSubscriptions(ctx context.Context) ([]Subscription, error)
+
+	// API key management. Keys are stored as bcrypt hashes; the plaintext
+	// secret is shown to the caller once at creation and never persisted.
+	// CreateAPIKey persists k (KeyHash must already be the bcrypt hash of
+	// the secret) and returns it with ID and CreatedAt populated.
+	CreateAPIKey(ctx context.Context, k APIKey) (APIKey, error)
+	// GetAPIKey returns the key with the given ID, or ErrNotFound.
+	GetAPIKey(ctx context.Context, id int64) (APIKey, error)
+	// LookupAPIKeyByPrefix returns the active (non-revoked) key with the
+	// given prefix, or ErrNotFound. Validation always goes through this
+	// method so a revocation takes effect on the next request.
+	LookupAPIKeyByPrefix(ctx context.Context, prefix string) (APIKey, error)
+	// ListAPIKeys returns every key, oldest first, including revoked ones.
+	ListAPIKeys(ctx context.Context) ([]APIKey, error)
+	// RevokeAPIKey marks the key with the given ID revoked. Returns
+	// ErrNotFound when the key does not exist; revoking an already
+	// revoked key is a no-op.
+	RevokeAPIKey(ctx context.Context, id int64) error
 
 	// IncrementSubscriptionFailures atomically increments failure_count
 	// and returns the new value. When newCount >= maxFailures the

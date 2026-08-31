@@ -2,6 +2,22 @@ BEGIN;
 
 ALTER TABLE events RENAME TO events_legacy;
 
+-- Index names are schema-wide in Postgres, and the renamed legacy table
+-- still owns the indexes created by earlier migrations (idx_events_*, the
+-- created_at index, and the positional topic indexes). Drop them so the
+-- fresh names can be recreated on the partitioned table below; the legacy
+-- table is dropped at the end of this migration anyway.
+DROP INDEX IF EXISTS idx_events_id;
+DROP INDEX IF EXISTS idx_events_contract_id;
+DROP INDEX IF EXISTS idx_events_ledger;
+DROP INDEX IF EXISTS idx_events_contract_ledger;
+DROP INDEX IF EXISTS idx_events_topics;
+DROP INDEX IF EXISTS idx_events_created_at;
+DROP INDEX IF EXISTS idx_events_topic0;
+DROP INDEX IF EXISTS idx_events_topic1;
+DROP INDEX IF EXISTS idx_events_topic2;
+DROP INDEX IF EXISTS idx_events_topic3;
+
 CREATE TABLE events (
     id                 text NOT NULL,
     contract_id        text NOT NULL,
@@ -25,6 +41,13 @@ CREATE INDEX idx_events_ledger ON events (ledger);
 CREATE INDEX idx_events_contract_ledger ON events (contract_id, ledger);
 CREATE INDEX idx_events_topics ON events USING gin (topics);
 CREATE INDEX idx_events_created_at ON events (created_at);
+-- Positional topic filters (topics->0 .. topics->3) were indexed before
+-- partitioning; recreate them on the partitioned table so those queries
+-- keep their index acceleration (the GIN index only serves @> containment).
+CREATE INDEX idx_events_topic0 ON events ((topics->0));
+CREATE INDEX idx_events_topic1 ON events ((topics->1));
+CREATE INDEX idx_events_topic2 ON events ((topics->2));
+CREATE INDEX idx_events_topic3 ON events ((topics->3));
 
 CREATE OR REPLACE FUNCTION ensure_event_partitions(from_ledger bigint, to_ledger bigint, partition_span bigint)
 RETURNS void

@@ -4,6 +4,7 @@
 // With no arguments it runs the indexer. Subcommands cover maintenance:
 //
 //	sorotrail replay --from-ledger N [--to-ledger M]
+//	sorotrail apikey create|list|revoke
 package main
 
 import (
@@ -53,6 +54,8 @@ func dispatch(args []string) error {
 	switch args[0] {
 	case "replay":
 		return runReplay(args[1:])
+	case "apikey":
+		return runAPIKey(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -70,6 +73,8 @@ With no subcommand, runs the indexer (ingester + HTTP API).
 subcommands:
   replay    re-decode stored events with the current decoder
             (sorotrail replay --help)
+  apikey    issue, list, and revoke API keys
+            (sorotrail apikey --help)
 `)
 }
 
@@ -151,6 +156,10 @@ func run() error {
 
 	apiServer := api.New(st, rpcClient, log, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetRateLimiter(limiter)
+	if cfg.APIKeyAuthEnabled {
+		log.Info("api key authentication enabled", "gated", "write/streaming/subscriptions routes")
+	}
+	apiServer.WithAPIKeyAuth(cfg.APIKeyAuthEnabled)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,

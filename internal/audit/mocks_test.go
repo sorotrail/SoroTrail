@@ -379,6 +379,22 @@ func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.D
 	return nil, nil
 }
 
+// API key stubs for the auth feature — unused by auditor tests.
+func (m *mockStore) CreateAPIKey(_ context.Context, k store.APIKey) (store.APIKey, error) {
+	k.ID = 1
+	return k, nil
+}
+func (m *mockStore) GetAPIKey(context.Context, int64) (store.APIKey, error) {
+	return store.APIKey{}, store.ErrNotFound
+}
+func (m *mockStore) LookupAPIKeyByPrefix(context.Context, string) (store.APIKey, error) {
+	return store.APIKey{}, store.ErrNotFound
+}
+func (m *mockStore) ListAPIKeys(context.Context) ([]store.APIKey, error) {
+	return nil, nil
+}
+func (m *mockStore) RevokeAPIKey(context.Context, int64) error { return nil }
+
 // seedLedgers records pre-existing events in m.events so tests can set up
 // "stored state that diverges from the RPC" without a database. IDs use
 // the same %020d-%05d format as mkEvents, so seeded events and RPC

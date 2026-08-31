@@ -39,8 +39,20 @@ func testStoreWithPartitionSpan(t *testing.T, span int64) *Postgres {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
-	_, err = pool.Exec(context.Background(),
-		`TRUNCATE events, ingestion_state, watched_contracts, replay_state`)
+	_, err = pool.Exec(context.Background(), `
+		TRUNCATE events, ingestion_state, watched_contracts, replay_state, api_keys;
+		-- Each test starts with a clean partition set: partitions persist
+		-- across tests (TRUNCATE only empties them), and a leftover
+		-- default-span partition would overlap the span-N partition a test
+		-- with a custom span tries to create.
+		DO $$
+		DECLARE r record;
+		BEGIN
+			FOR r IN SELECT tablename FROM pg_tables WHERE tablename LIKE 'events\_%' LOOP
+				EXECUTE format('DROP TABLE %I CASCADE', r.tablename);
+			END LOOP;
+		END $$;
+	`)
 	require.NoError(t, err)
 	return NewPostgres(pool, span)
 }
@@ -202,7 +214,9 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		require.Len(t, all, 10)
+		// 12 rows total: the 10 seeded above plus e1/e2 inserted by the
+		// "by topic0 and topic1 positionally" subtest.
+		require.Len(t, all, 12)
 		for i := 1; i < len(all); i++ {
 			assert.Less(t, all[i-1].ID, all[i].ID, "ascending ID order across pages")
 		}
@@ -262,7 +276,7 @@ func TestQueryEvents_FiltersAndPagination(t *testing.T) {
 			}
 			cursor = next
 		}
-		require.Len(t, all, 10)
+		require.Len(t, all, 12) // 10 seeded + e1/e2 from the positional subtest
 		for i := 1; i < len(all); i++ {
 			assert.Greater(t, all[i-1].ID, all[i].ID, "descending ID order across pages")
 		}
@@ -340,14 +354,26 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	st := NewPostgres(pool, 10)
 	ctx := context.Background()
 
+	// Simulate a pre-partition deployment: drop the partitioned table the
+	// initial Migrate built, recreate the legacy (0001 + raw XDR) schema
+	// with one event carrying raw XDR, and rewind the migration counter to
+	// version 5 so Migrate only re-applies the partitioning migration and
+	// later ones. The legacy table must be dropped outright rather than
+	// renamed: index names are schema-wide in Postgres, so a rename would
+	// leave idx_events_* behind and collide with the legacy CREATE INDEX.
 	original := testEvent(eventID(1), 100, contractA)
 	original.RawTopicXDR = []string{"AAAADwAAAAh0cmFuc2Zlcg=="}
 	original.RawValueXDR = "AAAACgAAAAAAAAAB"
-	_, err = st.UpsertEvents(ctx, []Event{original})
-	require.NoError(t, err)
 
 	_, err = pool.Exec(ctx, `
-		ALTER TABLE events RENAME TO events_partitioned;
+		-- Drop the tables migrations 6+ own so the rewinded Migrate can
+		-- recreate them; tables from migrations 1-5 stay as they are.
+		DROP TABLE IF EXISTS api_keys CASCADE;
+		DROP TABLE IF EXISTS delivery_attempts CASCADE;
+		DROP TABLE IF EXISTS subscriptions CASCADE;
+		DROP TABLE IF EXISTS contract_specs CASCADE;
+		DROP TABLE IF EXISTS events CASCADE;
+		DROP FUNCTION IF EXISTS ensure_event_partitions(bigint, bigint, bigint);
 		CREATE TABLE events (
 			id                 text PRIMARY KEY,
 			contract_id        text NOT NULL,
@@ -368,19 +394,22 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 		CREATE INDEX idx_events_contract_ledger ON events (contract_id, ledger);
 		CREATE INDEX idx_events_topics ON events USING gin (topics);
 		CREATE INDEX idx_events_created_at ON events (created_at);
+		UPDATE schema_migrations SET version = 5, dirty = false;
+	`)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
 		INSERT INTO events (
 			id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 			in_successful_call, topics, value, created_at, topics_xdr, value_xdr
-		)
-		SELECT
-			id, contract_id, ledger, type, tx_hash, tx_index, op_index,
-			in_successful_call, topics, value, created_at, topics_xdr, value_xdr
-		FROM events_partitioned
-		ORDER BY ledger, id;
-		DROP TABLE events_partitioned CASCADE;
-		DROP FUNCTION IF EXISTS ensure_event_partitions(bigint, bigint, bigint);
-		UPDATE schema_migrations SET version = 3, dirty = false;
-	`)
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+		)`,
+		original.ID, original.ContractID, original.Ledger, original.Type,
+		original.TxHash, original.TxIndex, original.OpIndex,
+		original.InSuccessfulCall, original.Topics, original.Value,
+		original.CreatedAt, original.RawTopicXDR, original.RawValueXDR,
+	)
 	require.NoError(t, err)
 
 	require.NoError(t, Migrate(dbURL))
@@ -391,14 +420,16 @@ func TestMigrate_UpgradesLegacyEventsTable(t *testing.T) {
 	assert.Equal(t, original.RawTopicXDR, got.RawTopicXDR)
 	assert.Equal(t, original.RawValueXDR, got.RawValueXDR)
 
-	partitions, err := pool.Query(ctx, `SELECT to_regclass('events_100_109'), to_regclass('events_110_119')`)
+	// The partition migration bakes in the default span (120960 ledgers),
+	// so ledger 100 lands in the events_0_120959 partition.
+	partitions, err := pool.Query(ctx, `SELECT to_regclass('events_0_120959'), to_regclass('events_100_109')`)
 	require.NoError(t, err)
 	defer partitions.Close()
 	require.True(t, partitions.Next())
-	var firstPartition, secondPartition sql.NullString
-	require.NoError(t, partitions.Scan(&firstPartition, &secondPartition))
-	assert.True(t, firstPartition.Valid)
-	assert.False(t, secondPartition.Valid)
+	var defaultSpanPartition, tinySpanPartition sql.NullString
+	require.NoError(t, partitions.Scan(&defaultSpanPartition, &tinySpanPartition))
+	assert.True(t, defaultSpanPartition.Valid, "ledger 100 must be inside the default-span partition")
+	assert.False(t, tinySpanPartition.Valid, "the migration does not use the store's test partition span")
 }
 
 func TestIngestionStateRoundTrip(t *testing.T) {

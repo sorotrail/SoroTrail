@@ -68,6 +68,7 @@ All configuration comes from environment variables (see `.env.example`):
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
+| `API_KEY_AUTH_ENABLED` | `false` | Require a valid API key on write, streaming, and subscription-management endpoints (see [API key authentication](#api-key-authentication)). Read endpoints stay public. |
 | `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
 
 ## Ingestion behavior
@@ -604,6 +605,71 @@ Audit behaviour:
 Set `AUDIT_ENABLED=false` (the default) to disable the auditor entirely;
 the binary's behavior is identical to a pre-audit build.
 
+## API key authentication
+
+Optional and off by default. Set `API_KEY_AUTH_ENABLED=true` to require a
+valid API key on the write, streaming, subscription-management, and
+key-management routes:
+
+- Webhook subscriptions: `POST /subscriptions`, `PUT /subscriptions/{id}`,
+  `DELETE /subscriptions/{id}`, and the read routes (`GET /subscriptions`,
+  `GET /subscriptions/{id}`, `GET /subscriptions/{id}/deliveries`).
+  Subscriptions carry the HMAC signing secrets subscribers use to verify
+  webhook payloads, so the whole subtree is protected — an unauthenticated
+  read would leak them.
+- Streaming: `GET /events/ws` (the WebSocket live stream).
+- Key management: `POST /apikeys`, `GET /apikeys`, `DELETE /apikeys/{id}`.
+  Key management is always authenticated, so an open create endpoint can't
+  be used to mint keys and walk around auth.
+
+Read-only query endpoints (`GET /events`, `GET /events/{id}`,
+`GET /contracts/{id}/events`, `GET /stats`, `GET /health`) stay public.
+
+Keys look like `sorotrail_<prefix>_<secret>` and are presented via either
+the `Authorization: Bearer <key>` header or the `X-API-Key: <key>` header.
+Only a bcrypt hash of the secret is stored in Postgres — the full key is
+displayed exactly once at creation and cannot be recovered later.
+
+### Managing keys
+
+Via the CLI (no auth needed — it talks to the database directly, so it is
+the bootstrap path for the first key):
+
+```sh
+sorotrail apikey create --name "deploy"   # prints the full key exactly once
+sorotrail apikey list                      # id, name, prefix, status
+sorotrail apikey revoke 3                  # immediate; cannot be undone
+```
+
+Or via the API (requires an already-valid key):
+
+```sh
+# Issue a key (the response includes the full key, shown exactly once):
+curl -s -X POST localhost:8080/apikeys \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"name":"ci"}'
+
+# List keys (prefixes only — never hashes or full keys):
+curl -s localhost:8080/apikeys -H "Authorization: Bearer $KEY"
+
+# Revoke a key (204 No Content):
+curl -s -X DELETE localhost:8080/apikeys/3 -H "Authorization: Bearer $KEY"
+```
+
+Revocation is immediate: key lookups only ever return non-revoked rows, so
+a revoked key is rejected on the very next request.
+
+With auth on, write requests carry the key:
+
+```sh
+curl -s -X POST localhost:8080/subscriptions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/webhook","secret":"whsec_...","filters":{}}'
+```
+
+Requests without a valid key are rejected with `401` and
+`{"error":"missing or invalid API key"}`.
+
 ## Caching
 
 Stored events are immutable — a row written by ingest is never rewritten
@@ -641,15 +707,17 @@ not-found status. We accept this self-healing delay rather than
 arbitrarily shortening the immutable max-age, because for un-deleted
 rows the long `max-age` is the whole point of the cache.
 
-### Auth'd deployments (#17)
+### Auth'd deployments
 
-When authentication lands, the spec calls out that caching must "never
-leak across keys". Today the API is unauthenticated, but the
-`CACHE_PRIVATE` config flag flips every cacheable response from
+API key authentication ([above](#api-key-authentication)) protects writes
+and subscriptions, but read endpoints stay public. When a deployment puts
+a per-user auth layer in front of the API, caching must "never leak across
+keys": the `CACHE_PRIVATE` config flag flips every cacheable response from
 `Cache-Control: public` to `Cache-Control: private` (with the same
 `max-age` and `immutable` preset), so the same build can serve shared
 caches in one deployment and per-user scenarios in another. Set
-`CACHE_PRIVATE=true` as soon as auth (#17) is in front of the API.
+`CACHE_PRIVATE=true` in any deployment that serves per-user data behind an
+auth layer.
 
 ## Development
 

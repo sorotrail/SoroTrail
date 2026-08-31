@@ -21,6 +21,7 @@ var envKeys = []string{
 	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
 	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
 	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
+	"API_KEY_AUTH_ENABLED",
 }
 
 func TestLoad(t *testing.T) {
@@ -43,6 +44,17 @@ func TestLoad(t *testing.T) {
 				assert.Zero(t, c.RateLimitRPS, "rate limiter disabled by default")
 				assert.Zero(t, c.RateLimitBurst)
 				assert.False(t, c.RateLimitTrustedProxy)
+				assert.False(t, c.APIKeyAuthEnabled, "API key auth off by default")
+			},
+		},
+		{
+			name: "API key auth can be enabled",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"API_KEY_AUTH_ENABLED": "true",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.True(t, c.APIKeyAuthEnabled)
 			},
 		},
 		{

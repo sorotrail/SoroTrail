@@ -47,6 +47,14 @@ type Config struct {
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
+	// APIKeyAuthEnabled turns on optional API key authentication: when
+	// true, write, streaming, and key-management endpoints reject
+	// requests that do not present a valid API key (see README "API key
+	// authentication"). Defaults to false so existing deployments see no
+	// behavior change. Keys are created/revoked via `sorotrail apikey`
+	// or the /apikeys endpoints.
+	APIKeyAuthEnabled bool `env:"API_KEY_AUTH_ENABLED" envDefault:"false"`
+
 	// CachePrivate flips the cacheable endpoints from Cache-Control: public
 	// to Cache-Control: private. Set this when the deployment serves
 	// per-user data behind an auth layer (#17, not yet merged) so shared

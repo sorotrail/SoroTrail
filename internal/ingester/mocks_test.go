@@ -205,6 +205,22 @@ func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int) ([]store.D
 	return nil, nil
 }
 
+// API key stubs for the auth feature — unused by ingester tests.
+func (m *mockStore) CreateAPIKey(_ context.Context, k store.APIKey) (store.APIKey, error) {
+	k.ID = 1
+	return k, nil
+}
+func (m *mockStore) GetAPIKey(context.Context, int64) (store.APIKey, error) {
+	return store.APIKey{}, store.ErrNotFound
+}
+func (m *mockStore) LookupAPIKeyByPrefix(context.Context, string) (store.APIKey, error) {
+	return store.APIKey{}, store.ErrNotFound
+}
+func (m *mockStore) ListAPIKeys(context.Context) ([]store.APIKey, error) {
+	return nil, nil
+}
+func (m *mockStore) RevokeAPIKey(context.Context, int64) error { return nil }
+
 // passthroughDecoder avoids XDR fixtures in ingester tests.
 type passthroughDecoder struct{}
 

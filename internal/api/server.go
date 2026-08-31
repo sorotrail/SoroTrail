@@ -63,6 +63,11 @@ type Server struct {
 	log      *slog.Logger
 	limiter  *RateLimiter
 	bcast    *broadcast.Broadcaster
+
+	// apiKeyAuth turns on API key authentication for the write,
+	// streaming, subscription-management, and key-management routes.
+	// Off by default: the API behaves exactly as before.
+	apiKeyAuth bool
 }
 
 // New builds the API server. rpcClient is only used by /health.
@@ -89,6 +94,17 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 	return s
 }
 
+// WithAPIKeyAuth turns on optional API key authentication (see
+// internal/api/auth.go). When enabled, requests to write, streaming,
+// subscription-management, and key-management endpoints must present a
+// valid API key; read-only endpoints stay public. The flag is off by
+// default, so deployments that don't set API_KEY_AUTH_ENABLED see no
+// behavior change.
+func (s *Server) WithAPIKeyAuth(enabled bool) *Server {
+	s.apiKeyAuth = enabled
+	return s
+}
+
 // Router returns the HTTP handler with all routes mounted.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
@@ -107,18 +123,40 @@ func (s *Server) Router() http.Handler {
 	r.Get("/events/{id}", s.handleGetEvent)
 	r.Get("/contracts/{id}/events", s.handleContractEvents)
 	r.Get("/stats", s.handleStats)
-	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// contributors: new read endpoints go here. Anything that writes (e.g.
 	// managing watched contracts at runtime) should come with auth first.
 
-	// Subscription CRUD and delivery history.
-	r.Post("/subscriptions", s.handleCreateSubscription)
-	r.Get("/subscriptions", s.handleListSubscriptions)
-	r.Get("/subscriptions/{id}", s.handleGetSubscription)
-	r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
-	r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
-	r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+	// API key management is ALWAYS authenticated: an unauthenticated
+	// create endpoint would let anyone mint keys and walk around auth
+	// entirely. The CLI (`sorotrail apikey`) is the bootstrap path for
+	// the first key.
+	r.Group(func(r chi.Router) {
+		r.Use(s.requireAPIKey)
+		r.Post("/apikeys", s.handleCreateAPIKey)
+		r.Get("/apikeys", s.handleListAPIKeys)
+		r.Delete("/apikeys/{id}", s.handleRevokeAPIKey)
+	})
+
+	// The streaming and subscription routes are the surface that auth
+	// gates. Subscriptions carry webhook HMAC signing secrets, so the
+	// whole subtree (reads included) is protected once auth is on —
+	// leaking a subscription's secret would let an attacker forge
+	// webhook payloads.
+	protect := func(next http.Handler) http.Handler { return next }
+	if s.apiKeyAuth {
+		protect = s.requireAPIKey
+	}
+	r.Group(func(r chi.Router) {
+		r.Use(protect)
+		r.Get("/events/ws", s.handleEventStreamWS)
+		r.Post("/subscriptions", s.handleCreateSubscription)
+		r.Get("/subscriptions", s.handleListSubscriptions)
+		r.Get("/subscriptions/{id}", s.handleGetSubscription)
+		r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
+		r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
+		r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+	})
 
 	return r
 }
