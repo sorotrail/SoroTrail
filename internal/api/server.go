@@ -119,6 +119,30 @@ func getRPCCounter() *rpc.CountingClient {
 	return rpcCounter
 }
 
+// SpecCacheStatsSource supplies spec-cache metrics for /stats. Mirrors
+// the SetAuditor pattern: one setter, called before ListenAndServe.
+// nil (the default) leaves the /stats spec_cache field omitted.
+type SpecCacheStatsSource interface {
+	SpecCacheStats() store.SpecCacheStats
+}
+
+var (
+	specCacheMu     sync.RWMutex
+	specCacheSource SpecCacheStatsSource
+)
+
+func SetSpecCache(src SpecCacheStatsSource) {
+	specCacheMu.Lock()
+	specCacheSource = src
+	specCacheMu.Unlock()
+}
+
+func getSpecCache() SpecCacheStatsSource {
+	specCacheMu.RLock()
+	defer specCacheMu.RUnlock()
+	return specCacheSource
+}
+
 // Enricher is the spec-based event enrichment interface used by the API.
 type Enricher interface {
 	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
@@ -452,6 +476,13 @@ func (s *Server) router() chi.Router {
 	watchedMW := apiKeyAuth(s.apiKey)
 	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
 	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
+
+	// Contract spec overrides: user-supplied spec JSON per contract_id.
+	// A spec override silently changes how that contract's events decode,
+	// so — like every other management surface — writes are never open.
+	r.With(watchedMW).Put("/contracts/{id}/spec", s.handlePutContractSpecOverride)
+	r.With(watchedMW).Get("/contracts/{id}/spec", s.handleGetContractSpecOverride)
+	r.With(watchedMW).Delete("/contracts/{id}/spec", s.handleDeleteContractSpecOverride)
 
 	r.With(watchedMW).Get("/dead-letters", s.handleListDeadLetters)
 	r.With(watchedMW).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)

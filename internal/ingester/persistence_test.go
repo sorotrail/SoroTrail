@@ -2,71 +2,76 @@ package ingester
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/rpc"
 )
 
 func TestIngester_Persistence(t *testing.T) {
 	t.Run("clean_page_persists_every_event", func(t *testing.T) {
-		ms := &mockStore{}
-		ing := &Ingester{store: ms}
-		events := []store.Event{{ID: "1"}, {ID: "2"}}
-		
-		err := ing.persistEvents(context.Background(), events)
-		require.NoError(t, err)
-		assert.Equal(t, 2, len(ms.upsertedEvents))
-		assert.Equal(t, 1, ms.indexedCalls)
+		st := newMockStore()
+		ing := newTestIngester(&mockRPC{}, st, Options{})
+		events := []rpc.Event{rpcEvent("1", 10), rpcEvent("2", 10)}
+
+		require.NoError(t, ing.persistEvents(context.Background(), events, 10))
+		assert.Contains(t, st.events, "1")
+		assert.Contains(t, st.events, "2")
 	})
 
 	t.Run("idempotent_re_persisted_page", func(t *testing.T) {
-		ms := &mockStore{err: nil}
-		ing := &Ingester{store: ms}
-		events := []store.Event{{ID: "1"}}
-		
-		// First pass
-		require.NoError(t, ing.persistEvents(context.Background(), events))
-		// Second pass
-		require.NoError(t, ing.persistEvents(context.Background(), events))
-		
-		assert.Equal(t, 2, ms.upsertedEventsCount)
-		assert.Equal(t, 2, ms.indexedCalls)
+		st := newMockStore()
+		ing := newTestIngester(&mockRPC{}, st, Options{})
+		events := []rpc.Event{rpcEvent("1", 10)}
+
+		require.NoError(t, ing.persistEvents(context.Background(), events, 10))
+		require.NoError(t, ing.persistEvents(context.Background(), events, 10))
+
+		// The mock records one UpsertEvents batch per persist call; both
+		// passes succeeded so the event is stored once and the page was
+		// re-persisted without error.
+		assert.Len(t, st.upserted, 2)
+		assert.Equal(t, "1", st.events["1"].ID)
 	})
 
+	// poisonEvent fails toStoreEvent via un-marshalable TopicJSON, mimicking
+	// an event that cannot be decoded/persisted.
+	poisonEvent := func() rpc.Event {
+		return rpc.Event{
+			ID:        "poison",
+			Type:      "contract",
+			Ledger:    10,
+			TopicJSON: []json.RawMessage{json.RawMessage(`{`)},
+		}
+	}
+
 	t.Run("poison_event_quarantined_with_sink", func(t *testing.T) {
-		ms := &mockStore{poison: "poison"}
-		// Dead letter sink
-		dls := &mockDeadLetterSink{}
-		ing := &Ingester{store: ms, deadLetterSink: dls}
-		events := []store.Event{{ID: "clean1"}, {ID: "poison"}, {ID: "clean2"}}
-		
-		err := ing.persistEvents(context.Background(), events)
-		require.NoError(t, err)
-		assert.Equal(t, 2, len(ms.upsertedEvents))
-		assert.Equal(t, 1, len(dls.quarantined))
-		assert.Equal(t, "poison", dls.quarantined[0].ID)
+		st := newMockStore()
+		ing := newTestIngester(&mockRPC{}, st, Options{})
+		// The mock store's DeadLetterEvent satisfies DeadLetterSink.
+		ing.deadLetterStore = st
+
+		events := []rpc.Event{rpcEvent("clean1", 10), poisonEvent(), rpcEvent("clean2", 10)}
+
+		require.NoError(t, ing.persistEvents(context.Background(), events, 10))
+		assert.Contains(t, st.events, "clean1")
+		assert.Contains(t, st.events, "clean2")
+		assert.NotContains(t, st.events, "poison")
+		require.Len(t, st.deadLetters, 1)
+		assert.Equal(t, "poison", st.deadLetters[0].EventID)
 	})
 
 	t.Run("poison_event_aborts_without_sink", func(t *testing.T) {
-		ms := &mockStore{poison: "poison"}
-		ing := &Ingester{store: ms}
-		events := []store.Event{{ID: "clean"}, {ID: "poison"}}
-		
-		err := ing.persistEvents(context.Background(), events)
+		st := newMockStore()
+		ing := newTestIngester(&mockRPC{}, st, Options{})
+
+		events := []rpc.Event{rpcEvent("clean", 10), poisonEvent()}
+
+		err := ing.persistEvents(context.Background(), events, 10)
 		assert.Error(t, err)
-		assert.Equal(t, 0, len(ms.upsertedEvents))
+		assert.Len(t, st.events, 0)
 	})
-}
-
-type mockDeadLetterSink struct {
-	quarantined []store.Event
-}
-
-func (m *mockDeadLetterSink) DeadLetter(ctx context.Context, e store.Event, reason error) error {
-	m.quarantined = append(m.quarantined, e)
-	return nil
 }

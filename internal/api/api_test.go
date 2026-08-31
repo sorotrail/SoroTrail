@@ -166,8 +166,6 @@ type stubStore struct {
 
 	subscriptions []store.Subscription
 
-	subscriptions []store.Subscription
-
 	contractCursors map[string]store.ContractCursor
 }
 
@@ -1526,6 +1524,40 @@ func TestStats(t *testing.T) {
 		require.NotNil(t, got.IngestLagLedgers)
 		assert.Equal(t, int64(21), *got.IngestLagLedgers)
 		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
+	})
+
+	t.Run("surfaces the ingester's last-successful-poll timestamp", func(t *testing.T) {
+		poll := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+		st := &stubStore{
+			stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999},
+			ingestionState: &store.IngestionState{
+				LastIngestedLedger: 999,
+				LastSuccessfulPoll: &poll,
+			},
+		}
+		resp, body := doGet(t, newTestServer(st, nil), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		require.NotNil(t, got.LastSuccessfulPoll)
+		assert.Equal(t, poll, *got.LastSuccessfulPoll)
+
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(body, &raw))
+		assert.Contains(t, raw, "last_successful_poll")
+	})
+
+	t.Run("omits last-successful-poll when the ingester has never polled", func(t *testing.T) {
+		st := &stubStore{stats: store.Stats{TotalEvents: 42, LastIngestedLedger: 999}}
+		resp, body := doGet(t, newTestServer(st, nil), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Nil(t, got.LastSuccessfulPoll)
+
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(body, &raw))
+		assert.NotContains(t, raw, "last_successful_poll")
 	})
 
 	t.Run("keeps stored stats when RPC is down", func(t *testing.T) {

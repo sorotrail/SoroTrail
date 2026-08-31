@@ -19,6 +19,24 @@ func (f *fakeClock) Advance(d time.Duration) {
 	f.t = f.t.Add(d)
 }
 
+// stubSpecStore implements the cache's Store interface with an in-memory
+// map for tests.
+type stubSpecStore struct {
+	specs map[string][]byte
+}
+
+func (s *stubSpecStore) GetContractSpec(_ context.Context, wasmHash string) ([]byte, error) {
+	if data, ok := s.specs[wasmHash]; ok {
+		return data, nil
+	}
+	return nil, errors.New("not found")
+}
+
+func (s *stubSpecStore) SetContractSpec(_ context.Context, wasmHash, _ string, specJSON []byte) error {
+	s.specs[wasmHash] = specJSON
+	return nil
+}
+
 // stubResolver is a controllable WasmHashResolver.
 type stubResolver struct {
 	hashes map[string]string

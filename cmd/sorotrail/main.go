@@ -24,7 +24,6 @@ import (
 
 	"github.com/sorotrail/sorotrail/internal/api"
 	"github.com/sorotrail/sorotrail/internal/api/graphql"
-	"github.com/sorotrail/sorotrail/internal/archive"
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/config"
@@ -227,6 +226,7 @@ func run() error {
 	specCache := spec.NewCache(st,
 		spec.WithWasmHashResolver(specFetcher),
 	)
+	specEnricher := spec.NewEnricher(specFetcher, specCache, log, st)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
 	// Wrap the raw RPC client so per-method error totals are tracked and
@@ -276,6 +276,8 @@ func run() error {
 		BatchSize:               cfg.BatchSize,
 		BatchTargetLatency:      cfg.BatchTargetLatency,
 		BatchMaxBackoff:         cfg.BatchMaxBackoff,
+		MinBackoff:              cfg.IngesterMinBackoff,
+		MaxBackoff:              cfg.IngesterMaxBackoff,
 		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
 		Network:                 cfg.Network,
@@ -337,14 +339,15 @@ func run() error {
 		// to parse logs to see pass/finding rates.
 		api.SetAuditor(aud)
 	}
-	var pruner *store.RetentionPruner
+	var retPruner *store.RetentionPruner
 	if cfg.RetentionAge > 0 {
-		pruner = store.NewRetentionPruner(st, log, store.RetentionOptions{
+		retPruner = store.NewRetentionPruner(pg, log, store.RetentionOptions{
 			Age:          cfg.RetentionAge,
 			PollInterval: cfg.RetentionPoll,
 		})
 	}
 
+	prn := pruner.New(st, log, pruner.Options{
 	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
 	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
 	// returns immediately. Only when at least one retention policy is
@@ -389,10 +392,14 @@ func run() error {
 		Pause:              cfg.RetentionPause,
 		Interval:           cfg.RetentionInterval,
 		ArchiveBeforePrune: cfg.ArchiveBeforePrune,
-	}, arch)
+	})
 	if cfg.RetentionEnabled() {
 		api.SetPruner(prn)
 	}
+
+	// Expose spec-cache hit/miss metrics via /stats.
+	api.SetSpecCache(specCache)
+
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
 	// its cleanup goroutine is never started.
@@ -533,10 +540,10 @@ func run() error {
 			}
 		}()
 	}
-	if pruner != nil {
+	if retPruner != nil {
 		go func() {
 			log.Info("event retention pruning starting", "age", cfg.RetentionAge, "poll_interval", cfg.RetentionPoll)
-			if err := pruner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			if err := retPruner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- fmt.Errorf("retention pruner: %w", err)
 			} else {
 				errCh <- nil
@@ -645,8 +652,6 @@ func newLoggerWithLevel(level, format string) (*slog.Logger, *slog.LevelVar) {
 		h = slog.NewTextHandler(os.Stdout, opts)
 	}
 	return slog.New(h), &levelVar
-	opts := &slog.HandlerOptions{Level: config.ParseLogLevel(level)}
-	return slog.New(config.NewLogHandler(os.Stdout, format, opts))
 }
 
 // graphqlServerDeps wraps the live store + enricher into the typed

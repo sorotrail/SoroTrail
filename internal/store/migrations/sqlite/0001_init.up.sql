@@ -106,3 +106,14 @@ CREATE TABLE IF NOT EXISTS contract_specs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_contract_specs_contract_id ON contract_specs (contract_id);
+
+-- User-supplied contract spec overrides (task: user-supplied contract spec).
+-- Some contracts do not expose a fetchable spec (no contractspecv0 section,
+-- unreachable wasm, etc.). Operators can upload a spec JSON per contract_id;
+-- the enricher prefers this override over the RPC-fetched spec.
+CREATE TABLE IF NOT EXISTS contract_spec_overrides (
+    contract_id TEXT PRIMARY KEY,
+    spec_json   TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
