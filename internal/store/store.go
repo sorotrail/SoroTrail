@@ -916,6 +916,17 @@ type Store interface {
 	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
 	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
 
+	// Contract spec overrides: user-supplied spec JSON per contract_id,
+	// preferred over the RPC-fetched spec during enrichment. Used when a
+	// contract does not expose a fetchable spec.
+	// GetContractSpecOverride returns the stored spec JSON for the contract,
+	// or ErrNotFound when no override exists.
+	GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error)
+	// SetContractSpecOverride upserts the override for the contract.
+	SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error
+	// DeleteContractSpecOverride removes the override. Idempotent.
+	DeleteContractSpecOverride(ctx context.Context, contractID string) error
+
 	// DeleteEventsBeforeLedger deletes all events with a ledger strictly less than
 	// the given ledger number. It returns the number of rows deleted.
 	// This is an admin operation and should be auth-gated at the API layer.

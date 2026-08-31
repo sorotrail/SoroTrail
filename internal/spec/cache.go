@@ -245,6 +245,16 @@ func (c *Cache) Set(ctx context.Context, spec *ContractSpec) error {
 	return nil
 }
 
+// Put stores a spec in the in-memory cache only (no db persistence, no
+// fetch counter). Used for user-supplied spec overrides, which live in
+// their own store table and are authoritative until replaced or deleted —
+// so they bypass the TTL expiry by being re-checked on the next miss.
+func (c *Cache) Put(key string, spec *ContractSpec) {
+	c.mu.Lock()
+	c.mem[key] = &entry{spec: spec, cachedAt: c.now()}
+	c.mu.Unlock()
+}
+
 // Invalidate evicts one spec by wasm hash (e.g. after detecting that a
 // contract upgraded away from it).
 func (c *Cache) Invalidate(wasmHash string) {

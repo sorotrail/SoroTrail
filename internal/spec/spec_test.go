@@ -16,10 +16,8 @@ func TestParseScSpecEntriesRawAndParseSpecEntries(t *testing.T) {
 	
 	t.Run("empty section yields empty spec", func(t *testing.T) {
 		// An empty or zero-length raw slice should return an empty spec/entries without error.
-		spec, err := parseSpecEntries([]byte{}, "dummy-hash", "dummy-id")
+		spec, err := parseSpecEntries([]byte{})
 		require.NoError(t, err)
-		assert.Equal(t, "dummy-hash", spec.WasmHash)
-		assert.Equal(t, "dummy-id", spec.ContractID)
 		assert.Empty(t, spec.Events)
 	})
 

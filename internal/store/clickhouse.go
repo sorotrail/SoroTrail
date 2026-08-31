@@ -251,6 +251,18 @@ func (c *ClickHouse) SetContractSpec(ctx context.Context, wasmHash, contractID s
 	return nil
 }
 
+func (c *ClickHouse) GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error) {
+	return nil, ErrNotFound
+}
+
+func (c *ClickHouse) SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error {
+	return nil
+}
+
+func (c *ClickHouse) DeleteContractSpecOverride(ctx context.Context, contractID string) error {
+	return nil
+}
+
 func (c *ClickHouse) DeleteEventsBeforeLedger(ctx context.Context, beforeLedger int64) (int64, error) {
 	return 0, nil
 }

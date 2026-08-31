@@ -1609,6 +1609,45 @@ func (p *Postgres) SetContractSpec(ctx context.Context, wasmHash, contractID str
 	return nil
 }
 
+func (p *Postgres) GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error) {
+	var specJSON []byte
+	err := p.pool.QueryRow(ctx,
+		`SELECT spec_json FROM contract_spec_overrides WHERE contract_id = $1`, contractID,
+	).Scan(&specJSON)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading contract spec override for %s: %w", contractID, err)
+	}
+	return specJSON, nil
+}
+
+func (p *Postgres) SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO contract_spec_overrides (contract_id, spec_json, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (contract_id) DO UPDATE SET
+			spec_json  = EXCLUDED.spec_json,
+			updated_at = now()`,
+		contractID, specJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("saving contract spec override for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+func (p *Postgres) DeleteContractSpecOverride(ctx context.Context, contractID string) error {
+	_, err := p.pool.Exec(ctx,
+		`DELETE FROM contract_spec_overrides WHERE contract_id = $1`, contractID,
+	)
+	if err != nil {
+		return fmt.Errorf("deleting contract spec override for %s: %w", contractID, err)
+	}
+	return nil
+}
+
 func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
 	err := p.pool.QueryRow(ctx, `
 		INSERT INTO audit_findings
