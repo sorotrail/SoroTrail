@@ -44,17 +44,16 @@ func TestExecuteOperation_NamedOperationSelection(t *testing.T) {
 		query SecondOp { opTwo }
 	`
 
-	// Execute targeting SecondOp
+	// A document with multiple operations is rejected outright, even when
+	// an operationName is supplied.
 	req := &GraphQLRequest{
 		Query:         query,
 		OperationName: "SecondOp",
 	}
 
-	env, err := executeOperation(context.Background(), req)
-	require.NoError(t, err)
-	require.NotNil(t, env)
-	assert.Empty(t, env.Errors)
-	assert.Equal(t, "second", env.Data["opTwo"])
+	_, err := executeOperation(context.Background(), req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "multiple operations per request not supported")
 }
 
 func TestExecuteOperation_AmbiguousSelectionWithoutName(t *testing.T) {
@@ -86,7 +85,7 @@ func TestExecuteOperation_AmbiguousSelectionWithoutName(t *testing.T) {
 
 	_, err := executeOperation(context.Background(), req)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "must specify operation name")
+	assert.Contains(t, err.Error(), "multiple operations per request not supported")
 }
 
 func TestExecuteOperation_FieldArgumentsReachResolver(t *testing.T) {

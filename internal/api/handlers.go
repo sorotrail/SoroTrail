@@ -152,6 +152,11 @@ type eventsWithXDRResponse struct {
 	Cursor string         `json:"cursor,omitempty"`
 }
 
+type addressEventsResponse struct {
+	Events []store.Event `json:"events"`
+	Cursor string        `json:"cursor,omitempty"`
+}
+
 // envelopeResponse is the JSON body returned when ?envelope=true is set on
 // any paginated list endpoint. It normalises the response shape across all
 // list endpoints so clients that prefer a consistent outer wrapper don't
@@ -1957,6 +1962,38 @@ func (s *Server) handleAddressEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, addressEventsResponse{Events: events, Cursor: cursor})
 }
 
+func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
+
+	if s.rpc == nil {
+
+		return
+
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+
+	defer cancel()
+
+	health, err := s.rpc.GetHealth(ctx)
+
+	if err != nil {
+
+		loggerFromContext(ctx).Warn("loading RPC health for stats", "error", err)
+
+		return
+
+	}
+
+	head := int64(health.LatestLedger)
+
+	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
+
+	stats.ChainHeadLedger = &head
+
+	stats.IngestLagLedgers = &lag
+
+}
+
 // handleAddressSummary returns aggregate information about an address's
 // event history.
 func (s *Server) handleAddressSummary(w http.ResponseWriter, r *http.Request) {
@@ -1996,67 +2033,6 @@ func isValidAddress(s string) bool {
 		}
 	}
 	return true
-}
-
-// Stats summarizes what the indexer has stored plus, when the auditor is
-// running, the post-processing counters it has accumulated.
-func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.store.Stats(r.Context())
-	if err != nil {
-		s.log.Error("loading stats", "error", err)
-		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
-		return
-	}
-	s.addStatsFreshness(r.Context(), &stats)
-	if a := getAuditor(); a != nil {
-		m := a.Metrics()
-		stats.Auditor = store.AuditStats{
-			PassesRun:             m.PassesRun,
-			LedgersChecked:        m.LedgersChecked,
-			FindingsOpened:        m.FindingsOpened,
-			FindingsRepaired:      m.FindingsRepaired,
-			FindingsUnverifiable:  m.FindingsUnverifiable,
-			FindingsUnrecoverable: m.FindingsUnrecoverable,
-			RPCRequests:           m.RPCRequests,
-		}
-	}
-	if sc := getSpecCache(); sc != nil {
-		stats.SpecCache = sc.SpecCacheStats()
-	}
-	writeCacheHeaders(w, cacheNoStore, 0, "")
-	writeJSON(w, http.StatusOK, stats)
-}
-
-func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
-
-	if s.rpc == nil {
-
-		return
-
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-
-	defer cancel()
-
-	health, err := s.rpc.GetHealth(ctx)
-
-	if err != nil {
-
-		loggerFromContext(ctx).Warn("loading RPC health for stats", "error", err)
-
-		return
-
-	}
-
-	head := int64(health.LatestLedger)
-
-	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
-
-	stats.ChainHeadLedger = &head
-
-	stats.IngestLagLedgers = &lag
-
 }
 
 func ingestLagLedgers(chainHead, lastIngested int64) int64 {

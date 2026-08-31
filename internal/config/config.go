@@ -500,12 +500,6 @@ func (c Config) Validate() error {
 	if c.RetentionLedgers == 0 {
 		return fmt.Errorf("RETENTION_LEDGERS must be positive")
 	}
-	if c.RetentionAge < 0 {
-		return fmt.Errorf("RETENTION_AGE must be non-negative")
-	}
-	if c.RetentionPoll <= 0 {
-		return fmt.Errorf("RETENTION_POLL_INTERVAL must be positive")
-	}
 	if c.PartitionLedgerSpan == 0 {
 		return fmt.Errorf("PARTITION_LEDGER_SPAN must be positive")
 	}

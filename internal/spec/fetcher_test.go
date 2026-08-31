@@ -21,6 +21,10 @@ type mockRPCClient struct {
 	simulateTxFn       func(ctx context.Context, req rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error)
 }
 
+func (m *mockRPCClient) GetEvents(ctx context.Context, req rpc.GetEventsRequest) (rpc.GetEventsResponse, error) {
+	return rpc.GetEventsResponse{}, nil
+}
+
 func (m *mockRPCClient) GetLedgerEntries(ctx context.Context, req rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
 	if m.getLedgerEntriesFn != nil {
 		return m.getLedgerEntriesFn(ctx, req)
@@ -49,45 +53,44 @@ func (m *mockRPCClient) SimulateTransaction(ctx context.Context, req rpc.Simulat
 	return rpc.SimulateTransactionResponse{}, nil
 }
 
-func TestExtractWasmHashFromInstance(t *testing.T)
-{
+// scvalBytes builds an ScVal SCV_BYTES wrapping data (ScVal.Bytes is *xdr.ScBytes).
+func scvalBytes(data []byte) xdr.ScVal {
+	b := xdr.ScBytes(data)
+	return xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &b}
+}
+
+// scvalSymbol builds an ScVal SCV_SYMBOL from a bare string.
+func scvalSymbol(s string) xdr.ScVal {
+	sym := xdr.ScSymbol(s)
+	return xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &sym}
+}
+
+// scvalMap builds an ScVal SCV_MAP (ScVal.Map is **ScMap).
+func scvalMap(entries []xdr.ScMapEntry) xdr.ScVal {
+	m := xdr.ScMap(entries)
+	mp := &m
+	return xdr.ScVal{Type: xdr.ScValTypeScvMap, Map: &mp}
+}
+
+// scvalVec builds an ScVal SCV_VEC (ScVal.Vec is **ScVec).
+func scvalVec(items []xdr.ScVal) xdr.ScVal {
+	v := xdr.ScVec(items)
+	vp := &v
+	return xdr.ScVal{Type: xdr.ScValTypeScvVec, Vec: &vp}
+}
+
+func TestExtractWasmHashFromInstance(t *testing.T) {
 	wasmBytes := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
 	expectedBase64 := base64.StdEncoding.EncodeToString(wasmBytes)
 
-	symWasmHash := xdr.ScString("wasm_hash")
-	symOther := xdr.ScString("other")
-
-	mapEntries := []xdr.MapEntry{
-		{
-			Key: xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &symWasmHash},
-			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmBytes},
-		},
-	}
-	mapVal := xdr.ScMap(mapEntries)
-
-	mapEntriesOther := []xdr.MapEntry{
-		{
-			Key: xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &symOther},
-			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmBytes},
-		},
-	}
-	mapValOther := xdr.ScMap(mapEntriesOther)
-
-	vecItems := []xdr.ScVal{
-		{
-			Type:  xdr.ScValTypeScvBytes,
-			Bytes: &wasmBytes,
-		},
-	}
-	vecVal := xdr.ScVec(vecItems)
-
-	vecItemsWrongLen := []xdr.ScVal{
-		{
-			Type:  xdr.ScValTypeScvBytes,
-			Bytes: &[]byte{1, 2, 3},
-		},
-	}
-	vecValWrongLen := xdr.ScVec(vecItemsWrongLen)
+	mapVal := scvalMap([]xdr.ScMapEntry{
+		{Key: scvalSymbol("wasm_hash"), Val: scvalBytes(wasmBytes)},
+	})
+	mapValOther := scvalMap([]xdr.ScMapEntry{
+		{Key: scvalSymbol("other"), Val: scvalBytes(wasmBytes)},
+	})
+	vecVal := scvalVec([]xdr.ScVal{scvalBytes(wasmBytes)})
+	vecValWrongLen := scvalVec([]xdr.ScVal{scvalBytes([]byte{1, 2, 3})})
 
 	tests := []struct {
 		name    string
@@ -95,50 +98,11 @@ func TestExtractWasmHashFromInstance(t *testing.T)
 		want    string
 		wantErr bool
 	}{
-		{
-			name: "map with wasm_hash key yields correct hash",
-			val: xdr.ScVal{
-				Type: xdr.ScValTypeScvMap,
-				Map:  &mapVal,
-			},
-			want:    expectedBase64,
-			wantErr: false,
-		},
-		{
-			name: "map without wasm_hash key returns error",
-			val: xdr.ScVal{
-				Type: xdr.ScValTypeScvMap,
-				Map:  &mapValOther,
-			},
-			want:    "",
-			wantErr: true,
-		},
-		{
-			name: "vec with 32-byte bytes yields correct hash",
-			val: xdr.ScVal{
-				Type: xdr.ScValTypeScvVec,
-				Vec:  &vecVal,
-			},
-			want:    expectedBase64,
-			wantErr: false,
-		},
-		{
-			name: "vec with non-32-byte bytes returns error",
-			val: xdr.ScVal{
-				Type: xdr.ScValTypeScvVec,
-				Vec:  &vecValWrongLen,
-			},
-			want:    "",
-			wantErr: true,
-		},
-		{
-			name: "unsupported scval type returns error",
-			val: xdr.ScVal{
-				Type: xdr.ScValTypeScvU32,
-			},
-			want:    "",
-			wantErr: true,
-		},
+		{name: "map with wasm_hash key yields correct hash", val: mapVal, want: expectedBase64, wantErr: false},
+		{name: "map without wasm_hash key returns error", val: mapValOther, want: "", wantErr: true},
+		{name: "vec with 32-byte bytes yields correct hash", val: vecVal, want: expectedBase64, wantErr: false},
+		{name: "vec with non-32-byte bytes returns error", val: vecValWrongLen, want: "", wantErr: true},
+		{name: "unsupported scval type returns error", val: xdr.ScVal{Type: xdr.ScValTypeScvU32}, want: "", wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -159,23 +123,23 @@ func TestFetchWasmHash(t *testing.T) {
 	wasmBytes := []byte{5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8}
 	expectedBase64 := base64.StdEncoding.EncodeToString(wasmBytes)
 
-	symWasmHash := xdr.ScString("wasm_hash")
-	mapEntries := []xdr.MapEntry{
-		{
-			Key: xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &symWasmHash},
-			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmBytes},
-		},
-	}
-	mapVal := xdr.ScMap(mapEntries)
+	mapVal := scvalMap([]xdr.ScMapEntry{
+		{Key: scvalSymbol("wasm_hash"), Val: scvalBytes(wasmBytes)},
+	})
 
+	contractAddr := xdr.ScAddress{
+		Type:       xdr.ScAddressTypeScAddressTypeContract,
+		ContractId: &xdr.ContractId{1},
+	}
+	keySym := xdr.ScSymbol("key")
 	validLedgerEntry := xdr.LedgerEntry{
 		Data: xdr.LedgerEntryData{
 			Type: xdr.LedgerEntryTypeContractData,
 			ContractData: &xdr.ContractDataEntry{
-				Val: xdr.ScVal{
-					Type: xdr.ScValTypeScvMap,
-					Map:  &mapVal,
-				},
+				Contract:   contractAddr,
+				Key:        xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &keySym},
+				Durability: xdr.ContractDataDurabilityPersistent,
+				Val:        mapVal,
 			},
 		},
 	}
@@ -257,7 +221,7 @@ func TestFetchWasmHash(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fetcher := NewFetcher(tt.rpcClient)
-			got, err := fetcher.fetchWasmHash(context.Background(), tt.contractID)
+			got, err := fetcher.FetchWasmHash(context.Background(), tt.contractID)
 			if tt.wantError {
 				assert.Error(t, err)
 			} else {

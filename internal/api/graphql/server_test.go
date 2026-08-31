@@ -3,12 +3,16 @@ package graphql
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/api"
 )
 
 // Every failure on the /graphql and /graphiql surface answers through
@@ -47,7 +51,7 @@ func TestDisabledPlaygroundAnswersInTheEnvelope(t *testing.T) {
 }
 
 func TestEnabledPlaygroundServesGraphiQL(t *testing.T) {
-	h, err := New(api.ServerDeps{Store: &stubStore{}}, testLogger(), true)
+	h, err := New(api.ServerDeps{Store: &stubStore{}}, slog.New(slog.NewTextHandler(io.Discard, nil)), true)
 	require.NoError(t, err)
 
 	rec := httptest.NewRecorder()
@@ -55,7 +59,7 @@ func TestEnabledPlaygroundServesGraphiQL(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Header().Get("Content-Type"), "text/html")
-	assert.Contains(t, rec.Body.String(), "GraphiQL")
+	assert.Contains(t, rec.Body.String(), "SoroTrail GraphQL Playground")
 }
 
 func TestHandleGet_WithoutQueryReturnsBrowserHint(t *testing.T) {
@@ -67,7 +71,7 @@ func TestHandleGet_WithoutQueryReturnsBrowserHint(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
-	assert.Contains(t, rec.Body.String(), "POST \"{\\\"query\\\":\\\"…\\\"}\" to this endpoint")
+	assert.Contains(t, rec.Body.String(), "POST {\\\"query\\\":\\\"…\\\"} to this endpoint")
 }
 
 func TestHandleGet_WithQueryExecutesOperation(t *testing.T) {

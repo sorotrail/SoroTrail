@@ -109,6 +109,18 @@ spec:
                 secretKeyRef:
                   name: existing-db-secret
                   key: DATABASE_URL
+          # Startup probe: allows the container time to connect to Postgres
+          # and run migrations before liveness/readiness probes begin.
+          # The Docker HEALTHCHECK uses start-period=10s + retries=3 with
+          # 10s intervals, so we mirror that budget here (period=5s,
+          # failureThreshold=6 → 30s total) with margin for cold starts
+          # against a remote Postgres.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /health

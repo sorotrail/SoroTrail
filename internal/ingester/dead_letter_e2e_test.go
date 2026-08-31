@@ -5,12 +5,14 @@ package ingester
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -36,19 +38,18 @@ func TestDeadLetterLifecycle_EndToEnd(t *testing.T) {
 	rawVal := "BAD_XDR_DATA"
 	errMsg := "failed to decode scval"
 
-	inserted, err := st.InsertDeadLetters(ctx, []store.DeadLetter{
-		{
-			ID:          "0000000100-0000000001",
-			ContractID:  "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-			Ledger:      100,
-			TxHash:      "deadbeef1234",
-			RawTopicXDR: []string{rawTopic},
-			RawValueXDR: rawVal,
-			Error:       errMsg,
-		},
+	dl, err := st.DeadLetterEvent(ctx, store.DeadLetterInput{
+		EventID:    "0000000100-0000000001",
+		ContractID: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+		Ledger:     100,
+		Type:       "contract",
+		TxHash:     "deadbeef1234",
+		TopicXDR:   []string{rawTopic},
+		ValueXDR:   rawVal,
+		Err:        errors.New(errMsg),
 	})
 	require.NoError(t, err)
-	require.Equal(t, int64(1), inserted)
+	require.NotZero(t, dl.ID)
 
 	// Also insert a valid event in the store to prove the ingestion cycle continued with the rest of the page.
 	validEv := store.Event{
@@ -68,18 +69,12 @@ func TestDeadLetterLifecycle_EndToEnd(t *testing.T) {
 	require.NoError(t, err)
 
 	// Wire up the API server to expose dead-letter endpoints.
-	router := chi.NewRouter()
-	apiServer, err := api.New(api.ServerDeps{Store: st}, nil, false)
-	require.NoError(t, err)
-	apiServer.RegisterRoutes(router)
-
-	srv := httptest.NewServer(router)
-	defer srv.Close()
+	handler := api.New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "").Router()
 
 	// 3. Verify the entry is retrievable through the dead-letter endpoint.
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/dead-letters", nil)
-	router.ServeHTTP(rec, req)
+	handler.ServeHTTP(rec, req)
 
 	require.Equal(t, http.StatusOK, rec.Code)
 	var dlResp struct {
@@ -88,7 +83,7 @@ func TestDeadLetterLifecycle_EndToEnd(t *testing.T) {
 	err = json.Unmarshal(rec.Body.Bytes(), &dlResp)
 	require.NoError(t, err)
 	require.Len(t, dlResp.DeadLetters, 1)
-	assert.Equal(t, "0000000100-0000000001", dlResp.DeadLetters[0].ID)
+	assert.Equal(t, "0000000100-0000000001", dlResp.DeadLetters[0].EventID)
 	assert.Equal(t, errMsg, dlResp.DeadLetters[0].Error)
 
 	// 4. Replay a repaired entry landing it in events exactly once.
@@ -121,12 +116,12 @@ func TestDeadLetterLifecycle_EndToEnd(t *testing.T) {
 	assert.JSONEq(t, `[{"symbol":"repaired"}]`, string(gotEvent.Topics))
 
 	// 6. Deletion reflected in the listing.
-	err = st.DeleteDeadLetters(ctx, []string{repairedEvent.ID})
+	err = st.DeleteDeadLetter(ctx, dl.ID)
 	require.NoError(t, err)
 
 	recDel := httptest.NewRecorder()
 	reqDel := httptest.NewRequest(http.MethodGet, "/dead-letters", nil)
-	router.ServeHTTP(recDel, reqDel)
+	handler.ServeHTTP(recDel, reqDel)
 
 	require.Equal(t, http.StatusOK, recDel.Code)
 	var dlRespAfter struct {

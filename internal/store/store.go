@@ -235,12 +235,6 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	// Topic0-Topic3 match the exact JSON value at that specific topic array
-	// position. Unspecified positions are wildcards.
-	Topic0     json.RawMessage
-	Topic1     json.RawMessage
-	Topic2     json.RawMessage
-	Topic3     json.RawMessage
 	// HasValue filters events by whether they carry a value payload.
 	// nil means no constraint; true means value IS NOT NULL;
 	// false means value IS NULL.
@@ -673,6 +667,9 @@ type Stats struct {
 	// Spec-cache counters are populated only when the API layer is given
 	// a spec cache; omitted from JSON otherwise.
 	SpecCache SpecCacheStats `json:"spec_cache,omitempty"`
+	// Pruner counters are populated only when retention is configured;
+	// omitted from JSON when the pruner is a no-op.
+	Pruner PrunerStats `json:"pruner,omitempty"`
 }
 
 // SpecCacheStats is a JSON-friendly view of spec.CacheStats. Defined here
@@ -684,9 +681,6 @@ type SpecCacheStats struct {
 	Fetches       uint64 `json:"fetches"`
 	Expiries      uint64 `json:"expiries"`
 	Invalidations uint64 `json:"invalidations"`
-	// Pruner counters are populated only when retention is configured;
-	// omitted from JSON when the pruner is a no-op.
-	Pruner PrunerStats `json:"pruner,omitempty"`
 }
 
 // PrunerStats is a JSON-friendly view of pruner.Metrics.

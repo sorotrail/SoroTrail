@@ -2,7 +2,6 @@ package rpc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -242,8 +241,9 @@ func TestFailover_CursorReanchorOnProviderSwitch(t *testing.T) {
 	assert.Equal(t, "cursor-0", resp.Cursor)
 	assert.Equal(t, int32(0), fc.lastActive.Load())
 
-	// Provider 0 fails next call, triggering demotion.
-	mocks[0].getEventsErr = []error{fmt.Errorf("connection refused")}
+	// Provider 0 fails next call, triggering demotion. The mock scripts
+	// errors by call index, so the first (successful) call gets nil.
+	mocks[0].getEventsErr = []error{nil, fmt.Errorf("connection refused")}
 	_, err = fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1, Pagination: &Pagination{Cursor: "cursor-0"}})
 	require.Error(t, err)
 
@@ -295,8 +295,10 @@ func TestFailover_HealthAndProbingHelpers(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		// Run probes explicitly
-		fc.runProbes(ctx)
+		// Run a probe cycle directly: runProbes is a ticker loop on
+		// probeInterval (default 30s), so probing must be invoked
+		// explicitly to test promotion deterministically.
+		fc.probeDownProviders(ctx)
 
 		assert.Equal(t, StateActive, ProviderState(fc.providers[0].state.Load()),
 			"provider should recover and return to active rotation after successful probe")

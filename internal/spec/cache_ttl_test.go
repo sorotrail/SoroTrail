@@ -51,6 +51,24 @@ func newTestSpec(wasmHash, contractID string) *ContractSpec {
 	}
 }
 
+// stubSpecStore is an in-memory spec.Store for the DB-backed cache tests.
+type stubSpecStore struct {
+	specs map[string][]byte
+}
+
+func (s *stubSpecStore) GetContractSpec(_ context.Context, wasmHash string) ([]byte, error) {
+	b, ok := s.specs[wasmHash]
+	if !ok {
+		return nil, errors.New("not cached")
+	}
+	return b, nil
+}
+
+func (s *stubSpecStore) SetContractSpec(_ context.Context, wasmHash, _ string, specJSON []byte) error {
+	s.specs[wasmHash] = specJSON
+	return nil
+}
+
 func TestCache_TTLExpiry(t *testing.T) {
 	clock := &fakeClock{t: time.Now()}
 	cache := NewCache(nil, WithClock(clock.Now))

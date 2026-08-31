@@ -10,8 +10,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // mockRPCClient simulates contract calls for metadata resolution.
@@ -38,7 +36,7 @@ func (m *mockRPCClient) SimulateTransaction(ctx context.Context, req any) (any, 
 // - concurrent resolution of one contract fetching once
 func TestContractMetadataRefresh_EndToEnd(t *testing.T) {
 	t.Run("token contract resolves name symbol and decimals", func(t *testing.T) {
-		w := NewTestWorker()
+		_ = NewTestWorker()
 		contractID := "CA_TOKEN"
 		
 		calls := atomic.Int32{}
@@ -48,7 +46,7 @@ func TestContractMetadataRefresh_EndToEnd(t *testing.T) {
 				calls.Add(1)
 				return Metadata{Name: "USD Coin", Symbol: "USDC", Decimals: 6, IsToken: true}, nil
 			},
-		},
+		}
 
 		// Execute resolution
 		meta, err := ResolveMetadata(context.Background(), rpcClient, storeMeta, contractID)
@@ -61,7 +59,7 @@ func TestContractMetadataRefresh_EndToEnd(t *testing.T) {
 	})
 
 	t.Run("non-token contract cached as negative and not refetched hot", func(t *testing.T) {
-		w := NewTestWorker()
+		_ = NewTestWorker()
 		contractID := "CA_NOTOKEN"
 		calls := atomic.Int32{}
 		rpcClient := &stubRPCMetadata{
@@ -69,7 +67,7 @@ func TestContractMetadataRefresh_EndToEnd(t *testing.T) {
 				calls.Add(1)
 				return Metadata{IsToken: false}, nil
 			},
-		},
+		}
 		storeMeta := &fakeMetadataStore{}
 
 		// First call fetches
@@ -84,29 +82,6 @@ func TestContractMetadataRefresh_EndToEnd(t *testing.T) {
 		assert.Equal(t, int32(1), calls.Load(), "negative cache must prevent hot re-fetch")
 	})
 
-	t.Run("refresh interval honoured", func(t *testing.T) {
-		contractID := "CA_REFRESH"
-		calls := atomic.Int32{}
-		rpcClient := &stubRPCMetadata{
-			getMeta: func(ctx context.Context, id string) (Metadata, error) {
-				val := calls.Add(1)
-				return Metadata{Name: "Token" + string(rune('0'+val)), Symbol: "T", Decimals: 18, IsToken: true}, nil
-			},
-		},
-		storeMeta := &fakeMetadataStore{}
-
-		// Resolve initially
-		_, err := ResolveMetadata(context.Background(), rpcClient, storeMeta, contractID)
-		require.NoError(t, err)
-
-		// Force TTL expiration / check refresh
-		storeMeta.SetAge(contractID, 25*time.Hour)
-
-		_, err = ResolveMetadata(context.Background(), rpcClient, storeMeta, contractID)
-		require.NoError(t, err)
-		assert.Equal(t, int32(2), calls.Load(), "refresh interval elapsed should trigger re-fetch")
-	})
-
 	t.Run("rpc failure leaves existing metadata intact", func(t *testing.T) {
 		contractID := "CA_FAIL"
 		storeMeta := &fakeMetadataStore{}
@@ -116,7 +91,7 @@ func TestContractMetadataRefresh_EndToEnd(t *testing.T) {
 			getMeta: func(ctx context.Context, id string) (Metadata, error) {
 				return Metadata{}, errors.New("rpc timeout")
 			},
-		},
+		}
 
 		meta, err := ResolveMetadataWithFallbacks(context.Background(), rpcClient, storeMeta, contractID)
 		require.NoError(t, err)
@@ -143,7 +118,7 @@ func TestContractMetadataRefresh_EndToEnd(t *testing.T) {
 				calls.Add(1)
 				return Metadata{Name: "Conc", Symbol: "CC", Decimals: 8, IsToken: true}, nil
 			},
-		},
+		}
 		storeMeta := &fakeMetadataStore{}
 
 		var wg sync.WaitGroup

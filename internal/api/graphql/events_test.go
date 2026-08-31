@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -266,7 +265,6 @@ func TestBuildEventFilterDirectly(t *testing.T) {
 				ContractID:    knownContractID,
 				Types:         []string{"contract", "system"},
 				Topic:         json.RawMessage(`["topic0"]`),
-				Topics:        &TopicPositionInput{T0: json.RawMessage(`"t0val"`)},
 				TopicContains: json.RawMessage(`["contains"]`),
 				TxHash:        "abcdef",
 				FromLedger:    &fromLedge,
@@ -287,7 +285,6 @@ func TestBuildEventFilterDirectly(t *testing.T) {
 		assert.Equal(t, knownContractID, filter.ContractID)
 		assert.Equal(t, []string{"contract", "system"}, filter.Types)
 		assert.JSONEq(t, `["topic0"]`, string(filter.Topic))
-		assert.JSONEq(t, `"t0val"`, string(filter.Topics.T0))
 		assert.JSONEq(t, `["contains"]`, string(filter.TopicContains))
 		assert.Equal(t, "abcdef", filter.TxHash)
 		assert.Equal(t, int64(100), filter.FromLedger)
@@ -309,7 +306,7 @@ func TestBuildEventFilterDirectly(t *testing.T) {
 		assert.Empty(t, filter.ContractID)
 		assert.Empty(t, filter.Types)
 		assert.Nil(t, filter.Topic)
-		assert.Nil(t, filter.Topics)
+		assert.Nil(t, filter.Topic0)
 		assert.Nil(t, filter.TopicContains)
 		assert.Empty(t, filter.TxHash)
 		assert.Zero(t, filter.FromLedger)
@@ -331,8 +328,8 @@ func TestBuildEventFilterDirectly(t *testing.T) {
 
 	// Test scope attachment via context principal
 	t.Run("scope attached from context principal", func(t *testing.T) {
-		specificScope := store.Scope{TenantID: "tenant-123"}
-		authCtx := api.WithPrincipal(ctx, api.Principal{Scope: specificScope})
+	specificScope := store.NewScope([]string{knownContractID})
+	authCtx := api.WithPrincipal(ctx, api.Principal{Scope: specificScope})
 
 		// Since buildEventFilter doesn't receive ctx directly in its signature (wait, let's verify if buildEventFilter takes ctx or not, or if scopeFrom uses ctx internally),
 		// let's check buildEventFilter signature in internal/api/graphql/events.go:

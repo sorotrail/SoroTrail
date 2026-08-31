@@ -144,6 +144,9 @@ type Options struct {
 	// so a severely degraded database cannot stretch a single ingestion
 	// cycle for minutes. Default 1s when batching is enabled.
 	BatchMaxBackoff time.Duration
+	// MinBackoff is the initial error backoff (and the value it resets
+	// to after a successful cycle). Default 1s.
+	MinBackoff time.Duration
 	// MaxBackoff caps the error backoff. Default 1m.
 	MaxBackoff time.Duration
 	// JitterMin and JitterMax bound the random jitter added to error

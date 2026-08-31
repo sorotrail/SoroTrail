@@ -1,12 +1,7 @@
 package config
 
 import (
-	"bytes"
-	"encoding/json"
-	"io"
-	"log/slog"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -84,8 +79,6 @@ func TestLoad(t *testing.T) {
 				assert.Equal(t, 5*time.Second, c.PollInterval)
 				assert.Equal(t, ":8080", c.HTTPAddr)
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
-				assert.Zero(t, c.RetentionAge)
-				assert.Equal(t, time.Hour, c.RetentionPoll)
 				assert.Equal(t, uint32(120960), c.PartitionLedgerSpan)
 				assert.Equal(t, uint(1000), c.IngestPageSize)
 				assert.Equal(t, uint(1000), c.IngestBatchSize)

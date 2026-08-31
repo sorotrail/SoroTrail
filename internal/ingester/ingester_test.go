@@ -1940,6 +1940,8 @@ func TestSetPollInterval_LiveUpdatesRunLoop(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return within 2s of cancel")
 	}
+}
+
 func TestColdStart_ExplicitStartLedgerRejectedWhenBelowRetention(t *testing.T) {
 	client := &mockRPC{
 		health:      rpc.Health{Status: "healthy", LatestLedger: 50_000, OldestLedger: 40_000},

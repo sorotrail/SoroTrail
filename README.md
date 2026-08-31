@@ -154,6 +154,7 @@ SoroTrail is tested in CI against the following Postgres major versions:
 | `DATABASE_URL` | — (required) | Postgres connection string. |
 | `POLL_INTERVAL` | `5s` | Sleep between polls once caught up. |
 | `HTTP_ADDR` | `:8080` | API listen address. |
+| `HTTP_REQUEST_BODY_LIMIT` | `1048576` | Maximum HTTP request body size in bytes (1 MiB default). |
 | `WATCHED_CONTRACTS` | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract automatically triggers a backfill from `latest − RETENTION_LEDGERS` (clamped to RPC retention), independent of other contracts. |
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
