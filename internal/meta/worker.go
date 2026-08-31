@@ -24,9 +24,7 @@ type MetadataStore interface {
 }
 
 // Worker orchestrates contract metadata background refresh.
-type Worker struct {
-	singleFlight sync.Map
-}
+type Worker struct{}
 
 func NewWorker() *Worker {
 	return &Worker{}
@@ -63,13 +61,13 @@ func ResolveMetadataCachedSingleFlight(ctx context.Context, rpc RPCClient, store
 	if m, ok := store.Get(contractID); ok {
 		return m, nil
 	}
-	
+
 	// Simple single-flight simulation for test/robustness
 	val, _ := workerSingleFlightMap.LoadOrStore(contractID, &singleFlightItem{
 		once: &sync.Once{},
 	})
 	item := val.(*singleFlightItem)
-	
+
 	var meta Metadata
 	var err error
 	item.once.Do(func() {

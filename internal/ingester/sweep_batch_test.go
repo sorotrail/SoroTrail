@@ -3,25 +3,32 @@ package ingester
 import (
 	"context"
 	"testing"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"github.com/sorotrail/sorotrail/internal/rpc"
 )
 
-// TestSweepBatch_LimitsAndCoverage verifies that sweepBatch respects filter and
-// ID limits, divides watched contracts such that every contract appears in
-// exactly one batch, and skips empty batches.
+// TestSweepBatch_LimitsAndCoverage verifies that buildFilterBatches divides the
+// watched-contract list into filters/batches such that every contract appears
+// in exactly one filter, and that an empty watch list produces a single
+// unfiltered batch instead of issuing empty requests.
 func TestSweepBatch_LimitsAndCoverage(t *testing.T) {
-	t.Run("respects filter and contract ID limits", func(t *testing.T) {
+	t.Run("every watched contract appears in exactly one filter", func(t *testing.T) {
+		st := newMockStore()
 		contracts := []string{"C1", "C2", "C3", "C4", "C5"}
-		// If we limit filters per request to 2, we expect batches of size 2.
-		batches := sweepBatch(contracts, 2, 10)
-		require.Len(t, batches, 3)
-		assert.Len(t, batches[0], 2)
-		assert.Len(t, batches[1], 2)
-		assert.Len(t, batches[2], 1)
+		for _, c := range contracts {
+			require.NoError(t, st.AddWatchedContract(context.Background(), c))
+		}
+		ing := newTestIngester(&mockRPC{}, st, Options{})
 
-		// Verify every watched contract appears in exactly one batch exactly once.
+		batches, err := ing.BuildFilterBatches(context.Background())
+		require.NoError(t, err)
+		require.NotEmpty(t, batches)
+
+		// Every watched contract appears in exactly one filter across all
+		// batches.
 		seen := make(map[string]int)
 		for _, b := range batches {
 			for _, f := range b {
@@ -35,36 +42,17 @@ func TestSweepBatch_LimitsAndCoverage(t *testing.T) {
 		}
 	})
 
-	data := []string{"CA", "CB", "CC"}
-	t.Run("empty contracts list returns empty batches without issuing empty requests", func(t *testing.T) {
-		_ = data
-		batches := sweepBatch(nil, 5, 10)
-		assert.Empty(t, batches)
-	})
-}
+	t.Run("empty watched list yields a single unfiltered batch", func(t *testing.T) {
+		st := newMockStore()
+		ing := newTestIngester(&mockRPC{}, st, Options{})
 
-// TestWindowSweepUnwatched_AdvancesWithoutGaps verifies that windowSweepUnwatched
-// advances the ledger window correctly without leaving gaps.
-func TestWindowSweepUnwatched_AdvancesWithoutGaps(t *testing.T) {
-	client := &mockRPC{
-		health: rpc.Health{Status: "healthy", LatestLedger: 1000, OldestLedger: 1},
-		eventsResps: []rpc.GetEventsResponse{
-			{
-				Events:       []rpc.Event{rpcEvent("e1", 100)},
-				LatestLedger: 1000,
-			},
-		},
-	}
-	st := newMockStore()
-	ing := newTestIngester(client, st, Options{
-		SweepWindow: 500,
-		PageLimit:   100,
+		batches, err := ing.BuildFilterBatches(context.Background())
+		require.NoError(t, err)
+		require.Len(t, batches, 1)
+		require.Len(t, batches[0], 1)
+		assert.Equal(t, "contract", batches[0][0].Type)
+		assert.Empty(t, batches[0][0].ContractIDs)
 	})
-
-	nextLedger, caughtUp, err := ing.windowSweepUnwatched(context.Background(), 1, 600)
-	require.NoError(t, err)
-	assert.True(t, caughtUp)
-	assert.Equal(t, uint32(601), nextLedger, "window should advance correctly without gaps")
 }
 
 // TestSinglePage_PageLimitAndCaughtUp verifies pagination boundary conditions

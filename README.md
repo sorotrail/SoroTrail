@@ -157,6 +157,8 @@ SoroTrail is tested in CI against the following Postgres major versions:
 | `WATCHED_CONTRACTS` | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract automatically triggers a backfill from `latest − RETENTION_LEDGERS` (clamped to RPC retention), independent of other contracts. |
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
+| `RETENTION_AGE` | `0` (disabled) | Delete events older than this duration. `0` disables age-based pruning. |
+| `RETENTION_POLL_INTERVAL` | `1h` | How often the age-based pruner re-examines events older than `RETENTION_AGE`. |
 | `PARTITION_LEDGER_SPAN` | `120960` | Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
 | `LOG_FORMAT` | `text` | `text` \| `json`. JSON emits one JSON object per line, compatible with Loki, CloudWatch, and ELK. |
@@ -170,7 +172,7 @@ SoroTrail is tested in CI against the following Postgres major versions:
 | `AUDIT_MAX_RPS` | `10` | Total request budget (split between ingest and audit). |
 | `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
 | `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
-| `API_MAX_LIMIT` | `500` | Maximum page size accepted for list endpoints (`/events`, `/subscriptions/{id}/deliveries`). Values above this are rejected with 400. |
+| `API_MAX_LIMIT` | `500` | Upper bound on the `limit` and `recent` page-size parameters for list endpoints (`/events`, `/subscriptions/{id}/deliveries`). Requests above the cap are rejected with 400 rather than returned clamped down. |
 | `STATS_CACHE_TTL` | `5s` | How long `GET /stats` results are served from the per-scope cache before being recomputed, short-circuiting the aggregation on busy endpoints. `0` disables caching. |
 | `API_KEY` | empty | Required to use the runtime `/watched-contracts` surface; empty means every request there is rejected with 503. This is a placeholder until #17 (real auth) lands — at that point `API_KEY` will be replaced. |
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
@@ -276,9 +278,10 @@ the struct tags in `internal/config/config.go` to prevent drift.
 | `HTTP_WRITE_TIMEOUT` | duration | `30s` | Maximum time to write the full response. `0` disables. |
 | `HTTP_IDLE_TIMEOUT` | duration | `60s` | Maximum time a keep-alive connection may idle before being closed. `0` disables. |
 | `HTTP_READ_HEADER_TIMEOUT` | duration | `10s` | Maximum time to read request headers. The most important defence against slow-client attacks. `0` disables. |
+| `HTTP_REQUEST_BODY_LIMIT` | int64 | `1048576` | Maximum accepted request body size in bytes (1 MiB default). Protects against memory/resource exhaustion. |
 | `API_QUERY_TIMEOUT` | duration | `25s` | Per-request database timeout for API-originated store reads. Enforced in-process and mirrored to Postgres via `statement_timeout`. |
 | `API_SLOW_QUERY_THRESHOLD` | duration | `2s` | Warn when an API-originated store query exceeds this duration; logs include the query name and elapsed time. |
-| `API_MAX_LIMIT` | int | `500` | Maximum page size accepted for list endpoints (`/events`, etc.). Values above this are rejected with 400. |
+| `API_MAX_LIMIT` | int | `500` | Upper bound on the `limit` and `recent` page-size parameters for list endpoints (`/events`, etc.). Values above the cap are rejected with 400 rather than clamped. |
 | `API_KEY` | string | empty | Gates the `/watched-contracts` management endpoints via constant-time header comparison. Empty means every write request is rejected with 503. |
 | `STATS_CACHE_TTL` | duration | `5s` | How long `GET /stats` results are served from the per-scope cache before recomputation. `0` disables caching. |
 | `CACHE_PRIVATE` | bool | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set when serving per-user data behind an auth layer. |

@@ -19,11 +19,12 @@ import (
 //  4. An explicit StartLedger overrides the cold-start calculation
 func TestResolvePosition(t *testing.T) {
 	tests := []struct {
-		name        string
-		state       *store.IngestionState
-		opts        Options
-		latest      uint32
-		wantRequest rpc.GetEventsRequest
+		name            string
+		state           *store.IngestionState
+		opts            Options
+		latest          uint32
+		wantStartLedger uint32
+		wantCursor      string
 	}{
 		{
 			name: "stored cursor takes precedence over stored ledger",
@@ -31,14 +32,10 @@ func TestResolvePosition(t *testing.T) {
 				LastIngestedLedger: 500,
 				LastCursor:         "cursor-123",
 			},
-			opts:   Options{RetentionLedgers: 100},
-			latest: 1000,
-			wantRequest: rpc.GetEventsRequest{
-				Pagination: &rpc.Pagination{
-					Cursor: "cursor-123",
-					Limit:  1000,
-				},
-			},
+			opts:            Options{RetentionLedgers: 100},
+			latest:          1000,
+			wantStartLedger: 0,
+			wantCursor:      "cursor-123",
 		},
 		{
 			name: "stored ledger with no cursor resumes at ledger plus one",
@@ -46,38 +43,26 @@ func TestResolvePosition(t *testing.T) {
 				LastIngestedLedger: 500,
 				LastCursor:         "",
 			},
-			opts:   Options{RetentionLedgers: 100},
-			latest: 1000,
-			wantRequest: rpc.GetEventsRequest{
-				StartLedger: 501,
-				Pagination: &rpc.Pagination{
-					Limit: 1000,
-				},
-			},
+			opts:            Options{RetentionLedgers: 100},
+			latest:          1000,
+			wantStartLedger: 501,
+			wantCursor:      "",
 		},
 		{
-			name:  "no stored state cold-starts at retention window",
-			state: nil,
-			opts:   Options{RetentionLedgers: 100},
-			latest: 1000,
-			wantRequest: rpc.GetEventsRequest{
-				StartLedger: 900, // 1000 - 100
-				Pagination: &rpc.Pagination{
-					Limit: 1000,
-				},
-			},
+			name:            "no stored state cold-starts at retention window",
+			state:           nil,
+			opts:            Options{RetentionLedgers: 100},
+			latest:          1000,
+			wantStartLedger: 900, // 1000 - 100
+			wantCursor:      "",
 		},
 		{
-			name:  "explicit StartLedger overrides cold-start calculation",
-			state: nil,
-			opts:   Options{StartLedger: 42, RetentionLedgers: 100},
-			latest: 1000,
-			wantRequest: rpc.GetEventsRequest{
-				StartLedger: 42,
-				Pagination: &rpc.Pagination{
-					Limit: 1000,
-				},
-			},
+			name:            "explicit StartLedger overrides cold-start calculation",
+			state:           nil,
+			opts:            Options{StartLedger: 42, RetentionLedgers: 100},
+			latest:          1000,
+			wantStartLedger: 42,
+			wantCursor:      "",
 		},
 	}
 
@@ -88,17 +73,12 @@ func TestResolvePosition(t *testing.T) {
 				require.NoError(t, storeMock.SaveIngestionState(context.Background(), *tt.state))
 			}
 
-			ing := newTestIngester(&mockRPC{}, storeMock, tt.opts)
-			req, err := ing.resolvePosition(context.Background(), tt.latest)
+			ing := newTestIngester(&mockRPC{health: rpc.Health{LatestLedger: tt.latest}}, storeMock, tt.opts)
+			startLedger, cursor, err := ing.resolvePosition(context.Background())
 			require.NoError(t, err)
 
-			assert.Equal(t, tt.wantRequest.StartLedger, req.StartLedger)
-			assert.Equal(t, tt.wantRequest.Pagination != nil, req.Pagination != nil)
-			if tt.wantRequest.Pagination != nil {
-				require.NotNil(t, req.Pagination)
-				assert.Equal(t, tt.wantRequest.Pagination.Cursor, req.Pagination.Cursor)
-				assert.Equal(t, tt.wantRequest.Pagination.Limit, req.Pagination.Limit)
-			}
+			assert.Equal(t, tt.wantStartLedger, startLedger)
+			assert.Equal(t, tt.wantCursor, cursor)
 		})
 	}
 }
@@ -110,14 +90,14 @@ func TestToStoreEvent(t *testing.T) {
 	ing := newTestIngester(&mockRPC{}, newMockStore(), Options{})
 
 	validEv := rpc.Event{
-		ID:               "0000000001-0000000001",
-		ContractID:       "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-		Ledger:           1,
-		Type:             "contract",
-		TxHash:           "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-		InSuccessfulCall: true,
-		TopicXDR:         []string{"AAAAAQ=="},
-		ValueXDR:         "AAAAAg==",
+		ID:                       "0000000001-0000000001",
+		ContractID:               "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+		Ledger:                   1,
+		Type:                     "contract",
+		TxHash:                   "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		InSuccessfulContractCall: true,
+		Topic:                    []string{"AAAAAQ=="},
+		Value:                    "AAAAAg==",
 	}
 
 	storeEv, err := ing.toStoreEvent(validEv)
@@ -127,24 +107,15 @@ func TestToStoreEvent(t *testing.T) {
 	assert.Equal(t, int64(validEv.Ledger), storeEv.Ledger)
 	assert.Equal(t, validEv.Type, storeEv.Type)
 	assert.Equal(t, validEv.TxHash, storeEv.TxHash)
-	assert.Equal(t, validEv.InSuccessfulCall, storeEv.InSuccessfulCall)
+	assert.Equal(t, validEv.InSuccessfulContractCall, storeEv.InSuccessfulCall)
 	assert.NotNil(t, storeEv.Topics)
 	assert.NotNil(t, storeEv.Value)
 
-	malformedEv := rpc.Event{
-		ID:       "", // missing ID/contract id or invalid shape depending on validation
-		Ledger:   0,
-	}
-
-	// Depending on implementation details, if toStoreEvent validates fields like ID or Ledger,
-	// we ensure it rejects invalid events gracefully.
+	// A malformed event that fails to convert surfaces as an error rather
+	// than being persisted partially. passthroughDecoder never fails, so use
+	// an un-marshalable topics payload to force toStoreEvent to error.
+	malformedEv := validEv
+	malformedEv.TopicJSON = []json.RawMessage{json.RawMessage(`{`)}
 	_, err = ing.toStoreEvent(malformedEv)
-	// If toStoreEvent doesn't reject empty IDs, we can test malformed XDR or other invalid structure.
-	// Let's test invalid topic/value XDR if decoded during toStoreEvent.
-	invalidXdrEv := validEv
-	invalidXdrEv.ValueXDR = "not-valid-base64-or-xdr-syntax"
-	// If the decoder fails on invalid XDR, it should return an error.
-	_, err = ing.toStoreEvent(invalidXdrEv)
-	// If it fails, that proves malformed RPC events are rejected rather than stored partially.
-	_ = err
+	assert.Error(t, err)
 }

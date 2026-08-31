@@ -276,6 +276,8 @@ func run() error {
 		BatchSize:               cfg.BatchSize,
 		BatchTargetLatency:      cfg.BatchTargetLatency,
 		BatchMaxBackoff:         cfg.BatchMaxBackoff,
+		MinBackoff:              cfg.IngesterMinBackoff,
+		MaxBackoff:              cfg.IngesterMaxBackoff,
 		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
 		Network:                 cfg.Network,
