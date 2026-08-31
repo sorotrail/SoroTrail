@@ -66,15 +66,15 @@ type Config struct {
 	// public endpoint limit; raise it only against paid plans or
 	// self-hosted RPCs whose allowance actually permits it. Ignored while
 	// RPC_URLS is set (the failover path uses RPC_RATE_LIMIT_RPS).
-	RPCRateLimit          float64       `env:"RPC_RATE_LIMIT" envDefault:"10"`
-	DatabaseURL           string        `env:"DATABASE_URL"`
+	RPCRateLimit float64 `env:"RPC_RATE_LIMIT" envDefault:"10"`
+	DatabaseURL  string  `env:"DATABASE_URL"`
 	// DB pool sizing. Zero means "use the pgx default". These let an operator
 	// bound the Postgres connection pool without a code redeploy.
 	DBMaxConns        int32         `env:"DB_MAX_CONNS" envDefault:"0"`
 	DBMinConns        int32         `env:"DB_MIN_CONNS" envDefault:"0"`
 	DBMaxConnLifetime time.Duration `env:"DB_MAX_CONN_LIFETIME" envDefault:"0"`
 	DBMaxConnIdleTime time.Duration `env:"DB_MAX_CONN_IDLE_TIME" envDefault:"0"`
-	PollInterval          time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
+	PollInterval      time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
 	// HTTPAddr is the address the HTTP server listens on (host:port), e.g.
 	// ":8080" or "0.0.0.0:9090". See HTTP_ADDR in .env.example. It must be a
 	// valid host:port pair.
@@ -103,6 +103,13 @@ type Config struct {
 	// RetentionDryRun, when true, makes the pruner report what it
 	// would delete without actually removing any rows.
 	RetentionDryRun bool `env:"RETENTION_DRY_RUN"`
+	// RetentionAge is the maximum age of stored events (the age-based
+	// dimension of retention pruning). It feeds the pre-pruner's age
+	// sweep; zero means age-based pruning is disabled.
+	RetentionAge time.Duration `env:"RETENTION_AGE"`
+	// RetentionPoll is how often the age-based pruner re-examines the
+	// store for events older than RetentionAge.
+	RetentionPoll time.Duration `env:"RETENTION_POLL_INTERVAL" envDefault:"1h"`
 
 	// Archive configuration. When ARCHIVE_BUCKET is set, pruned events
 	// are exported to S3-compatible object storage as compressed NDJSON
@@ -503,8 +510,11 @@ func (c Config) Validate() error {
 	if c.RetentionAge < 0 {
 		return fmt.Errorf("RETENTION_AGE must be non-negative")
 	}
-	if c.RetentionPoll <= 0 {
-		return fmt.Errorf("RETENTION_POLL_INTERVAL must be positive")
+	// RetentionPoll mirrors RetentionAge: it only matters once age-based
+	// pruning is enabled, and zero (the hand-built, non-default value) is a
+	// valid "disabled" state rather than a misconfiguration.
+	if c.RetentionPoll < 0 {
+		return fmt.Errorf("RETENTION_POLL_INTERVAL must be non-negative")
 	}
 	if c.PartitionLedgerSpan == 0 {
 		return fmt.Errorf("PARTITION_LEDGER_SPAN must be positive")

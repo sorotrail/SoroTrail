@@ -928,9 +928,10 @@ func (s *SQLite) GetIngestionState(ctx context.Context) (IngestionState, error) 
 func (s *SQLite) GetIngestionStateForNetwork(ctx context.Context, network string) (IngestionState, error) {
 	var st IngestionState
 	var ts string
+	var poll *string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT network, last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE network = ?`, defaultNetwork(network),
-	).Scan(&st.Network, &st.LastIngestedLedger, &st.LastCursor, &ts)
+		`SELECT network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state WHERE network = ?`, defaultNetwork(network),
+	).Scan(&st.Network, &st.LastIngestedLedger, &st.LastCursor, &poll, &ts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return IngestionState{}, ErrNotFound
 	}
@@ -938,20 +939,33 @@ func (s *SQLite) GetIngestionStateForNetwork(ctx context.Context, network string
 		return IngestionState{}, fmt.Errorf("loading ingestion state: %w", err)
 	}
 	st.UpdatedAt = parseTime(ts)
+	if poll != nil {
+		parsed := parseTime(*poll)
+		st.LastSuccessfulPoll = &parsed
+	}
 	return st, nil
 }
 
 func (s *SQLite) SaveIngestionState(ctx context.Context, st IngestionState) error {
 	st.Network = defaultNetwork(st.Network)
 	now := formatTime(time.Now().UTC())
+	// last_successful_poll mirrors the Postgres backend: the UPSERT sets
+	// it to EXCLUDED.last_successful_poll, so a nil value overwrites with
+	// NULL (not the previous timestamp). A non-nil poll is stored as an
+	// RFC3339Nano string that parseTime round-trips on read.
+	var poll any
+	if st.LastSuccessfulPoll != nil {
+		poll = formatTime(*st.LastSuccessfulPoll)
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO ingestion_state (network, last_ingested_ledger, last_cursor, updated_at)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO ingestion_state (network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT (network) DO UPDATE SET
 			last_ingested_ledger = excluded.last_ingested_ledger,
 			last_cursor          = excluded.last_cursor,
+			last_successful_poll = excluded.last_successful_poll,
 			updated_at           = excluded.updated_at`,
-		st.Network, st.LastIngestedLedger, st.LastCursor, now,
+		st.Network, st.LastIngestedLedger, st.LastCursor, poll, now,
 	)
 	if err != nil {
 		return fmt.Errorf("saving ingestion state: %w", err)
