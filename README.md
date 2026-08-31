@@ -153,6 +153,13 @@ Query parameters (all optional, combinable):
 | `cursor` | `0001234...` | Opaque pagination cursor from a previous response. |
 | `order` | `desc` | `asc` | `desc`, defaults to asc. Sort direction. |
 | `decoded` | `true` | When `true`, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with `"decoded": false`. |
+
+Decode failures are surfaced, not dropped: when an event matches a spec but
+the spec-declared fields cannot be decoded (or the topics are malformed),
+the enriched response keeps the raw event alongside `"decoded": false` and a
+`decode_error` string explaining what failed, e.g.
+`"decode_error": "decoding topic field ...: cannot decode"`. Every such
+failure is also counted in `GET /stats` (see below).
 | `include_xdr` | `true` | When `true`, includes raw base64 `topics_xdr` and `value_xdr` on each event. Omitted by default to keep responses small. |
 
 Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
@@ -496,7 +503,7 @@ curl -s localhost:8080/stats
 ```
 
 ```json
-{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"oldest_stored_ledger":242001,"chain_head_ledger":260130,"ingest_lag_ledgers":7,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
+{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"oldest_stored_ledger":242001,"chain_head_ledger":260130,"ingest_lag_ledgers":7,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340},"decode":{"decodes":4210,"decode_failures":12}}
 ```
 
 `oldest_stored_ledger` is the lowest ledger currently present in the
@@ -505,6 +512,10 @@ store. `chain_head_ledger` is read from Stellar RPC `getHealth`, and
 the RPC is temporarily unreachable, `/stats` still returns HTTP 200 with
 the stored fields populated and the RPC-derived freshness fields
 (`chain_head_ledger`, `ingest_lag_ledgers`) set to `null`.
+
+The `decode` block (present only when a spec enricher is wired) counts
+spec-enrichment decode attempts and failures, so the decode failure rate
+(`decode_failures` / `decodes`) is observable without parsing logs.
 
 `verified_through_ledger` is the inclusive highest ledger whose stored
 events have been proven to match a fresh RPC fetch by the auditor. When

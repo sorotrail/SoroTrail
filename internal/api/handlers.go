@@ -101,6 +101,7 @@ type enrichedEventWithXDR struct {
 	eventWithXDR
 	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
 	Decoded      bool                        `json:"decoded"`
+	DecodeError  string                      `json:"decode_error,omitempty"`
 }
 
 type healthResponse struct {
@@ -294,6 +295,7 @@ func enrichEventWithXDR(e store.EnrichedEvent) enrichedEventWithXDR {
 		eventWithXDR: eventToXDRResponse(e.Event),
 		DecodedEvent: e.DecodedEvent,
 		Decoded:      e.Decoded,
+		DecodeError:  e.DecodeError,
 	}
 }
 
@@ -315,6 +317,10 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.addStatsFreshness(r.Context(), &stats)
+	if s.enricher != nil {
+		d := s.enricher.DecodeStats()
+		stats.Decode = &d
+	}
 	if a := getAuditor(); a != nil {
 		m := a.Metrics()
 		stats.Auditor = store.AuditStats{

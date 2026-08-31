@@ -316,6 +316,106 @@ func TestEnricher_GracefulDegradation(t *testing.T) {
 	})
 }
 
+func TestEnricher_SurfacesDecodeErrors(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	cache := NewCache(nil)
+	cache.Set(context.Background(), &ContractSpec{
+		WasmHash:   "hash",
+		ContractID: "CDLZ...",
+		Events: []EventSpec{
+			{
+				Name:       "transfer",
+				TopicSpecs: []FieldSpec{{Name: "from", Type: "address"}},
+				ValueSpec:  &FieldSpec{Name: "amount", Type: "i128"},
+			},
+		},
+	})
+	enricher := NewEnricher(nil, cache, log)
+
+	t.Run("field decode failure sets decode_error and keeps raw event", func(t *testing.T) {
+		events := []store.Event{
+			{
+				ID:         "evt1",
+				ContractID: "CDLZ...",
+				// topic[1] is declared as an address field by the spec but the
+				// payload is a plain number, not a shape-tagged object — the
+				// scalar decode fails.
+				Topics: json.RawMessage(`[{"symbol":"transfer"},123]`),
+				Value:  json.RawMessage(`{"i128":"5000"}`),
+			},
+		}
+		enriched := enricher.EnrichEvents(context.Background(), events)
+		require.Len(t, enriched, 1)
+		assert.False(t, enriched[0].Decoded)
+		require.NotEmpty(t, enriched[0].DecodeError)
+		assert.Contains(t, enriched[0].DecodeError, "from")
+		// The raw event must be preserved alongside the error. ID and Topics
+		// are promoted from the embedded raw Event.
+		assert.Equal(t, "evt1", enriched[0].ID)
+		assert.JSONEq(t, `[{"symbol":"transfer"},123]`, string(enriched[0].Topics))
+		assert.Empty(t, enriched[0].DecodedEvent) // no partial enriched view on failure
+	})
+
+	t.Run("malformed topics sets decode_error and counts a failure", func(t *testing.T) {
+		events := []store.Event{
+			{ID: "evt2", ContractID: "CDLZ...", Topics: json.RawMessage(`"not an array"`)},
+		}
+		enriched := enricher.EnrichEvents(context.Background(), events)
+		require.Len(t, enriched, 1)
+		assert.False(t, enriched[0].Decoded)
+		require.NotEmpty(t, enriched[0].DecodeError)
+		assert.Equal(t, "evt2", enriched[0].ID) // raw event preserved (promoted from embedded Event)
+	})
+
+	t.Run("no spec is not a decode error", func(t *testing.T) {
+		events := []store.Event{
+			{
+				ID:         "evt3",
+				ContractID: "UNKNOWN",
+				Topics:     json.RawMessage(`[{"symbol":"transfer"}]`),
+			},
+		}
+		enriched := enricher.EnrichEvents(context.Background(), events)
+		require.Len(t, enriched, 1)
+		assert.False(t, enriched[0].Decoded)
+		assert.Empty(t, enriched[0].DecodeError)
+	})
+}
+
+func TestEnricher_DecodeStats(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	cache := NewCache(nil)
+	cache.Set(context.Background(), &ContractSpec{
+		WasmHash:   "hash",
+		ContractID: "CDLZ...",
+		Events: []EventSpec{
+			{
+				Name:       "transfer",
+				TopicSpecs: []FieldSpec{{Name: "from", Type: "address"}},
+				ValueSpec:  &FieldSpec{Name: "amount", Type: "i128"},
+			},
+		},
+	})
+	enricher := NewEnricher(nil, cache, log) // One good decode, two failures (bad event shape, bad field payload).
+	enricher.EnrichEvents(context.Background(), []store.Event{
+		{
+			ContractID: "CDLZ...",
+			Topics:     json.RawMessage(`[{"symbol":"transfer"},{"address":"G..."}]`),
+			Value:      json.RawMessage(`{"i128":"1"}`),
+		},
+		{ContractID: "CDLZ...", Topics: json.RawMessage(`"junk"`)},                      // no event name
+		{ContractID: "CDLZ...", Topics: json.RawMessage(`[{"symbol":"transfer"},123]`)}, // field not shape-tagged
+	})
+
+	d := enricher.DecodeStats()
+	assert.Equal(t, uint64(3), d.Decodes)
+	assert.Equal(t, uint64(2), d.DecodeFailures)
+
+	// A nil enricher reports zero values, so callers can always call it.
+	var nilEnricher *Enricher
+	assert.Equal(t, uint64(0), nilEnricher.DecodeStats().Decodes)
+}
+
 func TestCacheStats(t *testing.T) {
 	cache := NewCache(nil)
 

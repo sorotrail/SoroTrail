@@ -36,10 +36,17 @@ type Event struct {
 // EnrichedEvent wraps an Event with decoded field information derived from
 // the contract's spec. The original Event is preserved in full; DecodedEvent
 // carries the enriched view when decoding succeeded.
+//
+// When enrichment fails to decode the event's payload, DecodeError carries a
+// human-readable reason so consumers can see *why* an event was not decoded.
+// The raw Event is always available alongside it (embedded above), so a
+// failed decode returns the original payload plus decode_error rather than
+// silently dropping the event.
 type EnrichedEvent struct {
 	Event        `json:",inline"`      // embed all Event fields
 	DecodedEvent *DecodedEventResponse `json:"decoded_event,omitempty"`
 	Decoded      bool                  `json:"decoded"`
+	DecodeError  string                `json:"decode_error,omitempty"`
 }
 
 // DecodedEventResponse is the JSON shape returned when an event is successfully
@@ -91,14 +98,13 @@ type EventFilter struct {
 	Type       string
 	// Topic matches events whose topics array contains this JSON value at any
 	// position (Postgres jsonb containment).
-	Topic      json.RawMessage
+	Topic json.RawMessage
 	// TopicContains matches events whose topics array jsonb-contains this
 	// value (Postgres @> operator). Unlike Topic, the value is passed
 	// directly without array-wrapping, so callers can use multi-element
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	Topic json.RawMessage
 	// Topic0-Topic3 match the exact JSON value at that specific topic array
 	// position. Unspecified positions are wildcards.
 	Topic0     json.RawMessage
@@ -172,12 +178,12 @@ type AuditFinding struct {
 // GET /events query parameters. An empty (zero-value) filter matches
 // every event.
 type SubscriptionFilter struct {
-	ContractID string          `json:"contract_id,omitempty"`
-	Type       string          `json:"type,omitempty"`
+	ContractID    string          `json:"contract_id,omitempty"`
+	Type          string          `json:"type,omitempty"`
 	Topic         json.RawMessage `json:"topic,omitempty"`
 	TopicContains json.RawMessage `json:"topic_contains,omitempty"`
 	FromLedger    int64           `json:"from_ledger,omitempty"`
-	ToLedger   int64           `json:"to_ledger,omitempty"`
+	ToLedger      int64           `json:"to_ledger,omitempty"`
 }
 
 // MatchesEvent reports whether an event passes this filter. Zero fields
@@ -301,6 +307,18 @@ type Stats struct {
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
+	// Decode counters are populated only when a spec enricher is wired;
+	// omitted from JSON when it is nil (decoded=true is unavailable).
+	Decode *DecodeStats `json:"decode,omitempty"`
+}
+
+// DecodeStats is a JSON-friendly view of spec-enrichment decode counters,
+// surfaced via /stats so the decode failure rate is observable. Failures over
+// Decodes is the per-frame decode failure rate: when the enricher is disabled
+// the field stays nil and is omitted from JSON.
+type DecodeStats struct {
+	Decodes        uint64 `json:"decodes"`
+	DecodeFailures uint64 `json:"decode_failures"`
 }
 
 // AuditStats is a JSON-friendly view of audit.Metrics. Defined here so

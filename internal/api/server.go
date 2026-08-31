@@ -47,8 +47,12 @@ func getAuditor() *audit.Auditor {
 
 // Enricher is the spec-based event enrichment interface used by the API.
 // Defined here so the API package doesn't import internal/spec directly.
+// DecodeStats lets /stats surface the enrichment decode failure rate when a
+// concrete enricher is wired; nil servers (decoded=true unavailable) simply
+// leave the stats field empty.
 type Enricher interface {
 	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
+	DecodeStats() store.DecodeStats
 }
 
 // Server holds the API's dependencies.
