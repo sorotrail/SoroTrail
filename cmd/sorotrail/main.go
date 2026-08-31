@@ -108,8 +108,13 @@ func run() error {
 	wh := webhook.NewNotifier(st, log)
 
 	// Wire the spec cache and enricher for spec-decoded event views.
-	specCache := spec.NewCache(st)
+	// The cache is keyed by wasm hash with a TTL; the fetcher doubles as
+	// the wasm-hash resolver so contract upgrades (a changed hash)
+	// invalidate the previously cached spec automatically.
 	specFetcher := spec.NewFetcher(rpcClient)
+	specCache := spec.NewCache(st,
+		spec.WithWasmHashResolver(specFetcher),
+	)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
 	bcast := broadcast.New(broadcast.DefaultBufferSize)
@@ -141,6 +146,9 @@ func run() error {
 		// to parse logs to see pass/finding rates.
 		api.SetAuditor(aud)
 	}
+
+	// Expose spec-cache hit/miss metrics via /stats.
+	api.SetSpecCache(specCache)
 
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and

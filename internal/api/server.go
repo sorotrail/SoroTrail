@@ -45,6 +45,30 @@ func getAuditor() *audit.Auditor {
 	return auditor
 }
 
+// SpecCacheStatsSource supplies spec-cache metrics for /stats. Mirrors
+// the SetAuditor pattern: one setter, called before ListenAndServe.
+// nil (the default) leaves the /stats spec_cache field omitted.
+type SpecCacheStatsSource interface {
+	SpecCacheStats() store.SpecCacheStats
+}
+
+var (
+	specCacheMu     sync.RWMutex
+	specCacheSource SpecCacheStatsSource
+)
+
+func SetSpecCache(src SpecCacheStatsSource) {
+	specCacheMu.Lock()
+	specCacheSource = src
+	specCacheMu.Unlock()
+}
+
+func getSpecCache() SpecCacheStatsSource {
+	specCacheMu.RLock()
+	defer specCacheMu.RUnlock()
+	return specCacheSource
+}
+
 // Enricher is the spec-based event enrichment interface used by the API.
 // Defined here so the API package doesn't import internal/spec directly.
 type Enricher interface {

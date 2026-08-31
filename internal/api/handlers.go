@@ -327,6 +327,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			RPCRequests:           m.RPCRequests,
 		}
 	}
+	if sc := getSpecCache(); sc != nil {
+		stats.SpecCache = sc.SpecCacheStats()
+	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
 }

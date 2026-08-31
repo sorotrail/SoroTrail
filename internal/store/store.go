@@ -98,7 +98,6 @@ type EventFilter struct {
 	// arrays: topic_contains=[{"symbol":"transfer"},{"address":"C..."}].
 	// Uses the GIN index on events.topics.
 	TopicContains json.RawMessage
-	Topic json.RawMessage
 	// Topic0-Topic3 match the exact JSON value at that specific topic array
 	// position. Unspecified positions are wildcards.
 	Topic0     json.RawMessage
@@ -301,6 +300,20 @@ type Stats struct {
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
+	// Spec-cache counters are populated only when the API layer is given
+	// a spec cache; omitted from JSON otherwise.
+	SpecCache SpecCacheStats `json:"spec_cache,omitempty"`
+}
+
+// SpecCacheStats is a JSON-friendly view of spec.CacheStats. Defined here
+// so json.Marshal sees concrete field tags (same pattern as AuditStats).
+type SpecCacheStats struct {
+	CachedSpecs   int    `json:"cached_specs"`
+	Hits          uint64 `json:"hits"`
+	Misses        uint64 `json:"misses"`
+	Fetches       uint64 `json:"fetches"`
+	Expiries      uint64 `json:"expiries"`
+	Invalidations uint64 `json:"invalidations"`
 }
 
 // AuditStats is a JSON-friendly view of audit.Metrics. Defined here so

@@ -34,7 +34,7 @@ func NewFetcher(rpcClient rpc.Client) *Fetcher {
 // entries into a ContractSpec.
 func (f *Fetcher) FetchSpec(ctx context.Context, contractID string) (*ContractSpec, error) {
 	// Step 1: Fetch the contract instance to get the wasm_hash.
-	wasmHash, err := f.fetchWasmHash(ctx, contractID)
+	wasmHash, err := f.FetchWasmHash(ctx, contractID)
 	if err != nil {
 		return nil, fmt.Errorf("fetching wasm hash for %s: %w", contractID, err)
 	}
@@ -50,8 +50,11 @@ func (f *Fetcher) FetchSpec(ctx context.Context, contractID string) (*ContractSp
 	return spec, nil
 }
 
-// fetchWasmHash retrieves the Wasm hash from the contract's instance entry.
-func (f *Fetcher) fetchWasmHash(ctx context.Context, contractID string) (string, error) {
+// FetchWasmHash retrieves the current Wasm hash of a contract from its
+// instance ledger entry. Exported so the spec cache can re-resolve the
+// mapping and detect contract upgrades (a changed hash invalidates the
+// cached spec). Implements WasmHashResolver.
+func (f *Fetcher) FetchWasmHash(ctx context.Context, contractID string) (string, error) {
 	// Build the LedgerKey for the contract instance.
 	// Contract IDs are base32-encoded 32-byte hashes with a 'C' prefix.
 	// We decode them to get the raw bytes for the ScAddress.
