@@ -42,6 +42,10 @@ func (m *mockRPCClient) GetHealth(ctx context.Context) (rpc.Health, error) {
 	return rpc.Health{}, nil
 }
 
+func (m *mockRPCClient) GetEvents(ctx context.Context, req rpc.GetEventsRequest) (rpc.GetEventsResponse, error) {
+	return rpc.GetEventsResponse{}, nil
+}
+
 func (m *mockRPCClient) SimulateTransaction(ctx context.Context, req rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error) {
 	if m.simulateTxFn != nil {
 		return m.simulateTxFn(ctx, req)
@@ -63,10 +67,16 @@ func TestExtractWasmHashFromInstance(t *testing.T) {
 
 	symWasmHash := xdr.ScSymbol("wasm_hash")
 	symOther := xdr.ScSymbol("other")
+	wasmHashBytes := xdr.ScBytes(wasmBytes)
 
 	mapEntries := []xdr.ScMapEntry{
 		{
 			Key: xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &symWasmHash},
+			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmHashBytes},
+		},
+	}
+	scMapA := xdr.ScMap(mapEntries)
+	mapVal := &scMapA
 			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmScBytes},
 		},
 	}
@@ -76,6 +86,11 @@ func TestExtractWasmHashFromInstance(t *testing.T) {
 	mapEntriesOther := []xdr.ScMapEntry{
 		{
 			Key: xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &symOther},
+			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmHashBytes},
+		},
+	}
+	scMapB := xdr.ScMap(mapEntriesOther)
+	mapValOther := &scMapB
 			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmScBytes},
 		},
 	}
@@ -85,18 +100,26 @@ func TestExtractWasmHashFromInstance(t *testing.T) {
 	vecItems := []xdr.ScVal{
 		{
 			Type:  xdr.ScValTypeScvBytes,
+			Bytes: &wasmHashBytes,
+		},
+	}
+	scVecA := xdr.ScVec(vecItems)
+	vecVal := &scVecA
 			Bytes: &wasmScBytes,
 		},
 	}
 	vecVal := xdr.ScVec(vecItems)
 	vecPtr := &vecVal
 
+	shortBytes := xdr.ScBytes([]byte{1, 2, 3})
 	vecItemsWrongLen := []xdr.ScVal{
 		{
 			Type:  xdr.ScValTypeScvBytes,
 			Bytes: &shortBytes,
 		},
 	}
+	scVecB := xdr.ScVec(vecItemsWrongLen)
+	vecValWrongLen := &scVecB
 	vecValWrongLen := xdr.ScVec(vecItemsWrongLen)
 	vecWrongPtr := &vecValWrongLen
 
@@ -172,6 +195,15 @@ func TestFetchWasmHash(t *testing.T) {
 	expectedBase64 := base64.StdEncoding.EncodeToString(wasmBytes)
 
 	symWasmHash := xdr.ScSymbol("wasm_hash")
+	wasmHashBytes := xdr.ScBytes(wasmBytes)
+	mapEntries := []xdr.ScMapEntry{
+		{
+			Key: xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &symWasmHash},
+			Val: xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &wasmHashBytes},
+		},
+	}
+	scMapC := xdr.ScMap(mapEntries)
+	mapVal := &scMapC
 	mapEntries := []xdr.ScMapEntry{
 		{
 			Key: xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &symWasmHash},
@@ -284,7 +316,7 @@ func TestFetchWasmHash(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fetcher := NewFetcher(tt.rpcClient)
-			got, err := fetcher.fetchWasmHash(context.Background(), tt.contractID)
+			got, err := fetcher.FetchWasmHash(context.Background(), tt.contractID)
 			if tt.wantError {
 				assert.Error(t, err)
 			} else {

@@ -24,7 +24,6 @@ import (
 
 	"github.com/sorotrail/sorotrail/internal/api"
 	"github.com/sorotrail/sorotrail/internal/api/graphql"
-	"github.com/sorotrail/sorotrail/internal/archive"
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/config"
@@ -227,6 +226,7 @@ func run() error {
 	specCache := spec.NewCache(st,
 		spec.WithWasmHashResolver(specFetcher),
 	)
+	specEnricher := spec.NewEnricher(specFetcher, specCache, log, st)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
 	// Wrap the raw RPC client so per-method error totals are tracked and
@@ -339,6 +339,15 @@ func run() error {
 		// to parse logs to see pass/finding rates.
 		api.SetAuditor(aud)
 	}
+	var retPruner *store.RetentionPruner
+	if cfg.RetentionAge > 0 {
+		retPruner = store.NewRetentionPruner(pg, log, store.RetentionOptions{
+			Age:          cfg.RetentionAge,
+			PollInterval: cfg.RetentionPoll,
+		})
+	}
+
+	prn := pruner.New(st, log, pruner.Options{
 	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
 	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
 	// returns immediately. Only when at least one retention policy is
@@ -383,10 +392,14 @@ func run() error {
 		Pause:              cfg.RetentionPause,
 		Interval:           cfg.RetentionInterval,
 		ArchiveBeforePrune: cfg.ArchiveBeforePrune,
-	}, arch)
+	})
 	if cfg.RetentionEnabled() {
 		api.SetPruner(prn)
 	}
+
+	// Expose spec-cache hit/miss metrics via /stats.
+	api.SetSpecCache(specCache)
+
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
 	// its cleanup goroutine is never started.
@@ -527,6 +540,17 @@ func run() error {
 			}
 		}()
 	}
+	if retPruner != nil {
+		go func() {
+			log.Info("event retention pruning starting", "age", cfg.RetentionAge, "poll_interval", cfg.RetentionPoll)
+			if err := retPruner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("retention pruner: %w", err)
+			} else {
+				errCh <- nil
+			}
+		}()
+	}
+
 	// The pruner goroutine always runs; without a retention policy it
 	// returns immediately and reports nil so shutdown accounting holds.
 	remaining++ // + pruner

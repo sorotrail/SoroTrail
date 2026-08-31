@@ -1372,6 +1372,45 @@ func (s *SQLite) SetContractSpec(ctx context.Context, wasmHash, contractID strin
 	return nil
 }
 
+func (s *SQLite) GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error) {
+	var specJSON string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT spec_json FROM contract_spec_overrides WHERE contract_id = ?`, contractID,
+	).Scan(&specJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading contract spec override for %s: %w", contractID, err)
+	}
+	return []byte(specJSON), nil
+}
+
+func (s *SQLite) SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO contract_spec_overrides (contract_id, spec_json, updated_at)
+		VALUES (?, ?, datetime('now'))
+		ON CONFLICT (contract_id) DO UPDATE SET
+			spec_json  = excluded.spec_json,
+			updated_at = excluded.updated_at`,
+		contractID, string(specJSON),
+	)
+	if err != nil {
+		return fmt.Errorf("saving contract spec override for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+func (s *SQLite) DeleteContractSpecOverride(ctx context.Context, contractID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM contract_spec_overrides WHERE contract_id = ?`, contractID,
+	)
+	if err != nil {
+		return fmt.Errorf("deleting contract spec override for %s: %w", contractID, err)
+	}
+	return nil
+}
+
 func (s *SQLite) Stats(ctx context.Context, _ Scope) (Stats, error) {
 	var st Stats
 	err := s.db.QueryRowContext(ctx, `

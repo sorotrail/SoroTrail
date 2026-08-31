@@ -693,6 +693,20 @@ type SpecCacheStats struct {
 	// Pruner counters are populated only when retention is configured;
 	// omitted from JSON when the pruner is a no-op.
 	Pruner PrunerStats `json:"pruner,omitempty"`
+	// Spec-cache counters are populated only when the API layer is given
+	// a spec cache; omitted from JSON otherwise.
+	SpecCache SpecCacheStats `json:"spec_cache,omitempty"`
+}
+
+// SpecCacheStats is a JSON-friendly view of spec.CacheStats. Defined here
+// so json.Marshal sees concrete field tags (same pattern as AuditStats).
+type SpecCacheStats struct {
+	CachedSpecs   int    `json:"cached_specs"`
+	Hits          uint64 `json:"hits"`
+	Misses        uint64 `json:"misses"`
+	Fetches       uint64 `json:"fetches"`
+	Expiries      uint64 `json:"expiries"`
+	Invalidations uint64 `json:"invalidations"`
 }
 
 // PrunerStats is a JSON-friendly view of pruner.Metrics.
@@ -927,6 +941,17 @@ type Store interface {
 	// or ErrNotFound when no spec is cached for that hash.
 	GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error)
 	SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error
+
+	// Contract spec overrides: user-supplied spec JSON per contract_id,
+	// preferred over the RPC-fetched spec during enrichment. Used when a
+	// contract does not expose a fetchable spec.
+	// GetContractSpecOverride returns the stored spec JSON for the contract,
+	// or ErrNotFound when no override exists.
+	GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error)
+	// SetContractSpecOverride upserts the override for the contract.
+	SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error
+	// DeleteContractSpecOverride removes the override. Idempotent.
+	DeleteContractSpecOverride(ctx context.Context, contractID string) error
 
 	// DeleteEventsBeforeLedger deletes all events with a ledger strictly less than
 	// the given ledger number. It returns the number of rows deleted.
