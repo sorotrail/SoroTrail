@@ -3,7 +3,7 @@ replicaCount: 1
 
 image:
   # Container image repository.
-  repository: ghcr.io/khaylebfortune/sorotrail
+  repository: ghcr.io/sorotrail/sorotrail
   pullPolicy: IfNotPresent
   # Overrides the image tag. Defaults to the chart's appVersion.
   tag: ""
@@ -40,17 +40,29 @@ service:
 
 # CPU/memory requests and limits.
 # ref: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-resources: {}
-  # requests:
-  #   cpu: 100m
-  #   memory: 128Mi
-  # limits:
-  #   cpu: 500m
-  #   memory: 256Mi
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
 
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# ── Pod Disruption Budget ────────────────────────────────────────────────────
+#
+# Forbids voluntary disruptions (node drain, cluster upgrade) from taking
+# down every replica at once. Only useful when replicaCount > 1, but
+# harmless to leave enabled — an empty PDB has no effect.
+#
+pdb:
+  enabled: false
+  # Set one of these, not both.  "1" means at least one pod must stay up.
+  minAvailable: 1
+  # maxUnavailable: 1
 
 # ── SoroTrail application configuration ──────────────────────────────────────
 
@@ -84,6 +96,11 @@ config:
   # Log verbosity: debug | info | warn | error
   logLevel: "info"
 
+  # Optional: comma-separated browser origins allowed to call the API.
+  # "*" allows any origin; otherwise list explicit origins (scheme + host).
+  # Empty = CORS disabled (no CORS headers emitted).
+  corsAllowedOrigins: ""
+
   # Per-client-IP rate limiting. Both rps and burst must be set to enable;
   # leaving either empty disables the middleware entirely.
   rateLimitRps: ""
@@ -92,6 +109,9 @@ config:
   # Honor X-Forwarded-For for client IP detection.
   # Only enable behind a trusted proxy that strips/rewrites the header.
   rateLimitTrustedProxy: ""
+
+  # Expose the Prometheus /metrics endpoint.
+  enableMetrics: ""
 
 # ── Database ──────────────────────────────────────────────────────────────────
 #

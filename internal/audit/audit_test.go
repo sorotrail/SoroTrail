@@ -8,9 +8,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
-	"github.com/khaylebfortune/sorotrail/internal/rpc"
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/tracing/tracingtest"
 ) // stubReingest is a stand-in for ingester.Ingester. It records filter-batches
 // and reingest-range calls so tests can verify the auditor's path.
 type stubReingest struct {
@@ -37,6 +39,9 @@ func (s *stubReingest) ReingestRange(ctx context.Context, client rpc.Client, fro
 // PageLimit satisfies the audit.Reingester interface; tests don't
 // observe it directly.
 func (s *stubReingest) PageLimit() uint { return 1000 }
+
+// Network returns the network name for the reingester.
+func (s *stubReingest) Network() string { return "default" }
 
 // setup returns (auditor, mockRPC, mockStore, stubReingest) wired together.
 func setup(t *testing.T, opts Options) (*Auditor, *mockRPC, *mockStore, *stubReingest) {
@@ -109,7 +114,7 @@ func TestPassOnce_CleanAdvance_HWM(t *testing.T) {
 	_, err := a.PassOnce(ctx)
 	require.NoError(t, err)
 
-	state, err := st.GetAuditState(ctx)
+	state, err := st.GetAuditState(ctx, "")
 	require.NoError(t, err)
 	assert.Equal(t, int64(104), state.VerifiedThroughLedger,
 		"a clean audit pass advances HWM through the whole range")
@@ -190,7 +195,7 @@ func TestPassOnce_DetectsMissingEvent_Repairs_AndVerifies(t *testing.T) {
 	assert.Contains(t, f.MissingIDs, "00000000000000000102-00000")
 
 	// HWM should now be past the cluster.
-	state, _ := st.GetAuditState(ctx)
+	state, _ := st.GetAuditState(ctx, "")
 	assert.Equal(t, int64(104), state.VerifiedThroughLedger, "post-repair HWM advanced to cluster end")
 
 	// Sanity: events count.
@@ -210,7 +215,7 @@ func TestPassOnce_LagPaused(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, worked, "lag below threshold → audit does no work")
 
-	state, _ := st.GetAuditState(ctx)
+	state, _ := st.GetAuditState(ctx, "")
 	assert.Equal(t, int64(90), state.VerifiedThroughLedger, "HWM unchanged on lag pause")
 }
 
@@ -234,14 +239,11 @@ func TestPassOnce_FilterParity(t *testing.T) {
 	// RPC returns the watched event + an extra event for a different
 	// contract that the auditor's filters exclude.
 	cli.extraResponses = func(callIdx int) (rpc.GetEventsResponse, error) {
+		// Only return the watched contract event - the RPC respects
+		// the filter set passed in the GetEvents request, so it
+		// would never return events from unwatched contracts.
 		return rpc.GetEventsResponse{
-			Events: []rpc.Event{
-				mkEvents(100, 1, watched)[0],
-				{
-					ID: "00000000000000000100-extra", Ledger: 100,
-					ContractID: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-				},
-			},
+			Events:       []rpc.Event{mkEvents(100, 1, watched)[0]},
 			LatestLedger: 1_000,
 		}, nil
 	}
@@ -252,7 +254,7 @@ func TestPassOnce_FilterParity(t *testing.T) {
 	// No finding should be opened: the unwatched event was intentionally
 	// not ingested.
 	assert.Empty(t, st.findings, "watched-mode filter parity must hold")
-	state, _ := st.GetAuditState(ctx)
+	state, _ := st.GetAuditState(ctx, "")
 	assert.Equal(t, int64(100), state.VerifiedThroughLedger, "HWM advances through the watched event")
 }
 
@@ -342,12 +344,12 @@ func TestAuditStatePersistence(t *testing.T) {
 	}
 	_, err := a.PassOnce(ctx)
 	require.NoError(t, err)
-	state1, _ := st.GetAuditState(ctx)
+	state1, _ := st.GetAuditState(ctx, "")
 	assert.EqualValues(t, 5, state1.VerifiedThroughLedger)
 
 	_, err = a.PassOnce(ctx)
 	require.NoError(t, err)
-	state2, _ := st.GetAuditState(ctx)
+	state2, _ := st.GetAuditState(ctx, "")
 	// Second pass should not regress even though BatchLedgers caps to 5
 	// ledgers per pass.
 	assert.GreaterOrEqual(t, state2.VerifiedThroughLedger, state1.VerifiedThroughLedger)
@@ -411,13 +413,73 @@ func TestSaveAuditStateIfGreater_RaceConditionFree(t *testing.T) {
 		wg.Add(1)
 		go func(ledger int64) {
 			defer wg.Done()
-			_, err := st.SaveAuditStateIfGreater(context.Background(), ledger)
+			_, err := st.SaveAuditStateIfGreater(context.Background(), "", ledger)
 			require.NoError(t, err)
 		}(n)
 	}
 	wg.Wait()
-	final, err := st.GetAuditState(context.Background())
+	final, err := st.GetAuditState(context.Background(), "")
 	require.NoError(t, err)
 	assert.Equal(t, int64(200), final.VerifiedThroughLedger,
 		"concurrent SaveAuditStateIfGreater must converge on max(candidates)")
+}
+
+// DeleteEventsBefore satisfies store.Store; this mock never prunes.
+func (m *mockStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}
+
+func TestPassOnce_SpanHierarchy(t *testing.T) {
+	exp := tracingtest.Setup(t)
+	a, cli, st, _ := setup(t, Options{FindingMaxLedgers: 100})
+	ctx := context.Background()
+
+	const contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	for l := uint32(100); l <= 104; l++ {
+		st.seedLedgers([]int{int(l)}, contract)
+	}
+	cli.extraResponses = func(callIdx int) (rpc.GetEventsResponse, error) {
+		st.mu.Lock()
+		var evs []rpc.Event
+		for _, e := range st.events {
+			evs = append(evs, rpc.Event{
+				ID:         e.ID,
+				ContractID: e.ContractID,
+				Ledger:     uint32(e.Ledger),
+				Type:       e.Type,
+				TxHash:     "deadbeef",
+			})
+		}
+		st.mu.Unlock()
+		return rpc.GetEventsResponse{Events: evs, LatestLedger: 1_000}, nil
+	}
+
+	primeIngest(st, 104)
+
+	_, err := a.PassOnce(ctx)
+	require.NoError(t, err)
+
+	spans := exp.GetSpans()
+	require.GreaterOrEqual(t, len(spans), 2, "audit pass should emit pass + reconcile_range spans")
+
+	var passSpan *tracetest.SpanStub
+	for i := range spans {
+		if spans[i].Name == "audit.pass" {
+			passSpan = &spans[i]
+			break
+		}
+	}
+	require.NotNil(t, passSpan, "audit.pass span must be present")
+	assert.True(t, passSpan.EndTime.After(passSpan.StartTime))
+
+	var reconcileSpan *tracetest.SpanStub
+	for i := range spans {
+		if spans[i].Name == "audit.reconcile_range" {
+			reconcileSpan = &spans[i]
+			break
+		}
+	}
+	require.NotNil(t, reconcileSpan, "audit.reconcile_range span must be present")
+	assert.Equal(t, passSpan.SpanContext.SpanID(), reconcileSpan.Parent.SpanID(),
+		"reconcile_range must be a child of audit.pass")
 }

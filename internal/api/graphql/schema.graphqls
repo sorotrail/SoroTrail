@@ -1,0 +1,216 @@
+# SoroTrail GraphQL schema.
+#
+# Scope: read-only. Mirrors the REST surface — events, contracts — plus
+# a `tokenEvents` query that returns events enriched with spec-driven
+# field decoding (the closest analog of "recognizable token events"
+# without a dedicated token table). Filtering inputs map onto the same
+# set of fields the REST handlers already accept, and cursor pagination
+# follows the Relay spec so clients can use off-the-shelf relay
+# implementations.
+#
+# Limits enforced at the resolver layer:
+#   - Query depth: hard cap of 10.
+#   - Query complexity: hard cap of 1000.
+#
+# Both limits are documented in the README and configured via gqlgen
+# extensions in the resolver wiring.
+
+# Pagination ---------------------------------------------------------------
+
+# PageInfo is the Relay-style connection terminator. hasNextPage is
+# true when the store reports a non-empty cursor for the current page;
+# the client passes endCursor back as `after:` to fetch the next page.
+type PageInfo {
+  "True when the resolver returned a non-empty cursor for the next page."
+  hasNextPage: Boolean!
+  "Opaque cursor pointing at the last edge in this page. Use as `after:` for the next request."
+  endCursor: Cursor
+}
+
+# Cursor is an opaque base64-encoded token used by Relay connections.
+# Clients MUST treat cursors as opaque strings and NOT parse them.
+scalar Cursor
+
+# Sort orders for events and contracts.
+enum SortOrder {
+  ASC
+  DESC
+}
+
+# Sort columns accepted by the events queries. Mirrors REST order_by.
+enum EventOrderBy {
+  ID
+  LEDGER
+  CREATED_AT
+}
+
+# Event --------------------------------------------------------------------
+
+# Event type mirrors store.Event field-for-field. JSON fields (topics /
+# value) are exposed as the JSON scalar so clients can introspect shape
+# without SoroTrail having to define a tagged-union just for the
+# GraphQL surface.
+type Event {
+  id: ID!
+  contractId: String!
+  ledger: Int!
+  type: String!
+  txHash: String!
+  txIndex: Int!
+  opIndex: Int!
+  inSuccessfulCall: Boolean!
+  topics: JSON!
+  value: JSON!
+  createdAt: DateTime!
+}
+
+# Topic-position filter. Topics are matched positionally against the
+# event's topics array using the same JSON containment semantics the
+# REST API exposes as `?topic0=...` (etc.).
+input TopicPositionFilterInput {
+  "Filter against the event-name topic (topic[0])."
+  t0: JSON
+  "Filter against the second topic position."
+  t1: JSON
+  "Filter against the third topic position."
+  t2: JSON
+  "Filter against the fourth topic position."
+  t3: JSON
+}
+
+# EventFilterInput mirrors the filter query parameters the REST API
+# accepts. A nil / zero value on any field means "no constraint".
+input EventFilterInput {
+  "Filter by Stellar contract strkey (e.g. C...)."
+  contractId: String
+  "Filter by event type: contract | system | diagnostic."
+  types: [String!]
+  "Match an event whose topics array contains this value at any position."
+  topic: JSON
+  "Positional topic filters (t0 = event name, t1..t3 = subsequent topics)."
+  topics: TopicPositionFilterInput
+  "Jsonb-array containment on the topics field. Multi-element arrays are valid."
+  topicContains: JSON
+  "Filter by hex-encoded transaction hash."
+  txHash: String
+  "Inclusive lower ledger bound."
+  fromLedger: Int
+  "Inclusive upper ledger bound."
+  toLedger: Int
+  "Inclusive lower bound on event timestamp (RFC3339). Mutually exclusive with fromLedger."
+  fromTime: DateTime
+  "Inclusive upper bound on event timestamp (RFC3339)."
+  toTime: DateTime
+}
+
+# Pagination input mirrors Relay: `first`/`after` for forward, `last`/
+# `before` for backward. Forward and backward pagination cannot be
+# combined in the same query.
+input PageInput {
+  "Number of edges requested (1..MaxPageSize; default DefaultPageSize)."
+  first: Int
+  "Cursor of the edge to fetch after."
+  after: Cursor
+  "Number of edges requested from the end."
+  last: Int
+  "Cursor of the edge to fetch before."
+  before: Cursor
+  "Sort direction. ASC (default) or DESC."
+  order: SortOrder
+  "Sort column for events. Default ID."
+  orderBy: EventOrderBy
+}
+
+# Connections ---------------------------------------------------------------
+
+type EventEdge {
+  cursor: Cursor!
+  node: Event!
+}
+
+type EventConnection {
+  edges: [EventEdge!]!
+  nodes: [Event!]!
+  pageInfo: PageInfo!
+  "Total events matching the filter, ignoring pagination."
+  totalCount: Int!
+}
+
+# Token events --------------------------------------------------------------
+
+type TokenEvent {
+  id: ID!
+  contractId: String!
+  ledger: Int!
+  type: String!
+  txHash: String!
+  txIndex: Int!
+  opIndex: Int!
+  inSuccessfulCall: Boolean!
+  topics: JSON!
+  value: JSON!
+  createdAt: DateTime!
+  "True when the resolver successfully mapped the event to a spec entry."
+  decoded: Boolean!
+  "Field names + values derived from the contract spec; nil when decoded=false."
+  decodedEvent: DecodedEvent
+}
+
+type DecodedEvent {
+  "Event name from the contract spec (typically topic[0])."
+  name: String!
+  "Named-field view of the event payload. Keys are spec field names; values are decoded."
+  fields: JSON
+}
+
+type TokenEventEdge {
+  cursor: Cursor!
+  node: TokenEvent!
+}
+
+type TokenEventConnection {
+  edges: [TokenEventEdge!]!
+  nodes: [TokenEvent!]!
+  pageInfo: PageInfo!
+  "Total events matching the filter, ignoring pagination."
+  totalCount: Int!
+}
+
+# Watched contracts --------------------------------------------------------
+
+type Contract {
+  contractId: String!
+  addedAt: DateTime!
+}
+
+type ContractEdge {
+  cursor: Cursor!
+  node: Contract!
+}
+
+type ContractConnection {
+  edges: [ContractEdge!]!
+  nodes: [Contract!]!
+  pageInfo: PageInfo!
+  "Total watched contracts."
+  totalCount: Int!
+}
+
+# Queries ------------------------------------------------------------------
+
+type Query {
+  "List Soroban contract events."
+  events(filter: EventFilterInput, page: PageInput): EventConnection!
+
+  "Fetch a single event by ID. Returns null when the event is not in the store."
+  event(id: ID!): Event
+
+  "List events with spec-driven field decoding applied."
+  tokenEvents(filter: EventFilterInput, page: PageInput): TokenEventConnection!
+
+  "List watched contracts (the runtime subset of indexed contracts)."
+  contracts(page: PageInput): ContractConnection!
+
+  "Fetch a single watched contract by ID. Returns null when the contract is not in the watch list."
+  contract(id: ID!): Contract
+}

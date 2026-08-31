@@ -1,0 +1,232 @@
+# Prometheus recording and alerting rules for SoroTrail.
+#
+# Load this file via Prometheus rule_files configuration:
+#   rule_files:
+#     - "deploy/prometheus/sorotrail-rules.yml"
+#
+# All thresholds below are justified in the alert annotations.
+
+groups:
+  # ── Recording rules ────────────────────────────────────────────────────
+  # Pre-aggregate expensive queries so the dashboard and alerts share
+  # the same underlying data and don't double-scan the TSDB.
+  - name: sorotrail_recording
+    interval: 30s
+    rules:
+      # Ingestion throughput (events persisted per second, 5m window).
+      - record: sorotrail:events_ingested:rate5m
+        expr: rate(sorotrail_events_ingested_total[5m])
+
+      # Ingestion error rate (terminal pass failures per second).
+      - record: sorotrail:ingest_errors:rate5m
+        expr: rate(sorotrail_ingest_errors_total[5m])
+
+      # RPC call rate.
+      - record: sorotrail:rpc_calls:rate5m
+        expr: rate(sorotrail_rpc_call_duration_seconds_count[5m])
+
+      # RPC P95/P99 latency.
+      - record: sorotrail:rpc_latency:p95_5m
+        expr: histogram_quantile(0.95, rate(sorotrail_rpc_call_duration_seconds_bucket[5m]))
+      - record: sorotrail:rpc_latency:p99_5m
+        expr: histogram_quantile(0.99, rate(sorotrail_rpc_call_duration_seconds_bucket[5m]))
+
+      # DB write P95/P99 latency.
+      - record: sorotrail:db_write_latency:p95_5m
+        expr: histogram_quantile(0.95, rate(sorotrail_db_write_duration_seconds_bucket[5m]))
+      - record: sorotrail:db_write_latency:p99_5m
+        expr: histogram_quantile(0.99, rate(sorotrail_db_write_duration_seconds_bucket[5m]))
+
+      # Backpressure rate.
+      - record: sorotrail:backpressure:rate5m
+        expr: rate(sorotrail_event_backpressure_total[5m])
+
+  # ── Alerting rules ─────────────────────────────────────────────────────
+  - name: sorotrail_alerts
+    rules:
+      # ── Ingestion Lag ────────────────────────────────────────────────────
+      # The indexer is falling behind the Stellar RPC chain head.
+      #
+      # Threshold justification:
+      #   200 ledgers × ~5 s/ledger ≈ 16 min. The default RPC retention
+      #   window is ~24 h (17 280 ledgers on the public testnet), so 200
+      #   ledgers is well within the safe zone. However, sustained lag at
+      #   this level signals the ingester can't keep up — if the RPC
+      #   retention window were to shrink (e.g. provider change, incident)
+      #   the gap could become unrecoverable.
+      #
+      # What to do:
+      #   1. Check sorotrail_rpc_call_duration_seconds P99 — is the RPC slow?
+      #   2. Check sorotrail_ingest_errors_total — are passes failing?
+      #   3. Check sorotrail_event_backpressure_total — is the DB the bottleneck?
+      #   4. Check RPC_RATE_LIMIT — is the rate limiter too conservative?
+      #   5. Check WATCHED_CONTRACTS — too many contracts increases RPC load.
+      - alert: IngestionLagHigh
+        expr: sorotrail_ingestion_lag_ledgers > 200
+        for: 5m
+        labels:
+          severity: warning
+          component: ingester
+        annotations:
+          summary: "SoroTrail ingestion lag exceeds 200 ledgers"
+          description: >-
+            SoroTrail indexer is {{ $value }} ledgers behind the Stellar RPC chain head
+            (threshold: 200, ≈ 16 min at ~5 s/ledger). Sustained lag risks an
+            unrecoverable data gap if the RPC retention window closes.
+            Check RPC latency, ingestion errors, and DB backpressure.
+          runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+
+      # ── Ingestion Errors ────────────────────────────────────────────────
+      # Terminal ingestion pass failures (RPC errors, decode failures,
+      # DB write failures).
+      #
+      # Threshold justification:
+      #   Any non-zero sustained error rate means data is being dropped.
+      #   The ingester retries per-call (RPC_MAX_ATTEMPTS), so a terminal
+      #   pass failure means every retry was exhausted. Even a low rate
+      #   (0.01 errors/s = 1 error per ~100 s) compounds into a growing
+      #   lag over hours.
+      #
+      # What to do:
+      #   1. Check sorotrail_rpc_call_duration_seconds — are calls timing out?
+      #   2. Check logs for "ingestion pass failed" — is it RPC, decode, or DB?
+      #   3. If RPC: verify RPC_URL is reachable, check rate limiting (429s).
+      #   4. If DB: check sorotrail_db_write_duration_seconds, Postgres health.
+      #   5. If decode: check for protocol upgrades requiring a decoder update.
+      - alert: IngestionErrorsBurst
+        expr: rate(sorotrail_ingest_errors_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: ingester
+        annotations:
+          summary: "SoroTrail ingestion errors detected"
+          description: >-
+            SoroTrail ingestion pass error rate is {{ $value | humanize }} errors/s
+            for the last 10 minutes. Any sustained error rate means events are
+            being dropped. Check RPC reachability, rate limiting, and database health.
+          runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+
+      # ── RPC P99 Latency ─────────────────────────────────────────────────
+      # Slow RPC calls indicate provider issues or network problems.
+      #
+      # Threshold justification:
+      #   The default POLL_INTERVAL is 5 s. If the P99 of a single RPC
+      #   call exceeds 5 s, the ingester cannot complete a cycle within
+      #   one poll interval, causing it to fall behind. At 10 s P99 the
+      #   situation is critical — each cycle takes at least 2x the
+      #   intended interval.
+      #
+      # What to do:
+      #   1. Verify RPC_URL is the correct endpoint for your network.
+      #   2. Check if the RPC provider has an incident or is throttling.
+      #   3. If using RPC_URLS multi-provider: check health scores — the
+      #      degraded provider may need to be removed.
+      #   4. Consider increasing RPC_RATE_LIMIT if on a paid plan.
+      - alert: RPCP99LatencyHigh
+        expr: histogram_quantile(0.99, rate(sorotrail_rpc_call_duration_seconds_bucket[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+          component: rpc
+        annotations:
+          summary: "SoroTrail RPC P99 latency exceeds 5 seconds"
+          description: >-
+            Stellar RPC call P99 latency is {{ $value | humanizeDuration }} (threshold: 5 s).
+            The default poll interval is 5 s, so the ingester cannot keep up.
+            Check RPC provider status, network connectivity, and rate limiting.
+          runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+
+      # ── DB Write P99 Latency ────────────────────────────────────────────
+      # Slow database writes indicate Postgres saturation or connection
+      # pool exhaustion.
+      #
+      # Threshold justification:
+      #   DB writes above 10 s P99 indicate Postgres is saturated. The
+      #   adaptive batch controller will already be throttling (backpressure
+      #   > 0) but this alert fires when the underlying write itself is
+      #   slow, not just that the ingester is pushing too fast. This is
+      #   an infrastructure-level signal that Postgres needs attention
+      #   (connection pool sizing, vacuum, disk I/O, etc.).
+      #
+      # What to do:
+      #   1. Check Postgres metrics: connections, locks, disk I/O, vacuum.
+      #   2. Check sorotrail_event_backpressure_seconds_total — how long
+      #      has backpressure been active?
+      #   3. Check sorotrail_event_batch_size — has it scaled down?
+      #   4. Consider: connection pool limits, index bloat, table bloat.
+      #   5. If using managed Postgres: check provider dashboard for limits.
+      - alert: StoreWriteLatencyHigh
+        expr: histogram_quantile(0.99, rate(sorotrail_db_write_duration_seconds_bucket[5m])) > 10
+        for: 10m
+        labels:
+          severity: warning
+          component: store
+        annotations:
+          summary: "SoroTrail DB write P99 latency exceeds 10 seconds"
+          description: >-
+            Database write P99 latency is {{ $value | humanizeDuration }} (threshold: 10 s).
+            Postgres may be saturated. Check connection pool, disk I/O, locks,
+            and vacuum status. The adaptive batch controller is likely throttling
+            — check sorotrail_event_batch_size.
+          runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+
+      # ── Backpressure Active ─────────────────────────────────────────────
+      # The ingester is deliberately throttling because the DB can't keep up.
+      #
+      # Threshold justification:
+      #   Backpressure fires when the store falls behind the latency budget.
+      #   A 15-minute window avoids alerting on transient spikes (e.g. a
+      #   single large batch). Sustained backpressure means the DB write
+      #   rate is lower than the ingestion rate — the batch controller
+      #   will scale down, but throughput drops proportionally.
+      #
+      # What to do:
+      #   1. Check sorotrail_event_batch_size — how far has the controller scaled down?
+      #   2. Check sorotrail_db_write_duration_seconds — is the DB slow?
+      #   3. Check Postgres metrics (connections, locks, I/O).
+      #   4. Consider: increasing DB resources, reducing WATCHED_CONTRACTS,
+      #      or lowering RPC_RATE_LIMIT to reduce write pressure.
+      - alert: BackpressureActive
+        expr: rate(sorotrail_event_backpressure_total[5m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: ingester
+        annotations:
+          summary: "SoroTrail backpressure sustained for 15+ minutes"
+          description: >-
+            The event write backpressure has been active for 15+ minutes
+            at {{ $value | humanize }}/s. The DB cannot absorb the ingester's
+            write rate. Check DB health, batch size, and write latency.
+          runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+
+      # ── Batch Size Critical ─────────────────────────────────────────────
+      # The adaptive batch controller has scaled down to near-minimum.
+      #
+      # Threshold justification:
+      #   The batch controller starts at the configured maximum and steps
+      #   down under latency pressure. A batch size below 10 means the
+      #   store is severely strained and ingestion throughput is near zero.
+      #   At this point the indexer is effectively stalled — each cycle
+      #   writes only a handful of events.
+      #
+      # What to do:
+      #   1. This is a downstream effect — the root cause is almost always
+      #      slow DB writes. Check sorotrail_db_write_duration_seconds.
+      #   2. Check Postgres: is it overloaded, out of disk, locked?
+      #   3. Check if a migration or vacuum is running.
+      #   4. Consider scaling up Postgres or reducing ingestion rate.
+      - alert: EventBatchSizeCritical
+        expr: sorotrail_event_batch_size < 10
+        for: 10m
+        labels:
+          severity: critical
+          component: ingester
+        annotations:
+          summary: "SoroTrail event batch size below 10 — ingestion nearly stalled"
+          description: >-
+            The adaptive batch size is {{ $value }} (threshold: < 10).
+            The DB is severely strained and ingestion throughput is near zero.
+            Check DB write latency and Postgres health immediately.
+          runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"

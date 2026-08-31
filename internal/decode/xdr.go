@@ -4,10 +4,23 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math/big"
+	"sync/atomic"
 
-	"github.com/stellar/go/xdr"
+	"github.com/stellar/go-stellar-sdk/xdr"
 )
+
+// decodeErrors counts ScVal decode failures. Incremented by DecodeScVal
+// when unmarshaling or conversion fails. Reset only on process restart.
+// Exposed via DecodeErrorCount for monitoring / stats aggregation.
+var decodeErrors atomic.Uint64
+
+// DecodeErrorCount returns the number of ScVal XDR decode failures since
+// process start. A non-zero value indicates events whose raw XDR could not
+// be decoded — they are stored in a lossless fallback form so ingestion
+// never stalls.
+func DecodeErrorCount() uint64 { return decodeErrors.Load() }
 
 // XDRDecoder decodes base64 XDR ScVals into a typed-object JSON shape,
 // e.g. {"symbol": "transfer"}, {"u64": 123}, {"address": "C..."}.
@@ -22,17 +35,40 @@ var _ Decoder = XDRDecoder{}
 func (XDRDecoder) DecodeScVal(base64XDR string) (json.RawMessage, error) {
 	var val xdr.ScVal
 	if err := xdr.SafeUnmarshalBase64(base64XDR, &val); err != nil {
-		return nil, fmt.Errorf("unmarshaling ScVal XDR: %w", err)
+		decodeErrors.Add(1)
+		slog.Warn("decode: unmarshaling ScVal XDR", "error", err, "base64_len", len(base64XDR))
+		// Preserve the raw value in a lossless fallback so ingestion
+		// never stalls on a single un-decodable value.
+		return fallbackDecode(base64XDR, err), nil
 	}
 	v, err := scValToGo(val)
 	if err != nil {
-		return nil, err
+		decodeErrors.Add(1)
+		slog.Warn("decode: converting ScVal", "type", val.Type.String(), "error", err)
+		return fallbackDecode(base64XDR, err), nil
 	}
 	out, err := json.Marshal(v)
 	if err != nil {
-		return nil, fmt.Errorf("marshaling decoded ScVal: %w", err)
+		decodeErrors.Add(1)
+		slog.Warn("decode: marshaling ScVal", "error", err)
+		return fallbackDecode(base64XDR, err), nil
 	}
 	return out, nil
+}
+
+// fallbackDecode returns a lossless {"unknown": ...} wrapper for a value
+// that could not be decoded, preserving the raw base64 XDR so a future
+// decoder version can reprocess it. The error is embedded in the metadata
+// so the operator can inspect what went wrong.
+func fallbackDecode(base64XDR string, decodeErr error) json.RawMessage {
+	fallback, _ := json.Marshal(map[string]any{
+		"unknown": map[string]any{
+			"type":   "decode_error",
+			"base64": base64XDR,
+			"error":  decodeErr.Error(),
+		},
+	})
+	return fallback
 }
 
 // scValToGo maps one ScVal onto plain Go values that marshal to the JSON
@@ -95,25 +131,41 @@ func scValToGo(val xdr.ScVal) (any, error) {
 		}
 		return map[string]any{"vec": items}, nil
 	case xdr.ScValTypeScvMap:
-		m := *val.Map
-		if m == nil {
+		if val.Map == nil || *val.Map == nil {
 			return map[string]any{"map": []any{}}, nil
 		}
-		// Maps become ordered [{"key": K, "val": V}] pairs since ScMap keys
-		// aren't restricted to strings.
-		entries := make([]any, 0, len(*m))
-		for _, entry := range *m {
-			k, err := scValToGo(entry.Key)
-			if err != nil {
-				return nil, err
-			}
-			v, err := scValToGo(entry.Val)
-			if err != nil {
-				return nil, err
-			}
-			entries = append(entries, map[string]any{"key": k, "val": v})
+		entries, err := scMapToGo(**val.Map)
+		if err != nil {
+			return nil, err
 		}
 		return map[string]any{"map": entries}, nil
+	case xdr.ScValTypeScvContractInstance:
+		// SCV_CONTRACT_INSTANCE carries the contract's instance struct: which
+		// executable runs it plus its persistent storage map.
+		inst := *val.Instance
+		exec, err := contractExecutableToGo(inst.Executable)
+		if err != nil {
+			return nil, err
+		}
+		storage := []any{}
+		if inst.Storage != nil {
+			storage, err = scMapToGo(*inst.Storage)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return map[string]any{"contract_instance": map[string]any{
+			"executable": exec,
+			"storage":    storage,
+		}}, nil
+	case xdr.ScValTypeScvLedgerKeyNonce:
+		// SCNonceKey struct: the nonce guarding a contract's auth entries.
+		return map[string]any{"ledger_key_nonce": map[string]any{"nonce": int64(val.NonceKey.Nonce)}}, nil
+	case xdr.ScValTypeScvExecutableTag:
+		return map[string]any{"executable_tag": string(*val.ExecutableTag)}, nil
+	// SCV_LEDGER_KEY_CONTRACT_INSTANCE is a payload-less void marker used only
+	// as a special contract-data key; it is intentionally left to the lossless
+	// {"unknown": ...} fallback below rather than emitting an empty object.
 	case xdr.ScValTypeScvError:
 		e := map[string]any{"type": val.Error.Type.String()}
 		if val.Error.ContractCode != nil {
@@ -132,6 +184,56 @@ func scValToGo(val xdr.ScVal) (any, error) {
 		}
 		return map[string]any{"unknown": map[string]any{
 			"type":   val.Type.String(),
+			"base64": raw,
+		}}, nil
+	}
+}
+
+// scMapToGo converts an ScMap into an ordered list of {"key": K, "val": V}
+// pairs. ScMap keys aren't restricted to strings, so collapsing them into a
+// JSON object would lose information; the ordered pair form preserves it.
+// Shared by ScVal maps and contract-instance storage.
+func scMapToGo(m xdr.ScMap) ([]any, error) {
+	entries := make([]any, 0, len(m))
+	for _, entry := range m {
+		k, err := scValToGo(entry.Key)
+		if err != nil {
+			return nil, err
+		}
+		v, err := scValToGo(entry.Val)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, map[string]any{"key": k, "val": v})
+	}
+	return entries, nil
+}
+
+// contractExecutableToGo converts a ContractExecutable union — the executable
+// arm of SCV_CONTRACT_INSTANCE — into JSON. Unknown arms fall back to the same
+// lossless {"unknown": ...} wrapper as scValToGo.
+func contractExecutableToGo(exec xdr.ContractExecutable) (any, error) {
+	switch exec.Type {
+	case xdr.ContractExecutableTypeContractExecutableWasm:
+		return map[string]any{"wasm_hash": exec.WasmHash.HexString()}, nil
+	case xdr.ContractExecutableTypeContractExecutableStellarAsset:
+		return map[string]any{"stellar_asset": nil}, nil
+	case xdr.ContractExecutableTypeContractExecutableExternalRef:
+		owner, err := exec.ExternalRef.ExecutableOwner.String()
+		if err != nil {
+			return nil, fmt.Errorf("rendering external-ref owner: %w", err)
+		}
+		return map[string]any{"external_ref": map[string]any{
+			"executable_owner": owner,
+			"tag":              string(exec.ExternalRef.Tag),
+		}}, nil
+	default:
+		raw, err := xdr.MarshalBase64(exec)
+		if err != nil {
+			return nil, fmt.Errorf("re-encoding unhandled ContractExecutable type %s: %w", exec.Type, err)
+		}
+		return map[string]any{"unknown": map[string]any{
+			"type":   exec.Type.String(),
 			"base64": raw,
 		}}, nil
 	}

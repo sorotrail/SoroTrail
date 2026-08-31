@@ -41,14 +41,13 @@ import (
 // exemptPaths are HTTP paths that bypass the limiter. /health is polled
 // by orchestrators and /metrics is scraped by Prometheus — throttling
 // either of those degrades observability without slowing an abuser.
-//
-// /metrics is included prospectively even though the endpoint does not
-// exist yet, so that when it lands it is exempt by default (Prometheus
-// hammering the scrape target would otherwise generate rate-limit
-// errors against the very metrics that operators rely on to see the
-// rate-limit pressure).
+// Prometheus hammering the scrape target would otherwise generate
+// rate-limit errors against the very metrics operators rely on to see
+// the rate-limit pressure.
 var exemptPaths = map[string]bool{
 	"/health":  true,
+	"/livez":   true,
+	"/readyz":  true,
 	"/metrics": true,
 }
 
@@ -58,11 +57,18 @@ type RateLimiter struct {
 	burst   int
 	trusted bool
 
+	hourlyQuota int64
+	dailyQuota  int64
+
 	// idleTTL is the wall-clock age beyond which an untouched bucket is
 	// evicted. sweepEvery is the cleanup tick. Both are tunable for tests
 	// via WithIdleTTL and WithSweepInterval.
 	idleTTL    time.Duration
 	sweepEvery time.Duration
+
+	// resolve, when set, supplies a per-request bucket key and limits
+	// (the tenant path). Nil keeps the IP-keyed instance-wide behavior.
+	resolve LimitResolver
 
 	mu      sync.Mutex
 	buckets map[string]*bucketEntry
@@ -76,8 +82,12 @@ type RateLimiter struct {
 // its most recent observation. lastSeen uses atomic stores so the cleanup
 // sweeper can read it without holding the bucket-map mutex.
 type bucketEntry struct {
-	limiter  *rate.Limiter
-	lastSeen atomic.Int64 // unix nanos
+	limiter   *rate.Limiter
+	lastSeen  atomic.Int64 // unix nanos
+	hourStart time.Time
+	dayStart  time.Time
+	hourUsed  int64
+	dayUsed   int64
 }
 
 // LimiterOption configures optional tuning knobs. Defaults are tuned for
@@ -101,6 +111,42 @@ func WithSweepInterval(d time.Duration) LimiterOption {
 	return func(l *RateLimiter) {
 		if d > 0 {
 			l.sweepEvery = d
+		}
+	}
+}
+
+// LimitResolver derives a request's bucket identity and limits from the
+// request itself. ok=false falls back to the IP-keyed instance-wide limits.
+type LimitResolver func(r *http.Request) (key string, rps float64, burst int, ok bool)
+
+// WithLimitResolver keys the limiter on something other than the source IP —
+// in practice, on the authenticated tenant.
+//
+// Keying on IP is wrong once a deployment is shared. One tenant behind a NAT
+// or a serverless platform presents many addresses and gets many times its
+// quota; several tenants behind one corporate egress share a single bucket
+// and throttle each other. The whole point of per-tenant quotas is that a
+// tenant's budget follows its identity, not its network position.
+func WithLimitResolver(f LimitResolver) LimiterOption {
+	return func(l *RateLimiter) { l.resolve = f }
+}
+
+// WithHourlyQuota sets the maximum number of requests a caller may issue in a
+// rolling one-hour window. Zero disables the quota.
+func WithHourlyQuota(limit int64) LimiterOption {
+	return func(l *RateLimiter) {
+		if limit >= 0 {
+			l.hourlyQuota = limit
+		}
+	}
+}
+
+// WithDailyQuota sets the maximum number of requests a caller may issue in a
+// rolling 24-hour window. Zero disables the quota.
+func WithDailyQuota(limit int64) LimiterOption {
+	return func(l *RateLimiter) {
+		if limit >= 0 {
+			l.dailyQuota = limit
 		}
 	}
 }
@@ -130,8 +176,15 @@ func NewRateLimiter(rps float64, burst int, trustedProxy bool, opts ...LimiterOp
 
 // Enabled reports whether the limiter actually rejects anything. When
 // false, Middleware passes requests through unchanged.
+//
+// A resolver counts as enabled even with no instance-wide limits set: an
+// operator who configures per-tenant quotas but leaves RATE_LIMIT_RPS unset
+// still expects those quotas enforced.
 func (l *RateLimiter) Enabled() bool {
-	return l != nil && l.rps > 0 && l.burst > 0
+	if l == nil {
+		return false
+	}
+	return (l.rps > 0 && l.burst > 0) || l.resolve != nil || l.hourlyQuota > 0 || l.dailyQuota > 0
 }
 
 // Start runs the idle-bucket cleanup goroutine. No-op when disabled.
@@ -204,8 +257,26 @@ func (l *RateLimiter) Middleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		key := l.clientKey(r)
-		lim := l.bucketFor(key)
+		key, rps, burst, resolved := l.limitsFor(r)
+		if resolved && (rps <= 0 || burst <= 0) {
+			// An explicit zero quota is a deny, not an "unset". A tenant
+			// configured with rate_limit_rps=0 is meant to be shut off,
+			// and silently falling back to the instance default would
+			// hand them unlimited access instead.
+			l.writeLimited(w, time.Second, burst)
+			return
+		}
+		if !resolved {
+			// No resolver, or an unauthenticated request: fall back to the
+			// IP-keyed instance-wide bucket.
+			if l.rps <= 0 || l.burst <= 0 {
+				next.ServeHTTP(w, r)
+				return
+			}
+			key, rps, burst = l.clientKey(r), l.rps, l.burst
+		}
+		entry := l.bucketEntryFor(key, rps, burst)
+		lim := entry.limiter
 
 		// Reserve so we can read the actual wait-to-1-token time and use
 		// it for an accurate Retry-After. Cancel undoes the reservation
@@ -215,46 +286,162 @@ func (l *RateLimiter) Middleware(next http.Handler) http.Handler {
 		if !rsv.OK() {
 			// We use burst >= 1 in our validator so n>max tokens is not
 			// reachable; report a conservative retry-after just in case.
-			l.writeLimited(w, l.idleTTL)
+			l.writeLimited(w, l.idleTTL, burst)
 			return
 		}
 		delay := rsv.Delay()
 		if delay > 0 {
 			rsv.Cancel()
-			l.writeLimited(w, ceilSeconds(delay))
+			l.writeLimited(w, ceilSeconds(delay), burst)
 			return
+		}
+		if l.quotaEnabled() {
+			l.mu.Lock()
+			remaining, retryAfter, ok := l.checkQuota(entry)
+			l.mu.Unlock()
+			if !ok {
+				l.writeLimited(w, retryAfter, burst)
+				return
+			}
+			l.setRateLimitHeaders(w, burst, remaining, time.Now().Add(retryAfter))
+		} else {
+			remaining := int64(lim.Tokens())
+			if remaining < 0 {
+				remaining = 0
+			}
+			if remaining > int64(burst) {
+				remaining = int64(burst)
+			}
+			l.setRateLimitHeaders(w, burst, remaining, nextRateLimitReset(lim))
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
+func (l *RateLimiter) setRateLimitHeaders(w http.ResponseWriter, burst int, remaining int64, resetAt time.Time) {
+	if burst > 0 {
+		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(burst))
+	}
+	if remaining < 0 {
+		remaining = 0
+	}
+	w.Header().Set("X-RateLimit-Remaining", strconv.FormatInt(remaining, 10))
+	if !resetAt.IsZero() {
+		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(resetAt.Unix(), 10))
+	}
+}
+
+func nextRateLimitReset(lim *rate.Limiter) time.Time {
+	if lim == nil {
+		return time.Time{}
+	}
+	limit := lim.Limit()
+	if limit <= 0 {
+		return time.Time{}
+	}
+	tokens := lim.Tokens()
+	if tokens >= 1 {
+		return time.Now().Add(time.Second)
+	}
+	wait := time.Duration(
+		(1.0 - tokens) / float64(limit) * float64(time.Second),
+	)
+	if wait <= 0 {
+		wait = time.Second
+	}
+	return time.Now().Add(wait)
+}
+
 // writeLimited sends a 429 with the standard error envelope and a
 // Retry-After header rounded up to whole seconds (RFC 7231 §7.1.3
 // accepts delta-seconds as a non-negative integer).
-func (l *RateLimiter) writeLimited(w http.ResponseWriter, retryAfter time.Duration) {
+func (l *RateLimiter) writeLimited(w http.ResponseWriter, retryAfter time.Duration, burst int) {
 	secs := int(retryAfter.Seconds())
 	if secs < 1 {
 		secs = 1
 	}
 	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	l.setRateLimitHeaders(w, burst, 0, time.Now().Add(retryAfter))
 	writeError(w, http.StatusTooManyRequests,
 		errors.New("rate limit exceeded; retry later"))
 }
 
-// bucketFor returns the per-key limiter, creating one on first sight and
-// refreshing lastSeen so cleanup is debounced.
-func (l *RateLimiter) bucketFor(key string) *rate.Limiter {
+func (l *RateLimiter) quotaEnabled() bool {
+	return l.hourlyQuota > 0 || l.dailyQuota > 0
+}
+
+func (l *RateLimiter) checkQuota(entry *bucketEntry) (remaining int64, retryAfter time.Duration, ok bool) {
+	now := time.Now()
+	if l.hourlyQuota > 0 {
+		if entry.hourStart.IsZero() || now.Sub(entry.hourStart) >= time.Hour {
+			entry.hourStart = now
+			entry.hourUsed = 0
+		}
+		if entry.hourUsed >= l.hourlyQuota {
+			retryAfter = entry.hourStart.Add(time.Hour).Sub(now)
+			if retryAfter < 0 {
+				retryAfter = 0
+			}
+			return 0, retryAfter, false
+		}
+	}
+	if l.dailyQuota > 0 {
+		if entry.dayStart.IsZero() || now.Sub(entry.dayStart) >= 24*time.Hour {
+			entry.dayStart = now
+			entry.dayUsed = 0
+		}
+		if entry.dayUsed >= l.dailyQuota {
+			retryAfter = entry.dayStart.Add(24 * time.Hour).Sub(now)
+			if retryAfter < 0 {
+				retryAfter = 0
+			}
+			return 0, retryAfter, false
+		}
+	}
+	entry.hourUsed++
+	entry.dayUsed++
+	remaining = l.hourlyQuota - entry.hourUsed
+	if l.dailyQuota > 0 {
+		dailyRemaining := l.dailyQuota - entry.dayUsed
+		if l.hourlyQuota <= 0 || dailyRemaining < remaining {
+			remaining = dailyRemaining
+		}
+	}
+	if l.hourlyQuota > 0 && remaining < 0 {
+		remaining = 0
+	}
+	if l.dailyQuota > 0 && remaining < 0 {
+		remaining = 0
+	}
+	return remaining, 0, true
+}
+
+func (l *RateLimiter) bucketEntryFor(key string, rps float64, burst int) *bucketEntry {
 	now := time.Now().UnixNano()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if e, ok := l.buckets[key]; ok {
 		e.lastSeen.Store(now)
-		return e.limiter
+		// An operator who lowers a tenant's quota expects it to bind now,
+		// not whenever the bucket next ages out.
+		if e.limiter.Limit() != rate.Limit(rps) || e.limiter.Burst() != burst {
+			e.limiter.SetLimit(rate.Limit(rps))
+			e.limiter.SetBurst(burst)
+		}
+		return e
 	}
-	e := &bucketEntry{limiter: rate.NewLimiter(rate.Limit(l.rps), l.burst)}
+	e := &bucketEntry{limiter: rate.NewLimiter(rate.Limit(rps), burst)}
 	e.lastSeen.Store(now)
 	l.buckets[key] = e
-	return e.limiter
+	return e
+}
+
+// limitsFor asks the resolver for this request's bucket identity and quota.
+func (l *RateLimiter) limitsFor(r *http.Request) (key string, rps float64, burst int, ok bool) {
+	if l.resolve == nil {
+		return "", 0, 0, false
+	}
+	return l.resolve(r)
 }
 
 // clientKey returns the rate-limit key for this request.
@@ -266,6 +453,9 @@ func (l *RateLimiter) bucketFor(key string) *rate.Limiter {
 // misbehaving upstream proxy that strips the header still produces a
 // usable key instead of silently grouping all such traffic together.
 func (l *RateLimiter) clientKey(r *http.Request) string {
+	if key := credentialFromRequest(r); key != "" {
+		return "api:" + key
+	}
 	if ip := clientIP(r, l.trusted); ip != "" {
 		return ip
 	}
