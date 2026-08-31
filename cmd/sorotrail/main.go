@@ -220,8 +220,13 @@ func run() error {
 	wh := webhook.NewNotifier(st, log)
 
 	// Wire the spec cache and enricher for spec-decoded event views.
-	specCache := spec.NewCache(st)
+	// The cache is keyed by wasm hash with a TTL; the fetcher doubles as
+	// the wasm-hash resolver so contract upgrades (a changed hash)
+	// invalidate the previously cached spec automatically.
 	specFetcher := spec.NewFetcher(rpcClient)
+	specCache := spec.NewCache(st,
+		spec.WithWasmHashResolver(specFetcher),
+	)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
 	// Wrap the raw RPC client so per-method error totals are tracked and
@@ -373,6 +378,9 @@ func run() error {
 			"before_prune", cfg.ArchiveBeforePrune,
 		)
 	}
+
+	// Expose spec-cache hit/miss metrics via /stats.
+	api.SetSpecCache(specCache)
 
 	prn := pruner.NewWithArchiver(st, log, pruner.Options{
 		MaxAge:             cfg.RetentionMaxAge,
