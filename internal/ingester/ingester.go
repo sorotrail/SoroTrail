@@ -144,8 +144,8 @@ type Options struct {
 	// so a severely degraded database cannot stretch a single ingestion
 	// cycle for minutes. Default 1s when batching is enabled.
 	BatchMaxBackoff time.Duration
-	// MinBackoff is the initial error backoff (and the value it resets
-	// to after a successful cycle). Default 1s.
+	// MinBackoff is the initial error backoff before exponential growth.
+	// Default 1s (matches INGESTER_MIN_BACKOFF).
 	MinBackoff time.Duration
 	// MaxBackoff caps the error backoff. Default 1m.
 	MaxBackoff time.Duration
@@ -971,6 +971,23 @@ func (ing *Ingester) sweepBatch(ctx context.Context, ledgerOutOfRange *atomic.Bo
 	}
 }
 
+// removeDuplicateEvents returns a slice of events with duplicate IDs removed,
+// keeping the first occurrence of each ID. This is needed so that when the
+// RPC returns the same event ID multiple times within a single page (e.g.
+// due to RPC quirks or re-fetches), the ingester does not write duplicates
+// in a single batch before the store's own idempotent upserts can absorb them.
+func removeDuplicateEvents(events []store.Event) []store.Event {
+	seen := make(map[string]bool, len(events))
+	result := events[:0]
+	for _, ev := range events {
+		if !seen[ev.ID] {
+			seen[ev.ID] = true
+			result = append(result, ev)
+		}
+	}
+	return result
+}
+
 func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, latestLedger uint32) error {
 	if len(rpcEvents) == 0 {
 		return nil
@@ -1006,6 +1023,11 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 		}
 		events = append(events, ev)
 	}
+	// Drop duplicate event IDs within this batch before writing, keeping the
+	// first occurrence of each ID. This prevents a single batch from
+	// containing duplicates before the store's idempotent upserts can absorb
+	// the overlap on re-scans or restarts.
+	events = removeDuplicateEvents(events)
 	for start := 0; start < len(events); start += int(ing.opts.WriteBatchSize) {
 		end := min(start+int(ing.opts.WriteBatchSize), len(events))
 		if err := ing.persistEventBatch(ctx, events[start:end], rpcEvents[len(rpcEvents)-1].Ledger, latestLedger); err != nil {

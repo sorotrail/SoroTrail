@@ -455,6 +455,13 @@ func (s *Server) router() chi.Router {
 	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
 	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
 
+	// Contract spec overrides: user-supplied spec JSON per contract_id.
+	// A spec override silently changes how that contract's events decode,
+	// so — like every other management surface — writes are never open.
+	r.With(watchedMW).Put("/contracts/{id}/spec", s.handlePutContractSpecOverride)
+	r.With(watchedMW).Get("/contracts/{id}/spec", s.handleGetContractSpecOverride)
+	r.With(watchedMW).Delete("/contracts/{id}/spec", s.handleDeleteContractSpecOverride)
+
 	r.With(watchedMW).Get("/dead-letters", s.handleListDeadLetters)
 	r.With(watchedMW).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)
 

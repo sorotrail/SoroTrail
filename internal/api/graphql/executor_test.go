@@ -83,6 +83,8 @@ func TestExecuteOperation_AmbiguousSelectionWithoutName(t *testing.T) {
 		Query: query,
 	}
 
+	// executeOperation accepts at most one operation per document and
+	// rejects a multi-operation request outright.
 	_, err := executeOperation(context.Background(), req)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "multiple operations per request not supported")

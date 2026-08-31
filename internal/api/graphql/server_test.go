@@ -59,7 +59,11 @@ func TestEnabledPlaygroundServesGraphiQL(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Header().Get("Content-Type"), "text/html")
+	// The served page is SoroTrail's own GraphQL Playground HTML rather
+	// than the upstream GraphiQL build, so assert on its distinguishing
+	// markers instead of the literal "GraphiQL" string.
 	assert.Contains(t, rec.Body.String(), "SoroTrail GraphQL Playground")
+	assert.Contains(t, rec.Body.String(), "graphql-playground-react")
 }
 
 func TestHandleGet_WithoutQueryReturnsBrowserHint(t *testing.T) {
@@ -71,7 +75,9 @@ func TestHandleGet_WithoutQueryReturnsBrowserHint(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
-	assert.Contains(t, rec.Body.String(), "POST {\\\"query\\\":\\\"…\\\"} to this endpoint")
+	// handleGet writes its hint verbatim (not via JSON encoding), so the
+	// wire bytes carry literal backslashes before the embedded quotes.
+	assert.Contains(t, rec.Body.String(), `POST {\"query\":\"…\"} to this endpoint`)
 }
 
 func TestHandleGet_WithQueryExecutesOperation(t *testing.T) {

@@ -65,6 +65,16 @@ func (s *stubStore) ListWatchedContracts(_ context.Context) ([]store.WatchedCont
 	return s.watchedList, s.watchedListErr
 }
 
+func (s *stubStore) GetContractSpecOverride(context.Context, string) ([]byte, error) {
+	return nil, nil
+}
+func (s *stubStore) SetContractSpecOverride(context.Context, string, []byte) error {
+	return nil
+}
+func (s *stubStore) DeleteContractSpecOverride(context.Context, string) error {
+	return nil
+}
+
 // newGraphQLTestServer wires the stub store and returns a Handler.
 func newGraphQLTestServer(t *testing.T, st *stubStore) *Handler {
 	t.Helper()
@@ -328,8 +338,8 @@ func TestBuildEventFilterDirectly(t *testing.T) {
 
 	// Test scope attachment via context principal
 	t.Run("scope attached from context principal", func(t *testing.T) {
-	specificScope := store.NewScope([]string{knownContractID})
-	authCtx := api.WithPrincipal(ctx, api.Principal{Scope: specificScope})
+		specificScope := store.NewScope([]string{knownContractID})
+		authCtx := api.WithPrincipal(ctx, api.Principal{Scope: specificScope})
 
 		// Since buildEventFilter doesn't receive ctx directly in its signature (wait, let's verify if buildEventFilter takes ctx or not, or if scopeFrom uses ctx internally),
 		// let's check buildEventFilter signature in internal/api/graphql/events.go:

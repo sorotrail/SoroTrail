@@ -158,6 +158,8 @@ SoroTrail is tested in CI against the following Postgres major versions:
 | `WATCHED_CONTRACTS` | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract automatically triggers a backfill from `latest − RETENTION_LEDGERS` (clamped to RPC retention), independent of other contracts. |
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
 | `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
+| `RETENTION_AGE` | `0` (disabled) | Delete events older than this duration. `0` disables age-based pruning. |
+| `RETENTION_POLL_INTERVAL` | `1h` | How often the age-based pruner re-examines events older than `RETENTION_AGE`. |
 | `PARTITION_LEDGER_SPAN` | `120960` | Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
 | `LOG_FORMAT` | `text` | `text` \| `json`. JSON emits one JSON object per line, compatible with Loki, CloudWatch, and ELK. |
@@ -171,7 +173,7 @@ SoroTrail is tested in CI against the following Postgres major versions:
 | `AUDIT_MAX_RPS` | `10` | Total request budget (split between ingest and audit). |
 | `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
 | `AUDIT_FINDING_MAX_LEDGERS` | `100` | Largest range a single finding is allowed to span. |
-| `API_MAX_LIMIT` | `500` | Maximum page size accepted for list endpoints (`/events`, `/subscriptions/{id}/deliveries`). Values above this are rejected with 400. |
+| `API_MAX_LIMIT` | `500` | Upper bound on the `limit` and `recent` page-size parameters for list endpoints (`/events`, `/subscriptions/{id}/deliveries`). Requests above the cap are rejected with 400 rather than returned clamped down. |
 | `STATS_CACHE_TTL` | `5s` | How long `GET /stats` results are served from the per-scope cache before being recomputed, short-circuiting the aggregation on busy endpoints. `0` disables caching. |
 | `API_KEY` | empty | Required to use the runtime `/watched-contracts` surface; empty means every request there is rejected with 503. This is a placeholder until #17 (real auth) lands — at that point `API_KEY` will be replaced. |
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
@@ -277,9 +279,10 @@ the struct tags in `internal/config/config.go` to prevent drift.
 | `HTTP_WRITE_TIMEOUT` | duration | `30s` | Maximum time to write the full response. `0` disables. |
 | `HTTP_IDLE_TIMEOUT` | duration | `60s` | Maximum time a keep-alive connection may idle before being closed. `0` disables. |
 | `HTTP_READ_HEADER_TIMEOUT` | duration | `10s` | Maximum time to read request headers. The most important defence against slow-client attacks. `0` disables. |
+| `HTTP_REQUEST_BODY_LIMIT` | int64 | `1048576` | Maximum accepted request body size in bytes (1 MiB default). Protects against memory/resource exhaustion. |
 | `API_QUERY_TIMEOUT` | duration | `25s` | Per-request database timeout for API-originated store reads. Enforced in-process and mirrored to Postgres via `statement_timeout`. |
 | `API_SLOW_QUERY_THRESHOLD` | duration | `2s` | Warn when an API-originated store query exceeds this duration; logs include the query name and elapsed time. |
-| `API_MAX_LIMIT` | int | `500` | Maximum page size accepted for list endpoints (`/events`, etc.). Values above this are rejected with 400. |
+| `API_MAX_LIMIT` | int | `500` | Upper bound on the `limit` and `recent` page-size parameters for list endpoints (`/events`, etc.). Values above the cap are rejected with 400 rather than clamped. |
 | `API_KEY` | string | empty | Gates the `/watched-contracts` management endpoints via constant-time header comparison. Empty means every write request is rejected with 503. |
 | `STATS_CACHE_TTL` | duration | `5s` | How long `GET /stats` results are served from the per-scope cache before recomputation. `0` disables caching. |
 | `CACHE_PRIVATE` | bool | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set when serving per-user data behind an auth layer. |
@@ -1922,6 +1925,80 @@ the handler to accept the boundary value and reject the one immediately
 outside it. Companion tests check that each enum is exactly the set the
 parsing code allows, that required parameters really are refused when absent,
 and that no parameter is documented which the handler discards.
+
+## Monitoring
+
+SoroTrail emits OpenTelemetry traces over OTLP, so any OTLP-compatible
+backend can collect them. This section is the end-to-end guide to viewing
+traces **locally** with Jaeger; Prometheus metrics for the ingestion
+pipeline are documented separately under
+[Operational Monitoring](#operational-monitoring).
+
+Tracing is opt-in: unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set, the
+exporter is a no-op and spans are discarded in-process at zero overhead,
+so shipping the default build costs nothing.
+
+### Run Jaeger locally with Docker Compose
+
+The simplest way to view traces is the Jaeger all-in-one image, which
+bundles a collector, a storage backend, and the UI into one container and
+enables an OTLP HTTP receiver out of the box. Run it with Docker Compose (a
+standalone snippet you can paste anywhere, not tied to SoroTrail's stack):
+
+```yaml
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4318:4318" # OTLP over HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+```
+
+SoroTrail's own [`docker-compose.yml`](docker-compose.yml) also ships this
+exact service behind the `jaeger` profile, and forwards
+`OTEL_EXPORTER_OTLP_ENDPOINT` from the shell into the container. So if
+you're already using the repo's Compose stack, run:
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile jaeger up
+```
+
+This starts Jaeger and the full stack together on one Compose network,
+where the indexer reaches the collector by its service name (`jaeger`, not
+`localhost`). The UI is then available at http://localhost:16686.
+
+### Point SoroTrail at the collector
+
+Jaeger's OTLP HTTP receiver listens on port `4318`. The exact value of
+`OTEL_EXPORTER_OTLP_ENDPOINT` depends on where SoroTrail runs relative to
+the collector:
+
+```sh
+# Bare-metal SoroTrail, dockerized Jaeger
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+
+# SoroTrail + Jaeger on the same Compose network
+OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+```
+
+Inside a container, `localhost` refers to the container itself, so only
+reach the collector by `localhost` when both run on the host (or map the
+port through).
+
+Then open the Jaeger UI, pick the `sorotrail` service, and search for
+traces by operation; spans cover the RPC calls, ingestion sweeps, and HTTP
+API requests that carry OpenTelemetry context.
+
+### Notes
+
+- Only the OTLP “traces” signal is configured. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
+  is honored as an alternate way to set just the traces endpoint, and
+  `OTEL_TRACES_SAMPLER` controls sampling (default: always sample).
+- Service metadata (name and version) is attached to every exported span
+  under `service.name=sorotrail`, so you can filter the UI to SoroTrail's
+  spans even when other services share the same collector.
 
 ## Operational Monitoring
 

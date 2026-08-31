@@ -1589,6 +1589,10 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.getStatsCache().Put(key, stats, time.Now())
+	if sc := getSpecCache(); sc != nil {
+		stats.SpecCache = sc.SpecCacheStats()
+	}
+
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
 }
@@ -1613,6 +1617,12 @@ func (s *Server) assembleStats(ctx context.Context) (store.Stats, error) {
 	}
 
 	s.addStatsFreshness(ctx, &stats)
+
+	// Surface the ingester's last-successful-poll timestamp. Absent until
+	// the first successful cycle, so a fresh instance omits the field.
+	if state, err := s.store.GetIngestionState(ctx); err == nil && state.LastSuccessfulPoll != nil {
+		stats.LastSuccessfulPoll = state.LastSuccessfulPoll
+	}
 
 	stats.PanicsRecovered = s.recoverer.PanicsRecovered()
 

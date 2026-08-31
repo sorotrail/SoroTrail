@@ -241,8 +241,10 @@ func TestFailover_CursorReanchorOnProviderSwitch(t *testing.T) {
 	assert.Equal(t, "cursor-0", resp.Cursor)
 	assert.Equal(t, int32(0), fc.lastActive.Load())
 
-	// Provider 0 fails next call, triggering demotion. The mock scripts
-	// errors by call index, so the first (successful) call gets nil.
+	// Provider 0 fails next call, triggering demotion. The mock indexes its
+	// scripted responses by provider0's own call count, and the first call
+	// already consumed index 0 (the success), so the error must sit at
+	// index 1.
 	mocks[0].getEventsErr = []error{nil, fmt.Errorf("connection refused")}
 	_, err = fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1, Pagination: &Pagination{Cursor: "cursor-0"}})
 	require.Error(t, err)
@@ -269,7 +271,7 @@ func TestFailover_HealthAndProbingHelpers(t *testing.T) {
 		assert.Equal(t, uint32(100), resp.LatestLedger)
 		assert.Equal(t, int32(0), mocks[0].callCount.Load(), "rpc0 (down) was skipped")
 		assert.Greater(t, mocks[1].callCount.Load(), int32(0), "rpc1 (active) was selected")
-	});
+	})
 
 	t.Run("selection advances rather than pinning one endpoint", func(t *testing.T) {
 		fc, _ := newFailoverTestClient(
@@ -279,7 +281,7 @@ func TestFailover_HealthAndProbingHelpers(t *testing.T) {
 		// All active; check active selection order or rotation helper if applicable.
 		idx1 := fc.getActive()
 		assert.Equal(t, 0, idx1)
-	});
+	})
 
 	t.Run("recovered provider returns to rotation after successful probe", func(t *testing.T) {
 		fc, mocks := newFailoverTestClient(
@@ -295,14 +297,14 @@ func TestFailover_HealthAndProbingHelpers(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		// Run a probe cycle directly: runProbes is a ticker loop on
-		// probeInterval (default 30s), so probing must be invoked
-		// explicitly to test promotion deterministically.
+		// Probe once explicitly: runProbes is a blocking ticker loop meant
+		// for the background goroutine, while probeDownProviders performs a
+		// single pass over down providers.
 		fc.probeDownProviders(ctx)
 
 		assert.Equal(t, StateActive, ProviderState(fc.providers[0].state.Load()),
 			"provider should recover and return to active rotation after successful probe")
-	});
+	})
 
 	t.Run("all-unhealthy backs off rather than spinning", func(t *testing.T) {
 		fc, _ := newFailoverTestClient(
@@ -315,7 +317,7 @@ func TestFailover_HealthAndProbingHelpers(t *testing.T) {
 		_, err := fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1})
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrAllProvidersDown)
-	});
+	})
 
 	t.Run("probing respects context cancellation", func(t *testing.T) {
 		fc, _ := newFailoverTestClient(
@@ -329,5 +331,5 @@ func TestFailover_HealthAndProbingHelpers(t *testing.T) {
 
 		// Should return immediately without blocking or panicking on canceled context
 		fc.runProbes(ctx)
-	});
+	})
 }

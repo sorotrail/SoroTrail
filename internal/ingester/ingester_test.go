@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -348,6 +349,50 @@ func TestWarmStart_ResumesFromCursor(t *testing.T) {
 	require.NotNil(t, req.Pagination)
 	assert.Equal(t, "cursor-42", req.Pagination.Cursor)
 	assert.Zero(t, req.StartLedger, "cursor and startLedger are mutually exclusive")
+}
+
+// TestSuccessfulCycle_RecordsLastSuccessfulPoll verifies that a completed
+// (error-free) poll cycle stamps ingestion_state with a fresh
+// last_successful_poll timestamp so operators can detect a stalled indexer
+// (a poll that never fires). Table-driven over the two shapes a successful
+// cycle takes: a page that carried events and a caught-up page that did not.
+func TestSuccessfulCycle_RecordsLastSuccessfulPoll(t *testing.T) {
+	tests := []struct {
+		name     string
+		events   []rpc.Event
+		caughtUp bool
+	}{
+		{name: "page with events is caught up on short page", events: []rpc.Event{rpcEvent("e1", 100)}, caughtUp: true},
+		{name: "caught-up page with no events", events: nil, caughtUp: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mockRPC{
+				health: rpc.Health{Status: "healthy", LatestLedger: 1_000},
+				eventsResps: []rpc.GetEventsResponse{{
+					Events:       tt.events,
+					LatestLedger: 1_000,
+				}},
+			}
+			st := newMockStore()
+			ing := newTestIngester(client, st, Options{})
+			before := time.Now().Add(-time.Second)
+			after := time.Now().Add(time.Second)
+
+			caughtUp, err := ing.runOnce(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, tt.caughtUp, caughtUp)
+
+			state, err := st.GetIngestionState(context.Background())
+			require.NoError(t, err)
+			require.NotNil(t, state.LastSuccessfulPoll,
+				"a successful poll must record last_successful_poll")
+			assert.True(t, state.LastSuccessfulPoll.After(before),
+				"poll timestamp should be stamped during this cycle, not stale")
+			assert.True(t, state.LastSuccessfulPoll.Before(after),
+				"poll timestamp should be a real recent time")
+		})
+	}
 }
 
 func TestPagination_FullPageKeepsCursorAndContinues(t *testing.T) {
@@ -819,6 +864,67 @@ func TestPersistEvents_RetainsRawXDR(t *testing.T) {
 	assert.Equal(t, "value-xdr", st.events["e1"].RawValueXDR)
 	assert.Empty(t, st.events["e2"].RawTopicXDR)
 	assert.Empty(t, st.events["e2"].RawValueXDR)
+}
+
+func TestPersistEvents_DeduplicatesEventIDs(t *testing.T) {
+	tests := []struct {
+		name         string
+		rpcEvents    []rpc.Event
+		wantEventIDs []string
+	}{
+		{
+			name: "no duplicates, all events pass through",
+			rpcEvents: []rpc.Event{
+				rpcEvent("e1", 100),
+				rpcEvent("e2", 101),
+				rpcEvent("e3", 102),
+			},
+			wantEventIDs: []string{"e1", "e2", "e3"},
+		},
+		{
+			name: "duplicate ID removed, first occurrence kept",
+			rpcEvents: []rpc.Event{
+				rpcEvent("e1", 100),
+				rpcEvent("e2", 101),
+				rpcEvent("e1", 102), // duplicate of e1
+			},
+			wantEventIDs: []string{"e1", "e2"},
+		},
+		{
+			name: "multiple duplicate IDs, only first of each kept",
+			rpcEvents: []rpc.Event{
+				rpcEvent("e1", 100),
+				rpcEvent("e2", 101),
+				rpcEvent("e1", 102), // duplicate of e1
+				rpcEvent("e2", 103), // duplicate of e2
+				rpcEvent("e3", 104),
+			},
+			wantEventIDs: []string{"e1", "e2", "e3"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{
+				Events:       tt.rpcEvents,
+				LatestLedger: 500,
+			}}}
+			st := newMockStore()
+			ing := newTestIngester(client, st, Options{StartLedger: 100})
+
+			_, err := ing.runOnce(context.Background())
+			require.NoError(t, err)
+
+			// Check that only the expected event IDs were persisted (no duplicates)
+			var persistedIDs []string
+			for id := range st.events {
+				persistedIDs = append(persistedIDs, id)
+			}
+			sort.Strings(persistedIDs)
+			sort.Strings(tt.wantEventIDs)
+			assert.Equal(t, tt.wantEventIDs, persistedIDs,
+				"event IDs after deduplication should match expected set")
+		})
+	}
 }
 
 func TestFilterBatching(t *testing.T) {

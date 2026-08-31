@@ -1558,6 +1558,139 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+  /contracts/{id}/spec:
+    put:
+      operationId: putContractSpecOverride
+      summary: Upload a contract spec override
+      description: >-
+        Stores a user-supplied contract spec (SEP-0041 JSON) for a contract
+        that exposes no fetchable spec. The enricher prefers the override
+        over the RPC-fetched spec whenever one exists. Accepts either
+        {"spec": {...}} or a bare spec object.
+      tags: [Operations]
+      security:
+        - ManagementKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The contract whose spec is being overridden.
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+            example:
+              spec:
+                events:
+                  - name: transfer
+                    type: "(address, address, i128) -> void"
+      responses:
+        "200":
+          description: The stored override
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract_id, spec]
+                properties:
+                  contract_id:
+                    type: string
+                  spec:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      operationId: getContractSpecOverride
+      summary: Get a contract spec override
+      description: >-
+        Returns the stored spec override for a contract, or 404 when none
+        has been uploaded.
+      tags: [Operations]
+      security:
+        - ManagementKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The contract whose spec override is being read.
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+      responses:
+        "200":
+          description: The stored override
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract_id, spec]
+                properties:
+                  contract_id:
+                    type: string
+                  spec:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      operationId: deleteContractSpecOverride
+      summary: Delete a contract spec override
+      description: >-
+        Removes a contract's spec override. Idempotent: deleting an
+        override that does not exist still succeeds.
+      tags: [Operations]
+      security:
+        - ManagementKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The contract whose spec override is being removed.
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+      responses:
+        "200":
+          description: The deletion result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract_id, deleted]
+                properties:
+                  contract_id:
+                    type: string
+                  deleted:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /tenant:
     get:
       operationId: currentTenant

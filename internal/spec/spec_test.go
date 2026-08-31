@@ -13,7 +13,7 @@ func TestParseScSpecEntriesRawAndParseSpecEntries(t *testing.T) {
 	// We construct valid/invalid raw xdr/json byte streams or use package structures
 	// to exercise parseScSpecEntriesRaw and parseSpecEntries.
 	// Since ScSpecEntry is defined via stellar/go or internal packages, let's test via JSON/XDR or mock helpers where applicable.
-	
+
 	t.Run("empty section yields empty spec", func(t *testing.T) {
 		// An empty or zero-length raw slice should return an empty spec/entries without error.
 		spec, err := parseSpecEntries([]byte{})
