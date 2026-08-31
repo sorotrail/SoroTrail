@@ -227,6 +227,7 @@ func run() error {
 		spec.WithWasmHashResolver(specFetcher),
 	)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log, st)
+	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
 	// Wrap the raw RPC client so per-method error totals are tracked and
 	// surfaced via /stats. specFetcher already holds a reference to the
@@ -345,6 +346,44 @@ func run() error {
 	}
 
 	prn := pruner.New(st, log, pruner.Options{
+	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
+	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
+	// returns immediately. Only when at least one retention policy is
+	// configured does it allocate a goroutine and a metrics struct.
+	//
+	// When ARCHIVE_BUCKET is set, an archiver is created to export events
+	// to S3-compatible storage before pruning. Archival is optional and
+	// idempotent: without ARCHIVE_* vars, the binary behaves identically
+	// to the pre-archive build.
+	var arch *archive.Archiver
+	if cfg.ArchiveEnabled() {
+		var err error
+		aArchiverOpts := archive.Options{
+			Bucket:          cfg.ArchiveBucket,
+			Prefix:          cfg.ArchivePrefix,
+			Endpoint:        cfg.ArchiveEndpoint,
+			Region:          cfg.ArchiveRegion,
+			AccessKeyID:     cfg.ArchiveAccessKeyID,
+			SecretAccessKey: cfg.ArchiveSecretAccessKey,
+			UseSSL:          cfg.ArchiveUseSSL,
+			MaxRetries:      cfg.ArchiveMaxRetries,
+			Logger:          log,
+		}
+		arch, err = archive.New(st, aArchiverOpts)
+		if err != nil {
+			return fmt.Errorf("initializing archive: %w", err)
+		}
+		log.Info("archive enabled",
+			"bucket", cfg.ArchiveBucket,
+			"prefix", cfg.ArchivePrefix,
+			"before_prune", cfg.ArchiveBeforePrune,
+		)
+	}
+
+	// Expose spec-cache hit/miss metrics via /stats.
+	api.SetSpecCache(specCache)
+
+	prn := pruner.NewWithArchiver(st, log, pruner.Options{
 		MaxAge:             cfg.RetentionMaxAge,
 		MinLedger:          cfg.RetentionMinLedger,
 		BatchSize:          cfg.RetentionBatchSize,
