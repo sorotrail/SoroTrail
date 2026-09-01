@@ -93,11 +93,21 @@ func (e *Event) WithSEP41() {
 	}
 }
 
+// EnrichedEvent wraps an Event with decoded field information derived from
+// the contract's spec. The original Event is preserved in full; DecodedEvent
+// carries the enriched view when decoding succeeded.
+//
+// When enrichment fails to decode the event's payload, DecodeError carries a
+// human-readable reason so consumers can see *why* an event was not decoded.
+// The raw Event is always available alongside it (embedded above), so a
+// failed decode returns the original payload plus decode_error rather than
+// silently dropping the event.
 // EnrichedEvent wraps an Event with decoded field information.
 type EnrichedEvent struct {
 	Event        `json:",inline"`
 	DecodedEvent *DecodedEventResponse `json:"decoded_event,omitempty"`
 	Decoded      bool                  `json:"decoded"`
+	DecodeError  string                `json:"decode_error,omitempty"`
 }
 
 // DecodedEventResponse is the JSON shape returned when an event is successfully
@@ -588,6 +598,26 @@ func OwnedBy(tenantID int64) SubscriptionOwner {
 	return SubscriptionOwner{tenantID: tenantID}
 }
 
+// APIKey is a stored API key. Only the bcrypt hash of the secret token
+// is persisted (KeyHash, never serialized); Prefix identifies the key in
+// the full token and is the indexed lookup key. RevokedAt is non-nil
+// once the key has been revoked — revoked keys fail validation
+// immediately.
+type APIKey struct {
+	ID        int64      `json:"id"`
+	Name      string     `json:"name"`
+	Prefix    string     `json:"prefix"`
+	CreatedAt time.Time  `json:"created_at"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+
+	// KeyHash is the bcrypt hash of the secret part of the key. It is
+	// write-only: it is set on create and compared on validation, but
+	// never returned to callers.
+	KeyHash string `json:"-"`
+}
+
+// Revoked reports whether the key has been revoked.
+func (k APIKey) Revoked() bool { return k.RevokedAt != nil }
 // IsAll reports whether the owner filter is unrestricted.
 func (o SubscriptionOwner) IsAll() bool { return o.all }
 
@@ -670,6 +700,18 @@ type Stats struct {
 	// Auditor counters are populated only when the audit package is
 	// active; omitted from JSON when the auditor is nil.
 	Auditor AuditStats `json:"auditor,omitempty"`
+	// Decode counters are populated only when a spec enricher is wired;
+	// omitted from JSON when it is nil (decoded=true is unavailable).
+	Decode *DecodeStats `json:"decode,omitempty"`
+}
+
+// DecodeStats is a JSON-friendly view of spec-enrichment decode counters,
+// surfaced via /stats so the decode failure rate is observable. Failures over
+// Decodes is the per-frame decode failure rate: when the enricher is disabled
+// the field stays nil and is omitted from JSON.
+type DecodeStats struct {
+	Decodes        uint64 `json:"decodes"`
+	DecodeFailures uint64 `json:"decode_failures"`
 	// Spec-cache counters are populated only when the API layer is given
 	// a spec cache; omitted from JSON otherwise.
 	SpecCache SpecCacheStats `json:"spec_cache,omitempty"`
@@ -905,6 +947,28 @@ type Store interface {
 
 	// ListEnabledSubscriptions returns all subscriptions with enabled=true.
 	ListEnabledSubscriptions(ctx context.Context) ([]Subscription, error)
+
+	// API key management. Keys are stored as bcrypt hashes; the plaintext
+	// secret is shown to the caller once at creation and never persisted.
+	// CreateAPIKey persists k (KeyHash must already be the bcrypt hash of
+	// the secret) and returns it with ID and CreatedAt populated.
+	CreateAPIKey(ctx context.Context, k APIKey) (APIKey, error)
+	// GetAPIKey returns the key with the given ID, or ErrNotFound.
+	GetAPIKey(ctx context.Context, id int64) (APIKey, error)
+	// LookupAPIKeyByPrefix returns the active (non-revoked) key with the
+	// given prefix, or ErrNotFound. Validation always goes through this
+	// method so a revocation takes effect on the next request.
+	LookupAPIKeyByPrefix(ctx context.Context, prefix string) (APIKey, error)
+	// ListAPIKeys returns every key, oldest first, including revoked ones.
+	ListAPIKeys(ctx context.Context) ([]APIKey, error)
+	// RevokeAPIKey marks the key with the given ID revoked. Returns
+	// ErrNotFound when the key does not exist; revoking an already
+	// revoked key is a no-op.
+	RevokeAPIKey(ctx context.Context, id int64) error
+
+	// IncrementSubscriptionFailures atomically increments failure_count
+	// and returns the new value. When newCount >= maxFailures the
+	// subscription is also disabled.
 	IncrementSubscriptionFailures(ctx context.Context, id int64, maxFailures int) (newCount int, disabled bool, err error)
 	ResetSubscriptionFailures(ctx context.Context, id int64) error
 	RecordDeliveryAttempt(ctx context.Context, a DeliveryAttempt) (DeliveryAttempt, error)

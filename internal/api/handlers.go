@@ -1899,6 +1899,12 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 			return
 
+type enrichedEventWithXDR struct {
+	eventWithXDR
+	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                        `json:"decoded"`
+	DecodeError  string                      `json:"decode_error,omitempty"`
+}
 		}
 
 		s.log.Error("removing watched contract", "contract_id", id, "error", err)
@@ -2033,6 +2039,15 @@ func isValidAddress(s string) bool {
 	if len(s) != 56 {
 		return false
 	}
+	return out
+}
+
+func enrichEventWithXDR(e store.EnrichedEvent) enrichedEventWithXDR {
+	return enrichedEventWithXDR{
+		eventWithXDR: eventToXDRResponse(e.Event),
+		DecodedEvent: e.DecodedEvent,
+		Decoded:      e.Decoded,
+		DecodeError:  e.DecodeError,
 	prefix := s[0]
 	if prefix != 'G' && prefix != 'C' {
 		return false
@@ -2043,6 +2058,71 @@ func isValidAddress(s string) bool {
 		}
 	}
 	return true
+}
+
+// Stats summarizes what the indexer has stored plus, when the auditor is
+// running, the post-processing counters it has accumulated.
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.store.Stats(r.Context())
+	if err != nil {
+		s.log.Error("loading stats", "error", err)
+		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
+		return
+	}
+	s.addStatsFreshness(r.Context(), &stats)
+	if s.enricher != nil {
+		d := s.enricher.DecodeStats()
+		stats.Decode = &d
+	}
+	if a := getAuditor(); a != nil {
+		m := a.Metrics()
+		stats.Auditor = store.AuditStats{
+			PassesRun:             m.PassesRun,
+			LedgersChecked:        m.LedgersChecked,
+			FindingsOpened:        m.FindingsOpened,
+			FindingsRepaired:      m.FindingsRepaired,
+			FindingsUnverifiable:  m.FindingsUnverifiable,
+			FindingsUnrecoverable: m.FindingsUnrecoverable,
+			RPCRequests:           m.RPCRequests,
+		}
+	}
+	if sc := getSpecCache(); sc != nil {
+		stats.SpecCache = sc.SpecCacheStats()
+	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusOK, stats)
+}
+
+func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
+
+	if s.rpc == nil {
+
+		return
+
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+
+	defer cancel()
+
+	health, err := s.rpc.GetHealth(ctx)
+
+	if err != nil {
+
+		loggerFromContext(ctx).Warn("loading RPC health for stats", "error", err)
+
+		return
+
+	}
+
+	head := int64(health.LatestLedger)
+
+	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
+
+	stats.ChainHeadLedger = &head
+
+	stats.IngestLagLedgers = &lag
+
 }
 
 func ingestLagLedgers(chainHead, lastIngested int64) int64 {

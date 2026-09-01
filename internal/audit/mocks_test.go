@@ -381,6 +381,38 @@ func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int, store.Subs
 	return nil, nil
 }
 
+// API key stubs for the auth feature — unused by auditor tests.
+func (m *mockStore) CreateAPIKey(_ context.Context, k store.APIKey) (store.APIKey, error) {
+	k.ID = 1
+	return k, nil
+}
+func (m *mockStore) GetAPIKey(context.Context, int64) (store.APIKey, error) {
+	return store.APIKey{}, store.ErrNotFound
+}
+func (m *mockStore) LookupAPIKeyByPrefix(context.Context, string) (store.APIKey, error) {
+	return store.APIKey{}, store.ErrNotFound
+}
+func (m *mockStore) ListAPIKeys(context.Context) ([]store.APIKey, error) {
+	return nil, nil
+}
+func (m *mockStore) RevokeAPIKey(context.Context, int64) error { return nil }
+
+// seedLedgers records pre-existing events in m.events so tests can set up
+// "stored state that diverges from the RPC" without a database. IDs use
+// the same %020d-%05d format as mkEvents, so seeded events and RPC
+// events are comparable by id.
+func (m *mockStore) seedLedgers(ledgers []int, contractID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, l := range ledgers {
+		id := fmt.Sprintf("%020d-00000", l)
+		m.events[id] = store.Event{
+			ID:         id,
+			ContractID: contractID,
+			Ledger:     int64(l),
+			Type:       "contract",
+		}
+	}
 func (m *mockStore) GetEarliestLedger(ctx context.Context, network, contractID string) (int64, error) {
 	return 0, nil
 }

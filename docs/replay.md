@@ -158,7 +158,7 @@ keeps the order in one reviewable spot.
 ## Rows without raw XDR
 
 Raw XDR (`events.topics_xdr`, `events.value_xdr`) is stored from the
-migration `0004_raw_xdr_and_replay` onward. Rows ingested before that have
+migration `0005_raw_xdr_and_replay` onward. Rows ingested before that have
 `NULL` there and can never be replayed — the XDR is gone and the RPC dropped
 the ledger long ago. Replay counts them as *skipped* and leaves their stored
 decoding alone.

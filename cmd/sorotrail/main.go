@@ -4,6 +4,7 @@
 // With no arguments it runs the indexer. Subcommands cover maintenance:
 //
 //	sorotrail replay --from-ledger N [--to-ledger M]
+//	sorotrail apikey create|list|revoke
 //	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
 package main
 
@@ -61,6 +62,8 @@ func dispatch(args []string) error {
 	switch args[0] {
 	case "replay":
 		return runReplay(args[1:])
+	case "apikey":
+		return runAPIKey(args[1:])
 	case "backfill":
 		return runBackfill(args[1:])
 	case "index-addresses":
@@ -95,6 +98,10 @@ func usage() {
 With no subcommand, runs the indexer (ingester + HTTP API).
 
 subcommands:
+  replay    re-decode stored events with the current decoder
+            (sorotrail replay --help)
+  apikey    issue, list, and revoke API keys
+            (sorotrail apikey --help)
   replay       re-decode stored events with the current decoder
                (sorotrail replay --help)
   backfill     ingest historical contract events from Horizon
@@ -425,6 +432,10 @@ func run() error {
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetStatsTTL(cfg.StatsCacheTTL)
 	apiServer.SetRateLimiter(limiter)
+	if cfg.APIKeyAuthEnabled {
+		log.Info("api key authentication enabled", "gated", "write/streaming/subscriptions routes")
+	}
+	apiServer.WithAPIKeyAuth(cfg.APIKeyAuthEnabled)
 	apiServer.SetMetricsEnabled(cfg.MetricsEnabled)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 	apiServer.SetHTTPRequestBodyLimit(cfg.HTTPRequestBodyLimit)
