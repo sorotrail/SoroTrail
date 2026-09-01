@@ -178,6 +178,7 @@ SoroTrail is tested in CI against the following Postgres major versions:
 | `RATE_LIMIT_RPS` | unset | Per-client HTTP request rate limit (`requests/second`). Both `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST` must be set together; otherwise no rate limiting is applied. |
 | `RATE_LIMIT_BURST` | unset | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
 | `RATE_LIMIT_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For` for client IP detection. Must only be enabled behind a proxy you trust to strip/rewrite the header — clients control `X-Forwarded-For` themselves, so enabling it on an Internet-facing surface lets any caller pick their own rate-limit key. |
+| `API_KEY_AUTH_ENABLED` | `false` | Require a valid API key on write, streaming, and subscription-management endpoints (see [API key authentication](#api-key-authentication)). Read endpoints stay public. |
 | `CACHE_PRIVATE` | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set this when the deployment serves per-user data behind an auth layer (see [Caching](#caching)). |
 | `CORS_ALLOWED_ORIGINS` | unset | Comma-separated browser origins allowed to call the API. `*` allows any origin; otherwise each entry is an explicit origin (`scheme://host`). Unset = CORS disabled, no CORS headers emitted. Preflight `OPTIONS` is answered automatically; invalid entries (e.g. `null`, origins with a path) fail startup. |
 | `CORS_EXPOSED_HEADERS` | `X-Request-ID` | Response headers browser JavaScript may read on allowed origins via `Access-Control-Expose-Headers`. The API stamps every response with `X-Request-ID`; empty suppresses the header entirely. |
@@ -753,6 +754,14 @@ Shell
 | `order` | `desc` | `asc` \| `desc`, defaults to asc. Sort direction. |
 | `order_by` | `created_at` | `id` \| `ledger` \| `created_at`, defaults to `id`. Sort column. Anything else is a `400`. |
 | `decoded` | `true` | When `true`, enriches events with spec-driven named fields. Contracts without a spec return flagged raw data with `"decoded": false`. |
+
+Decode failures are surfaced, not dropped: when an event matches a spec but
+the spec-declared fields cannot be decoded (or the topics are malformed),
+the enriched response keeps the raw event alongside `"decoded": false` and a
+`decode_error` string explaining what failed, e.g.
+`"decode_error": "decoding topic field ...: cannot decode"`. Every such
+failure is also counted in `GET /stats` (see below).
+| `include_xdr` | `true` | When `true`, includes raw base64 `topics_xdr` and `value_xdr` on each event. Omitted by default to keep responses small. |
 
 Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
 
@@ -1525,7 +1534,7 @@ curl -s localhost:8080/stats
 JSON
 
 ```json
-{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"oldest_stored_ledger":242001,"chain_head_ledger":260130,"ingest_lag_ledgers":7,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340}}
+{"total_events":18234,"last_ingested_ledger":260123,"verified_through_ledger":258900,"oldest_stored_ledger":242001,"chain_head_ledger":260130,"ingest_lag_ledgers":7,"contract_count":57,"watched_contracts":0,"auditor":{"passes_run":87,"ledgers_checked":1200,"findings_opened":2,"findings_repaired":1,"findings_unverifiable":0,"findings_unrecoverable":1,"rpc_requests":340},"decode":{"decodes":4210,"decode_failures":12}}
 ```
 
 `oldest_stored_ledger` is the lowest ledger currently present in the
@@ -1534,6 +1543,10 @@ store. `chain_head_ledger` is read from Stellar RPC `getHealth`, and
 the RPC is temporarily unreachable, `/stats` still returns HTTP 200 with
 the stored fields populated and the RPC-derived freshness fields
 (`chain_head_ledger`, `ingest_lag_ledgers`) set to `null`.
+
+The `decode` block (present only when a spec enricher is wired) counts
+spec-enrichment decode attempts and failures, so the decode failure rate
+(`decode_failures` / `decodes`) is observable without parsing logs.
 
 `verified_through_ledger` is the inclusive highest ledger whose stored
 events have been proven to match a fresh RPC fetch by the auditor. When
@@ -1665,6 +1678,70 @@ with status='unrecoverable' — operators see it via /stats.
 Set AUDIT_ENABLED=false (the default) to disable the auditor entirely;
 the binary's behavior is identical to a pre-audit build.
 
+## API key authentication
+
+Optional and off by default. Set `API_KEY_AUTH_ENABLED=true` to require a
+valid API key on the write, streaming, subscription-management, and
+key-management routes:
+
+- Webhook subscriptions: `POST /subscriptions`, `PUT /subscriptions/{id}`,
+  `DELETE /subscriptions/{id}`, and the read routes (`GET /subscriptions`,
+  `GET /subscriptions/{id}`, `GET /subscriptions/{id}/deliveries`).
+  Subscriptions carry the HMAC signing secrets subscribers use to verify
+  webhook payloads, so the whole subtree is protected — an unauthenticated
+  read would leak them.
+- Streaming: `GET /events/ws` (the WebSocket live stream).
+- Key management: `POST /apikeys`, `GET /apikeys`, `DELETE /apikeys/{id}`.
+  Key management is always authenticated, so an open create endpoint can't
+  be used to mint keys and walk around auth.
+
+Read-only query endpoints (`GET /events`, `GET /events/{id}`,
+`GET /contracts/{id}/events`, `GET /stats`, `GET /health`) stay public.
+
+Keys look like `sorotrail_<prefix>_<secret>` and are presented via either
+the `Authorization: Bearer <key>` header or the `X-API-Key: <key>` header.
+Only a bcrypt hash of the secret is stored in Postgres — the full key is
+displayed exactly once at creation and cannot be recovered later.
+
+### Managing keys
+
+Via the CLI (no auth needed — it talks to the database directly, so it is
+the bootstrap path for the first key):
+
+```sh
+sorotrail apikey create --name "deploy"   # prints the full key exactly once
+sorotrail apikey list                      # id, name, prefix, status
+sorotrail apikey revoke 3                  # immediate; cannot be undone
+```
+
+Or via the API (requires an already-valid key):
+
+```sh
+# Issue a key (the response includes the full key, shown exactly once):
+curl -s -X POST localhost:8080/apikeys \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"name":"ci"}'
+
+# List keys (prefixes only — never hashes or full keys):
+curl -s localhost:8080/apikeys -H "Authorization: Bearer $KEY"
+
+# Revoke a key (204 No Content):
+curl -s -X DELETE localhost:8080/apikeys/3 -H "Authorization: Bearer $KEY"
+```
+
+Revocation is immediate: key lookups only ever return non-revoked rows, so
+a revoked key is rejected on the very next request.
+
+With auth on, write requests carry the key:
+
+```sh
+curl -s -X POST localhost:8080/subscriptions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/webhook","secret":"whsec_...","filters":{}}'
+```
+
+Requests without a valid key are rejected with `401` and
+`{"error":"missing or invalid API key"}`.
 ## Retention / pruning
 
 SoroTrail exists because the RPC drops history, but “keep everything
@@ -1805,6 +1882,15 @@ rows the long `max-age` is the whole point of the cache.
 
 ### Auth'd deployments
 
+API key authentication ([above](#api-key-authentication)) protects writes
+and subscriptions, but read endpoints stay public. When a deployment puts
+a per-user auth layer in front of the API, caching must "never leak across
+keys": the `CACHE_PRIVATE` config flag flips every cacheable response from
+`Cache-Control: public` to `Cache-Control: private` (with the same
+`max-age` and `immutable` preset), so the same build can serve shared
+caches in one deployment and per-user scenarios in another. Set
+`CACHE_PRIVATE=true` in any deployment that serves per-user data behind an
+auth layer.
 Caching must never leak across keys. The `CACHE_PRIVATE` flag flips every
 cacheable response from `Cache-Control: public` to `Cache-Control: private`
 (same `max-age` and `immutable` preset), so the same build can serve shared

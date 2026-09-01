@@ -1894,6 +1894,12 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 			return
 
+type enrichedEventWithXDR struct {
+	eventWithXDR
+	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                        `json:"decoded"`
+	DecodeError  string                      `json:"decode_error,omitempty"`
+}
 		}
 
 		s.log.Error("removing watched contract", "contract_id", id, "error", err)
@@ -1996,6 +2002,15 @@ func isValidAddress(s string) bool {
 	if len(s) != 56 {
 		return false
 	}
+	return out
+}
+
+func enrichEventWithXDR(e store.EnrichedEvent) enrichedEventWithXDR {
+	return enrichedEventWithXDR{
+		eventWithXDR: eventToXDRResponse(e.Event),
+		DecodedEvent: e.DecodedEvent,
+		Decoded:      e.Decoded,
+		DecodeError:  e.DecodeError,
 	prefix := s[0]
 	if prefix != 'G' && prefix != 'C' {
 		return false
@@ -2018,6 +2033,10 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.addStatsFreshness(r.Context(), &stats)
+	if s.enricher != nil {
+		d := s.enricher.DecodeStats()
+		stats.Decode = &d
+	}
 	if a := getAuditor(); a != nil {
 		m := a.Metrics()
 		stats.Auditor = store.AuditStats{
