@@ -22,23 +22,32 @@ func startLimiter(t *testing.T, lim *RateLimiter) func() {
 	}
 }
 
-func TestClientIPTrustedXFF(t *testing.T) {
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
-	r.RemoteAddr = "203.0.113.9:5432"
-	r.Header.Set("X-Forwarded-For", "198.51.100.7, 10.0.0.1")
-	if got := clientIP(r, true); got != "198.51.100.7" {
-		t.Fatalf("clientIP(trusted) = %q, want 198.51.100.7", got)
+func TestClientIP(t *testing.T) {
+	cases := []struct {
+		name       string
+		remoteAddr string
+		xff        string
+		trustXFF   bool
+		want       string
+	}{
+		{name: "trusted honors XFF", remoteAddr: "203.0.113.9:5432", xff: "198.51.100.7, 10.0.0.1", trustXFF: true, want: "198.51.100.7"},
+		{name: "untrusted ignores XFF", remoteAddr: "203.0.113.9:5432", xff: "198.51.100.7, 10.0.0.1", want: "203.0.113.9"},
+		{name: "trusted falls back to remote without XFF", remoteAddr: "203.0.113.9:5432", trustXFF: true, want: "203.0.113.9"},
+		{name: "trusted skips invalid XFF parts", remoteAddr: "203.0.113.9:5432", xff: "not-an-ip, 198.51.100.7", trustXFF: true, want: "198.51.100.7"},
+		{name: "bare IP remote without port", remoteAddr: "203.0.113.9", trustXFF: true, want: "203.0.113.9"},
 	}
-	if got := clientIP(r, false); got != "203.0.113.9" {
-		t.Fatalf("clientIP(untrusted) = %q, want 203.0.113.9", got)
-	}
-}
 
-func TestClientIPFallbackToRemote(t *testing.T) {
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
-	r.RemoteAddr = "203.0.113.9:5432"
-	if got := clientIP(r, true); got != "203.0.113.9" {
-		t.Fatalf("clientIP(no XFF) = %q, want 203.0.113.9", got)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = c.remoteAddr
+			if c.xff != "" {
+				r.Header.Set("X-Forwarded-For", c.xff)
+			}
+			if got := clientIP(r, c.trustXFF); got != c.want {
+				t.Fatalf("clientIP() = %q, want %q (trustXFF=%v, XFF=%q)", got, c.want, c.trustXFF, c.xff)
+			}
+		})
 	}
 }
 

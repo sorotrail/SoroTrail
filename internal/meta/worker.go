@@ -61,7 +61,6 @@ func ResolveMetadataCachedSingleFlight(ctx context.Context, rpc RPCClient, store
 	if m, ok := store.Get(contractID); ok {
 		return m, nil
 	}
-
 	// Simple single-flight simulation for test/robustness
 	val, _ := workerSingleFlightMap.LoadOrStore(contractID, &singleFlightItem{
 		once: &sync.Once{},

@@ -152,6 +152,11 @@ type eventsWithXDRResponse struct {
 	Cursor string         `json:"cursor,omitempty"`
 }
 
+type addressEventsResponse struct {
+	Events []store.Event `json:"events"`
+	Cursor string        `json:"cursor,omitempty"`
+}
+
 // envelopeResponse is the JSON body returned when ?envelope=true is set on
 // any paginated list endpoint. It normalises the response shape across all
 // list endpoints so clients that prefer a consistent outer wrapper don't
@@ -1971,6 +1976,38 @@ func (s *Server) handleAddressEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, addressEventsResponse{Events: events, Cursor: cursor})
+}
+
+func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
+
+	if s.rpc == nil {
+
+		return
+
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+
+	defer cancel()
+
+	health, err := s.rpc.GetHealth(ctx)
+
+	if err != nil {
+
+		loggerFromContext(ctx).Warn("loading RPC health for stats", "error", err)
+
+		return
+
+	}
+
+	head := int64(health.LatestLedger)
+
+	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
+
+	stats.ChainHeadLedger = &head
+
+	stats.IngestLagLedgers = &lag
+
 }
 
 // handleAddressSummary returns aggregate information about an address's

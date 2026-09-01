@@ -14,20 +14,20 @@ import (
 	"github.com/sorotrail/sorotrail/internal/testdb"
 )
 
-func TestFrontierStatsAndAggregateScanHelpers_Integration(t *testing.T) {
+// TestStatsAggregation_Integration verifies the event-derived Stats figures
+// (total count, oldest stored ledger) against a real Postgres: zeroes on an
+// empty table, populated figures after seeding, and scope restriction.
+func TestStatsAggregation_Integration(t *testing.T) {
 	pool := testdb.Setup(t, Migrate)
 	st := NewPostgres(pool)
 	ctx := context.Background()
 
 	// 1. Empty store reports zeroes rather than erroring or returning nil pointers
 	t.Run("empty store reports zeroes", func(t *testing.T) {
-		stats, err := st.FrontierStats(ctx, WildcardScope())
-		require.NoError(t, err, "frontier stats on an empty table must not error on SQL NULL")
+		stats, err := st.Stats(ctx, WildcardScope())
+		require.NoError(t, err, "stats on an empty table must not error on SQL NULL")
 		assert.Equal(t, int64(0), stats.TotalEvents)
-		assert.Equal(t, int64(0), stats.MinLedger)
-		assert.Equal(t, int64(0), stats.MaxLedger)
-		assert.True(t, stats.MinCreatedAt.IsZero())
-		assert.True(t, stats.MaxCreatedAt.IsZero())
+		assert.Equal(t, int64(0), stats.OldestStoredLedger)
 	})
 
 	// 2. Seed events across different ledgers and scopes, and verify populated figures
@@ -61,22 +61,16 @@ func TestFrontierStatsAndAggregateScanHelpers_Integration(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("populated store reports correct figures", func(t *testing.T) {
-		stats, err := st.FrontierStats(ctx, WildcardScope())
+		stats, err := st.Stats(ctx, WildcardScope())
 		require.NoError(t, err)
 		assert.Equal(t, int64(2), stats.TotalEvents)
-		assert.Equal(t, int64(100), stats.MinLedger)
-		assert.Equal(t, int64(200), stats.MaxLedger)
-		assert.Equal(t, now.Unix(), stats.MinCreatedAt.Unix())
-		assert.Equal(t, now.Add(10*time.Second).Unix(), stats.MaxCreatedAt.Unix())
+		assert.Equal(t, int64(100), stats.OldestStoredLedger)
 	})
 
 	t.Run("figures respect the caller scope", func(t *testing.T) {
-		scope := Scope{ContractID: contractA}
-		stats, err := st.FrontierStats(ctx, scope)
+		stats, err := st.Stats(ctx, NewScope([]string{contractA}))
 		require.NoError(t, err)
 		assert.Equal(t, int64(1), stats.TotalEvents)
-		assert.Equal(t, int64(100), stats.MinLedger)
-		assert.Equal(t, int64(100), stats.MaxLedger)
-		assert.Equal(t, now.Unix(), stats.MinCreatedAt.Unix())
+		assert.Equal(t, int64(100), stats.OldestStoredLedger)
 	})
 }

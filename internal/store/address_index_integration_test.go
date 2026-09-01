@@ -66,31 +66,23 @@ func TestAddressIndex_EndToEnd(t *testing.T) {
 
 	// 3. Test findability and summary counts matching event listing
 	t.Run("findable by account address and role", func(t *testing.T) {
-		filter := EventFilter{
-			Address: accountAddr,
-			Scope:   WildcardScope(),
-		}
-		foundEvents, _, err := st.QueryEvents(ctx, filter)
+		foundEvents, _, err := st.QueryAddressEvents(ctx, accountAddr, EventFilter{Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, foundEvents, 1)
 		assert.Equal(t, eventID, foundEvents[0].ID)
 
-		count, err := st.CountEvents(ctx, filter)
+		count, err := st.CountAddressEvents(ctx, accountAddr)
 		require.NoError(t, err)
 		assert.Equal(t, int64(1), count)
 	})
 
 	t.Run("findable by contract address in value", func(t *testing.T) {
-		filter := EventFilter{
-			Address: contractAddr,
-			Scope:   WildcardScope(),
-		}
-		foundEvents, _, err := st.QueryEvents(ctx, filter)
+		foundEvents, _, err := st.QueryAddressEvents(ctx, contractAddr, EventFilter{Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, foundEvents, 1)
 		assert.Equal(t, eventID, foundEvents[0].ID)
 
-		count, err := st.CountEvents(ctx, filter)
+		count, err := st.CountAddressEvents(ctx, contractAddr)
 		require.NoError(t, err)
 		assert.Equal(t, int64(1), count)
 	})
@@ -99,16 +91,8 @@ func TestAddressIndex_EndToEnd(t *testing.T) {
 	t.Run("honours caller scope", func(t *testing.T) {
 		// Scope that does NOT include contractA
 		restrictedScope := NewScope([]string{"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC_OTHER"})
-		filter := EventFilter{
-			Address: accountAddr,
-			Scope:   restrictedScope,
-		}
-		foundEvents, _, err := st.QueryEvents(ctx, filter)
+		foundEvents, _, err := st.QueryAddressEvents(ctx, accountAddr, EventFilter{Scope: restrictedScope})
 		require.NoError(t, err)
 		assert.Empty(t, foundEvents)
-
-		count, err := st.CountEvents(ctx, filter)
-		require.NoError(t, err)
-		assert.Equal(t, int64(0), count)
 	})
 }

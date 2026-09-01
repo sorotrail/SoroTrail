@@ -98,6 +98,13 @@ func getSpecCache() SpecCacheStatsSource {
 	specCacheMu.RLock()
 	defer specCacheMu.RUnlock()
 	return specCacheSource
+}
+
+// Enricher is the spec-based event enrichment interface used by the API.
+type Enricher interface {
+	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
+}
+
 // SetRPCCounter registers the CountingClient so /stats can expose
 // per-method RPC error totals. Call this before ListenAndServe.
 // The setter is guarded by a RWMutex so concurrent /stats readers

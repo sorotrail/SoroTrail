@@ -100,21 +100,14 @@ type Config struct {
 	// RetentionAge / RetentionPoll: age-based retention job knobs
 	// (RETENTION_AGE, RETENTION_POLL_INTERVAL). RetentionAge zero disables
 	// the age-based pruner; RetentionPoll defaults to one hour.
-	RetentionAge  time.Duration `env:"RETENTION_AGE"`
-	RetentionPoll time.Duration `env:"RETENTION_POLL_INTERVAL" envDefault:"1h"`
+	RetentionAge       time.Duration `env:"RETENTION_AGE"`
+	RetentionPoll      time.Duration `env:"RETENTION_POLL_INTERVAL" envDefault:"1h"`
 	RetentionBatchSize int           `env:"RETENTION_BATCH_SIZE" envDefault:"5000"`
 	RetentionPause     time.Duration `env:"RETENTION_PAUSE" envDefault:"100ms"`
 	RetentionInterval  time.Duration `env:"RETENTION_INTERVAL" envDefault:"1h"`
 	// RetentionDryRun, when true, makes the pruner report what it
 	// would delete without actually removing any rows.
 	RetentionDryRun bool `env:"RETENTION_DRY_RUN"`
-	// RetentionAge is the maximum age of stored events (the age-based
-	// dimension of retention pruning). It feeds the pre-pruner's age
-	// sweep; zero means age-based pruning is disabled.
-	RetentionAge time.Duration `env:"RETENTION_AGE"`
-	// RetentionPoll is how often the age-based pruner re-examines the
-	// store for events older than RetentionAge.
-	RetentionPoll time.Duration `env:"RETENTION_POLL_INTERVAL" envDefault:"1h"`
 
 	// Archive configuration. When ARCHIVE_BUCKET is set, pruned events
 	// are exported to S3-compatible object storage as compressed NDJSON

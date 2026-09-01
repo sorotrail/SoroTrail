@@ -18,7 +18,7 @@ func TestParseScSpecEntriesRawAndParseSpecEntries(t *testing.T) {
 		// An empty or zero-length raw slice should return an empty spec/entries without error.
 		spec, err := parseSpecEntries([]byte{})
 		require.NoError(t, err)
-		require.NotNil(t, spec)
+		assert.NotNil(t, spec)
 		assert.Empty(t, spec.Events)
 	})
 

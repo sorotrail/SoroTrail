@@ -13,7 +13,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -522,8 +521,6 @@ func (a *Auditor) advanceHWM(ctx context.Context, network string, ledger uint32)
 	_, err := a.store.SaveAuditStateIfGreater(ctx, a.opts.Network, int64(ledger))
 	return err
 }
-
-var _ Reingester = (*ingester.Ingester)(nil)
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {

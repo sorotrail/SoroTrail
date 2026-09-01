@@ -29,6 +29,33 @@ func TestExecuteOperation_SingleOperation(t *testing.T) {
 	assert.Equal(t, "hello world", env.Data["testField"])
 }
 
+func TestExecuteOperation_NamedOperationSelection(t *testing.T) {
+	RegisterRoute("Query", "opOne", func(r *Resolver, ctx context.Context, args json.RawMessage, vars map[string]any) (any, error) {
+		return "first", nil
+	})
+	RegisterRoute("Query", "opTwo", func(r *Resolver, ctx context.Context, args json.RawMessage, vars map[string]any) (any, error) {
+		return "second", nil
+	})
+
+	UseResolver(&Resolver{})
+
+	query := `
+		query FirstOp { opOne }
+		query SecondOp { opTwo }
+	`
+
+	// A document with multiple operations is rejected outright, even when
+	// an operationName is supplied.
+	req := &GraphQLRequest{
+		Query:         query,
+		OperationName: "SecondOp",
+	}
+
+	_, err := executeOperation(context.Background(), req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "multiple operations per request not supported")
+}
+
 func TestExecuteOperation_AmbiguousSelectionWithoutName(t *testing.T) {
 	RegisterRoute(
 		"Query",

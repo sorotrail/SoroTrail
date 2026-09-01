@@ -346,6 +346,15 @@ func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription
 func (s *stubStore) DeleteSubscription(context.Context, int64, store.SubscriptionOwner) error {
 	return nil
 }
+func (s *stubStore) GetContractSpecOverride(context.Context, string) ([]byte, error) {
+	return nil, nil
+}
+func (s *stubStore) SetContractSpecOverride(context.Context, string, []byte) error {
+	return nil
+}
+func (s *stubStore) DeleteContractSpecOverride(context.Context, string) error {
+	return nil
+}
 func (s *stubStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
 	return nil, nil
 }

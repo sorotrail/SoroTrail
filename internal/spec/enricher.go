@@ -161,8 +161,6 @@ func (e *Enricher) getSpec(ctx context.Context, contractID string) *ContractSpec
 	}
 
 	// 2. Try the cache; this also re-resolves the wasm hash when the
-func (e *Enricher) getSpec(ctx context.Context, contractID string) *ContractSpec {
-	// Try the cache first; this also re-resolves the wasm hash when the
 	// mapping is due for re-verification and invalidates stale specs.
 	if s := e.cache.GetForContract(ctx, contractID); s != nil {
 		return s
