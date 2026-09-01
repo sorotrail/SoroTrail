@@ -1,0 +1,154 @@
+---
+# Source: sorotrail/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sorotrail
+  labels:
+    helm.sh/chart: sorotrail-0.1.0
+    app.kubernetes.io/name: sorotrail
+    app.kubernetes.io/instance: sorotrail
+    app.kubernetes.io/version: "latest"
+    app.kubernetes.io/managed-by: Helm
+---
+# Source: sorotrail/templates/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sorotrail-db
+  labels:
+    helm.sh/chart: sorotrail-0.1.0
+    app.kubernetes.io/name: sorotrail
+    app.kubernetes.io/instance: sorotrail
+    app.kubernetes.io/version: "latest"
+    app.kubernetes.io/managed-by: Helm
+type: Opaque
+stringData:
+  DATABASE_URL: "postgres://user:pass@host:5432/db"
+---
+# Source: sorotrail/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sorotrail
+  labels:
+    helm.sh/chart: sorotrail-0.1.0
+    app.kubernetes.io/name: sorotrail
+    app.kubernetes.io/instance: sorotrail
+    app.kubernetes.io/version: "latest"
+    app.kubernetes.io/managed-by: Helm
+data:
+  RPC_URL: "https://soroban-testnet.stellar.org"
+  POLL_INTERVAL: "5s"
+  HTTP_ADDR: ":8080"
+  WATCHED_CONTRACTS: ""
+  START_LEDGER: ""
+  RETENTION_LEDGERS: "17280"
+  PARTITION_LEDGER_SPAN: "120960"
+  LOG_LEVEL: "info"
+---
+# Source: sorotrail/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: sorotrail
+  labels:
+    helm.sh/chart: sorotrail-0.1.0
+    app.kubernetes.io/name: sorotrail
+    app.kubernetes.io/instance: sorotrail
+    app.kubernetes.io/version: "latest"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: sorotrail
+    app.kubernetes.io/instance: sorotrail
+---
+# Source: sorotrail/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sorotrail
+  labels:
+    helm.sh/chart: sorotrail-0.1.0
+    app.kubernetes.io/name: sorotrail
+    app.kubernetes.io/instance: sorotrail
+    app.kubernetes.io/version: "latest"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sorotrail
+      app.kubernetes.io/instance: sorotrail
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sorotrail
+        app.kubernetes.io/instance: sorotrail
+    spec:
+      serviceAccountName: sorotrail
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: sorotrail
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          image: "ghcr.io/sorotrail/sorotrail:latest"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: sorotrail
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sorotrail-db
+                  key: DATABASE_URL
+          # Startup probe: allows the container time to connect to Postgres
+          # and run migrations before liveness/readiness probes begin.
+          # The Docker HEALTHCHECK uses start-period=10s + retries=3 with
+          # 10s intervals, so we mirror that budget here (period=5s,
+          # failureThreshold=6 → 30s total) with margin for cold starts
+          # against a remote Postgres.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi

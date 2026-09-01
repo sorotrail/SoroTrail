@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"sync/atomic"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // Enricher maps raw shape-tagged events onto named-field representations
@@ -24,17 +24,34 @@ type Enricher struct {
 
 	decodes        atomic.Uint64
 	decodeFailures atomic.Uint64
+	fetcher       *Fetcher
+	cache         *Cache
+	log           *slog.Logger
+	overrideStore SpecOverrideStore
+}
+
+// SpecOverrideStore is the subset of store.Store needed to read
+// user-supplied spec overrides. Defined here (rather than reusing the
+// cache's Store interface) so the enricher never depends on the full store.
+type SpecOverrideStore interface {
+	GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error)
 }
 
 // NewEnricher creates an enricher. The fetcher is used to lazily fetch
 // specs on first encounter with a contract; nil means no fetching is done
-// and enrichment only uses cached specs.
-func NewEnricher(fetcher *Fetcher, cache *Cache, log *slog.Logger) *Enricher {
-	return &Enricher{
+// and enrichment only uses cached specs. overrideStore is optional (may be
+// nil) and supplies user-uploaded spec overrides that take precedence over
+// fetched specs.
+func NewEnricher(fetcher *Fetcher, cache *Cache, log *slog.Logger, overrideStore ...SpecOverrideStore) *Enricher {
+	e := &Enricher{
 		fetcher: fetcher,
 		cache:   cache,
 		log:     log,
 	}
+	if len(overrideStore) > 0 {
+		e.overrideStore = overrideStore[0]
+	}
+	return e
 }
 
 // EnrichEvents enriches a slice of events with decoded fields from the
@@ -127,11 +144,27 @@ func (e *Enricher) enrichOne(ctx context.Context, ev store.Event) store.Enriched
 }
 
 // getSpec returns the spec for a contract, trying cache first and
-// falling back to fetching if a fetcher is configured.
+// falling back to fetching if a fetcher is configured. Cache lookups go
+// through GetForContract, which re-verifies the contract's wasm hash so
+// a contract upgrade invalidates the previously cached spec.
+//
+// User-supplied override: when the store holds a spec override for this
+// contract (uploaded via the API), it is parsed, cached under the
+// "override:<contractID>" key and returned INSTEAD of the fetched spec.
+// This serves contracts that expose no fetchable spec at all, and lets
+// operators correct a mis-decoded spec without redeploying the contract.
 func (e *Enricher) getSpec(ctx context.Context, contractID string) *ContractSpec {
-	// Try the cache first, by contract ID (specs are keyed by wasm hash,
-	// so this is a reverse lookup).
-	if s := e.cache.GetByContractID(contractID); s != nil {
+	// 1. User-supplied override always wins (checked first, cheap store read
+	// with an in-memory parsed cache in front).
+	if s := e.getOverride(ctx, contractID); s != nil {
+		return s
+	}
+
+	// 2. Try the cache; this also re-resolves the wasm hash when the
+func (e *Enricher) getSpec(ctx context.Context, contractID string) *ContractSpec {
+	// Try the cache first; this also re-resolves the wasm hash when the
+	// mapping is due for re-verification and invalidates stale specs.
+	if s := e.cache.GetForContract(ctx, contractID); s != nil {
 		return s
 	}
 
@@ -159,6 +192,45 @@ func (e *Enricher) getSpec(ctx context.Context, contractID string) *ContractSpec
 		e.log.Warn("failed to cache spec", "contract_id", contractID, "error", err)
 	}
 
+	return spec
+}
+
+// overrideKey is the cache namespace for parsed user-supplied overrides.
+// They live in the same in-memory map but under a key that can never
+// collide with a real wasm hash (hex/base64 alphabet has no ':').
+const overrideKeyPrefix = "override:"
+
+// getOverride loads the user-supplied spec override for a contract.
+// Returns nil when no override exists (or the stored JSON is invalid —
+// invalid specs are rejected at upload time, so this only guards against
+// hand-edited rows).
+func (e *Enricher) getOverride(ctx context.Context, contractID string) *ContractSpec {
+	key := overrideKeyPrefix + contractID
+
+	// Fast path: parsed override already in memory (never expires — an
+	// override is authoritative until explicitly replaced or deleted).
+	if s := e.cache.Get(key); s != nil {
+		return s
+	}
+
+	// Slow path: read from the store, validate, cache.
+	if e.overrideStore == nil {
+		return nil
+	}
+	data, err := e.overrideStore.GetContractSpecOverride(ctx, contractID)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	spec, err := ParseOverrideSpec(data)
+	if err != nil {
+		e.log.Warn("ignoring invalid spec override",
+			"contract_id", contractID,
+			"error", err,
+		)
+		return nil
+	}
+	spec.ContractID = contractID
+	e.cache.Put(key, spec)
 	return spec
 }
 

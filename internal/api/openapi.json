@@ -1,0 +1,4097 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "SoroTrail API",
+    "description": "A contract event indexer for the Stellar/Soroban network. SoroTrail polls\na Stellar RPC endpoint, stores contract events durably in Postgres, and\nserves them back through a queryable HTTP API long after the RPC has\nforgotten them.\n",
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "Local development"
+    }
+  ],
+  "security": [
+    {
+      "TenantAuth": []
+    },
+    {
+      "TenantAuthHeader": []
+    },
+    {}
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Dependency health check",
+        "tags": [
+          "System"
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "All dependencies healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                },
+                "example": {
+                  "status": "ok",
+                  "checks": {
+                    "database": "ok",
+                    "rpc": "ok"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "One or more dependencies degraded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                },
+                "example": {
+                  "status": "degraded",
+                  "checks": {
+                    "database": "ok",
+                    "rpc": "unavailable"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/events": {
+      "get": {
+        "operationId": "listEvents",
+        "summary": "List stored events",
+        "description": "Paginated list of stored events, filterable by contract, type, topic,\nledger range, time range, and sort order. Supports cursor-based\npagination and optional spec-driven enrichment.\n",
+        "tags": [
+          "Events"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContractID"
+          },
+          {
+            "$ref": "#/components/parameters/EventType"
+          },
+          {
+            "$ref": "#/components/parameters/Topic"
+          },
+          {
+            "$ref": "#/components/parameters/Topic0"
+          },
+          {
+            "$ref": "#/components/parameters/Topic1"
+          },
+          {
+            "$ref": "#/components/parameters/Topic2"
+          },
+          {
+            "$ref": "#/components/parameters/Topic3"
+          },
+          {
+            "$ref": "#/components/parameters/FromLedger"
+          },
+          {
+            "$ref": "#/components/parameters/ToLedger"
+          },
+          {
+            "$ref": "#/components/parameters/FromTime"
+          },
+          {
+            "$ref": "#/components/parameters/ToTime"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Order"
+          },
+          {
+            "$ref": "#/components/parameters/OrderBy"
+          },
+          {
+            "$ref": "#/components/parameters/Decoded"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of events",
+            "headers": {
+              "X-Total-Count": {
+                "description": "The total number of events matching the request's filters, ignoring pagination. Omitted when the count could not be computed; the page itself is still returned.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventsResponse"
+                },
+                "example": {
+                  "events": [
+                    {
+                      "id": "0001099511627776-0000000001",
+                      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                      "ledger": 256000,
+                      "type": "contract",
+                      "tx_hash": "9f5c7a2b...",
+                      "tx_index": 0,
+                      "op_index": 0,
+                      "in_successful_call": true,
+                      "topics": [
+                        {
+                          "symbol": "transfer"
+                        }
+                      ],
+                      "value": {
+                        "address": "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"
+                      },
+                      "created_at": "2026-07-21T12:00:00Z"
+                    }
+                  ],
+                  "cursor": "MjU2MDAwLTAwMDAwMDAwMDE="
+                }
+              }
+            }
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteEvents",
+        "summary": "Prune stored events",
+        "description": "Deletes stored events matching the given bounds. Intended for retention maintenance; gated behind the management credential.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "name": "before_ledger",
+            "in": "query",
+            "required": true,
+            "description": "Delete every stored event in a ledger strictly below this one. Required: without it the request is refused rather than defaulting to a bound that would delete everything.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 256000
+          }
+        ],
+        "security": [
+          {
+            "ManagementKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Number of events deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "deleted": {
+                      "type": "integer",
+                      "format": "int64"
+                    }
+                  }
+                },
+                "example": {
+                  "deleted": 42
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/events/{id}": {
+      "get": {
+        "operationId": "getEvent",
+        "summary": "Get a single event by ID",
+        "tags": [
+          "Events"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "TOID-based event identifier: the 16-digit ledger/transaction/ operation offset, a hyphen, and a 10-digit index within the operation. Take it from an event in a listing rather than composing it.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{16}-[0-9]{10}$"
+            },
+            "example": "0001099511627776-0000000001"
+          },
+          {
+            "$ref": "#/components/parameters/Decoded"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The requested event",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Event"
+                    },
+                    {
+                      "$ref": "#/components/schemas/EnrichedEvent"
+                    }
+                  ]
+                },
+                "example": {
+                  "id": "0001099511627776-0000000001",
+                  "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                  "ledger": 256000,
+                  "type": "contract",
+                  "tx_hash": "9f5c7a2b...",
+                  "tx_index": 0,
+                  "op_index": 0,
+                  "in_successful_call": true,
+                  "topics": [
+                    {
+                      "symbol": "transfer"
+                    }
+                  ],
+                  "value": {
+                    "address": "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"
+                  },
+                  "created_at": "2026-07-21T12:00:00Z"
+                }
+              }
+            }
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/contracts/{id}/events": {
+      "get": {
+        "operationId": "contractEvents",
+        "summary": "List events for a contract",
+        "description": "Convenience wrapper around GET /events with contract_id={id}",
+        "tags": [
+          "Events"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The contract whose events to return.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          },
+          {
+            "$ref": "#/components/parameters/EventType"
+          },
+          {
+            "$ref": "#/components/parameters/Topic"
+          },
+          {
+            "$ref": "#/components/parameters/Topic0"
+          },
+          {
+            "$ref": "#/components/parameters/Topic1"
+          },
+          {
+            "$ref": "#/components/parameters/Topic2"
+          },
+          {
+            "$ref": "#/components/parameters/Topic3"
+          },
+          {
+            "$ref": "#/components/parameters/FromLedger"
+          },
+          {
+            "$ref": "#/components/parameters/ToLedger"
+          },
+          {
+            "$ref": "#/components/parameters/FromTime"
+          },
+          {
+            "$ref": "#/components/parameters/ToTime"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Order"
+          },
+          {
+            "$ref": "#/components/parameters/OrderBy"
+          },
+          {
+            "$ref": "#/components/parameters/Decoded"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of events for the contract",
+            "headers": {
+              "X-Total-Count": {
+                "description": "The total number of events matching the request's filters, ignoring pagination. Omitted when the count could not be computed; the page itself is still returned.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventsResponse"
+                },
+                "example": {
+                  "events": [
+                    {
+                      "id": "0001099511627776-0000000001",
+                      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                      "ledger": 256000,
+                      "type": "contract",
+                      "tx_hash": "9f5c7a2b...",
+                      "tx_index": 0,
+                      "op_index": 0,
+                      "in_successful_call": true,
+                      "topics": [
+                        {
+                          "symbol": "transfer"
+                        }
+                      ],
+                      "value": {
+                        "address": "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"
+                      },
+                      "created_at": "2026-07-21T12:00:00Z"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/addresses/{address}/events": {
+      "get": {
+        "operationId": "addressEvents",
+        "summary": "List events involving an address",
+        "description": "Events where the given Stellar address appears in the event topics, as either sender or recipient. Backed by the address activity index.",
+        "tags": [
+          "Events"
+        ],
+        "parameters": [
+          {
+            "name": "address",
+            "in": "path",
+            "required": true,
+            "description": "Stellar account (G-prefixed) or contract (C-prefixed) address to look for in the event topics.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[GC][A-Z2-7]{55}$"
+            },
+            "example": "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"
+          },
+          {
+            "$ref": "#/components/parameters/FromLedger"
+          },
+          {
+            "$ref": "#/components/parameters/ToLedger"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Order"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of events involving the address",
+            "headers": {
+              "X-Total-Count": {
+                "description": "The total number of events matching the request's filters, ignoring pagination. Omitted when the count could not be computed; the page itself is still returned.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventsResponse"
+                },
+                "example": {
+                  "events": [
+                    {
+                      "id": "0001099511627776-0000000001",
+                      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                      "ledger": 256000,
+                      "type": "contract",
+                      "tx_hash": "9f5c7a2b...",
+                      "tx_index": 0,
+                      "op_index": 0,
+                      "in_successful_call": true,
+                      "topics": [
+                        {
+                          "symbol": "transfer"
+                        }
+                      ],
+                      "value": {
+                        "address": "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"
+                      },
+                      "created_at": "2026-07-21T12:00:00Z"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/addresses/{address}/summary": {
+      "get": {
+        "operationId": "addressSummary",
+        "summary": "Summarise an address's event history",
+        "description": "Aggregate view of an address's activity: first and last ledger it was seen in, total event count, and the contracts it interacted with.",
+        "tags": [
+          "Events"
+        ],
+        "parameters": [
+          {
+            "name": "address",
+            "in": "path",
+            "required": true,
+            "description": "Stellar account (G-prefixed) or contract (C-prefixed) address to summarise.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[GC][A-Z2-7]{55}$"
+            },
+            "example": "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Aggregate activity for the address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "address": "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR",
+                  "first_ledger": 256000,
+                  "last_ledger": 256050,
+                  "event_count": 12,
+                  "contracts": [
+                    "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/admin/tenants": {
+      "get": {
+        "operationId": "listTenants",
+        "summary": "List tenants",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Total-Count": {
+                "description": "The total number of tenants, which is the full list since this endpoint is not paginated.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "tenants": [
+                    {
+                      "id": 1,
+                      "name": "acme-corp",
+                      "enabled": true,
+                      "created_at": "2026-07-21T00:00:00Z"
+                    }
+                  ],
+                  "count": 1
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createTenant",
+        "summary": "Create a tenant",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "201": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "id": 1,
+                  "name": "acme-corp",
+                  "enabled": true,
+                  "created_at": "2026-07-21T00:00:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/admin/tenants/{id}": {
+      "get": {
+        "operationId": "getTenant",
+        "summary": "Get a tenant",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Tenant ID, as returned by POST /admin/tenants. Must be a positive integer.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "id": 1,
+                  "name": "acme-corp",
+                  "enabled": true,
+                  "created_at": "2026-07-21T00:00:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateTenant",
+        "summary": "Update a tenant",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Tenant ID, as returned by POST /admin/tenants. Must be a positive integer.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "id": 1,
+                  "name": "acme-corp",
+                  "enabled": true,
+                  "created_at": "2026-07-21T00:00:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteTenant",
+        "summary": "Delete a tenant",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Tenant ID, as returned by POST /admin/tenants. Must be a positive integer.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/admin/tenants/{id}/usage": {
+      "get": {
+        "operationId": "tenantUsage",
+        "summary": "Get a tenant's recorded usage",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Tenant ID, as returned by POST /admin/tenants. Must be a positive integer.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          },
+          {
+            "name": "days",
+            "in": "query",
+            "description": "How many days of usage history to return, counting back from today.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 365,
+              "default": 30
+            },
+            "example": 7
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "tenant_id": 1,
+                  "period_days": 7,
+                  "requests": 12345,
+                  "events_served": 67890
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/admin/tenants/{id}/grants": {
+      "get": {
+        "operationId": "listTenantGrants",
+        "summary": "List a tenant's contract grants",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Tenant ID, as returned by POST /admin/tenants. Must be a positive integer.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Total-Count": {
+                "description": "The total number of granted contracts, which is the full list since this endpoint is not paginated.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "grants": [
+                    "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                  ],
+                  "count": 1
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "post": {
+        "operationId": "grantContract",
+        "summary": "Grant a contract to a tenant",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Tenant ID, as returned by POST /admin/tenants. Must be a positive integer.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The tenant's refreshed grant list. Not a 201: the response is the whole list, not the created grant.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "grants": [
+                    "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                    "CAAAA..."
+                  ],
+                  "count": 2
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/admin/tenants/{id}/grants/{contract_id}": {
+      "delete": {
+        "operationId": "revokeContract",
+        "summary": "Revoke a contract grant",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Tenant ID, as returned by POST /admin/tenants. Must be a positive integer.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          },
+          {
+            "name": "contract_id",
+            "in": "path",
+            "required": true,
+            "description": "The contract grant to revoke from this tenant.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The tenant's refreshed grant list. Not a 204: the response carries the remaining grants.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "grants": [
+                    "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                  ],
+                  "count": 1
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/admin/tenants/{id}/keys": {
+      "get": {
+        "operationId": "listTenantKeys",
+        "summary": "List a tenant's API keys",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Tenant ID, as returned by POST /admin/tenants. Must be a positive integer.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Total-Count": {
+                "description": "The total number of API keys, which is the full list since this endpoint is not paginated.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "keys": [
+                    {
+                      "id": 7,
+                      "prefix": "st_abc12",
+                      "enabled": true,
+                      "created_at": "2026-07-21T00:00:00Z"
+                    }
+                  ],
+                  "count": 1
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createTenantKey",
+        "summary": "Issue an API key for a tenant",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Tenant ID, as returned by POST /admin/tenants. Must be a positive integer.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "id": 7,
+                  "prefix": "st_abc12",
+                  "key": "st_abc12_xylophone12345678",
+                  "enabled": true,
+                  "created_at": "2026-07-21T00:00:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/admin/keys/{key_id}": {
+      "delete": {
+        "operationId": "revokeKey",
+        "summary": "Revoke an API key",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential.",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "key_id",
+            "in": "path",
+            "required": true,
+            "description": "API key ID, as returned by POST /admin/tenants/{id}/keys. This is the key's database ID, not its public prefix and not the plaintext key.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 7
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/contracts": {
+      "get": {
+        "operationId": "listContracts",
+        "summary": "List indexed contracts",
+        "description": "Contracts that have at least one stored event, with per-contract event counts and ledger ranges. Ordered by contract_id ascending; pass sort=count to rank by activity instead. Paginated with an opaque cursor that is omitted on the last page.",
+        "tags": [
+          "Events"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContractsLimit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "description": "Ordering key for the listing. The default walks contract IDs alphabetically, which is stable as new contracts are indexed; count ranks by activity instead.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "contract_id",
+                "count",
+                "first_ledger",
+                "last_ledger",
+                "last_seen"
+              ],
+              "default": "contract_id"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Order"
+          },
+          {
+            "name": "contract_id",
+            "in": "query",
+            "description": "Only list contracts whose ID starts with this prefix. A prefix, not a whole ID, so it is not validated as a strkey and a short string is a legitimate value.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{0,55}$"
+            },
+            "example": "CDLZ"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of indexed contracts",
+            "headers": {
+              "X-Total-Count": {
+                "description": "The total number of contracts matching the request's filters, ignoring pagination. Omitted when the count could not be computed; the page itself is still returned.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContractsPage"
+                },
+                "example": {
+                  "contracts": [
+                    {
+                      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                      "event_count": 42,
+                      "first_ledger": 256000,
+                      "last_ledger": 256050,
+                      "last_seen": "2026-07-21T12:00:00Z"
+                    }
+                  ],
+                  "count": 1
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/livez": {
+      "get": {
+        "operationId": "livez",
+        "summary": "Liveness probe",
+        "description": "Reports only that the process is up. Never touches the database or RPC. It therefore has no failure response: a process that cannot answer 200 here cannot answer at all.",
+        "tags": [
+          "Operations"
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The process is running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                },
+                "example": {
+                  "status": "ok",
+                  "checks": {}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "readyz",
+        "summary": "Readiness probe",
+        "description": "Reports whether the database, RPC and schema are usable, and whether ingestion has fallen more than 100 ledgers behind the chain head.",
+        "tags": [
+          "Operations"
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Every dependency is usable and ingestion is current",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                },
+                "example": {
+                  "status": "ok",
+                  "checks": {
+                    "database": "ok",
+                    "rpc": "ok",
+                    "ingestion": "current"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A dependency is unusable or ingestion is lagging. The body names the failing check so the instance can be pulled from the load balancer without reading the logs. This is a degraded-readiness report rather than the shared error envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                },
+                "example": {
+                  "status": "degraded",
+                  "checks": {
+                    "database": "ok",
+                    "rpc": "unavailable",
+                    "ingestion": "lagging (150 ledgers behind)"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/version": {
+      "get": {
+        "operationId": "version",
+        "summary": "Build version information",
+        "description": "Version, commit and build date embedded at build time.",
+        "tags": [
+          "Operations"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "version": {
+                      "type": "string"
+                    },
+                    "commit": {
+                      "type": "string"
+                    },
+                    "build_date": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "example": {
+                  "version": "0.1.0",
+                  "commit": "dc0ff0d",
+                  "build_date": "2026-07-21T00:00:00Z"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "metrics",
+        "summary": "Prometheus metrics",
+        "description": "Prometheus text-format exposition of ingest, RPC and HTTP metrics. Exempt from rate limiting, so a scrape can never be throttled by the pressure it is there to measure.",
+        "tags": [
+          "Operations"
+        ],
+        "responses": {
+          "200": {
+            "description": "The metrics exposition",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/events/count": {
+      "get": {
+        "operationId": "countEvents",
+        "summary": "Count matching events",
+        "description": "Total number of events matching the filter, ignoring pagination.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContractID"
+          },
+          {
+            "$ref": "#/components/parameters/EventType"
+          },
+          {
+            "$ref": "#/components/parameters/Topic"
+          },
+          {
+            "$ref": "#/components/parameters/Topic0"
+          },
+          {
+            "$ref": "#/components/parameters/Topic1"
+          },
+          {
+            "$ref": "#/components/parameters/Topic2"
+          },
+          {
+            "$ref": "#/components/parameters/Topic3"
+          },
+          {
+            "$ref": "#/components/parameters/FromLedger"
+          },
+          {
+            "$ref": "#/components/parameters/ToLedger"
+          },
+          {
+            "$ref": "#/components/parameters/FromTime"
+          },
+          {
+            "$ref": "#/components/parameters/ToTime"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": {
+                      "type": "integer",
+                      "format": "int64"
+                    }
+                  }
+                },
+                "example": {
+                  "count": 42
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/events/aggregate": {
+      "get": {
+        "operationId": "aggregateEvents",
+        "summary": "Aggregate event counts",
+        "description": "Event counts bucketed by ledger or by a time interval.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContractID"
+          },
+          {
+            "$ref": "#/components/parameters/EventType"
+          },
+          {
+            "$ref": "#/components/parameters/Topic"
+          },
+          {
+            "$ref": "#/components/parameters/Topic0"
+          },
+          {
+            "$ref": "#/components/parameters/Topic1"
+          },
+          {
+            "$ref": "#/components/parameters/Topic2"
+          },
+          {
+            "$ref": "#/components/parameters/Topic3"
+          },
+          {
+            "$ref": "#/components/parameters/FromLedger"
+          },
+          {
+            "$ref": "#/components/parameters/ToLedger"
+          },
+          {
+            "$ref": "#/components/parameters/FromTime"
+          },
+          {
+            "$ref": "#/components/parameters/ToTime"
+          },
+          {
+            "name": "bucket",
+            "in": "query",
+            "required": true,
+            "description": "Grouping interval. Either the literal \"ledger\", which counts events per ledger, or a Go duration string, which counts them per interval of wall-clock time. Required: there is no default grouping to fall back on.",
+            "schema": {
+              "type": "string",
+              "pattern": "^(ledger|[0-9]+(ns|us|ms|s|m|h)([0-9]+(ns|us|ms|s|m|h))*)$"
+            },
+            "examples": {
+              "perLedger": {
+                "summary": "One bucket per ledger",
+                "value": "ledger"
+              },
+              "hourly": {
+                "summary": "One bucket per hour",
+                "value": "1h"
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "buckets": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "key": {
+                            "type": "string"
+                          },
+                          "count": {
+                            "type": "integer",
+                            "format": "int64"
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "buckets": [
+                    {
+                      "key": "256000",
+                      "count": 5
+                    },
+                    {
+                      "key": "256001",
+                      "count": 3
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/events.csv": {
+      "get": {
+        "operationId": "eventsCSV",
+        "summary": "Export events as CSV",
+        "description": "Streaming CSV export of matching events.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContractID"
+          },
+          {
+            "$ref": "#/components/parameters/EventType"
+          },
+          {
+            "$ref": "#/components/parameters/Topic"
+          },
+          {
+            "$ref": "#/components/parameters/Topic0"
+          },
+          {
+            "$ref": "#/components/parameters/Topic1"
+          },
+          {
+            "$ref": "#/components/parameters/Topic2"
+          },
+          {
+            "$ref": "#/components/parameters/Topic3"
+          },
+          {
+            "$ref": "#/components/parameters/FromLedger"
+          },
+          {
+            "$ref": "#/components/parameters/ToLedger"
+          },
+          {
+            "$ref": "#/components/parameters/FromTime"
+          },
+          {
+            "$ref": "#/components/parameters/ToTime"
+          },
+          {
+            "$ref": "#/components/parameters/Order"
+          },
+          {
+            "$ref": "#/components/parameters/OrderBy"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/events/{id}/raw": {
+      "get": {
+        "operationId": "rawEvent",
+        "summary": "Get an event's raw XDR",
+        "description": "The base64 XDR the event was decoded from, for re-decoding.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "TOID-based event identifier: the 16-digit ledger/transaction/ operation offset, a hyphen, and a 10-digit index within the operation. Take it from an event in a listing rather than composing it.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{16}-[0-9]{10}$"
+            },
+            "example": "0001099511627776-0000000001"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "topics_xdr": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "value_xdr": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "example": {
+                  "topics_xdr": [
+                    "AAAAA",
+                    "BBBBB"
+                  ],
+                  "value_xdr": "CCCCC"
+                }
+              }
+            }
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/events/{id}/transaction": {
+      "get": {
+        "operationId": "eventTransaction",
+        "summary": "Get an event's sibling events",
+        "description": "Other events emitted by the same transaction.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "TOID-based event identifier: the 16-digit ledger/transaction/ operation offset, a hyphen, and a 10-digit index within the operation. Take it from an event in a listing rather than composing it.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{16}-[0-9]{10}$"
+            },
+            "example": "0001099511627776-0000000001"
+          },
+          {
+            "$ref": "#/components/parameters/Decoded"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Event"
+                  }
+                },
+                "example": [
+                  {
+                    "id": "0001099511627776-0000000002",
+                    "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                    "ledger": 256000,
+                    "type": "contract",
+                    "tx_hash": "9f5c7a2b...",
+                    "tx_index": 0,
+                    "op_index": 1,
+                    "in_successful_call": true,
+                    "topics": [
+                      {
+                        "symbol": "transfer"
+                      }
+                    ],
+                    "value": {
+                      "address": "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"
+                    },
+                    "created_at": "2026-07-21T12:00:00Z"
+                  }
+                ]
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/contracts/{id}": {
+      "get": {
+        "operationId": "getContract",
+        "summary": "Get a single contract's summary",
+        "description": "Aggregate row for one indexed contract: how many events it has, the ledger range they span, and when it was last seen. Returns 404 for a contract with no indexed events.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The contract to describe.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Contract summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "contract_id",
+                    "event_count",
+                    "first_ledger",
+                    "last_ledger",
+                    "last_seen"
+                  ],
+                  "properties": {
+                    "contract_id": {
+                      "type": "string",
+                      "description": "Stellar contract ID (C-prefixed)"
+                    },
+                    "event_count": {
+                      "type": "integer",
+                      "format": "int64",
+                      "description": "Number of stored events for this contract"
+                    },
+                    "first_ledger": {
+                      "type": "integer",
+                      "format": "int64",
+                      "description": "Earliest ledger holding an event for this contract"
+                    },
+                    "last_ledger": {
+                      "type": "integer",
+                      "format": "int64",
+                      "description": "Most recent ledger holding an event for this contract"
+                    },
+                    "last_seen": {
+                      "type": "string",
+                      "format": "date-time",
+                      "description": "Timestamp of the most recent event"
+                    }
+                  }
+                },
+                "example": {
+                  "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                  "event_count": 42,
+                  "first_ledger": 256000,
+                  "last_ledger": 256050,
+                  "last_seen": "2026-07-21T12:00:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/contracts/{id}/stats": {
+      "get": {
+        "operationId": "contractStats",
+        "summary": "Get per-contract statistics",
+        "description": "Event count for one contract, plus cached token metadata (name, symbol, decimals) when the contract has been resolved as a token. The metadata fields are omitted for contracts with no cached metadata.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The contract to describe.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Contract statistics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "contract_id",
+                    "event_count"
+                  ],
+                  "properties": {
+                    "contract_id": {
+                      "type": "string",
+                      "description": "Stellar contract ID (C-prefixed)"
+                    },
+                    "name": {
+                      "type": "string",
+                      "description": "Token name, when cached metadata is available"
+                    },
+                    "symbol": {
+                      "type": "string",
+                      "description": "Token symbol, when cached metadata is available"
+                    },
+                    "decimals": {
+                      "type": "integer",
+                      "description": "Token decimals, when cached metadata is available"
+                    },
+                    "event_count": {
+                      "type": "integer",
+                      "format": "int64",
+                      "description": "Number of stored events for this contract"
+                    },
+                    "type_breakdown": {
+                      "type": "array",
+                      "description": "Per-type event counts for this contract. Omitted when the breakdown is unavailable.",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "count"
+                        ],
+                        "properties": {
+                          "type": {
+                            "type": "string",
+                            "description": "Event type, e.g. contract or diagnostic"
+                          },
+                          "count": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "Number of events of this type"
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                  "name": "Soroban Token",
+                  "symbol": "STOK",
+                  "decimals": 7,
+                  "event_count": 42,
+                  "type_breakdown": [
+                    {
+                      "type": "contract",
+                      "count": 38
+                    },
+                    {
+                      "type": "diagnostic",
+                      "count": 4
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/contracts/{id}/export": {
+      "get": {
+        "operationId": "contractExport",
+        "summary": "Export a contract's events",
+        "description": "Streaming export of every stored event for one contract.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The contract whose events to export.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          },
+          {
+            "name": "from_ledger",
+            "in": "query",
+            "required": true,
+            "description": "Inclusive lower ledger bound. Required, and must not be greater than to_ledger. Unlike the list endpoints the export refuses an open-ended range outright, so a missing bound cannot drain the database one stream at a time.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 256000
+          },
+          {
+            "name": "to_ledger",
+            "in": "query",
+            "required": true,
+            "description": "Inclusive upper ledger bound. Required. The span it forms with from_ledger is capped by the EXPORT_MAX_RANGE environment variable, so a wide range may be refused by a deployment even though both bounds are individually valid.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 256999
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "description": "Serialisation of the exported stream.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "csv",
+                "ndjson"
+              ],
+              "default": "csv"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/tenant": {
+      "get": {
+        "operationId": "currentTenant",
+        "summary": "Describe the calling tenant",
+        "description": "The authenticated tenant's identity and grants.",
+        "tags": [
+          "Operations"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "id": 1,
+                  "name": "acme-corp",
+                  "enabled": true,
+                  "grants": [
+                    "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/tenant/usage": {
+      "get": {
+        "operationId": "currentTenantUsage",
+        "summary": "Usage for the calling tenant",
+        "description": "Recorded request and event-served counters for the caller.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "description": "How many days of usage history to return, counting back from today.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 365,
+              "default": 30
+            },
+            "example": 7
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "tenant_id": 1,
+                  "period_days": 7,
+                  "requests": 12345,
+                  "events_served": 67890
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/tenant/watch": {
+      "get": {
+        "operationId": "tenantWatchList",
+        "summary": "List the tenant's watched contracts",
+        "description": "Contracts the calling tenant has asked the indexer to follow.",
+        "tags": [
+          "Operations"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Total-Count": {
+                "description": "The total number of contracts the tenant watches, which is the full list since this endpoint is not paginated.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "contracts": [
+                    "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                  ],
+                  "count": 1
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "post": {
+        "operationId": "addTenantWatch",
+        "summary": "Add a contract to the tenant's watch list",
+        "description": "Adds a contract to the calling tenant's watch list.",
+        "tags": [
+          "Operations"
+        ],
+        "responses": {
+          "200": {
+            "description": "The tenant's refreshed watch list. Not a 201: the response is the whole list, not the created row.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "contracts": [
+                    "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                    "CAAAA..."
+                  ],
+                  "count": 2
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/tenant/watch/{contract_id}": {
+      "delete": {
+        "operationId": "removeTenantWatch",
+        "summary": "Remove a contract from the tenant's watch list",
+        "description": "Removes a contract from the calling tenant's watch list.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "name": "contract_id",
+            "in": "path",
+            "required": true,
+            "description": "The contract to drop from the calling tenant's watch list.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The tenant's refreshed watch list. Not a 204: the response carries the remaining contracts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "contracts": [
+                    "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                  ],
+                  "count": 1
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/watched-contracts": {
+      "get": {
+        "operationId": "listWatchedContracts",
+        "summary": "List watched contracts",
+        "description": "Contracts the indexer is following.",
+        "tags": [
+          "Operations"
+        ],
+        "security": [
+          {
+            "ManagementKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Total-Count": {
+                "description": "The total number of watched contracts, which is the full list since this endpoint is not paginated.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "contracts": [
+                    {
+                      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                      "start_ledger": 256000
+                    }
+                  ],
+                  "count": 1
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "addWatchedContract",
+        "summary": "Add a watched contract",
+        "description": "Starts ingesting a contract on the next poll.",
+        "tags": [
+          "Operations"
+        ],
+        "security": [
+          {
+            "ManagementKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The refreshed watch list, plus the ledger ingestion for the new contract will start from. Not a 201: the response is the whole list, not the created row.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "contracts": [
+                    {
+                      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                      "start_ledger": 256000
+                    },
+                    {
+                      "contract_id": "CAAAA...",
+                      "start_ledger": 256000
+                    }
+                  ],
+                  "count": 2
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/watched-contracts/{id}": {
+      "delete": {
+        "operationId": "removeWatchedContract",
+        "summary": "Stop watching a contract",
+        "description": "Removes a contract from the watch list.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The contract to stop following.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          },
+          {
+            "name": "confirm",
+            "in": "query",
+            "description": "Must be \"true\" to remove the last watched contract, because emptying the list switches ingestion back from a specific list to all contract events. Not needed while other contracts remain.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true"
+              ]
+            }
+          }
+        ],
+        "security": [
+          {
+            "ManagementKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The refreshed watch list. Not a 204: the response carries the remaining contracts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "contracts": [
+                    {
+                      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                      "start_ledger": 256000
+                    }
+                  ],
+                  "count": 1
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/dead-letters": {
+      "get": {
+        "operationId": "listDeadLetters",
+        "summary": "List dead-lettered events",
+        "description": "Events that failed to decode or persist and were set aside instead of stalling ingestion.",
+        "tags": [
+          "Operations"
+        ],
+        "security": [
+          {
+            "ManagementKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "contract_id",
+            "in": "query",
+            "description": "Only list dead letters recorded for this contract. Matched exactly, and not validated as a strkey — a dead letter can be recorded for input the decoder could not make sense of.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Total-Count": {
+                "description": "The total number of dead-letter rows matching the request's contract filter, ignoring pagination. Omitted when the count could not be computed; the page itself is still returned.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "dead_letters": [
+                    {
+                      "id": 42,
+                      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                      "ledger": 256000,
+                      "error": "unexpected end of JSON input",
+                      "created_at": "2026-07-21T12:00:00Z"
+                    }
+                  ],
+                  "count": 1
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/dead-letters/{id}": {
+      "delete": {
+        "operationId": "deleteDeadLetter",
+        "summary": "Discard a dead-lettered event",
+        "description": "Removes one dead-letter row once it has been dealt with.",
+        "tags": [
+          "Operations"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The dead-letter row to discard.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 42
+          }
+        ],
+        "security": [
+          {
+            "ManagementKey": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/stats": {
+      "get": {
+        "operationId": "stats",
+        "summary": "Indexer statistics",
+        "tags": [
+          "System"
+        ],
+        "responses": {
+          "200": {
+            "description": "Indexer statistics, including auditor counters when active",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Stats"
+                },
+                "example": {
+                  "total_events": 12345,
+                  "last_ingested_ledger": 256050,
+                  "verified_through_ledger": 256000,
+                  "contract_count": 3,
+                  "watched_contracts": 1,
+                  "auditor": null
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/events/ws": {
+      "get": {
+        "operationId": "eventStreamWS",
+        "summary": "WebSocket live event stream",
+        "description": "Upgrades to a WebSocket connection that pushes ingested events as they\nare stored. The stream starts at \"now\" — no replay of historical events.\nUse the same EventFilter query parameters as GET /events.\n",
+        "tags": [
+          "Events"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContractID"
+          },
+          {
+            "$ref": "#/components/parameters/EventType"
+          },
+          {
+            "$ref": "#/components/parameters/Topic"
+          },
+          {
+            "$ref": "#/components/parameters/Topic0"
+          },
+          {
+            "$ref": "#/components/parameters/Topic1"
+          },
+          {
+            "$ref": "#/components/parameters/Topic2"
+          },
+          {
+            "$ref": "#/components/parameters/Topic3"
+          },
+          {
+            "$ref": "#/components/parameters/FromLedger"
+          },
+          {
+            "$ref": "#/components/parameters/ToLedger"
+          },
+          {
+            "$ref": "#/components/parameters/FromTime"
+          },
+          {
+            "$ref": "#/components/parameters/ToTime"
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade successful"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          }
+        }
+      }
+    },
+    "/subscriptions": {
+      "post": {
+        "operationId": "createSubscription",
+        "summary": "Register a new webhook subscription",
+        "tags": [
+          "Webhooks"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSubscriptionRequest"
+              },
+              "example": {
+                "url": "https://example.com/webhook",
+                "secret": "whsec_z8eP5qL3vR2xK9yB4w",
+                "filters": {
+                  "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                  "type": "contract"
+                },
+                "enabled": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Subscription created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Subscription"
+                },
+                "example": {
+                  "id": 1,
+                  "url": "https://example.com/webhook",
+                  "filters": {
+                    "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                    "type": "contract"
+                  },
+                  "secret": "whsec_z8eP5qL3vR2xK9yB4w",
+                  "enabled": true,
+                  "failure_count": 0,
+                  "created_at": "2026-07-21T12:00:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "get": {
+        "operationId": "listSubscriptions",
+        "summary": "List all webhook subscriptions",
+        "tags": [
+          "Webhooks"
+        ],
+        "responses": {
+          "200": {
+            "description": "All registered subscriptions",
+            "headers": {
+              "X-Total-Count": {
+                "description": "The total number of subscriptions visible to the caller, which is the full list since this endpoint is not paginated.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Subscription"
+                  }
+                },
+                "example": [
+                  {
+                    "id": 1,
+                    "url": "https://example.com/webhook",
+                    "filters": {
+                      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                    },
+                    "secret": "whsec_z8eP5qL3vR2xK9yB4w",
+                    "enabled": true,
+                    "failure_count": 0,
+                    "created_at": "2026-07-21T12:00:00Z"
+                  }
+                ]
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/subscriptions/{id}": {
+      "get": {
+        "operationId": "getSubscription",
+        "summary": "Get a single subscription by ID",
+        "tags": [
+          "Webhooks"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Subscription ID, as returned by POST /subscriptions.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The requested subscription",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Subscription"
+                },
+                "example": {
+                  "id": 1,
+                  "url": "https://example.com/webhook",
+                  "filters": {
+                    "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                  },
+                  "secret": "whsec_z8eP5qL3vR2xK9yB4w",
+                  "enabled": true,
+                  "failure_count": 0,
+                  "created_at": "2026-07-21T12:00:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateSubscription",
+        "summary": "Update a subscription",
+        "description": "Only fields present in the request body are changed.",
+        "tags": [
+          "Webhooks"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Subscription ID, as returned by POST /subscriptions.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSubscriptionRequest"
+              },
+              "example": {
+                "url": "https://new.example.com/webhook",
+                "enabled": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated subscription",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Subscription"
+                },
+                "example": {
+                  "id": 1,
+                  "url": "https://new.example.com/webhook",
+                  "filters": {
+                    "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                  },
+                  "secret": "whsec_z8eP5qL3vR2xK9yB4w",
+                  "enabled": true,
+                  "failure_count": 0,
+                  "created_at": "2026-07-21T12:00:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteSubscription",
+        "summary": "Delete a subscription and its delivery history",
+        "tags": [
+          "Webhooks"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Subscription ID, as returned by POST /subscriptions.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted successfully"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/subscriptions/{id}/deliveries": {
+      "get": {
+        "operationId": "listDeliveries",
+        "summary": "List delivery attempts for a subscription",
+        "tags": [
+          "Webhooks"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Subscription ID, as returned by POST /subscriptions.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 1
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Delivery attempts, newest first",
+            "headers": {
+              "X-Total-Count": {
+                "description": "The total number of delivery attempts recorded for the subscription, ignoring the limit. Omitted when the count could not be computed; the page itself is still returned.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DeliveryAttempt"
+                  }
+                },
+                "example": [
+                  {
+                    "id": 1,
+                    "subscription_id": 1,
+                    "event_id": "0001099511627776-0000000001",
+                    "status": "delivered",
+                    "response_code": 200,
+                    "duration_ms": 142,
+                    "created_at": "2026-07-21T12:00:00Z"
+                  }
+                ]
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "ContractID": {
+        "name": "contract_id",
+        "in": "query",
+        "description": "Filter by contract ID. Accepts a single Stellar contract strkey, or\nseveral separated by commas, in which case events from any of them\nmatch. Every element is validated: one typo rejects the whole\nrequest rather than silently narrowing the result to nothing.\n\nThe alphabet is base32 (`A`-`Z` and `2`-`7`), so `0`, `1`, `8` and\n`9` never appear in a contract ID.\n",
+        "schema": {
+          "type": "string",
+          "pattern": "^C[A-Z2-7]{55}(,C[A-Z2-7]{55})*$"
+        },
+        "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+      },
+      "EventType": {
+        "name": "type",
+        "in": "query",
+        "description": "Filter by event type. Accepts several types separated by commas, in which case events of any listed type match. An unrecognised type is rejected rather than ignored.",
+        "schema": {
+          "type": "string",
+          "pattern": "^(contract|system|diagnostic)(,(contract|system|diagnostic))*$"
+        },
+        "example": "contract,diagnostic"
+      },
+      "Topic": {
+        "name": "topic",
+        "in": "query",
+        "description": "Exact JSON match against any topic position. Cannot be combined with\ntopic0..topic3 — a request carrying both is rejected, because the\ntwo ask different questions and silently preferring one would hide\nthe mistake.\n\nA value that parses as JSON is used as-is; anything else is treated\nas a JSON string, so `transfer` and `\"transfer\"` mean the same\nthing.\n",
+        "schema": {
+          "type": "string"
+        },
+        "example": "{\"symbol\":\"transfer\"}"
+      },
+      "Topic0": {
+        "name": "topic0",
+        "in": "query",
+        "description": "Exact JSON match against topic position 0, usually the event name. Same value rules as topic, and likewise cannot be combined with it.",
+        "schema": {
+          "type": "string"
+        },
+        "example": "{\"symbol\":\"transfer\"}"
+      },
+      "Topic1": {
+        "name": "topic1",
+        "in": "query",
+        "description": "Exact JSON match against topic position 1. Same value rules as topic, and likewise cannot be combined with it.",
+        "schema": {
+          "type": "string"
+        },
+        "example": "{\"address\":\"GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR\"}"
+      },
+      "Topic2": {
+        "name": "topic2",
+        "in": "query",
+        "description": "Exact JSON match against topic position 2. Same value rules as topic, and likewise cannot be combined with it.",
+        "schema": {
+          "type": "string"
+        },
+        "example": "{\"address\":\"GBUKOFF6BLZID2WGVUOFQNPJXBAY3HRUYBOG5DXCTNRHOMCVQ4KKXOTQ\"}"
+      },
+      "Topic3": {
+        "name": "topic3",
+        "in": "query",
+        "description": "Exact JSON match against topic position 3. Same value rules as topic, and likewise cannot be combined with it.",
+        "schema": {
+          "type": "string"
+        },
+        "example": "{\"string\":\"native\"}"
+      },
+      "FromLedger": {
+        "name": "from_ledger",
+        "in": "query",
+        "description": "Inclusive lower ledger bound. Must be a positive integer; zero is rejected rather than treated as \"unbounded\", so a miscomputed bound cannot silently widen a query. When to_ledger is also given, from_ledger must not be greater than it.",
+        "schema": {
+          "type": "integer",
+          "format": "int64",
+          "minimum": 1
+        },
+        "example": 256000
+      },
+      "ToLedger": {
+        "name": "to_ledger",
+        "in": "query",
+        "description": "Inclusive upper ledger bound. Must be a positive integer; zero is rejected rather than treated as \"unbounded\". When from_ledger is also given, it must not be greater than this value.",
+        "schema": {
+          "type": "integer",
+          "format": "int64",
+          "minimum": 1
+        },
+        "example": 256999
+      },
+      "FromTime": {
+        "name": "from_time",
+        "in": "query",
+        "description": "Inclusive lower created_at bound, as an RFC 3339 timestamp with a timezone and whole-second precision. Sub-second precision is rejected rather than truncated, because a truncated bound would quietly include or exclude a boundary event. When to_time is also given, from_time must not be after it.",
+        "schema": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "example": "2026-07-21T00:00:00Z"
+      },
+      "ToTime": {
+        "name": "to_time",
+        "in": "query",
+        "description": "Inclusive upper created_at bound, as an RFC 3339 timestamp with a timezone and whole-second precision. Sub-second precision is rejected rather than truncated. When from_time is also given, it must not be after this value.",
+        "schema": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "example": "2026-07-22T00:00:00Z"
+      },
+      "Limit": {
+        "name": "limit",
+        "in": "query",
+        "description": "Page size. Out-of-range values are rejected rather than clamped, so\na caller asking for more than it may have finds out instead of\nsilently receiving a short page and assuming it reached the end.\n\nThe ceiling is 500. An operator can lower it with the API_MAX_LIMIT\nenvironment variable, so a deployment may reject a value this schema\npermits; the store never returns more than 500 rows in one page\nregardless.\n",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 50
+        },
+        "example": 100
+      },
+      "ContractsLimit": {
+        "name": "limit",
+        "in": "query",
+        "description": "Page size for the contract listing. Bounded tighter than the event endpoints, and by a compile-time constant rather than API_MAX_LIMIT, because the listing is a grouped scan over the events table — one row of output costs far more than one event does.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 50
+        },
+        "example": 100
+      },
+      "Cursor": {
+        "name": "cursor",
+        "in": "query",
+        "description": "Opaque pagination cursor. Pass back the cursor a previous response\nreturned, unchanged; clients must not construct, parse or modify\none, and its encoding is not part of this API's contract.\n\nA cursor is only meaningful for the ordering that produced it.\nReplaying one against a different order_by is rejected rather than\nsilently restarting the walk. The absence of a cursor in a response\nmeans that page was the last one.\n",
+        "schema": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        }
+      },
+      "Order": {
+        "name": "order",
+        "in": "query",
+        "description": "Sort direction for the order_by key. Cannot be combined with the recent shorthand, which pins the direction itself.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "asc",
+            "desc"
+          ],
+          "default": "asc"
+        }
+      },
+      "OrderBy": {
+        "name": "order_by",
+        "in": "query",
+        "description": "Sort key. Whichever key is chosen also decides which cursors are valid for the walk, so changing it mid-pagination means starting over. Cannot be combined with the recent shorthand.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "id",
+            "ledger",
+            "created_at"
+          ],
+          "default": "id"
+        }
+      },
+      "Decoded": {
+        "name": "decoded",
+        "in": "query",
+        "description": "When \"true\", enrich events with spec-driven named fields. Any other value leaves the response undecoded; only the exact string \"true\" turns enrichment on. Enrichment is skipped silently when no contract spec is available, so a decoded request is never an error.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "true"
+          ]
+        }
+      }
+    },
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "description": "Standard error envelope",
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Human-readable error message"
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded"
+            ]
+          },
+          "checks": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "example": {
+              "database": "ok",
+              "rpc": "ok"
+            }
+          }
+        },
+        "required": [
+          "status",
+          "checks"
+        ]
+      },
+      "Event": {
+        "type": "object",
+        "description": "A Stellar/Soroban contract event",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "TOID-based event identifier",
+            "example": "0001099511627776-0000000001"
+          },
+          "contract_id": {
+            "type": "string",
+            "description": "Contract ID",
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          },
+          "ledger": {
+            "type": "integer",
+            "description": "Ledger sequence number",
+            "example": 256000
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "contract",
+              "system",
+              "diagnostic"
+            ]
+          },
+          "tx_hash": {
+            "type": "string",
+            "description": "Transaction hash",
+            "example": "9f5c..."
+          },
+          "tx_index": {
+            "type": "integer",
+            "description": "Transaction index within the ledger"
+          },
+          "op_index": {
+            "type": "integer",
+            "description": "Operation index within the transaction"
+          },
+          "in_successful_call": {
+            "type": "boolean",
+            "description": "Whether the event was emitted in a successful call"
+          },
+          "topics": {
+            "type": "array",
+            "description": "Event topic values (JSON-encoded)",
+            "items": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "value": {
+            "description": "Event value (JSON-encoded)"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the event was persisted"
+          }
+        },
+        "required": [
+          "id",
+          "contract_id",
+          "ledger",
+          "type",
+          "tx_hash",
+          "tx_index",
+          "op_index",
+          "in_successful_call",
+          "topics",
+          "value",
+          "created_at"
+        ]
+      },
+      "EnrichedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Event"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "decoded_event": {
+                "type": "object",
+                "nullable": true,
+                "properties": {
+                  "event": {
+                    "type": "string"
+                  },
+                  "fields": {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                }
+              },
+              "decoded": {
+                "type": "boolean"
+              }
+            }
+          }
+        ]
+      },
+      "EventsResponse": {
+        "type": "object",
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/Event"
+                },
+                {
+                  "$ref": "#/components/schemas/EnrichedEvent"
+                }
+              ]
+            }
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Present when more results exist; pass back as ?cursor="
+          }
+        },
+        "required": [
+          "events"
+        ]
+      },
+      "Stats": {
+        "type": "object",
+        "properties": {
+          "total_events": {
+            "type": "integer"
+          },
+          "last_ingested_ledger": {
+            "type": "integer"
+          },
+          "verified_through_ledger": {
+            "type": "integer"
+          },
+          "contract_count": {
+            "type": "integer"
+          },
+          "watched_contracts": {
+            "type": "integer"
+          },
+          "auditor": {
+            "type": "object",
+            "nullable": true,
+            "properties": {
+              "passes_run": {
+                "type": "integer"
+              },
+              "ledgers_checked": {
+                "type": "integer"
+              },
+              "findings_opened": {
+                "type": "integer"
+              },
+              "findings_repaired": {
+                "type": "integer"
+              },
+              "findings_unverifiable": {
+                "type": "integer"
+              },
+              "findings_unrecoverable": {
+                "type": "integer"
+              },
+              "rpc_requests": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "CreateSubscriptionRequest": {
+        "type": "object",
+        "required": [
+          "url",
+          "secret"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Callback URL",
+            "example": "https://example.com/webhook"
+          },
+          "secret": {
+            "type": "string",
+            "description": "HMAC-SHA256 secret for payload verification",
+            "example": "whsec_z8eP5qL3vR2xK9yB4w"
+          },
+          "filters": {
+            "$ref": "#/components/schemas/SubscriptionFilter"
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Defaults to true"
+          }
+        }
+      },
+      "UpdateSubscriptionRequest": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "secret": {
+            "type": "string"
+          },
+          "filters": {
+            "$ref": "#/components/schemas/SubscriptionFilter"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SubscriptionFilter": {
+        "type": "object",
+        "description": "Filter that callbacks use to select which events to deliver. An empty filter matches every event.",
+        "properties": {
+          "contract_id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "contract",
+              "system",
+              "diagnostic"
+            ]
+          },
+          "topic": {
+            "description": "Exact JSON match against any topic position"
+          },
+          "from_ledger": {
+            "type": "integer"
+          },
+          "to_ledger": {
+            "type": "integer"
+          }
+        }
+      },
+      "Subscription": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "url": {
+            "type": "string"
+          },
+          "filters": {
+            "$ref": "#/components/schemas/SubscriptionFilter"
+          },
+          "secret": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "failure_count": {
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "url",
+          "filters",
+          "secret",
+          "enabled",
+          "failure_count",
+          "created_at"
+        ]
+      },
+      "DeliveryAttempt": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "subscription_id": {
+            "type": "integer"
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "response_code": {
+            "type": "integer"
+          },
+          "duration_ms": {
+            "type": "integer"
+          },
+          "error": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "subscription_id",
+          "event_id",
+          "status",
+          "response_code",
+          "duration_ms",
+          "created_at"
+        ]
+      },
+      "ContractSummary": {
+        "type": "object",
+        "properties": {
+          "contract_id": {
+            "type": "string"
+          },
+          "event_count": {
+            "type": "integer",
+            "description": "Total stored events for this contract"
+          },
+          "first_ledger": {
+            "type": "integer",
+            "description": "Oldest ledger with a stored event for this contract"
+          },
+          "last_ledger": {
+            "type": "integer",
+            "description": "Newest ledger with a stored event for this contract"
+          },
+          "last_seen": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Wall-clock time the most recent event was ingested"
+          }
+        },
+        "required": [
+          "contract_id",
+          "event_count",
+          "first_ledger",
+          "last_ledger",
+          "last_seen"
+        ]
+      },
+      "ContractsPage": {
+        "type": "object",
+        "properties": {
+          "contracts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ContractSummary"
+            }
+          },
+          "count": {
+            "type": "integer",
+            "description": "Number of contracts on this page"
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Present when more results exist; pass back as ?cursor="
+          }
+        },
+        "required": [
+          "contracts",
+          "count"
+        ]
+      }
+    },
+    "securitySchemes": {
+      "TenantAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The tenant API key issued by POST /admin/tenants/{id}/keys, presented\nas `Authorization: Bearer st_<prefix>_<secret>`. The same key is also\naccepted in an `X-API-Key` header (see TenantAuthHeader); Bearer wins\nwhen both are present.\n\nOnly enforced when the instance runs with MULTI_TENANT=true. On a\nsingle-tenant instance every request is served as an implicit\nwildcard principal and no credential is required, which is why most\noperations list this scheme as optional rather than required.\n"
+      },
+      "TenantAuthHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "The same tenant API key as TenantAuth, presented in a header instead of a Bearer token."
+      },
+      "ManagementKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "The operator's instance-wide management key, configured through the\nAPI_KEY environment variable. It gates the endpoints that mutate\ningestion or read the dead-letter queue, and it is always required on\nthose endpoints — independently of MULTI_TENANT, and independently of\nthe tenant credential above.\n\nWhen API_KEY is unset the server fails closed: those endpoints answer\n503 rather than running unauthenticated.\n"
+      }
+    },
+    "responses": {
+      "NotModified": {
+        "description": "The cached copy is still current. Returned for a conditional GET whose If-None-Match matches the resource's current ETag. The body is empty; the validators are repeated so the client can refresh its cache entry.",
+        "headers": {
+          "ETag": {
+            "description": "The validator that matched.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          "Cache-Control": {
+            "description": "The caching policy for the unchanged resource.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "BadRequest": {
+        "description": "The request could not be parsed or violates a documented constraint — a malformed identifier, an out-of-range limit, an unparseable cursor, or a JSON body the endpoint cannot decode. The message names the offending parameter.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "No credential was presented, or the one presented is malformed,\nunknown or revoked.\n\nWhich credential is missing depends on the endpoint's security\nrequirement: endpoints requiring ManagementKey want the operator's\n`X-API-Key`, while everything else wants the tenant key and only\nrejects when the instance runs with MULTI_TENANT=true.\n",
+        "headers": {
+          "WWW-Authenticate": {
+            "description": "The authentication challenge, per RFC 7235 §4.1 — for example `Bearer realm=\"sorotrail\"`. Present on the tenant-authentication failures; the ManagementKey path answers without a challenge because it accepts no Bearer token.",
+            "schema": {
+              "type": "string",
+              "examples": [
+                "Bearer realm=\"sorotrail\""
+              ]
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The credential is valid but does not entitle the caller to what it asked for: a disabled tenant, a non-admin calling an admin endpoint, or a request naming a contract outside the tenant's grants. Contract IDs are public on-chain identifiers, so a request for an ungranted contract is answered 403 rather than 404.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "The addressed resource does not exist, or is not visible to the caller. Event lookups answer 404 rather than 403 for an event the caller may not read, so the endpoint cannot be used as an existence oracle. The tenant and admin endpoints also answer 404 when the instance runs single-tenant and those routes are therefore inert.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "The request collides with the current state — a duplicate tenant name, or a tenant attempting to delete the account it is authenticated as.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "The caller exceeded its request quota, or asked to watch more\ncontracts than its quota allows.\n\nRate limiting is per client — keyed on the authenticated tenant where\none exists and on the client IP otherwise — and is only active when\nthe operator configured RATE_LIMIT_RPS or a per-tenant override. The\nprobe and scrape endpoints (/health, /livez, /readyz, /metrics) are\nnever rate limited, so throttling cannot blind an operator to the\nthrottling itself.\n",
+        "headers": {
+          "Retry-After": {
+            "description": "Whole seconds to wait before retrying, per RFC 7231 §7.1.3. Always at least 1, and rounded up from the limiter's own wait-to-next-token estimate.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "examples": [
+                1
+              ]
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "The request failed for a reason the caller cannot act on — a store or RPC failure, or a panic caught by the recovery middleware. The message is deliberately generic; the specifics are logged against the request's X-Request-ID rather than returned.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "NotImplemented": {
+        "description": "The endpoint exists but the feature behind it is not configured on this instance. Returned by the live event stream when the broadcaster is disabled.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "The endpoint is temporarily unusable or not configured on this instance. The management endpoints answer this when API_KEY is unset, failing closed so writes are never open on a misconfigured instance; /metrics answers it when no metrics collector is wired in.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    }
+  }
+}

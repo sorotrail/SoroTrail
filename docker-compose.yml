@@ -5,6 +5,8 @@ services:
       POSTGRES_USER: sorotrail
       POSTGRES_PASSWORD: sorotrail
       POSTGRES_DB: sorotrail
+    # The host port here must match DATABASE_URL in the Makefile so that
+    # `make test-db` works out of the box after `make docker-up`.
     ports:
       - "5432:5432"
     volumes:
@@ -14,21 +16,73 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
+    restart: unless-stopped
 
   indexer:
     build: .
     depends_on:
       postgres:
+        # Real readiness gating: the indexer doesn't start until
+        # pg_isready reports ok, so a fresh stack never races on
+        # migrations or first-poll errors from a half-up database.
         condition: service_healthy
     environment:
       RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
+      # Keep user/password/db in sync with DATABASE_URL in the Makefile.
       DATABASE_URL: postgres://sorotrail:sorotrail@postgres:5432/sorotrail?sslmode=disable
       POLL_INTERVAL: ${POLL_INTERVAL:-5s}
       HTTP_ADDR: ":8080"
       WATCHED_CONTRACTS: ${WATCHED_CONTRACTS:-}
+      RETENTION_AGE: ${RETENTION_AGE:-}
+      RETENTION_POLL_INTERVAL: ${RETENTION_POLL_INTERVAL:-1h}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Forwarded from the shell so traces reach the profile-gated Jaeger
+      # (e.g. OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318) without
+      # editing this file. Unset = tracing is a no-op.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     ports:
       - "8080:8080"
+    # Probe `/health` using the same binary already shipped in the
+    # image (the docker HEALTHCHECK directive sets this; repeat it
+    # here so users running against a published image — where the
+    # Dockerfile is authoritative — see the same shape in compose).
+    # Flags mirror the Dockerfile defaults and stay operator-editable.
+    # --addr is intentionally omitted: the probe falls back to
+    # $HTTP_ADDR (rewritten to 127.0.0.1:<port> for the loopback-only
+    # probe) then 127.0.0.1:8080, so the probe follows whichever port
+    # HTTP_ADDR names rather than drifting against a hardcoded one.
+    healthcheck:
+      test:
+        - "CMD"
+        - "sorotrail"
+        - "healthcheck"
+        - "--endpoint"
+        - "/health"
+        - "--timeout"
+        - "3s"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # Jaeger all-in-one for viewing OpenTelemetry traces locally. Gated
+  # behind the `jaeger` profile so a plain `docker compose up` stays lean;
+  # opt in with `docker compose --profile jaeger up`. SoroTrail's OTLP
+  # exporter (OTEL_EXPORTER_OTLP_ENDPOINT) sends spans here, and the UI
+  # is served from http://localhost:16686.
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    profiles:
+      - jaeger
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4318:4318" # OTLP over HTTP
+    environment:
+      # Enable the OTLP HTTP receiver so SoroTrail's otlptracehttp exporter
+      # (which talks plain HTTP, not gRPC) can reach it on port 4318.
+      COLLECTOR_OTLP_ENABLED: "true"
+    restart: unless-stopped
 
 volumes:
   pgdata:
