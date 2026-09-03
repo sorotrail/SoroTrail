@@ -1671,10 +1671,6 @@ func (s *Server) assembleStats(ctx context.Context) (store.Stats, error) {
 		}
 	}
 
-	writeCacheHeaders(w, cacheNoStore, 0, "")
-
-	writeJSON(w, http.StatusOK, stats)
-
 	return stats, nil
 }
 

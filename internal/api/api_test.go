@@ -1475,6 +1475,9 @@ func TestStats_IngesterEffectivePollInterval(t *testing.T) {
 		var got store.Stats
 		require.NoError(t, json.Unmarshal(body, &got))
 		assert.Equal(t, int64(5000), got.Ingester.EffectivePollIntervalMs)
+	})
+}
+
 // TestStats_Cache verifies the /stats TTL cache end-to-end: repeated calls
 // within the window hit the cache (the store is consulted once), and the value
 // refreshes after the TTL expires.
