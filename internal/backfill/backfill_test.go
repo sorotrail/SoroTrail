@@ -388,7 +388,7 @@ type cancelingHorizon struct {
 
 func (c *cancelingHorizon) ListContractTransactions(ctx context.Context, contractID, cursor string, limit int, includeFailed bool) (horizon.TransactionsResponse, error) {
 	resp, err := c.fakeHorizon.ListContractTransactions(ctx, contractID, cursor, limit, includeFailed)
-	if !c.fired && c.fakeHorizon.calls == c.cancelAfter {
+	if !c.fired && c.calls == c.cancelAfter {
 		c.fired = true
 		c.cancel()
 	}
