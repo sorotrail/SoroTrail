@@ -383,3 +383,73 @@ func TestFormatEventID(t *testing.T) {
 		}
 	})
 }
+
+// TestEventKind pins down the mapping from xdr.ContractEventType to the
+// textual type string the API and store expose. These strings are
+// load-bearing: the REST and GraphQL type filters only accept the
+// documented set, so any drift between what the extractor writes and
+// what the API can select would silently hide events from every query
+// that filters by type.
+func TestEventKind(t *testing.T) {
+	// The type filter values the API accepts (see the Validate and
+	// ParseTypes switches in internal/api/queries). eventKind must only
+	// ever return members of this set, otherwise stored rows become
+	// unfilterable.
+	documentedFilterValues := map[string]bool{
+		"contract":   true,
+		"system":     true,
+		"diagnostic": true,
+	}
+
+	tests := []struct {
+		name string
+		in   xdr.ContractEventType
+		want string
+	}{
+		{
+			// Contract events are the ordinary case: every user-visible
+			// emission from an invoked contract carries this enum value,
+			// and it must surface as the "contract" type the API exposes.
+			name: "contract events map to the documented contract type",
+			in:   xdr.ContractEventTypeContract,
+			want: "contract",
+		},
+		{
+			// System events come from the host itself rather than a
+			// contract, so they must be labelled "system" to let clients
+			// filter diagnostics separately from user emissions.
+			name: "system events map to the documented system type",
+			in:   xdr.ContractEventTypeSystem,
+			want: "system",
+		},
+		{
+			// Diagnostic sub-events are deliberately folded into the
+			// contract bucket: the type the API filter selects already
+			// covers their consumers, so they never need their own string.
+			name: "diagnostic events fall back to the contract bucket",
+			in:   xdr.ContractEventTypeDiagnostic,
+			want: "contract",
+		},
+		{
+			// Any future enum value we have not seen must fall back to
+			// the contract bucket rather than produce an unmapped string:
+			// an unknown XDR variant must never stall backfill or emit a
+			// type no filter can select.
+			name: "unknown future variants fall back to the contract bucket",
+			in:   xdr.ContractEventType(99),
+			want: "contract",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := eventKind(tt.in)
+			assert.Equal(t, tt.want, got)
+			// The value must stay a documented API type filter value; if
+			// it ever drifts outside the accepted set, events of this
+			// kind become invisible to type-filtered queries.
+			assert.True(t, documentedFilterValues[got],
+				"eventKind(%d) = %q must be a documented API type filter value",
+				tt.in, got)
+		})
+	}
+}

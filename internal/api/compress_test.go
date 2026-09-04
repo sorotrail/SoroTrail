@@ -716,3 +716,55 @@ func TestCompressWriter_ShouldCompress(t *testing.T) {
 		})
 	}
 }
+
+func TestIsWebSocketUpgrade(t *testing.T) {
+	tests := []struct {
+		name     string
+		setup    func(*http.Request)
+		expected bool
+	}{
+		{
+			name: "Connection: Upgrade with Upgrade: websocket returns true",
+			setup: func(r *http.Request) {
+				r.Header.Set("Connection", "Upgrade")
+				r.Header.Set("Upgrade", "websocket")
+			},
+			expected: true,
+		},
+		{
+			name: "the header comparison is case-insensitive",
+			setup: func(r *http.Request) {
+				r.Header.Set("Connection", "upgrade")
+				r.Header.Set("Upgrade", "WEBSOCKET")
+			},
+			expected: true,
+		},
+		{
+			name: "a Connection: keep-alive request returns false",
+			setup: func(r *http.Request) {
+				r.Header.Set("Connection", "keep-alive")
+			},
+			expected: false,
+		},
+		{
+			name:     "a request with no upgrade headers returns false",
+			setup:    func(r *http.Request) {},
+			expected: false,
+		},
+		{
+			name: "Connection: Upgrade without the websocket token returns false",
+			setup: func(r *http.Request) {
+				r.Header.Set("Connection", "Upgrade")
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			tt.setup(req)
+			assert.Equal(t, tt.expected, isWebSocketUpgrade(req))
+		})
+	}
+}

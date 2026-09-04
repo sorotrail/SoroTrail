@@ -64,6 +64,11 @@ type Options struct {
 	// DryRun decodes and reports without writing anything — no rewrites and
 	// no progress, so it is safe to run at any time.
 	DryRun bool
+
+	// Progress, when non-nil, is called after each batch with the number
+	// of rows processed since the last call. The callback must be safe
+	// for concurrent use and should not block.
+	Progress func(processed int64)
 }
 
 func (o *Options) applyDefaults() {
@@ -177,6 +182,9 @@ func (r *Replayer) Run(ctx context.Context) (Summary, error) {
 				}
 				return sum, err
 			}
+		}
+		if r.opts.Progress != nil {
+			r.opts.Progress(int64(len(events)))
 		}
 		r.log.Debug("replay batch done",
 			"through_event_id", cursor, "processed", sum.Processed, "changed", sum.Changed)

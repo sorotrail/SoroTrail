@@ -162,7 +162,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	default:
 		w.Header().Set("Allow", "GET, POST")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		// The GraphQL contract fixes the response shape (data + errors), so
+		// failures travel through this transport's own envelope rather than
+		// the REST one — but always through writeErrorEnvelope, never bare.
+		writeErrorEnvelope(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 	}
 }
 
@@ -227,7 +230,7 @@ func writeErrorEnvelope(w http.ResponseWriter, status int, msg string, path []st
 func (h *Handler) PlaygroundHandler() http.Handler {
 	if !h.playground {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, "playground is disabled", http.StatusNotFound)
+			writeErrorEnvelope(w, http.StatusNotFound, "playground is disabled", nil)
 		})
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

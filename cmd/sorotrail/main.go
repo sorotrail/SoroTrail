@@ -4,6 +4,7 @@
 // With no arguments it runs the indexer. Subcommands cover maintenance:
 //
 //	sorotrail replay --from-ledger N [--to-ledger M]
+//	sorotrail apikey create|list|revoke
 //	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
 package main
 
@@ -24,6 +25,7 @@ import (
 
 	"github.com/sorotrail/sorotrail/internal/api"
 	"github.com/sorotrail/sorotrail/internal/api/graphql"
+	"github.com/sorotrail/sorotrail/internal/archive"
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/config"
@@ -60,6 +62,8 @@ func dispatch(args []string) error {
 	switch args[0] {
 	case "replay":
 		return runReplay(args[1:])
+	case "apikey":
+		return runAPIKey(args[1:])
 	case "backfill":
 		return runBackfill(args[1:])
 	case "index-addresses":
@@ -75,6 +79,10 @@ func dispatch(args []string) error {
 			os.Exit(code)
 		}
 		return nil
+	case "schema-inspect":
+		return runSchemaInspect(args[1:])
+	case "migrate-status":
+		return runMigrateStatus(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -90,6 +98,10 @@ func usage() {
 With no subcommand, runs the indexer (ingester + HTTP API).
 
 subcommands:
+  replay    re-decode stored events with the current decoder
+            (sorotrail replay --help)
+  apikey    issue, list, and revoke API keys
+            (sorotrail apikey --help)
   replay       re-decode stored events with the current decoder
                (sorotrail replay --help)
   backfill     ingest historical contract events from Horizon
@@ -98,6 +110,10 @@ subcommands:
                (sorotrail index-addresses --help)
   healthcheck  probe /health and exit (used by docker HEALTHCHECK)
                (sorotrail healthcheck --help)
+  schema-inspect  report migration state, partitions, and table sizes
+               (sorotrail schema-inspect --help)
+  migrate-status report pending migrations without applying them
+               (sorotrail migrate-status --help)
 `)
 }
 
@@ -106,7 +122,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log := newLogger(cfg.LogLevel, cfg.LogFormat)
+	log, logLevel := newLoggerWithLevel(cfg.LogLevel, cfg.LogFormat)
 
 	log.Info("startup configuration", cfg.LoggableFields()...)
 
@@ -136,7 +152,7 @@ func run() error {
 			return err
 		}
 	} else {
-		pool, err = pgxpool.New(ctx, cfg.DatabaseURL)
+		pool, err = store.NewPool(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns, cfg.DBMaxConnLifetime, cfg.DBMaxConnIdleTime)
 		if err != nil {
 			return fmt.Errorf("connecting to postgres: %w", err)
 		}
@@ -196,7 +212,11 @@ func run() error {
 	// the retry wrapper applies the configured backoff, honoring any
 	// Retry-After hint a rate-limiting provider sends (issue #58).
 	rpcClient := rpc.NewRetryClient(
-		rpc.NewHTTPClient(cfg.RPCURL, rpc.WithRateLimitRPS(cfg.RPCRateLimit)),
+		rpc.NewHTTPClient(
+			cfg.RPCURL,
+			rpc.WithRateLimitRPS(cfg.RPCRateLimit),
+			rpc.WithHTTPTimeout(cfg.RPCHTTPTimeout),
+		),
 		rpc.RetryConfig{
 			MaxAttempts: cfg.RPCMaxAttempts,
 			BaseBackoff: cfg.RPCBaseBackoff,
@@ -207,9 +227,14 @@ func run() error {
 	wh := webhook.NewNotifier(st, log)
 
 	// Wire the spec cache and enricher for spec-decoded event views.
-	specCache := spec.NewCache(st)
+	// The cache is keyed by wasm hash with a TTL; the fetcher doubles as
+	// the wasm-hash resolver so contract upgrades (a changed hash)
+	// invalidate the previously cached spec automatically.
 	specFetcher := spec.NewFetcher(rpcClient)
-	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
+	specCache := spec.NewCache(st,
+		spec.WithWasmHashResolver(specFetcher),
+	)
+	specEnricher := spec.NewEnricher(specFetcher, specCache, log, st)
 
 	// Wrap the raw RPC client so per-method error totals are tracked and
 	// surfaced via /stats. specFetcher already holds a reference to the
@@ -250,15 +275,21 @@ func run() error {
 		PollIntervalMin:         cfg.PollIntervalMin,
 		PollIntervalMax:         cfg.PollIntervalMax,
 		StartLedger:             cfg.StartLedger,
+		StartLedgerRaw:          cfg.StartLedgerRaw,
 		RetentionLedgers:        cfg.RetentionLedgers,
+		PageLimit:               cfg.IngestPageSize,
+		WriteBatchSize:          cfg.IngestBatchSize,
 		LagWarnLedgers:          cfg.LagWarnLedgers,
 		SweepConcurrency:        cfg.SweepConcurrency,
 		MaxEventsPerCycle:       cfg.MaxEventsPerCycle,
 		BatchSize:               cfg.BatchSize,
 		BatchTargetLatency:      cfg.BatchTargetLatency,
 		BatchMaxBackoff:         cfg.BatchMaxBackoff,
+		MinBackoff:              cfg.IngesterMinBackoff,
+		MaxBackoff:              cfg.IngesterMaxBackoff,
 		ReorgConfirmationWindow: cfg.ReorgConfirmationWindow,
 		ReorgRescanInterval:     cfg.ReorgRescanInterval,
+		Network:                 cfg.Network,
 	}).WithBroadcaster(bcast)
 	ing.SetNotifier(wh)
 	// Wire the same store as the dead-letter sink: events that fail to
@@ -269,6 +300,36 @@ func run() error {
 	// registered — there is exactly one Ingester per process even when
 	// INGESTION_LOCK_ENABLED causes its Run loop to be skipped.
 	api.SetIngester(ing)
+
+	// SIGHUP config hot-reload (issue #148): re-reads and validates the
+	// full environment on every SIGHUP, then applies only the safe subset
+	// (poll interval, log level) to the already-running ingester/logger.
+	// Topology (DATABASE_URL, RPC_URL(S), LOG_FORMAT) never changes live —
+	// a differing value there is logged and ignored rather than failing
+	// the reload, since it can't be applied to the already-constructed
+	// store/RPC client/log handler without a restart. A validation failure
+	// in the new config rejects the whole reload and leaves the running
+	// configuration untouched. This only applies to the long-running
+	// indexer; the one-shot subcommands have no reload path.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	defer signal.Stop(hupCh)
+	go func() {
+		activeCfg := cfg
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hupCh:
+				reloaded, err := applyReload(activeCfg, log, ing, logLevel)
+				if err != nil {
+					log.Error("config reload via SIGHUP rejected; keeping previous configuration", "error", err)
+					continue
+				}
+				activeCfg = reloaded
+			}
+		}
+	}()
 
 	// The auditor and its request-rate budget are constructed lazily:
 	// AUDIT_ENABLED=false (the default) means a binary identical to a
@@ -291,25 +352,70 @@ func run() error {
 		// to parse logs to see pass/finding rates.
 		api.SetAuditor(aud)
 	}
+	var retPruner *store.RetentionPruner
+	if cfg.RetentionAge > 0 {
+		retPruner = store.NewRetentionPruner(pg, log, store.RetentionOptions{
+			Age:          cfg.RetentionAge,
+			PollInterval: cfg.RetentionPoll,
+		})
+	}
 
 	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
 	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
 	// returns immediately. Only when at least one retention policy is
 	// configured does it allocate a goroutine and a metrics struct.
-	prn := pruner.New(st, log, pruner.Options{
-		MaxAge:    cfg.RetentionMaxAge,
-		MinLedger: cfg.RetentionMinLedger,
-		BatchSize: cfg.RetentionBatchSize,
-		Pause:     cfg.RetentionPause,
-		Interval:  cfg.RetentionInterval,
-	})
+	//
+	// When ARCHIVE_BUCKET is set, an archiver is created to export events
+	// to S3-compatible storage before pruning. Archival is optional and
+	// idempotent: without ARCHIVE_* vars, the binary behaves identically
+	// to the pre-archive build.
+	var arch *archive.Archiver
+	if cfg.ArchiveEnabled() {
+		var err error
+		aArchiverOpts := archive.Options{
+			Bucket:          cfg.ArchiveBucket,
+			Prefix:          cfg.ArchivePrefix,
+			Endpoint:        cfg.ArchiveEndpoint,
+			Region:          cfg.ArchiveRegion,
+			AccessKeyID:     cfg.ArchiveAccessKeyID,
+			SecretAccessKey: cfg.ArchiveSecretAccessKey,
+			UseSSL:          cfg.ArchiveUseSSL,
+			MaxRetries:      cfg.ArchiveMaxRetries,
+			Logger:          log,
+		}
+		arch, err = archive.New(st, aArchiverOpts)
+		if err != nil {
+			return fmt.Errorf("initializing archive: %w", err)
+		}
+		log.Info("archive enabled",
+			"bucket", cfg.ArchiveBucket,
+			"prefix", cfg.ArchivePrefix,
+			"before_prune", cfg.ArchiveBeforePrune,
+		)
+	}
+
+	// Expose spec-cache hit/miss metrics via /stats.
+	api.SetSpecCache(specCache)
+
+	prn := pruner.NewWithArchiver(st, log, pruner.Options{
+		MaxAge:             cfg.RetentionMaxAge,
+		MinLedger:          cfg.RetentionMinLedger,
+		BatchSize:          cfg.RetentionBatchSize,
+		Pause:              cfg.RetentionPause,
+		Interval:           cfg.RetentionInterval,
+		ArchiveBeforePrune: cfg.ArchiveBeforePrune,
+	}, arch)
 	if cfg.RetentionEnabled() {
 		api.SetPruner(prn)
 	}
+
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
 	// its cleanup goroutine is never started.
-	limiterOpts := []api.LimiterOption{}
+	limiterOpts := []api.LimiterOption{
+		api.WithHourlyQuota(cfg.HourlyQuota),
+		api.WithDailyQuota(cfg.DailyQuota),
+	}
 	if cfg.MultiTenant {
 		// Key buckets on the authenticated tenant rather than the source
 		// IP, so a tenant's quota follows its identity across however many
@@ -332,8 +438,13 @@ func run() error {
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetStatsTTL(cfg.StatsCacheTTL)
 	apiServer.SetRateLimiter(limiter)
+	if cfg.APIKeyAuthEnabled {
+		log.Info("api key authentication enabled", "gated", "write/streaming/subscriptions routes")
+	}
+	apiServer.WithAPIKeyAuth(cfg.APIKeyAuthEnabled)
 	apiServer.SetMetricsEnabled(cfg.MetricsEnabled)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
+	apiServer.SetHTTPRequestBodyLimit(cfg.HTTPRequestBodyLimit)
 	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
 	apiServer.SetCORSConfig(api.CORSConfig{
 		AllowedOrigins: cfg.CORSAllowedOrigins,
@@ -396,7 +507,7 @@ func run() error {
 		log.Info("cors enabled", "origins", strings.Join(cfg.CORSAllowedOrigins, ","))
 	}
 
-	errCh := make(chan error, 4)
+	errCh := make(chan error, 5)
 	go func() {
 		go wh.Run(ctx)
 	}()
@@ -437,6 +548,16 @@ func run() error {
 				"max_repair_attempts", cfg.AuditMaxRepair)
 			if err := aud.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- fmt.Errorf("auditor: %w", err)
+			} else {
+				errCh <- nil
+			}
+		}()
+	}
+	if retPruner != nil {
+		go func() {
+			log.Info("event retention pruning starting", "age", cfg.RetentionAge, "poll_interval", cfg.RetentionPoll)
+			if err := retPruner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				errCh <- fmt.Errorf("retention pruner: %w", err)
 			} else {
 				errCh <- nil
 			}
@@ -520,8 +641,30 @@ func bootstrapAdminKey(ctx context.Context, ts store.TenantStore, key string, lo
 }
 
 func newLogger(level, format string) *slog.Logger {
-	opts := &slog.HandlerOptions{Level: config.ParseLogLevel(level)}
-	return slog.New(config.NewLogHandler(os.Stdout, format, opts))
+	log, _ := newLoggerWithLevel(level, format)
+	return log
+}
+
+// newLoggerWithLevel builds a logger exactly like newLogger, but also
+// returns the slog.LevelVar backing its handler. slog handlers don't
+// support swapping their level after construction, so a caller that needs
+// to adjust the effective log level in place at runtime — the long-running
+// indexer's SIGHUP config-reload handler — holds onto the returned
+// LevelVar and calls Set on it instead of rebuilding the logger/handler.
+// The one-shot subcommands (replay/backfill/index-addresses) have no
+// reload path, so they keep using the simpler newLogger.
+func newLoggerWithLevel(level, format string) (*slog.Logger, *slog.LevelVar) {
+	var levelVar slog.LevelVar
+	levelVar.Set(config.ParseLogLevel(level))
+	opts := &slog.HandlerOptions{Level: &levelVar}
+	var h slog.Handler
+	switch strings.ToLower(format) {
+	case "json":
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	default:
+		h = slog.NewTextHandler(os.Stdout, opts)
+	}
+	return slog.New(h), &levelVar
 }
 
 // graphqlServerDeps wraps the live store + enricher into the typed

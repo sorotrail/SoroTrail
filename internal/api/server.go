@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -76,6 +77,35 @@ func getAuditor() *audit.Auditor {
 	return auditor
 }
 
+// SpecCacheStatsSource supplies spec-cache metrics for /stats. Mirrors
+// the SetAuditor pattern: one setter, called before ListenAndServe.
+// nil (the default) leaves the /stats spec_cache field omitted.
+type SpecCacheStatsSource interface {
+	SpecCacheStats() store.SpecCacheStats
+}
+
+var (
+	specCacheMu     sync.RWMutex
+	specCacheSource SpecCacheStatsSource
+)
+
+func SetSpecCache(src SpecCacheStatsSource) {
+	specCacheMu.Lock()
+	specCacheSource = src
+	specCacheMu.Unlock()
+}
+
+func getSpecCache() SpecCacheStatsSource {
+	specCacheMu.RLock()
+	defer specCacheMu.RUnlock()
+	return specCacheSource
+}
+
+// Enricher is the spec-based event enrichment interface used by the API.
+type Enricher interface {
+	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
+}
+
 // SetRPCCounter registers the CountingClient so /stats can expose
 // per-method RPC error totals. Call this before ListenAndServe.
 // The setter is guarded by a RWMutex so concurrent /stats readers
@@ -121,15 +151,59 @@ func getIngester() *ingester.Ingester {
 	ingesterMu.RLock()
 	defer ingesterMu.RUnlock()
 	return ing
+// SpecCacheStatsSource supplies spec-cache metrics for /stats. Mirrors
+// the SetAuditor pattern: one setter, called before ListenAndServe.
+// nil (the default) leaves the /stats spec_cache field omitted.
+type SpecCacheStatsSource interface {
+	SpecCacheStats() store.SpecCacheStats
+}
+
+var (
+	specCacheMu     sync.RWMutex
+	specCacheSource SpecCacheStatsSource
+)
+
+func SetSpecCache(src SpecCacheStatsSource) {
+	specCacheMu.Lock()
+	specCacheSource = src
+	specCacheMu.Unlock()
+}
+
+func getSpecCache() SpecCacheStatsSource {
+	specCacheMu.RLock()
+	defer specCacheMu.RUnlock()
+	return specCacheSource
 }
 
 // Enricher is the spec-based event enrichment interface used by the API.
+// Defined here so the API package doesn't import internal/spec directly.
+// DecodeStats lets /stats surface the enrichment decode failure rate when a
+// concrete enricher is wired; nil servers (decoded=true unavailable) simply
+// leave the stats field empty.
 type Enricher interface {
 	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
+	DecodeStats() store.DecodeStats
 }
 
 // Server holds the API's dependencies.
 type Server struct {
+	store    store.Store
+	rpc      rpc.Client
+	enricher Enricher
+	log      *slog.Logger
+	limiter  *RateLimiter
+	bcast    *broadcast.Broadcaster
+
+	// apiKeyAuth turns on API key authentication for the write,
+	// streaming, subscription-management, and key-management routes.
+	// Off by default: the API behaves exactly as before.
+	apiKeyAuth bool
+}
+
+// New builds the API server. rpcClient is only used by /health.
+// enricher is optional — pass nil to disable spec decoding.
+func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enricher) *Server {
+	s := &Server{store: st, rpc: rpcClient, log: log}
 	store            store.Store
 	rpc              rpc.Client
 	log              *slog.Logger
@@ -142,6 +216,8 @@ type Server struct {
 	metrics          *metrics.HTTPMetrics
 	tracer           trace.Tracer
 	retentionLedgers uint32
+
+	httpRequestBodyLimit int64 // max accepted request body size, in bytes
 
 	// GraphQL transport, injected by main after the server is built.
 	// internal/api/graphql imports this package for its ServerDeps, so
@@ -182,6 +258,11 @@ type Server struct {
 	cors CORSConfig
 }
 
+// SetHTTPRequestBodyLimit sets the request body size limit, in bytes, for all handlers accepting a body.
+func (s *Server) SetHTTPRequestBodyLimit(n int64) {
+	s.httpRequestBodyLimit = n
+}
+
 // SetCompressMinSize overrides the body size at which responses are
 // compressed. Pass a negative value to disable compression.
 func (s *Server) SetCompressMinSize(n int) {
@@ -194,9 +275,12 @@ func (s *Server) SetMetricsEnabled(enabled bool) {
 }
 
 // maxLimit is the API's upper bound for page-size parameters (limit and
-// recent). It is set once at startup via SetMaxLimit (driven by the
+// recent); values above it are rejected with 400 before the store is
+// consulted. It is set once at startup via SetMaxLimit (driven by the
 // API_MAX_LIMIT env var) before any requests are served so no mutex is
-// needed. Default 500.
+// needed. Default 500 — keep it at or below store.MaxQueryLimit: the store
+// hard-clamps every query at that constant, so an API_MAX_LIMIT above 500
+// accepts limits the store then silently truncates.
 var maxLimit = 500
 
 // SetMaxLimit configures the API's maximum page size for list endpoints.
@@ -287,6 +371,17 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 	return s
 }
 
+// WithAPIKeyAuth turns on optional API key authentication (see
+// internal/api/auth.go). When enabled, requests to write, streaming,
+// subscription-management, and key-management endpoints must present a
+// valid API key; read-only endpoints stay public. The flag is off by
+// default, so deployments that don't set API_KEY_AUTH_ENABLED see no
+// behavior change.
+func (s *Server) WithAPIKeyAuth(enabled bool) *Server {
+	s.apiKeyAuth = enabled
+	return s
+}
+
 // SetExportMaxRange caps the ledger span a /contracts/{id}/export call
 // may request. Zero means no cap (the handler still validates range fits
 // the requested bound, but won't reject on span alone). The config layer
@@ -346,6 +441,12 @@ func (s *Server) router() chi.Router {
 	// unconditionally so an operator can flip the config on without
 	// restarts; CORS() is a no-op when the allowlist is empty.
 	r.Use(CORS(s.cors))
+	// Limit request body size to prevent resource exhaustion.
+	// Applied after CORS so preflight requests (OPTIONS) pass through
+	// without body size restrictions.
+	if s.httpRequestBodyLimit > 0 {
+		r.Use(s.bodyLimitMiddleware)
+	}
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 	if s.limiter != nil {
@@ -377,7 +478,7 @@ func (s *Server) router() chi.Router {
 	// collector (hand-built Server) answers 503 rather than 404.
 	r.Get("/metrics", func(w http.ResponseWriter, req *http.Request) {
 		if s.metrics == nil {
-			http.Error(w, "metrics not enabled", http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, errors.New("metrics not enabled"))
 			return
 		}
 		s.metrics.Handler().ServeHTTP(w, req)
@@ -403,7 +504,6 @@ func (s *Server) router() chi.Router {
 	r.Get("/contracts/{id}/export", s.handleContractExport)
 	r.Get("/contracts/{id}/stats", s.handleContractStats)
 	r.Get("/stats", s.handleStats)
-	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.
 	adminMW := apiKeyAuth(s.apiKey)
@@ -441,9 +541,46 @@ func (s *Server) router() chi.Router {
 	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
 	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
 
+	// Contract spec overrides: user-supplied spec JSON per contract_id.
+	// A spec override silently changes how that contract's events decode,
+	// so — like every other management surface — writes are never open.
+	r.With(watchedMW).Put("/contracts/{id}/spec", s.handlePutContractSpecOverride)
+	r.With(watchedMW).Get("/contracts/{id}/spec", s.handleGetContractSpecOverride)
+	r.With(watchedMW).Delete("/contracts/{id}/spec", s.handleDeleteContractSpecOverride)
+
 	r.With(watchedMW).Get("/dead-letters", s.handleListDeadLetters)
 	r.With(watchedMW).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)
 
+	// API key management is ALWAYS authenticated: an unauthenticated
+	// create endpoint would let anyone mint keys and walk around auth
+	// entirely. The CLI (`sorotrail apikey`) is the bootstrap path for
+	// the first key.
+	r.Group(func(r chi.Router) {
+		r.Use(s.requireAPIKey)
+		r.Post("/apikeys", s.handleCreateAPIKey)
+		r.Get("/apikeys", s.handleListAPIKeys)
+		r.Delete("/apikeys/{id}", s.handleRevokeAPIKey)
+	})
+
+	// The streaming and subscription routes are the surface that auth
+	// gates. Subscriptions carry webhook HMAC signing secrets, so the
+	// whole subtree (reads included) is protected once auth is on —
+	// leaking a subscription's secret would let an attacker forge
+	// webhook payloads.
+	protect := func(next http.Handler) http.Handler { return next }
+	if s.apiKeyAuth {
+		protect = s.requireAPIKey
+	}
+	r.Group(func(r chi.Router) {
+		r.Use(protect)
+		r.Get("/events/ws", s.handleEventStreamWS)
+		r.Post("/subscriptions", s.handleCreateSubscription)
+		r.Get("/subscriptions", s.handleListSubscriptions)
+		r.Get("/subscriptions/{id}", s.handleGetSubscription)
+		r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
+		r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
+		r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+	})
 	// Subscription CRUD and delivery history.
 	r.Post("/subscriptions", s.handleCreateSubscription)
 	r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
@@ -509,17 +646,23 @@ func (s *Server) router() chi.Router {
 }
 
 // handleOpenAPI serves the embedded OpenAPI 3.1 specification.
+// The spec is a compiled-in static asset, so it is cacheable and
+// immutable for an hour. In multi-tenant mode the shared helper marks
+// it private — conservative but harmless: the document contains no
+// tenant data, and losing CDN pooling on a docs route is a fair price
+// for a single cache policy.
 func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
+	writeCacheHeaders(w, cacheImmutable, time.Hour, "")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(openapiSpec)
 }
 
 // handleDocs serves the Swagger UI page that renders /openapi.json.
+// Same cacheability as the spec it renders: a compiled-in static asset.
 func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
+	writeCacheHeaders(w, cacheImmutable, time.Hour, "")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(swaggerUI))
 }
@@ -560,6 +703,19 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 			"status", ww.Status(),
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
+	})
+}
+
+// bodyLimitMiddleware wraps the request body with http.MaxBytesReader to
+// enforce a maximum request body size. This prevents resource exhaustion
+// from clients sending excessively large request bodies. A limit <= 0 means
+// no limit is enforced.
+func (s *Server) bodyLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.httpRequestBodyLimit > 0 {
+			r.Body = http.MaxBytesReader(w, r.Body, s.httpRequestBodyLimit)
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 

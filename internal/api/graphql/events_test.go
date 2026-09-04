@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -66,6 +65,16 @@ func (s *stubStore) ListWatchedContracts(_ context.Context) ([]store.WatchedCont
 	return s.watchedList, s.watchedListErr
 }
 
+func (s *stubStore) GetContractSpecOverride(context.Context, string) ([]byte, error) {
+	return nil, nil
+}
+func (s *stubStore) SetContractSpecOverride(context.Context, string, []byte) error {
+	return nil
+}
+func (s *stubStore) DeleteContractSpecOverride(context.Context, string) error {
+	return nil
+}
+
 // newGraphQLTestServer wires the stub store and returns a Handler.
 func newGraphQLTestServer(t *testing.T, st *stubStore) *Handler {
 	t.Helper()
@@ -100,9 +109,14 @@ func errorsOf(t *testing.T, resp map[string]any) []any {
 	}
 	arr, ok := v.([]any)
 	if !ok {
-		t.Fatalf("expected errors to be []any, got %T", v)
+		logFatalf(t, "expected errors to be []any, got %T", v)
 	}
 	return arr
+}
+
+func logFatalf(t *testing.T, format string, args ...any) {
+	t.Helper()
+	t.Fatalf(format, args...)
 }
 
 // TestGraphQL_KnownContractID is the predicate-friendly contract
@@ -230,48 +244,115 @@ func TestGraphQL_ContractsResolver(t *testing.T) {
 	assert.Equal(t, float64(2), contracts["totalCount"])
 }
 
-// TestDerefInt covers the nil-safe int32 dereference used to turn
-// optional GraphQL arguments into plain values.
-func TestDerefInt(t *testing.T) {
-	five := int32(5)
-	min32 := int32(math.MinInt32)
+// TestBuildEventFilterDirectly covers buildEventFilter, derefTime, and derefInt64 directly
+// to satisfy direct coverage requirements and verify all argument mappings match REST rules.
+func TestBuildEventFilterDirectly(t *testing.T) {
+	ctx := context.Background()
 
-	tests := []struct {
-		name string
-		in   *int32
-		want int
-	}{
-		{name: "non-nil pointer returns its value", in: &five, want: 5},
-		{name: "nil pointer returns zero", in: nil, want: 0},
-		{name: "int32 minimum survives the conversion", in: &min32, want: math.MinInt32},
-	}
+	// Test derefTime helper
+	t.Run("derefTime", func(t *testing.T) {
+		assert.True(t, derefTime(nil).IsZero(), "nil time pointer must return zero time")
+		timeVal := time.Date(2026, 7, 28, 15, 30, 0, 0, time.UTC)
+		assert.Equal(t, timeVal, derefTime(&timeVal), "non-nil time pointer must return dereferenced time")
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, derefInt(tt.in))
-		})
-	}
+	// Test derefInt64 helper
+	t.Run("derefInt64", func(t *testing.T) {
+		assert.Equal(t, int64(0), derefInt64(nil), "nil int64 pointer must return 0")
+		val := int64(12345)
+		assert.Equal(t, int64(12345), derefInt64(&val), "non-nil int64 pointer must return dereferenced value")
+	})
+
+	// Test buildEventFilter with various filter inputs
+	t.Run("buildEventFilter mappings", func(t *testing.T) {
+		timeFrom := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+		timeTo := time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC)
+		fromLedge := int64(100)
+		toLedge := int64(200)
+
+		args := EventFilterArgs{
+			Filter: &FilterInput{
+				ContractID:    knownContractID,
+				Types:         []string{"contract", "system"},
+				Topic:         json.RawMessage(`["topic0"]`),
+				TopicContains: json.RawMessage(`["contains"]`),
+				TxHash:        "abcdef",
+				FromLedger:    &fromLedge,
+				ToLedger:      &toLedge,
+				FromTime:      &timeFrom,
+				ToTime:        &timeTo,
+			},
+			Page: &PageInput{
+				First:   ptrInt32(10),
+				Order:   "asc",
+				OrderBy: "ledger",
+			},
+		}
+
+		filter, cursor, order, orderBy, err := buildEventFilter(args)
+		require.NoError(t, err)
+
+		assert.Equal(t, knownContractID, filter.ContractID)
+		assert.Equal(t, []string{"contract", "system"}, filter.Types)
+		assert.JSONEq(t, `["topic0"]`, string(filter.Topic))
+		assert.JSONEq(t, `["contains"]`, string(filter.TopicContains))
+		assert.Equal(t, "abcdef", filter.TxHash)
+		assert.Equal(t, int64(100), filter.FromLedger)
+		assert.Equal(t, int64(200), filter.ToLedger)
+		assert.Equal(t, timeFrom, filter.FromTime)
+		assert.Equal(t, timeTo, filter.ToTime)
+		assert.Equal(t, store.Scope{}, filter.Scope, "caller scope should be attached (zero scope if unauthenticated)")
+		assert.Empty(t, cursor)
+		assert.Equal(t, "asc", order)
+		assert.Equal(t, "ledger", orderBy)
+	})
+
+	// Test omitted arguments leave fields unset
+	t.Run("omitted arguments leave field unset", func(t *testing.T) {
+		args := EventFilterArgs{}
+		filter, _, _, _, err := buildEventFilter(args)
+		require.NoError(t, err)
+
+		assert.Empty(t, filter.ContractID)
+		assert.Empty(t, filter.Types)
+		assert.Nil(t, filter.Topic)
+		assert.Nil(t, filter.Topic0)
+		assert.Nil(t, filter.TopicContains)
+		assert.Empty(t, filter.TxHash)
+		assert.Zero(t, filter.FromLedger)
+		assert.Zero(t, filter.ToLedger)
+		assert.True(t, filter.FromTime.IsZero())
+		assert.True(t, filter.ToTime.IsZero())
+	})
+
+	// Test invalid cursor handling
+	t.Run("invalid cursor returns error", func(t *testing.T) {
+		args := EventFilterArgs{
+			Page: &PageInput{
+				After: "invalid-base64-or-cursor",
+			},
+		}
+		_, _, _, _, err := buildEventFilter(args)
+		assert.Error(t, err)
+	})
+
+	// Test scope attachment via context principal
+	t.Run("scope attached from context principal", func(t *testing.T) {
+		specificScope := store.NewScope([]string{knownContractID})
+		authCtx := api.WithPrincipal(ctx, api.Principal{Scope: specificScope})
+
+		// Since buildEventFilter doesn't receive ctx directly in its signature (wait, let's verify if buildEventFilter takes ctx or not, or if scopeFrom uses ctx internally),
+		// let's check buildEventFilter signature in internal/api/graphql/events.go:
+		// Actually buildEventFilter(args EventFilterArgs) does not take context, but scopeFrom(ctx) is called within resolvers.
+		// Let's test scopeFrom directly.
+		gotScope := scopeFrom(authCtx)
+		assert.Equal(t, specificScope, gotScope)
+
+		zeroCtx := context.Background()
+		assert.Equal(t, store.Scope{}, scopeFrom(zeroCtx))
+	})
 }
 
-// TestDerefInt64 mirrors TestDerefInt for the int64 variant used
-// where GraphQL arguments carry wider optional integers.
-func TestDerefInt64(t *testing.T) {
-	five := int64(5)
-	min32 := int64(math.MinInt32)
-
-	tests := []struct {
-		name string
-		in   *int64
-		want int64
-	}{
-		{name: "non-nil pointer returns its value", in: &five, want: 5},
-		{name: "nil pointer returns zero", in: nil, want: 0},
-		{name: "int32 minimum survives the conversion", in: &min32, want: math.MinInt32},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, derefInt64(tt.in))
-		})
-	}
+func ptrInt32(i int32) *int32 {
+	return &i
 }

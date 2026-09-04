@@ -87,6 +87,11 @@ type Options struct {
 	MaxBackoff time.Duration
 	// DryRun reports what would change without writing anything.
 	DryRun bool
+
+	// Progress, when non-nil, is called after each page is processed
+	// with the number of events extracted. The callback must be safe
+	// for concurrent use and should not block.
+	Progress func(extracted int64)
 }
 
 // applyDefaults fills in zero-value options so a partially-populated
@@ -214,6 +219,9 @@ func (b *Backfiller) Run(ctx context.Context) (Summary, error) {
 		sum.Skipped += perPage.Skipped
 		sum.Failed += perPage.Failed
 		sum.Extracted += int64(len(events))
+		if b.opts.Progress != nil {
+			b.opts.Progress(int64(len(events)))
+		}
 		if lastProcessedLedger > sum.ThroughLedger {
 			sum.ThroughLedger = lastProcessedLedger
 		}

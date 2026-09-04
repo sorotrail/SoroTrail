@@ -13,9 +13,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      matrix:
+        postgres-version: ["15", "16"]
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:${{ matrix.postgres-version }}-alpine
         env:
           POSTGRES_USER: sorotrail
           POSTGRES_PASSWORD: sorotrail
@@ -34,19 +37,12 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache-dependency-path: |
-            go.sum
-            **/*.go
-          cache: true
+          cache-dependency-path: go.sum
       - name: Build
         run: go build ./...
-        env:
-          GONOSUMCHECK: "*"
       - name: Vet
         run: go vet ./...
       - name: Wait for Postgres
-        # Belt-and-braces: the services healthcheck already gates this, but
-        # a clear error is better than a 30s hang if pg_isready still hiccups.
         run: |
           for i in $(seq 1 30); do
             if pg_isready -h localhost -p 5433 -U sorotrail -d sorotrail; then
@@ -60,15 +56,17 @@ jobs:
       # and internal/replay share one database and truncate the same tables.
       # -race catches data races inside a single package's test binary.
       - name: Test (with Postgres integration tests)
-        # This job covers the TEST_DATABASE_URL-based tests; the
-        # //go:build integration-tagged suite is exercised by the separate
-        # `integration` job below.
-        run: go test -p 1 ./... -count=1 -race -timeout=120s
+        run: go test -p 1 ./... -count=1 -race -timeout=120s -coverprofile=coverage.out -covermode=atomic
         env:
           TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5433/sorotrail?sslmode=disable
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-pg${{ matrix.postgres-version }}
+          path: coverage.out
+          retention-days: 5
       - name: Verify Benchmarks (compilation and short run)
         run: make bench-ci
-
 
   # Issue #9: separate CI job for the integration test layer gated behind
   # the `integration` build tag. Same Postgres service as the `test` job;
@@ -76,6 +74,7 @@ jobs:
   # integration tests share the database and truncate the same tables.
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:16-alpine
@@ -95,10 +94,32 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+          cache-dependency-path: go.sum
       - name: Build (integration tag)
         run: go build -tags=integration ./...
       - name: Vet (integration tag)
         run: go vet -tags=integration ./...
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h localhost -p 5432 -U sorotrail -d sorotrail; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Postgres did not become ready in time" >&2
+          exit 1
+      - name: Migration safety gate
+        # Exercise the up → down → up round-trip to verify every migration
+        # reverses cleanly and re-applies identically. This is the most
+        # valuable safety check: a broken down migration is invisible until
+        # a rollback is needed in production.
+        run: >
+          go test -tags=integration -p 1 -count=1 -run
+          'TestMigrate_UpFromEmpty|TestMigrate_DownFromHead|TestMigrate_UpDownUpRoundTrip|TestMigrate_EachDownReversesItsUp'
+          ./internal/store/...
+        env:
+          TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
       - name: Run integration tests
         # The integration tests cover:
         #   1. migration up from empty
@@ -116,6 +137,27 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
 
+  coverage:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Download all coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-pg*
+          merge-multiple: true
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.out
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -124,13 +166,17 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache-dependency-path: |
-            go.sum
-            **/*.go
-          cache: true
+          cache-dependency-path: go.sum
       - uses: golangci/golangci-lint-action@v9.3.0
         with:
           version: v2.12.2
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Docker image
+        run: docker build --no-cache .
 
   helm:
     runs-on: ubuntu-latest
@@ -139,7 +185,41 @@ jobs:
       - uses: azure/setup-helm@v5
         with:
           version: v3.15.0
-      - name: Helm lint
+      - name: Helm lint (defaults)
         run: helm lint deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db
-      - name: Helm template render
+      - name: Helm lint (invalid value — schema must reject)
+        run: |
+          if helm lint deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db --set replicaCount=not-a-number; then
+            echo "::error::Schema validation did not reject invalid replicaCount"
+            exit 1
+          fi
+      - name: Helm template render (defaults)
         run: helm template sorotrail deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db > /dev/null
+      - name: Helm template render (existing secret)
+        run: |
+          helm template sorotrail deploy/helm/sorotrail \
+            --set database.existingSecret=my-db-secret \
+            > /dev/null
+      - name: Helm template render (production values)
+        run: |
+          helm template sorotrail deploy/helm/sorotrail \
+            --set database.url=postgres://user:pass@host:5432/db \
+            --set replicaCount=3 \
+            --set pdb.enabled=true \
+            --set pdb.minAvailable=1 \
+            --set config.rpcUrl=https://soroban-mainnet.stellar.org \
+            --set config.logLevel=warn \
+            --set config.enableMetrics=true \
+            --set serviceMonitor.enabled=true \
+            --set resources.requests.cpu=250m \
+            --set resources.requests.memory=256Mi \
+            --set resources.limits.cpu=1000m \
+            --set resources.limits.memory=512Mi \
+            > /dev/null
+      - name: Helm template render (minimal overrides)
+        run: |
+          helm template sorotrail deploy/helm/sorotrail \
+            --set database.url=postgres://user:pass@host:5432/db \
+            --set image.tag=v1.2.3 \
+            --set config.watchedContracts=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC \
+            > /dev/null

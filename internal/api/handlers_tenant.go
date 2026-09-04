@@ -38,7 +38,7 @@ type tenantRequest struct {
 
 func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 	var req tenantRequest
-	if err := decodeJSON(w, r, &req); err != nil {
+	if err := decodeJSON(w, r, &req, s.httpRequestBodyLimit); err != nil {
 		return
 	}
 	if req.Name == nil || *req.Name == "" {
@@ -128,7 +128,7 @@ func (s *Server) handleUpdateTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req tenantRequest
-	if err := decodeJSON(w, r, &req); err != nil {
+	if err := decodeJSON(w, r, &req, s.httpRequestBodyLimit); err != nil {
 		return
 	}
 	// PATCH semantics: absent fields keep their stored value.
@@ -209,7 +209,7 @@ func (s *Server) handleGrantContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req grantRequest
-	if err := decodeJSON(w, r, &req); err != nil {
+	if err := decodeJSON(w, r, &req, s.httpRequestBodyLimit); err != nil {
 		return
 	}
 	if !config.ValidContractID(req.ContractID) {
@@ -276,7 +276,7 @@ func (s *Server) handleCreateTenantKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req keyRequest
-	if err := decodeJSON(w, r, &req); err != nil {
+	if err := decodeJSON(w, r, &req, s.httpRequestBodyLimit); err != nil {
 		return
 	}
 	plaintext, prefix, digest, err := GenerateAPIKey()
@@ -411,7 +411,7 @@ func (s *Server) handleListOwnWatched(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAddOwnWatched(w http.ResponseWriter, r *http.Request) {
 	p, _ := PrincipalFrom(r.Context())
 	var req watchRequest
-	if err := decodeJSON(w, r, &req); err != nil {
+	if err := decodeJSON(w, r, &req, s.httpRequestBodyLimit); err != nil {
 		return
 	}
 	if !config.ValidContractID(req.ContractID) {
@@ -494,8 +494,9 @@ func pathInt64(w http.ResponseWriter, r *http.Request, name string) (int64, bool
 // decodeJSON reads a JSON body, writing a 400 and returning an error when it
 // cannot. The body is length-limited so an oversized payload is rejected
 // rather than buffered.
-func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
-	const maxBody = 1 << 20
+// decodeJSON reads a JSON body, writing a 400 and returning an error when it
+// cannot. The body is length-limited using the provided maxBody argument.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any, maxBody int64) error {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {

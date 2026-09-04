@@ -51,8 +51,8 @@ func (p *Postgres) AcquireReplayLock(ctx context.Context) (ReplayLock, error) {
 	return &pgReplayLock{conn: conn}, nil
 }
 
-// GetReplayState returns the persisted replay progress, or ErrNotFound when
-// no replay has ever run.
+// GetReplayState returns the persisted replay progress, or [ErrNotFound]
+// when no replay has ever run.
 func (p *Postgres) GetReplayState(ctx context.Context) (ReplayState, error) {
 	var s ReplayState
 	err := p.pool.QueryRow(ctx, `

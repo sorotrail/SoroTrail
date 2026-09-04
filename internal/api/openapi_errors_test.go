@@ -238,10 +238,20 @@ func errorCases() []errorCase {
 			},
 		},
 		{
+			name:  "503 when the metrics collector is not wired in",
+			route: "/metrics", target: "/metrics", method: http.MethodGet,
+			status: http.StatusServiceUnavailable, envelope: true,
+			build: func(t *testing.T) (http.Handler, *http.Request) {
+				s := newTestServer(&stubStore{}, nil)
+				s.metrics = nil
+				return s.Router(), httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			},
+		},
+		{
 			name: "501 when the live stream has no broadcaster", route: "/events/ws",
 			target: "/events/ws", method: http.MethodGet,
-			status: http.StatusNotImplemented,
-			build:  plain(&stubStore{}, http.MethodGet, "/events/ws"),
+			status: http.StatusNotImplemented, envelope: true,
+			build: plain(&stubStore{}, http.MethodGet, "/events/ws"),
 		},
 		{
 			name:  "503 when the readiness probe's database is unreachable",
@@ -472,12 +482,11 @@ func TestEveryErrorStatusIsAReusableResponse(t *testing.T) {
 	doc := loadSpec(t)
 
 	// The exceptions are the responses that genuinely are not the error
-	// envelope: the probes report health, and two paths answer in plain
-	// text from http.Error before their JSON contract begins.
+	// envelope: the probes report health with a status/checks body rather
+	// than an error message.
 	inline := map[string]bool{
-		"get /health 503":  true,
-		"get /readyz 503":  true,
-		"get /metrics 503": true,
+		"get /health 503": true,
+		"get /readyz 503": true,
 	}
 
 	for route, pathItem := range doc.Paths {

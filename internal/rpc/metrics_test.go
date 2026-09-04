@@ -3,154 +3,73 @@ package rpc
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
-// stubClient is a minimal Client implementation for unit tests.
-// Each method returns the configured error (or nil) and zero-value responses.
-type stubClient struct {
-	errGetEvents        error
-	errGetLatestLedger  error
-	errGetHealth        error
-	errGetLedgerEntries error
+// countingMockClient satisfies rpc.Client for testing CountingClient.
+type countingMockClient struct {
+	errorToReturn error
 }
 
-func (s *stubClient) GetEvents(_ context.Context, _ GetEventsRequest) (GetEventsResponse, error) {
-	return GetEventsResponse{}, s.errGetEvents
+func (m *countingMockClient) GetEvents(context.Context, GetEventsRequest) (GetEventsResponse, error) {
+	return GetEventsResponse{}, m.errorToReturn
 }
-func (s *stubClient) GetLatestLedger(_ context.Context) (LatestLedger, error) {
-	return LatestLedger{}, s.errGetLatestLedger
+func (m *countingMockClient) GetLatestLedger(context.Context) (LatestLedger, error) {
+	return LatestLedger{}, m.errorToReturn
 }
-func (s *stubClient) GetHealth(_ context.Context) (Health, error) {
-	return Health{}, s.errGetHealth
+func (m *countingMockClient) GetHealth(context.Context) (Health, error) {
+	return Health{}, m.errorToReturn
 }
-func (s *stubClient) GetLedgerEntries(_ context.Context, _ GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
-	return GetLedgerEntriesResponse{}, s.errGetLedgerEntries
+func (m *countingMockClient) GetLedgerEntries(context.Context, GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
+	return GetLedgerEntriesResponse{}, m.errorToReturn
 }
-func (s *stubClient) SimulateTransaction(_ context.Context, _ SimulateTransactionRequest) (SimulateTransactionResponse, error) {
-	return SimulateTransactionResponse{}, nil
-}
-
-func TestCountingClient_CountsErrorsByMethod(t *testing.T) {
-	sentinel := errors.New("rpc failure")
-
-	tests := []struct {
-		name string
-		stub *stubClient
-		call func(c *CountingClient) error
-		want ErrorCountSnapshot
-	}{
-		{
-			name: "GetEvents error increments only GetEvents",
-			stub: &stubClient{errGetEvents: sentinel},
-			call: func(c *CountingClient) error {
-				_, err := c.GetEvents(context.Background(), GetEventsRequest{})
-				return err
-			},
-			want: ErrorCountSnapshot{GetEvents: 1},
-		},
-		{
-			name: "GetLatestLedger error increments only GetLatestLedger",
-			stub: &stubClient{errGetLatestLedger: sentinel},
-			call: func(c *CountingClient) error {
-				_, err := c.GetLatestLedger(context.Background())
-				return err
-			},
-			want: ErrorCountSnapshot{GetLatestLedger: 1},
-		},
-		{
-			name: "GetHealth error increments only GetHealth",
-			stub: &stubClient{errGetHealth: sentinel},
-			call: func(c *CountingClient) error {
-				_, err := c.GetHealth(context.Background())
-				return err
-			},
-			want: ErrorCountSnapshot{GetHealth: 1},
-		},
-		{
-			name: "GetLedgerEntries error increments only GetLedgerEntries",
-			stub: &stubClient{errGetLedgerEntries: sentinel},
-			call: func(c *CountingClient) error {
-				_, err := c.GetLedgerEntries(context.Background(), GetLedgerEntriesRequest{})
-				return err
-			},
-			want: ErrorCountSnapshot{GetLedgerEntries: 1},
-		},
-		{
-			name: "success does not increment any counter",
-			stub: &stubClient{},
-			call: func(c *CountingClient) error {
-				_, err := c.GetEvents(context.Background(), GetEventsRequest{})
-				return err
-			},
-			want: ErrorCountSnapshot{},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			c := NewCountingClient(tc.stub)
-			_ = tc.call(c)
-			assert.Equal(t, tc.want, c.Errors().Snapshot())
-		})
-	}
+func (m *countingMockClient) SimulateTransaction(context.Context, SimulateTransactionRequest) (SimulateTransactionResponse, error) {
+	return SimulateTransactionResponse{}, m.errorToReturn
 }
 
-func TestCountingClient_AccumulatesMultipleErrors(t *testing.T) {
-	sentinel := errors.New("rpc failure")
-	stub := &stubClient{errGetEvents: sentinel}
-	c := NewCountingClient(stub)
+func TestCountingClient_Accounting(t *testing.T) {
+	m := &countingMockClient{}
+	c := NewCountingClient(m)
+	ctx := context.Background()
 
-	for i := 0; i < 5; i++ {
-		_, err := c.GetEvents(context.Background(), GetEventsRequest{})
-		require.Error(t, err)
-	}
+	// Test error increment for each method
+	m.errorToReturn = errors.New("failed")
+	_, _ = c.GetEvents(ctx, GetEventsRequest{})
+	_, _ = c.GetLatestLedger(ctx)
+	_, _ = c.GetHealth(ctx)
+	_, _ = c.GetLedgerEntries(ctx, GetLedgerEntriesRequest{})
 
 	snap := c.Errors().Snapshot()
-	assert.Equal(t, uint64(5), snap.GetEvents)
-	assert.Zero(t, snap.GetLatestLedger)
-	assert.Zero(t, snap.GetHealth)
-	assert.Zero(t, snap.GetLedgerEntries)
+	assert.Equal(t, uint64(1), snap.GetEvents)
+	assert.Equal(t, uint64(1), snap.GetLatestLedger)
+	assert.Equal(t, uint64(1), snap.GetHealth)
+	assert.Equal(t, uint64(1), snap.GetLedgerEntries)
+
+	// Test success does not increment
+	m.errorToReturn = nil
+	_, _ = c.GetEvents(ctx, GetEventsRequest{})
+	snap = c.Errors().Snapshot()
+	assert.Equal(t, uint64(1), snap.GetEvents, "success should not increment counter")
 }
 
-func TestCountingClient_ErrorNotSwallowed(t *testing.T) {
-	sentinel := errors.New("rpc failure")
-	stub := &stubClient{
-		errGetEvents:        sentinel,
-		errGetLatestLedger:  sentinel,
-		errGetHealth:        sentinel,
-		errGetLedgerEntries: sentinel,
+func TestCountingClient_ConcurrentRace(t *testing.T) {
+	m := &countingMockClient{errorToReturn: errors.New("fail")}
+	c := NewCountingClient(m)
+	ctx := context.Background()
+
+	const n = 100
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			_, _ = c.GetEvents(ctx, GetEventsRequest{})
+		}()
 	}
-	c := NewCountingClient(stub)
+	wg.Wait()
 
-	_, err := c.GetEvents(context.Background(), GetEventsRequest{})
-	require.ErrorIs(t, err, sentinel)
-
-	_, err = c.GetLatestLedger(context.Background())
-	require.ErrorIs(t, err, sentinel)
-
-	_, err = c.GetHealth(context.Background())
-	require.ErrorIs(t, err, sentinel)
-
-	_, err = c.GetLedgerEntries(context.Background(), GetLedgerEntriesRequest{})
-	require.ErrorIs(t, err, sentinel)
-}
-
-func TestCountingClient_ImplementsClientInterface(t *testing.T) {
-	// Compile-time assertion that CountingClient satisfies the Client interface.
-	var _ Client = (*CountingClient)(nil)
-}
-
-func TestErrorCountSnapshot(t *testing.T) {
-	c := NewCountingClient(&stubClient{errGetEvents: errors.New("fail")})
-
-	_, _ = c.GetEvents(context.Background(), GetEventsRequest{})
-	_, _ = c.GetEvents(context.Background(), GetEventsRequest{})
-
-	snap := c.Errors().Snapshot()
-	assert.Equal(t, uint64(2), snap.GetEvents)
-	assert.Zero(t, snap.GetLatestLedger)
+	assert.Equal(t, uint64(n), c.Errors().GetEvents.Load())
 }

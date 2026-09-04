@@ -1582,17 +1582,7 @@
             "$ref": "#/components/responses/InternalError"
           },
           "503": {
-            "description": "No metrics collector is wired into this server. Plain text rather than the error envelope, because it is written by the route stub ahead of the collector's own handler.",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string",
-                  "examples": [
-                    "metrics not enabled"
-                  ]
-                }
-              }
-            }
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       }
@@ -2288,6 +2278,217 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/contracts/{id}/spec": {
+      "put": {
+        "operationId": "putContractSpecOverride",
+        "summary": "Upload a contract spec override",
+        "description": "Stores a user-supplied contract spec (SEP-0041 JSON) for a contract that exposes no fetchable spec. The enricher prefers the override over the RPC-fetched spec whenever one exists. Accepts either {\"spec\": {...}} or a bare spec object.",
+        "tags": [
+          "Operations"
+        ],
+        "security": [
+          {
+            "ManagementKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The contract whose spec is being overridden.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              },
+              "example": {
+                "spec": {
+                  "events": [
+                    {
+                      "name": "transfer",
+                      "type": "(address, address, i128) -> void"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored override",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "contract_id",
+                    "spec"
+                  ],
+                  "properties": {
+                    "contract_id": {
+                      "type": "string"
+                    },
+                    "spec": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "get": {
+        "operationId": "getContractSpecOverride",
+        "summary": "Get a contract spec override",
+        "description": "Returns the stored spec override for a contract, or 404 when none has been uploaded.",
+        "tags": [
+          "Operations"
+        ],
+        "security": [
+          {
+            "ManagementKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The contract whose spec override is being read.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stored override",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "contract_id",
+                    "spec"
+                  ],
+                  "properties": {
+                    "contract_id": {
+                      "type": "string"
+                    },
+                    "spec": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteContractSpecOverride",
+        "summary": "Delete a contract spec override",
+        "description": "Removes a contract's spec override. Idempotent: deleting an override that does not exist still succeeds.",
+        "tags": [
+          "Operations"
+        ],
+        "security": [
+          {
+            "ManagementKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The contract whose spec override is being removed.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The deletion result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "contract_id",
+                    "deleted"
+                  ],
+                  "properties": {
+                    "contract_id": {
+                      "type": "string"
+                    },
+                    "deleted": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
@@ -4083,20 +4284,17 @@
         }
       },
       "NotImplemented": {
-        "description": "The endpoint exists but the feature behind it is not configured on this instance. Returned by the live event stream when the broadcaster is disabled. This one response is plain text rather than the error envelope, because it is written before the endpoint's JSON contract begins.",
+        "description": "The endpoint exists but the feature behind it is not configured on this instance. Returned by the live event stream when the broadcaster is disabled.",
         "content": {
-          "text/plain": {
+          "application/json": {
             "schema": {
-              "type": "string",
-              "examples": [
-                "streaming not configured"
-              ]
+              "$ref": "#/components/schemas/ErrorResponse"
             }
           }
         }
       },
       "ServiceUnavailable": {
-        "description": "The endpoint is temporarily unusable. The management endpoints answer this when API_KEY is unset, failing closed so that writes are never open on a misconfigured instance.",
+        "description": "The endpoint is temporarily unusable or not configured on this instance. The management endpoints answer this when API_KEY is unset, failing closed so writes are never open on a misconfigured instance; /metrics answers it when no metrics collector is wired in.",
         "content": {
           "application/json": {
             "schema": {

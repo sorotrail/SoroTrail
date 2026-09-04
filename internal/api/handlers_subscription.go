@@ -110,6 +110,9 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, errors.New("creating subscription failed"))
 		return
 	}
+	// The response carries the webhook secret in plaintext; it must never
+	// be cached anywhere.
+	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusCreated, created)
 }
 
@@ -129,6 +132,9 @@ func (s *Server) handleGetSubscription(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("getting subscription failed"))
 		return
 	}
+	// Subscription rows embed the webhook secret; a cached copy would leak
+	// it to whoever can read the cache.
+	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, sub)
 }
 
@@ -139,6 +145,9 @@ func (s *Server) handleListSubscriptions(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, errors.New("listing subscriptions failed"))
 		return
 	}
+	// Subscription rows embed the webhook secret; a cached copy would leak
+	// it to whoever can read the cache.
+	writeCacheHeaders(w, cacheNoStore, 0, "")
 	// The whole owner-scoped list is returned on one page, so the total
 	// is just the page size; no separate count query is needed.
 	w.Header().Set("X-Total-Count", fmt.Sprintf("%d", len(subs)))
@@ -206,6 +215,9 @@ func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, errors.New("updating subscription failed"))
 		return
 	}
+	// Subscription rows embed the webhook secret; a cached copy would leak
+	// it to whoever can read the cache.
+	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -224,6 +236,7 @@ func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, errors.New("deleting subscription failed"))
 		return
 	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -259,6 +272,9 @@ func (s *Server) handleListDeliveries(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("listing delivery attempts failed"))
 		return
 	}
+	// Delivery history reveals which events matched; like the subscription
+	// itself it must never be cached.
+	writeCacheHeaders(w, cacheNoStore, 0, "")
 
 	// Total matching count (ignoring the limit) as a response header,
 	// following the events pattern: a failed count is logged and the

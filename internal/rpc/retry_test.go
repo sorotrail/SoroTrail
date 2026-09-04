@@ -450,3 +450,54 @@ func TestContainsStr(t *testing.T) {
 		})
 	}
 }
+
+func TestIsContextErr_Table(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "context.Canceled",
+			err:  context.Canceled,
+			want: true,
+		},
+		{
+			name: "context.DeadlineExceeded",
+			err:  context.DeadlineExceeded,
+			want: true,
+		},
+		{
+			name: "wrapped context.Canceled",
+			err:  fmt.Errorf("outer: %w", context.Canceled),
+			want: false, // isContextErr uses ==, not errors.Is
+		},
+		{
+			name: "wrapped context.DeadlineExceeded",
+			err:  fmt.Errorf("timeout: %w", context.DeadlineExceeded),
+			want: false, // isContextErr uses ==, not errors.Is
+		},
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "unrelated error",
+			err:  errors.New("connection refused"),
+			want: false,
+		},
+		{
+			name: "network timeout error",
+			err:  errors.New("i/o timeout"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isContextErr(tt.err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}

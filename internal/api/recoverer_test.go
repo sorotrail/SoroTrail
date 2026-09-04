@@ -59,6 +59,7 @@ func TestRecoverer_Panics(t *testing.T) {
 
 			assert.Equal(t, http.StatusInternalServerError, w.Code)
 			assert.Equal(t, before+1, rcv.PanicsRecovered(), "counter must increment")
+			assertErrorEnvelope(t, w)
 
 			logged := buf.String()
 			assert.Contains(t, logged, "http panic recovered")
