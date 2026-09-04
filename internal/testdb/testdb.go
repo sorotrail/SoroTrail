@@ -144,6 +144,15 @@ func isDockerUnavailable(err error) bool {
 
 // truncateAll wipes the tables every package's tests touch. New tables
 // added in later migrations belong here.
+//
+// It also drops every non-default events partition: range partitions are
+// DDL, so TRUNCATE clears their rows but leaves them behind, and the
+// store package's partition-span experiments (e.g. span=10) can leave a
+// narrow child that a later package's default-span (120960) partition
+// would overlap ("partition would overlap partition", SQLSTATE 42P17).
+// Dropping them here keeps every package's DB-backed tests starting from
+// the clean layout Migrate produced, regardless of what a previous
+// package did.
 func truncateAll(ctx context.Context, pool *pgxpool.Pool) error {
 	_, err := pool.Exec(ctx, `TRUNCATE
 		events,
@@ -155,6 +164,24 @@ func truncateAll(ctx context.Context, pool *pgxpool.Pool) error {
 		RESTART IDENTITY`)
 	if err != nil {
 		return fmt.Errorf("truncating tables: %w", err)
+	}
+	_, err = pool.Exec(ctx, `
+		DO $$
+		DECLARE
+		    child text;
+		BEGIN
+		    FOR child IN
+		        SELECT c.relname
+		        FROM pg_inherits i
+		        JOIN pg_class c ON c.oid = i.inhrelid
+		        JOIN pg_class p ON p.oid = i.inhparent
+		        WHERE p.relname = 'events' AND c.relname <> 'events_default'
+		    LOOP
+		        EXECUTE format('DROP TABLE IF EXISTS %I', child);
+		    END LOOP;
+		END $$;`)
+	if err != nil {
+		return fmt.Errorf("dropping leftover event partitions: %w", err)
 	}
 	return nil
 }

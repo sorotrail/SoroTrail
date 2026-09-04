@@ -1,12 +1,27 @@
 // Package config loads and validates SoroTrail's configuration from
 // environment variables.
+//
+// The entry point is [Load], which parses the environment into a [Config]
+// and calls [Config.Validate]. Every field is settable via the environment
+// variable named in its `env` tag; see .env.example for documentation.
+//
+// Non-obvious contracts:
+//   - DATABASE_URL is the only required variable; all others have safe
+//     defaults.
+//   - [Config.Validate] is idempotent and can be called again after
+//     programmatic mutation.
+//   - [ValidContractID] checks shape only (C prefix, 56 base32 chars),
+//     not the checksum.
 package config
 
 import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,13 +30,26 @@ import (
 
 // NetworkConfig describes one Stellar network to index.
 type NetworkConfig struct {
-	Name   string `json:"name"`
-	RPCURL string `json:"rpc_url"`
+	Name       string `json:"name"`
+	RPCURL     string `json:"rpc_url"`
+	Passphrase string `json:"passphrase"`
+}
+
+var networks = map[string]NetworkConfig{
+	"testnet":   {Name: "testnet", RPCURL: "https://soroban-testnet.stellar.org", Passphrase: "Test SDF Network ; September 2015"},
+	"mainnet":   {Name: "mainnet", RPCURL: "https://mainnet.sorobanrpc.com", Passphrase: "Public Global Stellar Network ; September 2015"},
+	"futurenet": {Name: "futurenet", RPCURL: "https://rpc-futurenet.stellar.org", Passphrase: "Test SDF Future Network ; October 2022"},
+}
+
+func NetworkConfigFor(name string) (NetworkConfig, bool) {
+	c, ok := networks[strings.ToLower(strings.TrimSpace(name))]
+	return c, ok
 }
 
 // Config holds all runtime configuration. Every field is settable via the
 // environment variable named in its `env` tag; see .env.example for docs.
 type Config struct {
+	Network string `env:"NETWORK" envDefault:"testnet"`
 	// RPCURL is the single-provider RPC endpoint. When RPC_URLS is set the
 	// multi-provider failover client is used instead and RPC_URL is ignored.
 	RPCURL string `env:"RPC_URL" envDefault:"https://soroban-testnet.stellar.org"`
@@ -38,13 +66,41 @@ type Config struct {
 	// public endpoint limit; raise it only against paid plans or
 	// self-hosted RPCs whose allowance actually permits it. Ignored while
 	// RPC_URLS is set (the failover path uses RPC_RATE_LIMIT_RPS).
-	RPCRateLimit          float64       `env:"RPC_RATE_LIMIT" envDefault:"10"`
-	DatabaseURL           string        `env:"DATABASE_URL"`
-	PollInterval          time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
+	RPCRateLimit float64       `env:"RPC_RATE_LIMIT" envDefault:"10"`
+	DatabaseURL  string        `env:"DATABASE_URL"`
+	PollInterval time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
+	// PollIntervalMin and PollIntervalMax bound the ingester's adaptive
+	// poll interval (issue #146): once caught up with the chain, the
+	// effective interval shrinks toward the min when backlog was just
+	// observed and grows toward the max on idle cycles, so a bursty
+	// chain gets polled quickly while a quiet one doesn't waste
+	// requests. Both default to 0, which the ingester treats as "no
+	// explicit bound — use POLL_INTERVAL", collapsing min == max ==
+	// POLL_INTERVAL. That makes the adaptive logic a no-op for any
+	// deployment that only sets POLL_INTERVAL, so existing deployments
+	// keep their exact pre-#146 fixed-interval behavior unless they
+	// opt in by setting these explicitly.
+	PollIntervalMin       time.Duration `env:"POLL_INTERVAL_MIN"`
+	PollIntervalMax       time.Duration `env:"POLL_INTERVAL_MAX"`
+	RPCRateLimit float64 `env:"RPC_RATE_LIMIT" envDefault:"10"`
+	DatabaseURL  string  `env:"DATABASE_URL"`
+	// DB pool sizing. Zero means "use the pgx default". These let an operator
+	// bound the Postgres connection pool without a code redeploy.
+	DBMaxConns        int32         `env:"DB_MAX_CONNS" envDefault:"0"`
+	DBMinConns        int32         `env:"DB_MIN_CONNS" envDefault:"0"`
+	DBMaxConnLifetime time.Duration `env:"DB_MAX_CONN_LIFETIME" envDefault:"0"`
+	DBMaxConnIdleTime time.Duration `env:"DB_MAX_CONN_IDLE_TIME" envDefault:"0"`
+	PollInterval      time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
+	// HTTPAddr is the address the HTTP server listens on (host:port), e.g.
+	// ":8080" or "0.0.0.0:9090". See HTTP_ADDR in .env.example. It must be a
+	// valid host:port pair.
 	HTTPAddr              string        `env:"HTTP_ADDR" envDefault:":8080"`
 	WatchedContracts      []string      `env:"WATCHED_CONTRACTS"`
 	StartLedger           uint32        `env:"START_LEDGER"`
+	StartLedgerRaw        string        `env:"START_LEDGER_RAW"`
 	RetentionLedgers      uint32        `env:"RETENTION_LEDGERS" envDefault:"17280"`
+	IngestPageSize        uint          `env:"INGEST_PAGE_SIZE" envDefault:"1000"`
+	IngestBatchSize       uint          `env:"INGEST_BATCH_SIZE" envDefault:"1000"`
 	PartitionLedgerSpan   uint32        `env:"PARTITION_LEDGER_SPAN" envDefault:"120960"`
 	LogLevel              string        `env:"LOG_LEVEL" envDefault:"info"`
 	LogFormat             string        `env:"LOG_FORMAT" envDefault:"text"`
@@ -57,13 +113,44 @@ type Config struct {
 	// deletes so a single sweep never holds a long lock.
 	RetentionMaxAge    time.Duration `env:"RETENTION_MAX_AGE"`
 	RetentionMinLedger uint64        `env:"RETENTION_MIN_LEDGER"`
+	// RetentionAge / RetentionPoll: age-based retention job knobs
+	// (RETENTION_AGE, RETENTION_POLL_INTERVAL). RetentionAge zero disables
+	// the age-based pruner; RetentionPoll defaults to one hour.
+	RetentionAge       time.Duration `env:"RETENTION_AGE"`
+	RetentionPoll      time.Duration `env:"RETENTION_POLL_INTERVAL" envDefault:"1h"`
 	RetentionBatchSize int           `env:"RETENTION_BATCH_SIZE" envDefault:"5000"`
 	RetentionPause     time.Duration `env:"RETENTION_PAUSE" envDefault:"100ms"`
 	RetentionInterval  time.Duration `env:"RETENTION_INTERVAL" envDefault:"1h"`
+	// RetentionDryRun, when true, makes the pruner report what it
+	// would delete without actually removing any rows.
+	RetentionDryRun bool `env:"RETENTION_DRY_RUN"`
+
+	// Archive configuration. When ARCHIVE_BUCKET is set, pruned events
+	// are exported to S3-compatible object storage as compressed NDJSON
+	// before deletion, ensuring pruned ranges are recoverable. All
+	// archive_* fields are optional; without them the binary behaves
+	// identically to the pre-archive build.
+	ArchiveBucket          string `env:"ARCHIVE_BUCKET"`
+	ArchivePrefix          string `env:"ARCHIVE_PREFIX"`
+	ArchiveEndpoint        string `env:"ARCHIVE_ENDPOINT"`
+	ArchiveRegion          string `env:"ARCHIVE_REGION"`
+	ArchiveAccessKeyID     string `env:"ARCHIVE_ACCESS_KEY_ID"`
+	ArchiveSecretAccessKey string `env:"ARCHIVE_SECRET_ACCESS_KEY"`
+	ArchiveUseSSL          bool   `env:"ARCHIVE_USE_SSL"`
+	ArchiveBeforePrune     bool   `env:"ARCHIVE_BEFORE_PRUNE" envDefault:"false"`
+	ArchiveMaxRetries      int    `env:"ARCHIVE_MAX_RETRIES" envDefault:"3"`
 
 	// LagWarnLedgers triggers a warn-level log when the ingester falls this
 	// many ledgers behind the chain head. Zero disables the alarm.
 	LagWarnLedgers uint32 `env:"LAG_WARN_LEDGERS" envDefault:"100"`
+
+	// Ingester retry backoff. A zero jitter max preserves the ingester's
+	// proportional jitter behavior; non-zero bounds make the random range
+	// explicit.
+	IngesterMinBackoff time.Duration `env:"INGESTER_MIN_BACKOFF" envDefault:"1s"`
+	IngesterMaxBackoff time.Duration `env:"INGESTER_MAX_BACKOFF" envDefault:"1m"`
+	IngesterJitterMin  time.Duration `env:"INGESTER_JITTER_MIN" envDefault:"0"`
+	IngesterJitterMax  time.Duration `env:"INGESTER_JITTER_MAX" envDefault:"0"`
 
 	// GraphQLPlayground gates the dev-mode GraphiQL UI at /graphiql.
 	GraphQLPlayground bool `env:"GRAPHQL_PLAYGROUND"`
@@ -89,6 +176,10 @@ type Config struct {
 	RPCBaseBackoff time.Duration `env:"RPC_BASE_BACKOFF" envDefault:"500ms"`
 	RPCMaxBackoff  time.Duration `env:"RPC_MAX_BACKOFF" envDefault:"30s"`
 	RPCJitter      bool          `env:"RPC_JITTER" envDefault:"true"`
+	// RPCHTTPTimeout is the timeout on the underlying HTTP client's RPC
+	// requests (e.g. "30s"). Zero (default) keeps the client's 30s timeout;
+	// operators can raise it for a slow private RPC endpoint.
+	RPCHTTPTimeout time.Duration `env:"RPC_HTTP_TIMEOUT" envDefault:"30s"`
 
 	// Audit config. AUDIT_ENABLED=false (default) disables the auditor
 	// entirely; the binary behaves exactly like the pre-audit build.
@@ -109,6 +200,9 @@ type Config struct {
 	HTTPWriteTimeout      time.Duration `env:"HTTP_WRITE_TIMEOUT" envDefault:"30s"`
 	HTTPIdleTimeout       time.Duration `env:"HTTP_IDLE_TIMEOUT" envDefault:"60s"`
 	HTTPReadHeaderTimeout time.Duration `env:"HTTP_READ_HEADER_TIMEOUT" envDefault:"10s"`
+	// HTTPRequestBodyLimit caps the max size accepted for any request body (all endpoints).
+	// Default 1048576 (1 MiB) protects against memory/resource exhaustion. Set higher if needed when trusting clients.
+	HTTPRequestBodyLimit int64 `env:"HTTP_REQUEST_BODY_LIMIT" envDefault:"1048576"`
 
 	// APIKey, when set, gates the watched-contracts management endpoints
 	// via a constant-time comparison against the X-API-Key request header.
@@ -120,6 +214,15 @@ type Config struct {
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
+	// APIKeyAuthEnabled turns on optional API key authentication: when
+	// true, write, streaming, and key-management endpoints reject
+	// requests that do not present a valid API key (see README "API key
+	// authentication"). Defaults to false so existing deployments see no
+	// behavior change. Keys are created/revoked via `sorotrail apikey`
+	// or the /apikeys endpoints.
+	APIKeyAuthEnabled bool `env:"API_KEY_AUTH_ENABLED" envDefault:"false"`
+	HourlyQuota           int64   `env:"HOURLY_QUOTA"`
+	DailyQuota            int64   `env:"DAILY_QUOTA"`
 
 	// CompressMinSize is the response body size, in bytes, at or above which
 	// responses are gzip/deflate encoded for clients that advertise support.
@@ -265,12 +368,15 @@ type Config struct {
 	// response headers. X-Request-ID is set on every response by the API's
 	// request logger (#29), so it is the default; an operator can extend
 	// the list or empty it to suppress the header entirely.
-	CORSExposedHeaders []string `env:"CORS_EXPOSED_HEADERS" envDefault:"X-Request-ID"`
+	CORSExposedHeaders []string `env:"CORS_EXPOSED_HEADERS" envDefault:"X-Request-ID,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset"`
 }
 
 // Load reads configuration from the environment and validates it.
 // All validation failures are aggregated into a single error.
 func Load() (Config, error) {
+	if err := resolveFileEnv(); err != nil {
+		return Config{}, fmt.Errorf("resolving *_FILE environment values: %w", err)
+	}
 	var cfg Config
 	if err := env.Parse(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parsing environment: %w", err)
@@ -278,6 +384,13 @@ func Load() (Config, error) {
 	cfg.WatchedContracts = cleanContractList(cfg.WatchedContracts)
 	cfg.RPCURLS = cleanContractList(cfg.RPCURLS)
 	cfg.CORSAllowedOrigins = cleanOrigins(cfg.CORSAllowedOrigins)
+	cfg.Network = strings.ToLower(strings.TrimSpace(cfg.Network))
+	if _, ok := NetworkConfigFor(cfg.Network); !ok {
+		return Config{}, fmt.Errorf("NETWORK must be one of testnet, mainnet, futurenet; got %q", cfg.Network)
+	}
+	if _, explicitlySet := os.LookupEnv("RPC_URL"); !explicitlySet && len(cfg.RPCURLS) == 0 {
+		cfg.RPCURL = networks[cfg.Network].RPCURL
+	}
 	if err := cfg.ValidateAll(); err != nil {
 		return Config{}, err
 	}
@@ -294,6 +407,31 @@ func Load() (Config, error) {
 }
 
 // IsSQLite reports whether the database URL points to a SQLite database.
+func resolveFileEnv() error {
+	for _, kv := range os.Environ() {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		name, filePath := parts[0], parts[1]
+		if !strings.HasSuffix(name, "_FILE") {
+			continue
+		}
+		baseName := strings.TrimSuffix(name, "_FILE")
+		if _, set := os.LookupEnv(baseName); set {
+			continue
+		}
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return fmt.Errorf("%s: reading %q: %w", name, filePath, err)
+		}
+		if err := os.Setenv(baseName, strings.TrimRight(string(data), "\r\n")); err != nil {
+			return fmt.Errorf("%s: setting %s: %w", name, baseName, err)
+		}
+	}
+	return nil
+}
+
 func IsSQLite(databaseURL string) bool {
 	return strings.HasPrefix(databaseURL, "sqlite:")
 }
@@ -353,6 +491,18 @@ func (c Config) Validate() error {
 			return fmt.Errorf("sqlite DATABASE_URL %q must be an absolute or relative path (or :memory:)", c.DatabaseURL)
 		}
 	}
+	if c.DBMaxConns < 0 {
+		return fmt.Errorf("DB_MAX_CONNS must be non-negative, got %d", c.DBMaxConns)
+	}
+	if c.DBMinConns < 0 {
+		return fmt.Errorf("DB_MIN_CONNS must be non-negative, got %d", c.DBMinConns)
+	}
+	if c.DBMaxConnLifetime < 0 {
+		return fmt.Errorf("DB_MAX_CONN_LIFETIME must be non-negative, got %s", c.DBMaxConnLifetime)
+	}
+	if c.DBMaxConnIdleTime < 0 {
+		return fmt.Errorf("DB_MAX_CONN_IDLE_TIME must be non-negative, got %s", c.DBMaxConnIdleTime)
+	}
 	// Empty means "unused": HORIZON_URL is only read by `sorotrail backfill`
 	// and Load supplies a default, so an unset value is not a misconfigured
 	// indexer. Validate the shape only when someone actually set one.
@@ -360,8 +510,24 @@ func (c Config) Validate() error {
 		return fmt.Errorf("HORIZON_URL %q is not a valid URL", c.HorizonURL)
 	}
 
+	if c.HTTPAddr != "" {
+		if _, _, err := net.SplitHostPort(c.HTTPAddr); err != nil {
+			return fmt.Errorf("HTTP_ADDR %q is not a valid host:port (e.g. :8080)", c.HTTPAddr)
+		}
+	}
+
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("POLL_INTERVAL must be positive, got %s", c.PollInterval)
+	}
+	if c.PollIntervalMin < 0 {
+		return fmt.Errorf("POLL_INTERVAL_MIN must be non-negative, got %s", c.PollIntervalMin)
+	}
+	if c.PollIntervalMax < 0 {
+		return fmt.Errorf("POLL_INTERVAL_MAX must be non-negative, got %s", c.PollIntervalMax)
+	}
+	if c.PollIntervalMin > 0 && c.PollIntervalMax > 0 && c.PollIntervalMin > c.PollIntervalMax {
+		return fmt.Errorf("POLL_INTERVAL_MIN (%s) must be <= POLL_INTERVAL_MAX (%s)",
+			c.PollIntervalMin, c.PollIntervalMax)
 	}
 	if c.APIQueryTimeout <= 0 {
 		return fmt.Errorf("API_QUERY_TIMEOUT must be positive, got %s", c.APIQueryTimeout)
@@ -371,6 +537,15 @@ func (c Config) Validate() error {
 	}
 	if c.RetentionLedgers == 0 {
 		return fmt.Errorf("RETENTION_LEDGERS must be positive")
+	}
+	if c.RetentionAge < 0 {
+		return fmt.Errorf("RETENTION_AGE must be non-negative")
+	}
+	// RetentionPoll mirrors RetentionAge: it only matters once age-based
+	// pruning is enabled, and zero (the hand-built, non-default value) is a
+	// valid "disabled" state rather than a misconfiguration.
+	if c.RetentionPoll < 0 {
+		return fmt.Errorf("RETENTION_POLL_INTERVAL must be non-negative")
 	}
 	if c.PartitionLedgerSpan == 0 {
 		return fmt.Errorf("PARTITION_LEDGER_SPAN must be positive")
@@ -420,6 +595,12 @@ func (c Config) Validate() error {
 	if c.RetentionBatchSize <= 0 {
 		return fmt.Errorf("RETENTION_BATCH_SIZE must be positive")
 	}
+	if c.IngestPageSize == 0 {
+		return fmt.Errorf("INGEST_PAGE_SIZE must be positive")
+	}
+	if c.IngestBatchSize == 0 {
+		return fmt.Errorf("INGEST_BATCH_SIZE must be positive")
+	}
 	if c.RetentionPause < 0 {
 		return fmt.Errorf("RETENTION_PAUSE must be non-negative")
 	}
@@ -441,6 +622,9 @@ func (c Config) Validate() error {
 	if c.RPCMaxBackoff <= 0 {
 		return fmt.Errorf("RPC_MAX_BACKOFF must be positive, got %s", c.RPCMaxBackoff)
 	}
+	if c.RPCHTTPTimeout < 0 {
+		return fmt.Errorf("RPC_HTTP_TIMEOUT must be non-negative, got %s", c.RPCHTTPTimeout)
+	}
 	if c.RateLimitRPS < 0 {
 		return fmt.Errorf("RATE_LIMIT_RPS must be non-negative")
 	}
@@ -458,6 +642,9 @@ func (c Config) Validate() error {
 	}
 	if c.HTTPReadHeaderTimeout < 0 {
 		return fmt.Errorf("HTTP_READ_HEADER_TIMEOUT must be non-negative, got %s", c.HTTPReadHeaderTimeout)
+	}
+	if c.HTTPRequestBodyLimit < 0 {
+		return fmt.Errorf("HTTP_REQUEST_BODY_LIMIT must be non-negative, got %d", c.HTTPRequestBodyLimit)
 	}
 	if c.APIMaxLimit < 1 {
 		return fmt.Errorf("API_MAX_LIMIT must be positive, got %d", c.APIMaxLimit)
@@ -513,6 +700,15 @@ func (c Config) Validate() error {
 	if c.MultiTenantBootstrapKey != "" && !c.MultiTenant {
 		return fmt.Errorf("MULTI_TENANT_BOOTSTRAP_KEY is set but MULTI_TENANT is false")
 	}
+	// Archive configuration: ARCHIVE_BUCKET is the master switch. When
+	// set, the endpoint must also be provided (S3-compatible stores
+	// need an explicit endpoint).
+	if c.ArchiveBucket != "" && c.ArchiveEndpoint == "" {
+		return fmt.Errorf("ARCHIVE_ENDPOINT is required when ARCHIVE_BUCKET is set")
+	}
+	if c.ArchiveMaxRetries < 0 {
+		return fmt.Errorf("ARCHIVE_MAX_RETRIES must be non-negative")
+	}
 	return nil
 }
 
@@ -520,6 +716,13 @@ func (c Config) Validate() error {
 // configured — the pruner only runs when this is true.
 func (c Config) RetentionEnabled() bool {
 	return c.RetentionMaxAge > 0 || c.RetentionMinLedger > 0
+}
+
+// ArchiveEnabled reports whether the S3-compatible archive backend
+// is configured. When true, pruned events can be exported before
+// deletion.
+func (c Config) ArchiveEnabled() bool {
+	return c.ArchiveBucket != ""
 }
 
 // ValidContractID reports whether s looks like a Soroban contract strkey.
@@ -551,6 +754,40 @@ func ValidCursor(s string) bool {
 		}
 	}
 	return true
+}
+
+// ParseStartLedger parses a START_LEDGER value that may be an absolute
+// ledger number or a relative offset like "latest-1000". Absolute values
+// must be positive. Relative offsets subtract from latestLedger and must
+// resolve to at least ledger 2.
+func ParseStartLedger(raw string, latestLedger ...uint32) (uint32, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	if n, err := strconv.ParseUint(raw, 10, 32); err == nil {
+		if n < 2 {
+			return 0, fmt.Errorf("START_LEDGER %q: ledger must be >= 2", raw)
+		}
+		return uint32(n), nil
+	}
+	if !strings.HasPrefix(strings.ToLower(raw), "latest-") {
+		return 0, fmt.Errorf("START_LEDGER %q: not an absolute ledger number or relative offset (expected N or latest-N)", raw)
+	}
+	offsetStr := raw[len("latest-"):]
+	offset, err := strconv.ParseUint(offsetStr, 10, 32)
+	if err != nil || offset == 0 {
+		return 0, fmt.Errorf("START_LEDGER %q: offset must be a positive integer", raw)
+	}
+	if len(latestLedger) == 0 || latestLedger[0] == 0 {
+		return 0, fmt.Errorf("START_LEDGER %q: relative offset requires RPC latest ledger (not available at config parse time)", raw)
+	}
+	latest := int64(latestLedger[0])
+	start := latest - int64(offset)
+	if start < 2 {
+		start = 2
+	}
+	return uint32(start), nil
 }
 
 // ValidOrigin reports whether s is a valid CORS origin: either the "*"
@@ -630,18 +867,26 @@ func (c Config) LoggableFields() []any {
 		dbURL = u.String()
 	}
 	return []any{
+		"network", c.Network,
 		"rpc_url", c.RPCURL,
 		"metrics_enabled", c.MetricsEnabled,
 		"rpc_max_attempts", c.RPCMaxAttempts,
 		"rpc_base_backoff", c.RPCBaseBackoff,
 		"rpc_max_backoff", c.RPCMaxBackoff,
 		"rpc_jitter", c.RPCJitter,
+		"ingester_min_backoff", c.IngesterMinBackoff,
+		"ingester_max_backoff", c.IngesterMaxBackoff,
+		"ingester_jitter_min", c.IngesterJitterMin,
+		"ingester_jitter_max", c.IngesterJitterMax,
 		"rpc_rate_limit", c.RPCRateLimit,
 		"database_url", dbURL,
 		"poll_interval", c.PollInterval,
+		"poll_interval_min", c.PollIntervalMin,
+		"poll_interval_max", c.PollIntervalMax,
 		"http_addr", c.HTTPAddr,
 		"watched_contracts", len(c.WatchedContracts),
 		"start_ledger", c.StartLedger,
+		"start_ledger_raw", c.StartLedgerRaw,
 		"retention_ledgers", c.RetentionLedgers,
 		"log_level", c.LogLevel,
 		"http_read_timeout", c.HTTPReadTimeout,

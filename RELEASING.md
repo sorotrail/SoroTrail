@@ -76,3 +76,25 @@ prefixes (feat:, fix:, etc.).
 Edit the generated release notes on GitHub if the auto-generated grouping
 needs adjustment. The PR is the source of truth for what changed; the release
 notes are a summary for downstream consumers.
+
+## Versioning the API client (pkg/client)
+
+`pkg/client` is generated from `api/openapi.yaml` (see `pkg/client/README.md`),
+and its `SpecVersion` const mirrors the spec's `info.version`. The client is
+versioned in lockstep with the API: when a release changes the HTTP surface,
+bump `info.version` in `api/openapi.yaml` (semver), then run `make spec` and
+`make client` so the committed `internal/api/openapi.json` and
+`pkg/client/client.gen.go` are regenerated together — the drift tests in
+`pkg/docs` and `pkg/client` fail the build otherwise.
+
+Downstream consumers import `github.com/sorotrail/sorotrail/pkg/client`
+directly from the module at a release tag; because the module is the
+repository root, every release tag publishes a coherent (spec, client) pair.
+A breaking API change therefore ships as a spec version bump plus a new
+release tag, and consumers pin the tag that matches the server version they
+target (compare against the server's `/openapi.json`, which embeds the same
+`info.version`).
+
+Release checklist addition: if the release changes any route, schema, or
+parameter, regenerate with `make spec && make client` and include the
+regenerated files in the release commit.

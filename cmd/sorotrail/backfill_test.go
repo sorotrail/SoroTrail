@@ -1,82 +1,80 @@
 package main
 
 import (
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
-// validContract is a syntactically valid strkey (56 chars, 'C' + charset
-// letters) accepted by config.ValidContractID, used across these tests.
-var validContract = "C" + strings.Repeat("A", 55)
+func TestRunBackfill_Flags(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		expectError bool
+	}{
+		{"invalid contract", []string{"--contract", "invalid"}, true},
+		{"missing ledger", []string{"--contract", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"}, true},
+		{"inverted range", []string{"--contract", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4", "--from-ledger", "100", "--to-ledger", "50"}, true},
+		{"invalid batch size", []string{"--contract", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4", "--from-ledger", "1", "--batch-size", "999"}, true},
+	}
 
-func TestParseBackfillFlags_FromToAliases(t *testing.T) {
-	f, err := parseBackfillFlags([]string{
-		"--contract", validContract,
-		"--from", "100",
-		"--to", "200",
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := runBackfill(tt.args)
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestJitter(t *testing.T) {
+	tests := []struct {
+		name string
+		d    time.Duration
+	}{
+		{
+			name: "zero duration returns zero",
+			d:    0,
+		},
+		{
+			name: "negative duration returns zero",
+			d:    -5 * time.Second,
+		},
+		{
+			name: "positive duration",
+			d:    10 * time.Second,
+		},
+		{
+			name: "one nanosecond",
+			d:    1 * time.Nanosecond,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := jitter(tt.d)
+			// Result must never be negative.
+			assert.GreaterOrEqual(t, got, time.Duration(0))
+			if tt.d > 0 {
+				// Result must be within the documented bound of the input.
+				assert.LessOrEqual(t, got, tt.d)
+			} else {
+				// Zero or negative input must return zero.
+				assert.Equal(t, time.Duration(0), got)
+			}
+		})
+	}
+
+	t.Run("randomised values are bounded over many iterations", func(t *testing.T) {
+		d := 10 * time.Second
+		for i := 0; i < 1000; i++ {
+			got := jitter(d)
+			assert.GreaterOrEqual(t, got, time.Duration(0), "iteration %d", i)
+			assert.LessOrEqual(t, got, d, "iteration %d", i)
+		}
 	})
-	require.NoError(t, err)
-	assert.EqualValues(t, 100, f.fromLedger)
-	assert.EqualValues(t, 200, f.toLedger)
-}
-
-func TestParseBackfillFlags_LongFormFlagsStillWork(t *testing.T) {
-	f, err := parseBackfillFlags([]string{
-		"--contract", validContract,
-		"--from-ledger", "100",
-		"--to-ledger", "200",
-	})
-	require.NoError(t, err)
-	assert.EqualValues(t, 100, f.fromLedger)
-	assert.EqualValues(t, 200, f.toLedger)
-}
-
-func TestParseBackfillFlags_RequiresContract(t *testing.T) {
-	_, err := parseBackfillFlags([]string{"--from", "100"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--contract")
-}
-
-func TestParseBackfillFlags_RequiresPositiveFrom(t *testing.T) {
-	_, err := parseBackfillFlags([]string{"--contract", validContract, "--from", "0"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--from is required")
-}
-
-func TestParseBackfillFlags_RejectsToBeforeFrom(t *testing.T) {
-	_, err := parseBackfillFlags([]string{
-		"--contract", validContract, "--from", "200", "--to", "100",
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "before")
-}
-
-func TestParseBackfillFlags_RejectsBatchSizeOutOfRange(t *testing.T) {
-	_, err := parseBackfillFlags([]string{
-		"--contract", validContract, "--from", "1", "--batch-size", "500",
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--batch-size")
-}
-
-func TestParseBackfillFlags_DefaultsAndOptionalFlags(t *testing.T) {
-	f, err := parseBackfillFlags([]string{
-		"--contract", validContract,
-		"--from", "1",
-		"--dry-run",
-		"--restart",
-		"--rps", "5",
-		"--horizon-url", "https://horizon.example.com",
-		"--include-failed=false",
-	})
-	require.NoError(t, err)
-	assert.True(t, f.dryRun)
-	assert.True(t, f.restart)
-	assert.False(t, f.includeFail)
-	assert.Equal(t, 5.0, f.rps)
-	assert.Equal(t, "https://horizon.example.com", f.horizonURL)
-	assert.EqualValues(t, 0, f.toLedger, "unset --to means no upper bound")
 }

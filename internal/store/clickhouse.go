@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -12,7 +13,13 @@ import (
 // ClickHouse implements Store with clickhouse-go/v2.
 // It is intentionally minimal for now and is wired through the same
 // interface so the app can select it via DATABASE_URL.
-type ClickHouse struct{}
+//
+// contributors: Ping performs a real TCP dial to the server so the
+// readiness probe cannot report healthy against an unreachable database.
+type ClickHouse struct {
+	host string
+	port int
+}
 
 var _ Store = (*ClickHouse)(nil)
 
@@ -84,11 +91,11 @@ func parseClickHouseConfig(raw string) (clickHouseConfig, error) {
 
 func NewStoreFromURL(databaseURL string) (Store, error) {
 	if strings.HasPrefix(databaseURL, "clickhouse://") {
-		_, err := parseClickHouseConfig(databaseURL)
+		cfg, err := parseClickHouseConfig(databaseURL)
 		if err != nil {
 			return nil, err
 		}
-		return &ClickHouse{}, nil
+		return &ClickHouse{host: cfg.host, port: cfg.port}, nil
 	}
 	if strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://") {
 		return &Postgres{}, nil
@@ -244,6 +251,18 @@ func (c *ClickHouse) SetContractSpec(ctx context.Context, wasmHash, contractID s
 	return nil
 }
 
+func (c *ClickHouse) GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error) {
+	return nil, ErrNotFound
+}
+
+func (c *ClickHouse) SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error {
+	return nil
+}
+
+func (c *ClickHouse) DeleteContractSpecOverride(ctx context.Context, contractID string) error {
+	return nil
+}
+
 func (c *ClickHouse) DeleteEventsBeforeLedger(ctx context.Context, beforeLedger int64) (int64, error) {
 	return 0, nil
 }
@@ -270,6 +289,11 @@ func (c *ClickHouse) DeleteEventsBefore(context.Context, int64, time.Time, int) 
 	return 0, nil
 }
 
+// CountEventsBefore is a stub: dry-run pruning is not implemented for the ClickHouse backend.
+func (c *ClickHouse) CountEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
+}
+
 func (c *ClickHouse) DeadLetterEvent(context.Context, DeadLetterInput) (DeadLetter, error) {
 	return DeadLetter{}, nil
 }
@@ -291,6 +315,15 @@ func (c *ClickHouse) DeleteDeadLetter(context.Context, int64) error {
 }
 
 func (c *ClickHouse) Ping(ctx context.Context) error {
+	if c.host == "" {
+		return fmt.Errorf("clickhouse: not configured (empty host)")
+	}
+	addr := net.JoinHostPort(c.host, strconv.Itoa(c.port))
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("clickhouse ping %s: %w", addr, err)
+	}
+	conn.Close()
 	return nil
 }
 

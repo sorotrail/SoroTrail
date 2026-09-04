@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"time"
+
+	"github.com/sorotrail/sorotrail/internal/metrics"
 )
 
 // RetryConfig controls the retry/backoff behaviour applied to every RPC call
@@ -64,10 +66,11 @@ func NewRetryClient(inner Client, cfg RetryConfig) *RetryClient {
 }
 
 // doWithRetry runs fn, retrying on transient errors with exponential backoff.
-// fn should return a retryable error or a non-retryable error that should
-// surface immediately. The context passed to fn carries the overall deadline,
-// and backoff sleep respects ctx cancellation.
-func (c *RetryClient) doWithRetry(ctx context.Context, fn func(context.Context) error) error {
+// method is the JSON-RPC method name and is used to label the retry and
+// backoff metrics. fn should return a retryable error or a non-retryable
+// error that should surface immediately. The context passed to fn carries
+// the overall deadline, and backoff sleep respects ctx cancellation.
+func (c *RetryClient) doWithRetry(ctx context.Context, method string, fn func(context.Context) error) error {
 	var lastErr error
 	backoff := c.config.BaseBackoff
 	for attempt := 1; attempt <= c.config.MaxAttempts; attempt++ {
@@ -85,6 +88,10 @@ func (c *RetryClient) doWithRetry(ctx context.Context, fn func(context.Context) 
 		}
 		if attempt < c.config.MaxAttempts {
 			wait, source := c.retryWait(err, backoff)
+			// Retries and the time spent sleeping between them are the
+			// first signal that the upstream is slow or throttling.
+			metrics.RPCRetriesTotal.WithLabelValues(method, source).Inc()
+			metrics.RPCBackoffSeconds.WithLabelValues(method).Add(wait.Seconds())
 			c.log().Debug("rpc retry scheduled",
 				"attempt", attempt,
 				"wait", wait.String(),
@@ -243,7 +250,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 
 func (c *RetryClient) GetEvents(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error) {
 	var resp GetEventsResponse
-	err := c.doWithRetry(ctx, func(ctx context.Context) error {
+	err := c.doWithRetry(ctx, "getEvents", func(ctx context.Context) error {
 		var innerErr error
 		resp, innerErr = c.inner.GetEvents(ctx, req)
 		return innerErr
@@ -253,7 +260,7 @@ func (c *RetryClient) GetEvents(ctx context.Context, req GetEventsRequest) (GetE
 
 func (c *RetryClient) GetLatestLedger(ctx context.Context) (LatestLedger, error) {
 	var resp LatestLedger
-	err := c.doWithRetry(ctx, func(ctx context.Context) error {
+	err := c.doWithRetry(ctx, "getLatestLedger", func(ctx context.Context) error {
 		var innerErr error
 		resp, innerErr = c.inner.GetLatestLedger(ctx)
 		return innerErr
@@ -263,7 +270,7 @@ func (c *RetryClient) GetLatestLedger(ctx context.Context) (LatestLedger, error)
 
 func (c *RetryClient) GetHealth(ctx context.Context) (Health, error) {
 	var resp Health
-	err := c.doWithRetry(ctx, func(ctx context.Context) error {
+	err := c.doWithRetry(ctx, "getHealth", func(ctx context.Context) error {
 		var innerErr error
 		resp, innerErr = c.inner.GetHealth(ctx)
 		return innerErr
@@ -273,7 +280,7 @@ func (c *RetryClient) GetHealth(ctx context.Context) (Health, error) {
 
 func (c *RetryClient) SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error) {
 	var resp SimulateTransactionResponse
-	err := c.doWithRetry(ctx, func(ctx context.Context) error {
+	err := c.doWithRetry(ctx, "simulateTransaction", func(ctx context.Context) error {
 		var innerErr error
 		resp, innerErr = c.inner.SimulateTransaction(ctx, req)
 		return innerErr
@@ -283,7 +290,7 @@ func (c *RetryClient) SimulateTransaction(ctx context.Context, req SimulateTrans
 
 func (c *RetryClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {
 	var resp GetLedgerEntriesResponse
-	err := c.doWithRetry(ctx, func(ctx context.Context) error {
+	err := c.doWithRetry(ctx, "getLedgerEntries", func(ctx context.Context) error {
 		var innerErr error
 		resp, innerErr = c.inner.GetLedgerEntries(ctx, req)
 		return innerErr

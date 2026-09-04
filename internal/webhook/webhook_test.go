@@ -16,8 +16,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/tracing/tracingtest"
 )
 
 func testLogger() *slog.Logger {
@@ -403,4 +407,95 @@ func TestNotifier_ListErrorIsLogged(t *testing.T) {
 
 	// Should not panic — the error is logged and delivery is skipped.
 	n.NotifyEvents(context.Background(), []store.Event{testEvent("e1")})
+}
+
+func TestDeliver_PropagatesTraceContext(t *testing.T) {
+	// Install the W3C propagator so Inject writes traceparent headers.
+	prev := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+	))
+	t.Cleanup(func() { otel.SetTextMapPropagator(prev) })
+
+	tracingtest.Setup(t)
+
+	var capturedHeaders http.Header
+	done := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedHeaders = r.Header.Clone()
+		close(done)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	st := newStubSubscriptionStore()
+	st.enabledSubs = []store.Subscription{{
+		ID:      1,
+		URL:     server.URL + "/callback",
+		Secret:  "secret123",
+		Enabled: true,
+	}}
+
+	n := newTestNotifier(st, testLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	go n.Run(ctx)
+	defer cancel()
+
+	n.NotifyEvents(context.Background(), []store.Event{testEvent("e1")})
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for delivery")
+	}
+
+	assert.NotEmpty(t, capturedHeaders.Get("traceparent"),
+		"subscriber must receive traceparent header")
+}
+
+func TestDeliver_SpanAttributes(t *testing.T) {
+	exp := tracingtest.Setup(t)
+
+	done := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(done)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	st := newStubSubscriptionStore()
+	st.enabledSubs = []store.Subscription{{
+		ID:      1,
+		URL:     server.URL + "/callback",
+		Secret:  "secret123",
+		Enabled: true,
+	}}
+
+	n := newTestNotifier(st, testLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	go n.Run(ctx)
+	defer cancel()
+
+	n.NotifyEvents(context.Background(), []store.Event{testEvent("e1")})
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for delivery")
+	}
+
+	// Poll until the span appears — span.End() fires after client.Do
+	// returns, which is after the handler closes `done`.
+	var spans []tracetest.SpanStub
+	for i := 0; i < 50; i++ {
+		spans = exp.GetSpans()
+		for _, s := range spans {
+			if s.Name == "webhook.deliver" {
+				assert.NotEmpty(t, s.Attributes, "deliver span should have attributes")
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("webhook.deliver span not found after %d polls; got %d spans", 50, len(spans))
 }

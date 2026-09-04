@@ -37,11 +37,12 @@ flags:
 		fs.PrintDefaults()
 	}
 	var (
-		fromLedger = fs.Int64("from-ledger", 0, "first ledger to replay (inclusive, required)")
-		toLedger   = fs.Int64("to-ledger", 0, "last ledger to replay (inclusive; 0 = no upper bound)")
-		batchSize  = fs.Int("batch-size", replay.DefaultBatchSize, "events re-decoded per transaction")
-		restart    = fs.Bool("restart", false, "discard saved progress and replay the range from the start")
-		dryRun     = fs.Bool("dry-run", false, "report what would change without writing anything")
+		fromLedger       = fs.Int64("from-ledger", 0, "first ledger to replay (inclusive, required)")
+		toLedger         = fs.Int64("to-ledger", 0, "last ledger to replay (inclusive; 0 = no upper bound)")
+		batchSize        = fs.Int("batch-size", replay.DefaultBatchSize, "events re-decoded per transaction")
+		restart          = fs.Bool("restart", false, "discard saved progress and replay the range from the start")
+		dryRun           = fs.Bool("dry-run", false, "report what would change without writing anything")
+		progressInterval = fs.Duration("progress-interval", 0, "emit periodic progress to stderr (e.g. 30s, 1m); 0 disables")
 	)
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -80,15 +81,28 @@ flags:
 	}
 	defer pool.Close()
 
+	var prog *Progress
+	if *progressInterval > 0 {
+		prog = NewProgress("replay", *progressInterval)
+	}
+
 	r := replay.New(store.NewPostgres(pool, int64(cfg.PartitionLedgerSpan)), decode.XDRDecoder{}, log, replay.Options{
 		FromLedger: *fromLedger,
 		ToLedger:   *toLedger,
 		BatchSize:  *batchSize,
 		Restart:    *restart,
 		DryRun:     *dryRun,
+		Progress: func(n int64) {
+			if prog != nil {
+				prog.Tick(n)
+			}
+		},
 	})
 
 	sum, err := r.Run(ctx)
+	if prog != nil {
+		prog.Report(sum.Completed)
+	}
 	if errors.Is(err, store.ErrReplayLocked) {
 		return errors.New("another replay is already running against this database")
 	}

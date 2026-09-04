@@ -29,7 +29,7 @@ func NewSQLite(db *sql.DB) *SQLite {
 	return &SQLite{db: db}
 }
 
-const eventColumnsSQLite = `id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+const eventColumnsSQLite = `network, id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 	in_successful_call, topics, value, created_at, topics_xdr, value_xdr`
 
 func (s *SQLite) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
@@ -50,9 +50,9 @@ func (s *SQLite) upsertEvents(ctx context.Context, events []Event, onUpdate bool
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	conflict := "ON CONFLICT (id) DO NOTHING"
+	conflict := "ON CONFLICT (network, id) DO NOTHING"
 	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
+		conflict = `ON CONFLICT (network, id) DO UPDATE SET
 			contract_id        = excluded.contract_id,
 			ledger             = excluded.ledger,
 			type               = excluded.type,
@@ -69,7 +69,7 @@ func (s *SQLite) upsertEvents(ctx context.Context, events []Event, onUpdate bool
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO events (`+eventColumnsSQLite+`)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`+conflict)
 	if err != nil {
 		return 0, fmt.Errorf("prepare upsert: %w", err)
@@ -79,7 +79,7 @@ func (s *SQLite) upsertEvents(ctx context.Context, events []Event, onUpdate bool
 	var affected int64
 	for _, e := range events {
 		res, err := stmt.ExecContext(ctx,
-			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+			e.Network, e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, formatTime(e.CreatedAt),
 			nullableXDRTopics(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
@@ -141,9 +141,9 @@ func (s *SQLite) ReplaceEventsInRange(ctx context.Context, events []Event, fromL
 }
 
 func (s *SQLite) upsertEventsTx(ctx context.Context, tx *sql.Tx, events []Event, onUpdate bool) (int64, error) {
-	conflict := "ON CONFLICT (id) DO NOTHING"
+	conflict := "ON CONFLICT (network, id) DO NOTHING"
 	if onUpdate {
-		conflict = `ON CONFLICT (id) DO UPDATE SET
+		conflict = `ON CONFLICT (network, id) DO UPDATE SET
 			contract_id        = excluded.contract_id,
 			ledger             = excluded.ledger,
 			type               = excluded.type,
@@ -160,7 +160,7 @@ func (s *SQLite) upsertEventsTx(ctx context.Context, tx *sql.Tx, events []Event,
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO events (`+eventColumnsSQLite+`)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`+conflict)
 	if err != nil {
 		return 0, fmt.Errorf("prepare upsert tx: %w", err)
@@ -170,7 +170,7 @@ func (s *SQLite) upsertEventsTx(ctx context.Context, tx *sql.Tx, events []Event,
 	var affected int64
 	for _, e := range events {
 		res, err := stmt.ExecContext(ctx,
-			e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
+			defaultNetwork(e.Network), e.ID, e.ContractID, e.Ledger, e.Type, e.TxHash, e.TxIndex,
 			e.OpIndex, e.InSuccessfulCall, e.Topics, e.Value, formatTime(e.CreatedAt),
 			nullableXDRTopics(e.RawTopicXDR), nullableText(e.RawValueXDR),
 		)
@@ -286,6 +286,9 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 	arg := func(v any) string {
 		args = append(args, v)
 		return "?"
+	}
+	if f.Network != "" {
+		where = append(where, "network = "+arg(defaultNetwork(f.Network)))
 	}
 	if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
@@ -845,6 +848,23 @@ func (s *SQLite) DeleteEventsBeforeLedger(ctx context.Context, beforeLedger int6
 	rows, _ := result.RowsAffected()
 	return rows, nil
 }
+func (s *SQLite) CountEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	var where string
+	var args []interface{}
+	where = "ledger < ?"
+	args = append(args, maxLedger)
+	if !beforeTime.IsZero() {
+		where += " AND created_at < ?"
+		args = append(args, beforeTime)
+	}
+	var total int64
+	query := "SELECT count(*) FROM (SELECT 1 FROM events WHERE " + where + " LIMIT " + fmt.Sprintf("%d", limit) + ")"
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("counting events before ledger %d: %w", maxLedger, err)
+	}
+	return total, nil
+}
 
 func (s *SQLite) GetAddressSummary(ctx context.Context, address string) (AddressSummary, error) {
 	var sum AddressSummary
@@ -902,13 +922,16 @@ func (s *SQLite) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int
 }
 
 func (s *SQLite) GetIngestionState(ctx context.Context) (IngestionState, error) {
-	var (
-		st IngestionState
-		ts string
-	)
+	return s.GetIngestionStateForNetwork(ctx, "default")
+}
+
+func (s *SQLite) GetIngestionStateForNetwork(ctx context.Context, network string) (IngestionState, error) {
+	var st IngestionState
+	var ts string
+	var poll *string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT last_ingested_ledger, last_cursor, updated_at FROM ingestion_state WHERE id = 1`,
-	).Scan(&st.LastIngestedLedger, &st.LastCursor, &ts)
+		`SELECT network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state WHERE network = ?`, defaultNetwork(network),
+	).Scan(&st.Network, &st.LastIngestedLedger, &st.LastCursor, &poll, &ts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return IngestionState{}, ErrNotFound
 	}
@@ -916,19 +939,33 @@ func (s *SQLite) GetIngestionState(ctx context.Context) (IngestionState, error) 
 		return IngestionState{}, fmt.Errorf("loading ingestion state: %w", err)
 	}
 	st.UpdatedAt = parseTime(ts)
+	if poll != nil {
+		parsed := parseTime(*poll)
+		st.LastSuccessfulPoll = &parsed
+	}
 	return st, nil
 }
 
 func (s *SQLite) SaveIngestionState(ctx context.Context, st IngestionState) error {
+	st.Network = defaultNetwork(st.Network)
 	now := formatTime(time.Now().UTC())
+	// last_successful_poll mirrors the Postgres backend: the UPSERT sets
+	// it to EXCLUDED.last_successful_poll, so a nil value overwrites with
+	// NULL (not the previous timestamp). A non-nil poll is stored as an
+	// RFC3339Nano string that parseTime round-trips on read.
+	var poll any
+	if st.LastSuccessfulPoll != nil {
+		poll = formatTime(*st.LastSuccessfulPoll)
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO ingestion_state (id, last_ingested_ledger, last_cursor, updated_at)
-		VALUES (1, ?, ?, ?)
-		ON CONFLICT (id) DO UPDATE SET
+		INSERT INTO ingestion_state (network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (network) DO UPDATE SET
 			last_ingested_ledger = excluded.last_ingested_ledger,
 			last_cursor          = excluded.last_cursor,
+			last_successful_poll = excluded.last_successful_poll,
 			updated_at           = excluded.updated_at`,
-		st.LastIngestedLedger, st.LastCursor, now,
+		st.Network, st.LastIngestedLedger, st.LastCursor, poll, now,
 	)
 	if err != nil {
 		return fmt.Errorf("saving ingestion state: %w", err)
@@ -1335,6 +1372,45 @@ func (s *SQLite) SetContractSpec(ctx context.Context, wasmHash, contractID strin
 	return nil
 }
 
+func (s *SQLite) GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error) {
+	var specJSON string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT spec_json FROM contract_spec_overrides WHERE contract_id = ?`, contractID,
+	).Scan(&specJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading contract spec override for %s: %w", contractID, err)
+	}
+	return []byte(specJSON), nil
+}
+
+func (s *SQLite) SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO contract_spec_overrides (contract_id, spec_json, updated_at)
+		VALUES (?, ?, datetime('now'))
+		ON CONFLICT (contract_id) DO UPDATE SET
+			spec_json  = excluded.spec_json,
+			updated_at = excluded.updated_at`,
+		contractID, string(specJSON),
+	)
+	if err != nil {
+		return fmt.Errorf("saving contract spec override for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+func (s *SQLite) DeleteContractSpecOverride(ctx context.Context, contractID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM contract_spec_overrides WHERE contract_id = ?`, contractID,
+	)
+	if err != nil {
+		return fmt.Errorf("deleting contract spec override for %s: %w", contractID, err)
+	}
+	return nil
+}
+
 func (s *SQLite) Stats(ctx context.Context, _ Scope) (Stats, error) {
 	var st Stats
 	err := s.db.QueryRowContext(ctx, `
@@ -1381,7 +1457,7 @@ func scanEventSQLite(row interface {
 		rawTopics *string
 		rawValue  sql.NullString
 	)
-	err := row.Scan(&e.ID, &e.ContractID, &e.Ledger, &e.Type, &e.TxHash,
+	err := row.Scan(&e.Network, &e.ID, &e.ContractID, &e.Ledger, &e.Type, &e.TxHash,
 		&e.TxIndex, &e.OpIndex, &e.InSuccessfulCall, &e.Topics, &e.Value,
 		&createdAt, &rawTopics, &rawValue)
 	if err != nil {

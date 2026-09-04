@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/source"
@@ -49,6 +50,24 @@ func GetMigrationStatus(databaseURL string) (MigrationStatus, error) {
 	}
 
 	return MigrationStatus{Version: version, Dirty: dirty, Pending: pending}, nil
+}
+
+// CountEmbeddedMigrations returns the total number of embedded migration
+// versions (the count of .up.sql files). This is used by the schema-inspect
+// command to compare the applied version against the embedded set without
+// opening a database connection.
+func CountEmbeddedMigrations() (int, error) {
+	entries, err := postgresMigrationsFS.ReadDir("migrations")
+	if err != nil {
+		return 0, fmt.Errorf("reading embedded migrations: %w", err)
+	}
+	count := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".up.sql") {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func migrationVersions(migrationSource source.Driver, current uint) ([]uint, error) {

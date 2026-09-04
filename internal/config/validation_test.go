@@ -32,6 +32,8 @@ func TestValidateAll_ValidConfig(t *testing.T) {
 		AuditMaxRPS:         10,
 		AuditMaxRepair:      3,
 		AuditFindingMaxLgrs: 100,
+		IngesterMinBackoff:  time.Second,
+		IngesterMaxBackoff:  time.Minute,
 		LogLevel:            "info",
 		LogFormat:           "text",
 	}
@@ -77,6 +79,32 @@ func TestValidateAll_Duration(t *testing.T) {
 	checkContains(t, err, "AUDIT_POLL_INTERVAL")
 }
 
+func TestValidateAll_PollIntervalBounds(t *testing.T) {
+	cfg := validBase()
+
+	cfg.PollIntervalMin = -1
+	err := cfg.ValidateAll()
+	checkContains(t, err, "POLL_INTERVAL_MIN")
+
+	cfg.PollIntervalMin = 0
+	cfg.PollIntervalMax = -1
+	err = cfg.ValidateAll()
+	checkContains(t, err, "POLL_INTERVAL_MAX")
+
+	cfg.PollIntervalMin = 30 * time.Second
+	cfg.PollIntervalMax = 5 * time.Second
+	err = cfg.ValidateAll()
+	checkContains(t, err, "POLL_INTERVAL_MIN")
+	checkContains(t, err, "POLL_INTERVAL_MAX")
+
+	cfg.PollIntervalMin = time.Second
+	cfg.PollIntervalMax = 30 * time.Second
+	cfg.LogFormat = "text" // validBase() leaves this empty; unrelated to what this test checks
+	if err := cfg.ValidateAll(); err != nil {
+		t.Fatalf("unexpected error with ordered bounds: %s", err)
+	}
+}
+
 func TestValidateAll_NumericRanges(t *testing.T) {
 	cfg := validBase()
 
@@ -90,6 +118,24 @@ func TestValidateAll_NumericRanges(t *testing.T) {
 	checkContains(t, err, "PARTITION_LEDGER_SPAN")
 
 	cfg.PartitionLedgerSpan = 120960
+	cfg.LogFormat = "text"
+	cfg.IngesterMinBackoff = 0
+	err = cfg.ValidateAll()
+	checkContains(t, err, "INGESTER_MIN_BACKOFF")
+
+	cfg.IngesterMinBackoff = 2 * time.Second
+	cfg.IngesterMaxBackoff = time.Second
+	err = cfg.ValidateAll()
+	checkContains(t, err, "INGESTER_MIN_BACKOFF")
+
+	cfg.IngesterMaxBackoff = time.Minute
+	cfg.IngesterJitterMin = 2 * time.Second
+	cfg.IngesterJitterMax = time.Second
+	err = cfg.ValidateAll()
+	checkContains(t, err, "INGESTER_JITTER_MIN")
+
+	cfg.IngesterJitterMin = 0
+	cfg.IngesterJitterMax = 0
 	cfg.AuditBatchLedgers = 0
 	err = cfg.ValidateAll()
 	checkContains(t, err, "AUDIT_BATCH_LEDGERS")
@@ -278,7 +324,10 @@ func validBase() Config {
 		AuditMaxRPS:         10,
 		AuditMaxRepair:      3,
 		AuditFindingMaxLgrs: 100,
+		IngesterMinBackoff:  time.Second,
+		IngesterMaxBackoff:  time.Minute,
 		LogLevel:            "info",
+		LogFormat:           "text",
 	}
 }
 

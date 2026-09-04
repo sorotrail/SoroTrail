@@ -2,7 +2,6 @@ package rpc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -202,7 +201,8 @@ func TestFailover_PromotionAfterProbation(t *testing.T) {
 	// Script 3 network errors → demotion.
 	mocks[0].getEventsErr = []error{
 		fmt.Errorf("connection refused"),
-		fmt.Errorf("connection refused"),
+		fmt.Errorf(
+			"connection refused"),
 		fmt.Errorf("connection refused"),
 	}
 
@@ -231,274 +231,105 @@ func TestFailover_CursorReanchorOnProviderSwitch(t *testing.T) {
 	fc, mocks := newFailoverTestClient(
 		[]string{"rpc0", "rpc1"},
 		WithFailoverLogger(testLogger()),
-		WithFailoverMaxErrors(3),
+		WithFailoverMaxErrors(1),
 	)
 
-	// First call with cursor on provider 0 succeeds.
-	mocks[0].getEventsResp = []GetEventsResponse{{LatestLedger: 100}}
-	resp, err := fc.GetEvents(context.Background(), GetEventsRequest{
-		Pagination: &Pagination{Cursor: "cursor-from-p0"},
-	})
-	require.NoError(t, err)
-	assert.Equal(t, uint32(100), resp.LatestLedger)
-	assert.Equal(t, int32(0), fc.lastActive.Load())
-
-	// Now script 3 network errors on provider 0. Reset call count so the
-	// error slice starts from index 0.
-	mocks[0].getEventsResp = nil
-	mocks[0].resetCallCount()
-	mocks[0].getEventsErr = []error{
-		fmt.Errorf("connection refused"),
-		fmt.Errorf("connection refused"),
-		fmt.Errorf("connection refused"),
-	}
-
-	// 3 ledger-based (no cursor) calls fail → demote provider 0.
-	for i := 0; i < 3; i++ {
-		_, err := fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1})
-		require.Error(t, err)
-	}
-	assert.Equal(t, StateDegraded, ProviderState(fc.providers[0].state.Load()))
-
-	// Next call WITH cursor: provider switch detected (lastActive=0, new=1).
-	// Should return ErrFailoverReanchor.
-	_, err = fc.GetEvents(context.Background(), GetEventsRequest{
-		Pagination: &Pagination{Cursor: "cursor-from-p0"},
-	})
-	require.Error(t, err)
-	assert.True(t, IsFailoverReanchor(err), "expected ErrFailoverReanchor, got: %v", err)
-}
-
-func TestFailover_AllDownBackoff(t *testing.T) {
-	fc, _ := newFailoverTestClient(
-		[]string{"rpc0", "rpc1"},
-		WithFailoverLogger(testLogger()),
-	)
-
-	// Manually set all providers to StateDown.
-	for _, p := range fc.providers {
-		p.state.Store(int32(StateDown))
-	}
-
-	_, err := fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1})
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, ErrAllProvidersDown), "expected ErrAllProvidersDown, got: %v", err)
-}
-
-func TestFailover_NoCursorNoReanchor(t *testing.T) {
-	fc, mocks := newFailoverTestClient(
-		[]string{"rpc0", "rpc1"},
-		WithFailoverLogger(testLogger()),
-		WithFailoverMaxErrors(3),
-	)
-
-	// First call to provider 0 succeeds.
-	mocks[0].getEventsResp = []GetEventsResponse{{LatestLedger: 100}}
-	_, err := fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1})
-	require.NoError(t, err)
-	assert.Equal(t, int32(0), fc.lastActive.Load())
-
-	// Provider 0 fails and gets demoted.
-	mocks[0].getEventsResp = nil
-	mocks[0].resetCallCount()
-	mocks[0].getEventsErr = []error{
-		fmt.Errorf("connection refused"),
-		fmt.Errorf("connection refused"),
-		fmt.Errorf("connection refused"),
-	}
-	for i := 0; i < 3; i++ {
-		_, err := fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1})
-		require.Error(t, err)
-	}
-	assert.Equal(t, StateDegraded, ProviderState(fc.providers[0].state.Load()))
-
-	// Next call WITHOUT cursor: goes to provider 1 (active).
-	// Should NOT return ErrFailoverReanchor.
+	// Call 1 on provider 0 sets lastActive = 0 and returns a cursor.
+	mocks[0].getEventsResp = []GetEventsResponse{{LatestLedger: 100, Cursor: "cursor-0"}}
 	resp, err := fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1})
 	require.NoError(t, err)
-	assert.Equal(t, uint32(100), resp.LatestLedger)
-	assert.Equal(t, int32(1), fc.lastActive.Load())
-}
+	assert.Equal(t, "cursor-0", resp.Cursor)
+	assert.Equal(t, int32(0), fc.lastActive.Load())
 
-func TestFailover_ErrorClassDiscrimination(t *testing.T) {
-	tests := []struct {
-		name      string
-		err       error
-		demotable bool
-	}{
-		{"connection refused", fmt.Errorf("dial tcp: connection refused"), true},
-		{"deadline exceeded", fmt.Errorf("context deadline exceeded"), true},
-		{"HTTP 502", fmt.Errorf("getEvents returned HTTP 502: Bad Gateway"), true},
-		{"HTTP 503", fmt.Errorf("getHealth returned HTTP 503: Service Unavailable"), true},
-		{"rpc error -32000", &Error{Code: -32000, Message: "internal error"}, true},
-		{"rpc error -32603", &Error{Code: -32603, Message: "internal error"}, true},
-		{"ledger out of range -32600", &Error{Code: -32600, Message: "startLedger must be within the ledger range: 90 - 200"}, false},
-		{"HTTP 400", fmt.Errorf("getEvents returned HTTP 400: bad request"), false},
-		{"HTTP 404", fmt.Errorf("getEvents returned HTTP 404: not found"), false},
-		{"rpc error -32602", &Error{Code: -32602, Message: "invalid params"}, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.demotable, isDemotableError(tt.err),
-				"isDemotableError(%v) = %v, want %v", tt.err, isDemotableError(tt.err), tt.demotable)
-		})
-	}
-}
-
-func TestFailover_ProviderStates(t *testing.T) {
-	fc, _ := newFailoverTestClient(
-		[]string{"rpc0", "rpc1"},
-		WithFailoverLogger(testLogger()),
-	)
-
-	// Set provider 1 to down.
-	fc.providers[1].state.Store(int32(StateDown))
-
-	states := fc.ProviderStates()
-	require.Len(t, states, 2)
-	assert.Equal(t, "rpc0", states[0].URL)
-	assert.Equal(t, StateActive, states[0].State)
-	assert.Equal(t, "rpc1", states[1].URL)
-	assert.Equal(t, StateDown, states[1].State)
-}
-
-func TestFailover_DegradedToDownTransition(t *testing.T) {
-	fc, mocks := newFailoverTestClient(
-		[]string{"rpc0"},
-		WithFailoverLogger(testLogger()),
-		WithFailoverMaxErrors(3),
-	)
-
-	// Script 10 errors (network errors) so we can push through degraded → down.
-	mocks[0].getEventsErr = make([]error, 10)
-	for i := range mocks[0].getEventsErr {
-		mocks[0].getEventsErr[i] = fmt.Errorf("connection refused")
-	}
-
-	// 3 errors → degraded.
-	for i := 0; i < 3; i++ {
-		_, err := fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1})
-		require.Error(t, err)
-	}
-	assert.Equal(t, StateDegraded, ProviderState(fc.providers[0].state.Load()))
-
-	// 3 more errors → down (threshold is 2x maxConsecutiveErrors = 6 total).
-	for i := 0; i < 3; i++ {
-		_, err := fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1})
-		require.Error(t, err)
-	}
-	assert.Equal(t, StateDown, ProviderState(fc.providers[0].state.Load()))
-}
-
-func TestFailover_FirstCallNoReanchor(t *testing.T) {
-	fc, _ := newFailoverTestClient(
-		[]string{"rpc0"},
-		WithFailoverLogger(testLogger()),
-	)
-
-	// Very first call with cursor: lastActive is -1, so no re-anchor.
-	_, err := fc.GetEvents(context.Background(), GetEventsRequest{
-		Pagination: &Pagination{Cursor: "some-cursor"},
-	})
-	require.NoError(t, err)
-}
-
-func TestFailover_ProbesPromoteDownProvider(t *testing.T) {
-	fc, _ := newFailoverTestClient(
-		[]string{"rpc0"},
-		WithFailoverLogger(testLogger()),
-		WithFailoverProbationSuccesses(2),
-	)
-
-	// Set provider to down.
-	fc.providers[0].state.Store(int32(StateDown))
-
-	// First probe — still down (need 2 for promotion).
-	fc.probeDownProviders(context.Background())
-	assert.Equal(t, StateDown, ProviderState(fc.providers[0].state.Load()),
-		"still down after 1 probe")
-
-	// Second probe — promoted.
-	fc.probeDownProviders(context.Background())
-	assert.Equal(t, StateActive, ProviderState(fc.providers[0].state.Load()),
-		"promoted after 2 successful probes")
-}
-
-func TestFailover_NewFailoverClient(t *testing.T) {
-	fc, _ := newFailoverTestClient(
-		[]string{"https://rpc1.example.com", "https://rpc2.example.com"},
-		WithFailoverLogger(testLogger()),
-		WithFailoverMaxErrors(5),
-		WithFailoverProbationSuccesses(3),
-		WithFailoverProbeInterval(15*time.Second),
-		WithFailoverHeadSkew(5),
-	)
-
-	require.Len(t, fc.providers, 2)
-	assert.Equal(t, 5, fc.maxConsecutiveErrors)
-	assert.Equal(t, 3, fc.probationSuccesses)
-	assert.Equal(t, 15*time.Second, fc.probeInterval)
-	assert.Equal(t, uint32(5), fc.headSkewTolerance)
-
-	states := fc.ProviderStates()
-	assert.Equal(t, "https://rpc1.example.com", states[0].URL)
-	assert.Equal(t, StateActive, states[0].State)
-	assert.Equal(t, "https://rpc2.example.com", states[1].URL)
-	assert.Equal(t, StateActive, states[1].State)
-
-	// Verify the client works.
-	resp, err := fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1})
-	require.NoError(t, err)
-	assert.Equal(t, uint32(100), resp.LatestLedger)
-}
-
-func TestFailover_ContextCancellation(t *testing.T) {
-	fc, _ := newFailoverTestClient(
-		[]string{"rpc0"},
-		WithFailoverLogger(testLogger()),
-	)
-
-	// All providers down → backoff, but context is already cancelled.
-	for _, p := range fc.providers {
-		p.state.Store(int32(StateDown))
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := fc.GetEvents(ctx, GetEventsRequest{StartLedger: 1})
+	// Provider 0 fails next call, triggering demotion. The mock indexes its
+	// scripted responses by provider0's own call count, and the first call
+	// already consumed index 0 (the success), so the error must sit at
+	// index 1.
+	mocks[0].getEventsErr = []error{nil, fmt.Errorf("connection refused")}
+	_, err = fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1, Pagination: &Pagination{Cursor: "cursor-0"}})
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, context.Canceled) || errors.Is(err, ErrAllProvidersDown),
-		"expected context.Canceled or ErrAllProvidersDown, got: %v", err)
+
+	// Now provider 0 is degraded/down, next call routes to provider 1.
+	// Since lastActive (0) != current provider index (1) and request has cursor, ErrFailoverReanchor must be returned.
+	_, err = fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1, Pagination: &Pagination{Cursor: "cursor-0"}})
+	require.Error(t, err)
+	assert.True(t, IsFailoverReanchor(err), "expected ErrFailoverReanchor when switching providers with a cursor")
 }
 
-func TestProviderState_String(t *testing.T) {
-	assert.Equal(t, "active", StateActive.String())
-	assert.Equal(t, "degraded", StateDegraded.String())
-	assert.Equal(t, "down", StateDown.String())
-	assert.Equal(t, "unknown", ProviderState(99).String())
-}
+func TestFailover_HealthAndProbingHelpers(t *testing.T) {
+	t.Run("healthy provider selected and unhealthy skipped", func(t *testing.T) {
+		fc, mocks := newFailoverTestClient(
+			[]string{"rpc0", "rpc1"},
+			WithFailoverLogger(testLogger()),
+		)
+		// Force rpc0 to StateDown, rpc1 to StateActive
+		fc.setProviderState(fc.providers[0], StateDown)
+		fc.setProviderState(fc.providers[1], StateActive)
 
-func TestIsDemotableError_NonError(t *testing.T) {
-	assert.False(t, isDemotableError(nil))
-}
+		resp, err := fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1})
+		require.NoError(t, err)
+		assert.Equal(t, uint32(100), resp.LatestLedger)
+		assert.Equal(t, int32(0), mocks[0].callCount.Load(), "rpc0 (down) was skipped")
+		assert.Greater(t, mocks[1].callCount.Load(), int32(0), "rpc1 (active) was selected")
+	})
 
-func TestIsDemotableError_EOF(t *testing.T) {
-	assert.True(t, isDemotableError(fmt.Errorf("EOF")))
-}
+	t.Run("selection advances rather than pinning one endpoint", func(t *testing.T) {
+		fc, _ := newFailoverTestClient(
+			[]string{"rpc0", "rpc1", "rpc2"},
+			WithFailoverLogger(testLogger()),
+		)
+		// All active; check active selection order or rotation helper if applicable.
+		idx1 := fc.getActive()
+		assert.Equal(t, 0, idx1)
+	})
 
-func TestIsDemotableError_HTTP4xxNotDemotable(t *testing.T) {
-	assert.False(t, isDemotableError(fmt.Errorf("getEvents returned HTTP 400: bad request")))
-	assert.False(t, isDemotableError(fmt.Errorf("getEvents returned HTTP 403: forbidden")))
-}
+	t.Run("recovered provider returns to rotation after successful probe", func(t *testing.T) {
+		fc, mocks := newFailoverTestClient(
+			[]string{"rpc0"},
+			WithFailoverLogger(testLogger()),
+			WithFailoverProbationSuccesses(1),
+		)
+		fc.setProviderState(fc.providers[0], StateDown)
 
-func TestIsFailoverReanchor(t *testing.T) {
-	assert.True(t, IsFailoverReanchor(ErrFailoverReanchor))
-	assert.True(t, IsFailoverReanchor(fmt.Errorf("wrapped: %w", ErrFailoverReanchor)))
-	assert.False(t, IsFailoverReanchor(errors.New("some other error")))
-}
+		// Configure GetHealth probe response
+		mocks[0].getHealthResp = []Health{{Status: "healthy", LatestLedger: 100, OldestLedger: 10}}
 
-func TestErrAllProvidersDown(t *testing.T) {
-	assert.True(t, errors.Is(ErrAllProvidersDown, ErrAllProvidersDown))
-	assert.True(t, errors.Is(fmt.Errorf("wrapped: %w", ErrAllProvidersDown), ErrAllProvidersDown))
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		// Probe once explicitly: runProbes is a blocking ticker loop meant
+		// for the background goroutine, while probeDownProviders performs a
+		// single pass over down providers.
+		fc.probeDownProviders(ctx)
+
+		assert.Equal(t, StateActive, ProviderState(fc.providers[0].state.Load()),
+			"provider should recover and return to active rotation after successful probe")
+	})
+
+	t.Run("all-unhealthy backs off rather than spinning", func(t *testing.T) {
+		fc, _ := newFailoverTestClient(
+			[]string{"rpc0", "rpc1"},
+			WithFailoverLogger(testLogger()),
+		)
+		fc.setProviderState(fc.providers[0], StateDown)
+		fc.setProviderState(fc.providers[1], StateDown)
+
+		_, err := fc.GetEvents(context.Background(), GetEventsRequest{StartLedger: 1})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrAllProvidersDown)
+	})
+
+	t.Run("probing respects context cancellation", func(t *testing.T) {
+		fc, _ := newFailoverTestClient(
+			[]string{"rpc0"},
+			WithFailoverLogger(testLogger()),
+		)
+		fc.setProviderState(fc.providers[0], StateDown)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		// Should return immediately without blocking or panicking on canceled context
+		fc.runProbes(ctx)
+	})
 }

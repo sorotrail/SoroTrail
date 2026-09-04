@@ -1,0 +1,72 @@
+# Labeler rules for SoroTrail.
+#
+# Auto-applies area/* labels to pull requests based on the paths they touch.
+# Mirrors the area taxonomy in docs/triage.md. `type/*` and priority labels
+# are applied by maintainers during triage (see docs/triage.md).
+#
+# Uses actions/labeler@v6 — a PR opened against the default branch is labeled
+# by these path globs. Push access to labels is via the GITHUB_TOKEN granted
+# in .github/workflows/labeler.yml (pull-requests: write).
+
+area/ingester:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/ingester/**'
+
+area/store:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/store/**'
+
+area/api:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/api/**'
+      - any-glob-to-any-file: 'api/**'
+
+area/spec:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/spec/**'
+      - any-glob-to-any-file: 'internal/sep41/**'
+      - any-glob-to-any-file: 'cmd/specgen/**'
+
+area/rpc:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/rpc/**'
+      - any-glob-to-any-file: 'internal/horizon/**'
+
+area/decode:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/decode/**'
+
+area/replay:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/replay/**'
+      - any-glob-to-any-file: 'cmd/sorotrail/replay.go'
+
+area/audit:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/audit/**'
+      - any-glob-to-any-file: 'internal/pruner/**'
+      - any-glob-to-any-file: 'internal/backfill/**'
+
+area/webhook:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/webhook/**'
+      - any-glob-to-any-file: 'internal/broadcast/**'
+
+area/build:
+  - changed-files:
+      - any-glob-to-any-file: 'Makefile'
+      - any-glob-to-any-file: 'Dockerfile*'
+      - any-glob-to-any-file: '.goreleaser.yaml'
+      - any-glob-to-any-file: 'go.mod'
+      - any-glob-to-any-file: 'go.sum'
+      - any-glob-to-any-file: 'cmd/**'
+      - any-glob-to-any-file: 'scripts/**'
+      - any-glob-to-any-file: 'deploy/**'
+      - any-glob-to-any-file: 'docker-compose*.yml'
+
+area/docs:
+  - changed-files:
+      - any-glob-to-any-file: 'docs/**'
+      - any-glob-to-any-file: '*.md'
+      - any-glob-to-any-file: '.github/ISSUE_TEMPLATE/**'
+      - any-glob-to-any-file: '.github/PULL_REQUEST_TEMPLATE.md'

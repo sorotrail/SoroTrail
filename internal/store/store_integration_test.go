@@ -59,8 +59,13 @@ func requireSchema(t *testing.T, pool *pgxpool.Pool) {
 			},
 		},
 		{
-			table:   "ingestion_state",
-			columns: []string{"id", "last_ingested_ledger", "last_cursor", "updated_at"},
+			// Ingestion state is keyed by network so each network can resume
+			// independently with its own cursor and ledger frontier.
+			table: "ingestion_state",
+			columns: []string{
+				"network", "last_ingested_ledger", "last_cursor",
+				"last_successful_poll", "updated_at",
+			},
 		},
 		{
 			// audit_state is keyed by network, not by the singleton id the

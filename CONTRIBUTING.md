@@ -3,22 +3,39 @@
 Thanks for helping! SoroTrail aims to stay small, idiomatic Go with clear
 seams — most features should slot in behind an existing interface.
 
+## Start here
+
+- **New contributor?** Read [`docs/local-setup.md`](docs/local-setup.md) to
+  clone, build, run, and test locally, and [`docs/architecture-overview.md`](docs/architecture-overview.md)
+  for the ingester / store / api / spec seams.
+- **Triaging or reviewing?** See [`docs/triage.md`](docs/triage.md) for the
+  label taxonomy and workflow.
+
 ## Dev setup
 
 1. Go 1.25+ (any Go ≥ 1.21 works too — the go toolchain auto-downloads the
    version pinned in go.mod) and Docker.
-2. `docker compose up -d postgres` for a local database (the integration
+2. Run `make help` to see every available target.
+3. `docker compose up -d postgres` for a local database (the integration
    suite can also spin up its own ephemeral container — see "How the
    integration test layer works" below).
-3. `make test` for the unit suite; it stays fast (under ~10s) because
-   the integration tests are gated behind the `integration` build tag.
-4. `make test-integration` runs the integration suite against a real
+4. `make test` for the unit suite, race-detector enabled
+   (`go test -race ./...`) — the same race checking CI runs, so a data
+   race can't pass locally and fail in CI. The integration tests are
+   gated behind the `integration` build tag, so it stays a unit-only
+   run. `-race` requires cgo and a C toolchain; on Windows, install gcc
+   (e.g. MinGW-w64) or use `make test-fast` for the plain, non-race
+   run.
+5. `make test-integration` runs the integration suite against a real
    Postgres — `go test -tags=integration -p 1 ./... -count=1`.
-5. `make test-db` runs everything, including integration tests, against
+6. `make test-db` runs everything, including integration tests, against
    whatever `TEST_DATABASE_URL` points at — kept for backwards
    compatibility with the previous workflow.
-6. `make cover` / `make cover-html` for coverage.
-7. `make lint` (install [golangci-lint](https://golangci-lint.run/) locally).
+7. `make cover` / `make cover-html` for coverage.
+8. `make lint` (install [golangci-lint](https://golangci-lint.run/) locally).
+
+The full, copy-pasteable setup and testing walkthrough lives in
+[`docs/local-setup.md`](docs/local-setup.md).
 
 ### How the integration test layer works (issue #9)
 
@@ -57,8 +74,8 @@ Database resolution, in order:
   missing infra.
 
 `make test-integration` runs `go test -tags=integration -p 1 ./... -count=1`.
-Without the tag, `go test ./...` is unit-suite-only and stays fast
-(under ~10s).
+Without the tag, the run is unit-suite-only: `make test` adds `-race`
+(CI's race checking) and `make test-fast` keeps the plain, fastest run.
 
 ## Fuzz testing
 
@@ -82,6 +99,11 @@ directory. Commit any panic reproducer together with a regression test.
 
 ## Architecture
 
+A concise tour of the four seams (ingester, store, api, spec) and how they
+connect is in [`docs/architecture-overview.md`](docs/architecture-overview.md);
+the full component write-up with data-flow diagrams is in
+[`docs/architecture.md`](docs/architecture.md).
+
 ```
 cmd/sorotrail        main: wiring + graceful shutdown
 internal/config      env parsing + validation
@@ -91,6 +113,7 @@ internal/store       Postgres persistence    (interface: store.Store)
 internal/ingester    polling loop, pagination, backoff
 internal/replay      re-decode stored raw XDR (sorotrail replay)
 internal/api         chi HTTP handlers
+internal/spec        contract-spec enrichment (interface: spec.Enricher)
 internal/testdb      //go:build integration helper shared by tests
 ```
 
@@ -147,17 +170,81 @@ be merged without deep audit.
 
 ## Verification & Automated Checks
 
-Before submitting a pull request, please run the following commands locally:
+Before submitting a pull request, run `make ci` — it reproduces the CI gate
+locally (build, `go vet` with and without the `integration` tag, the tagged
+and untagged test suites, the benchmark smoke run, and `golangci-lint`) and
+stops at the first failing step, just like CI. The database-backed tests skip
+gracefully when `TEST_DATABASE_URL` (or Docker) is unavailable, so `make ci`
+passes without Postgres and runs the full gate once one is available. Every
+target is documented; run `make help` to list them all.
+
+`make test-ci` is the exact command the CI test job runs
+(`go test -p 1 ./... -count=1 -race -timeout=120s`); `make test` runs the
+same race detector with less ceremony, and `make test-fast` is the plain
+non-race run.
+
+For individual checks, run each step on its own:
 
 ```bash
-go build ./...
-make test-db   # Requires local Postgres instance
-make lint
+make build-all        # go build ./...
+make vet              # go vet ./...
+make test-ci          # CI test job's exact command; DB-backed tests skip without TEST_DATABASE_URL
+make test-integration # integration-tagged suite against a real Postgres
+make bench-ci         # benchmark smoke run
+make lint             # golangci-lint run
+```
+
+## Migration safety
+
+Migrations are the riskiest change applied to a running database. The CI gate
+runs several static checks without a Postgres connection so a broken migration
+is caught at build time:
+
+- **Version uniqueness** — no two .up.sql files share a version number
+  (`TestMigrate_VersionNumbersAreUnique`).
+- **Paired up/down** — every .up.sql has a matching .down.sql and vice versa
+  (`TestMigrate_FilesAreWellFormed`).
+- **No drop-after-create** — a migration cannot drop a table that a later
+  migration depends on (`TestMigrate_NoUpDropsTableDependency`).
+- **No rebuild-after-alter** — a migration cannot rebuild a table (rename +
+  create) that a later migration alters, because the rebuild silently discards
+  columns added before it (`TestMigrate_NoUpRebuildsTableDependency`).
+
+The integration suite (`go test -tags=integration`) exercises the full
+up-from-empty → down-to-zero → up-again round-trip against a real Postgres
+(`TestMigrate_UpDownUpRoundTrip`), and verifies that each down migration
+reverses its up exactly (`TestMigrate_EachDownReversesItsUp`).
+
+Run `sorotrail migrate-status` to report pending migrations without applying
+them — useful for pre-deploy checks.
+
+### Dirty version recovery
+
+If a migration partially applies and then fails, the database enters a
+dirty state (the `dirty` flag in `schema_migrations` is set to `1`).
+Recovery steps:
+
+1. Inspect the current state:
+   ```sql
+   SELECT version, dirty FROM schema_migrations;
+   ```
+2. If the version number is correct but dirty, mark it clean:
+   ```sql
+   UPDATE schema_migrations SET dirty = false;
+   ```
+3. If the version number is wrong, set it to the correct value:
+   ```sql
+   UPDATE schema_migrations SET version = <N>, dirty = false;
+   ```
+4. Re-run `sorotrail` to verify it starts cleanly.
+
+Never manually modify migration SQL files after they have been applied to
+any environment. If a migration is broken, write a new forward migration
+to fix it.
 
 ## Pull requests
 
-- `go build ./...`, `make test`, `make test-integration` and `make lint`
-  must pass.
+- `make ci` must pass before pushing.
 - Touching the events table? Update the column list in the migration test
   (`TestMigrations_ApplyFromEmptyLand`) — it's what catches drift
   between SQL and Go.

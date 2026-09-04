@@ -236,14 +236,39 @@ func ParseTopic(raw string) (json.RawMessage, error) {
 	if raw == "" {
 		return nil, nil
 	}
-	if json.Valid([]byte(raw)) {
-		return json.RawMessage(raw), nil
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
 	}
-	quoted, err := json.Marshal(raw)
+	if json.Valid([]byte(trimmed)) {
+		return json.RawMessage(trimmed), nil
+	}
+	if looksLikeJSON(trimmed) {
+		return nil, errors.New("topic must be valid JSON")
+	}
+	quoted, err := json.Marshal(trimmed)
 	if err != nil {
 		return nil, fmt.Errorf("invalid json: %w", err)
 	}
 	return quoted, nil
+}
+
+func looksLikeJSON(s string) bool {
+	if s == "" {
+		return false
+	}
+	switch s[0] {
+	case '{', '[', '"', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		return true
+	case 't':
+		return s == "true"
+	case 'f':
+		return s == "false"
+	case 'n':
+		return s == "null"
+	default:
+		return false
+	}
 }
 
 // ParseTopicContains requires a JSON value (no auto-quoting). Used by

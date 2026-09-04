@@ -17,6 +17,11 @@ import (
 	"net/http"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
@@ -88,6 +93,10 @@ func NewNotifier(st store.Store, log *slog.Logger) *Notifier {
 	return n
 }
 
+// webhookTracer returns the OTel tracer for the webhook package.
+// Using a function ensures we always pick up the current global provider.
+func webhookTracer() trace.Tracer { return otel.Tracer("sorotrail/webhook") }
+
 // NotifyEvents is called by the ingester after persisting a batch of
 // events. It finds all enabled subscriptions whose filters match each
 // event and enqueues delivery tasks. Enqueuing is non-blocking for the
@@ -98,6 +107,9 @@ func (n *Notifier) NotifyEvents(ctx context.Context, events []store.Event) {
 		return
 	}
 
+	_, span := webhookTracer().Start(ctx, "webhook.notify_events")
+	defer span.End()
+
 	subs, err := n.store.ListEnabledSubscriptions(ctx)
 	if err != nil {
 		n.log.Error("listing enabled subscriptions for webhook delivery", "error", err)
@@ -106,6 +118,9 @@ func (n *Notifier) NotifyEvents(ctx context.Context, events []store.Event) {
 	if len(subs) == 0 {
 		return
 	}
+
+	span.SetAttributes(attribute.Int("webhook.matching_events", len(events)),
+		attribute.Int("webhook.subscriptions", len(subs)))
 
 	for i := range events {
 		ev := events[i]
@@ -168,6 +183,13 @@ func (n *Notifier) deliverWithRetry(ctx context.Context, task deliveryTask) {
 	sig := Sign(task.Subscription.Secret, body)
 
 	for attempt := 0; attempt < n.maxAttempts; attempt++ {
+		attemptCtx, span := webhookTracer().Start(ctx, "webhook.deliver",
+			trace.WithAttributes(
+				attribute.Int("webhook.attempt", attempt+1),
+				attribute.Int64("webhook.subscription_id", task.Subscription.ID),
+				attribute.String("webhook.event_id", task.Event.ID),
+			))
+
 		if attempt > 0 {
 			backoff := n.backoffFunc(attempt)
 			n.log.Debug("webhook retry",
@@ -176,18 +198,23 @@ func (n *Notifier) deliverWithRetry(ctx context.Context, task deliveryTask) {
 				"attempt", attempt+1,
 				"backoff", backoff)
 			if !sleepCtx(ctx, backoff) {
+				span.End()
 				return
 			}
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, task.Subscription.URL, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, task.Subscription.URL, bytes.NewReader(body))
 		if err != nil {
-			n.recordAttempt(ctx, task, 0, 0, err)
+			n.recordAttempt(attemptCtx, task, 0, 0, err)
 			n.incrementFailures(ctx, task.Subscription.ID)
+			span.End()
 			return // bad URL is terminal
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set(SignatureHeader, sig)
+
+		// Propagate trace context to the subscriber endpoint.
+		otel.GetTextMapPropagator().Inject(attemptCtx, propagation.HeaderCarrier(req.Header))
 
 		start := time.Now()
 		resp, err := n.client.Do(req)
@@ -199,20 +226,32 @@ func (n *Notifier) deliverWithRetry(ctx context.Context, task deliveryTask) {
 				"event_id", task.Event.ID,
 				"attempt", attempt+1,
 				"error", err)
-			n.recordAttempt(ctx, task, 0, dur, err)
+			n.recordAttempt(attemptCtx, task, 0, dur, err)
+			span.SetAttributes(
+				attribute.Int64("webhook.duration_ms", dur.Milliseconds()),
+				attribute.Bool("webhook.success", false),
+			)
+			span.End()
 			continue
 		}
+
+		span.SetAttributes(
+			attribute.Int("webhook.status_code", resp.StatusCode),
+			attribute.Int64("webhook.duration_ms", dur.Milliseconds()),
+		)
 
 		resp.Body.Close()
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			// Success.
-			n.recordAttempt(ctx, task, resp.StatusCode, dur, nil)
+			n.recordAttempt(attemptCtx, task, resp.StatusCode, dur, nil)
 			n.recordSuccess(ctx, task.Subscription.ID)
 			n.log.Debug("webhook delivered",
 				"subscription_id", task.Subscription.ID,
 				"event_id", task.Event.ID,
 				"status", resp.StatusCode)
+			span.SetAttributes(attribute.Bool("webhook.success", true))
+			span.End()
 			return
 		}
 
@@ -222,8 +261,10 @@ func (n *Notifier) deliverWithRetry(ctx context.Context, task deliveryTask) {
 			"event_id", task.Event.ID,
 			"attempt", attempt+1,
 			"status", resp.StatusCode)
-		n.recordAttempt(ctx, task, resp.StatusCode, dur,
+		n.recordAttempt(attemptCtx, task, resp.StatusCode, dur,
 			fmt.Errorf("HTTP %d", resp.StatusCode))
+		span.SetAttributes(attribute.Bool("webhook.success", false))
+		span.End()
 	}
 
 	// All attempts exhausted — auto-disable.
