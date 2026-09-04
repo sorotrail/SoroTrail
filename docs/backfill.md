@@ -50,8 +50,8 @@ sorotrail backfill --contract C... --from-ledger N [--to-ledger M] [flags]
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--contract` | — (required) | Contract ID to backfill events for (`C...` strkey). |
-| `--from-ledger` | — (required) | First ledger to backfill, inclusive. |
-| `--to-ledger` | `0` | Last ledger to backfill, inclusive. `0` = no upper bound (run until Horizon returns an empty page). |
+| `--from-ledger`, `--from` | — (required) | First ledger to backfill, inclusive. `--from` is a short alias for `--from-ledger`. |
+| `--to-ledger`, `--to` | `0` | Last ledger to backfill, inclusive. `0` = no upper bound (run until Horizon returns an empty page). `--to` is a short alias for `--to-ledger`. |
 | `--batch-size` | `200` | Transactions per Horizon page. Capped at Horizon's per-page limit. |
 | `--rps` | from env | Override `BACKFILL_RATE_RPS` for this run only. |
 | `--horizon-url` | from env | Override `HORIZON_URL` for this run only. |
