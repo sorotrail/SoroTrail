@@ -253,6 +253,11 @@ func (p *Postgres) PruneEventsBefore(ctx context.Context, cutoff time.Time) (int
 // relies on that).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	batch := &pgx.Batch{}
+	conflict := "ON CONFLICT DO NOTHING"
+	if onUpdate {
+		conflict = `
+		ON CONFLICT (ledger, id) DO UPDATE SET
+			contract_id        = EXCLUDED.contract_id,
 	conflict := "ON CONFLICT (id) DO NOTHING"
 	conflict := `ON CONFLICT (network, ledger, id) DO NOTHING`
 	if onUpdate {
@@ -267,10 +272,10 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			topics             = EXCLUDED.topics,
 			value              = EXCLUDED.value,
 			created_at         = EXCLUDED.created_at,
-			topics_xdr         = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
-			value_xdr          = coalesce(EXCLUDED.value_xdr, events.value_xdr)`
 			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
 			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
+			topics_xdr         = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
+			value_xdr          = coalesce(EXCLUDED.value_xdr, events.value_xdr)`
 	}
 	stmt := `
 		INSERT INTO events
@@ -279,7 +284,6 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			 raw_topic_xdr, raw_value_xdr)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		` + conflict
-	batch := &pgx.Batch{}
 	for _, e := range events {
 		// 14 placeholders → 14 args. nullable helpers turn empty raw XDR
 		// into SQL NULL so the column has one representation of "absent"

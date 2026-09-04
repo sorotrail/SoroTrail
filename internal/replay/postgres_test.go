@@ -134,12 +134,12 @@ func TestReplay_ImprovedDecoderRewritesStoredRows(t *testing.T) {
 		assert.Contains(t, string(initialGet.Value), "unknown")
 
 		// 2. Perform the initial replay using the current decode.XDRDecoder().
-		r := replay.New(p, decode.XDRDecoder{}, testLogger(), replay.Config{
+		r := replay.New(p, decode.XDRDecoder{}, testLogger(), replay.Options{
 			BatchSize: 2,
-			MaxLedger: 200,
+			ToLedger:  200,
 		})
 
-		err = r.Run(ctx)
+		_, err = r.Run(ctx)
 		require.NoError(t, err)
 
 		// Assert rows written by stale decoder are rewritten by the current one.
@@ -149,11 +149,11 @@ func TestReplay_ImprovedDecoderRewritesStoredRows(t *testing.T) {
 		assert.Contains(t, string(replayedGet.Value), "u64")
 
 		// 3. Rows already current reported unchanged and second replay changes nothing.
-		r2 := replay.New(p, decode.XDRDecoder{}, testLogger(), replay.Config{
+		r2 := replay.New(p, decode.XDRDecoder{}, testLogger(), replay.Options{
 			BatchSize: 2,
-			MaxLedger: 200,
+			ToLedger:  200,
 		})
-		err = r2.Run(ctx)
+		_, err = r2.Run(ctx)
 		require.NoError(t, err)
 
 		replayedSecondGet, err := p.GetEvent(ctx, eventID(1), store.SystemScope())
@@ -161,9 +161,9 @@ func TestReplay_ImprovedDecoderRewritesStoredRows(t *testing.T) {
 		assert.Equal(t, string(replayedGet.Value), string(replayedSecondGet.Value))
 
 		// 4. Test progress persistence across interruptions: progress is saved and bounds work correctly.
-		prog, err := p.GetReplayProgress(ctx)
+		replayState, err := p.GetReplayState(ctx)
 		require.NoError(t, err)
-		assert.GreaterOrEqual(t, prog, int64(100))
+		assert.GreaterOrEqual(t, replayState.Processed, int64(100))
 	})
 }
 
@@ -177,17 +177,18 @@ func TestReplay_RawXDRPreservedAndFallbackStaleRows(t *testing.T) {
 	// Verify raw XDR is present.
 	e, err := p.GetEvent(ctx, eventID(1), store.SystemScope())
 	require.NoError(t, err)
-	assert.True(t, e.HasRawXDR())
+	assert.True(t, len(e.RawTopicXDR) > 0 || e.RawValueXDR != "")
 
-	r := replay.New(p, decode.XDRDecoder{}, testLogger(), replay.Config{
+	r := replay.New(p, decode.XDRDecoder{}, testLogger(), replay.Options{
 		BatchSize: 10,
-		MaxLedger: 200,
+		ToLedger:  200,
 	})
 
-	require.NoError(t, r.Run(ctx))
+	_, err = r.Run(ctx)
+	require.NoError(t, err)
 
 	// Ensure progress and replay succeeded cleanly.
-	prog, err := p.GetReplayProgress(ctx)
+	replayState, err := p.GetReplayState(ctx)
 	require.NoError(t, err)
-	assert.Greater(t, prog, int64(0))
+	assert.Greater(t, replayState.Processed, int64(0))
 }

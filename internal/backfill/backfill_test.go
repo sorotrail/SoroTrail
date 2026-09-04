@@ -3,6 +3,7 @@ package backfill
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -109,6 +110,15 @@ func dummyLog() *slog.Logger {
 }
 
 // fakeStore implements the backfill Store interface and captures writes.
+//
+// UpsertEvents mirrors the real store.Postgres.UpsertEvents dedupe key —
+// `ON CONFLICT (ledger, id) DO NOTHING` (see internal/store/postgres.go's
+// insertEventsBatch) — by keeping a rows map keyed on (ledger, id) and
+// only counting a write as "inserted" the first time that key is seen.
+// Without this, a fake that just returns len(events) on every call
+// can't distinguish a genuine double-run duplicate from an idempotent
+// no-op, which is exactly the property TestRun_RunningTwiceDoesNotDuplicateRows
+// and TestRun_ResumeDiscardsOverlapWithoutDuplicating need to observe.
 type fakeStore struct {
 	state           store.BackfillState
 	startCalled     bool
@@ -117,12 +127,30 @@ type fakeStore struct {
 	upsertCallCount int
 	upsertBatches   [][]store.Event
 	completeCalled  bool
+	rows            map[string]store.Event
+}
+
+// rowKey mirrors the real store's ON CONFLICT (ledger, id) target.
+func rowKey(e store.Event) string {
+	return fmt.Sprintf("%d|%s", e.Ledger, e.ID)
 }
 
 func (f *fakeStore) UpsertEvents(_ context.Context, events []store.Event) (int64, error) {
 	f.upsertCallCount++
 	f.upsertBatches = append(f.upsertBatches, events)
-	return int64(len(events)), nil
+	if f.rows == nil {
+		f.rows = make(map[string]store.Event)
+	}
+	var inserted int64
+	for _, e := range events {
+		key := rowKey(e)
+		if _, exists := f.rows[key]; exists {
+			continue // DO NOTHING: same (ledger, id) already stored.
+		}
+		f.rows[key] = e
+		inserted++
+	}
+	return inserted, nil
 }
 func (f *fakeStore) GetBackfillState(_ context.Context) (store.BackfillState, error) {
 	if !f.startCalled && !f.completeCalled && f.state.ContractID == "" {
@@ -343,6 +371,149 @@ func TestRun_AbortsOnContextCancel(t *testing.T) {
 	sum, err := b.Run(ctx)
 	require.NoError(t, err)
 	assert.False(t, sum.Completed, "interrupted run reports not completed")
+}
+
+// cancelingHorizon wraps fakeHorizon and cancels the run's context right
+// after serving its cancelAfter-th page, simulating an operator hitting
+// Ctrl-C mid-run. Run's loop only checks ctx.Err() at the top of the
+// loop (before the next fetch), so the page that was already fetched
+// finishes committing normally and the interruption lands cleanly at
+// the next page boundary.
+type cancelingHorizon struct {
+	fakeHorizon
+	cancelAfter int
+	cancel      context.CancelFunc
+	fired       bool
+}
+
+func (c *cancelingHorizon) ListContractTransactions(ctx context.Context, contractID, cursor string, limit int, includeFailed bool) (horizon.TransactionsResponse, error) {
+	resp, err := c.fakeHorizon.ListContractTransactions(ctx, contractID, cursor, limit, includeFailed)
+	if !c.fired && c.calls == c.cancelAfter {
+		c.fired = true
+		c.cancel()
+	}
+	return resp, err
+}
+
+// TestRun_RunningTwiceDoesNotDuplicateRows proves the acceptance
+// criterion "running twice does not duplicate rows" end to end through
+// the Backfiller, not just at the store layer. It runs a full Run()
+// against a fixed set of Horizon pages, then builds a fresh Backfiller
+// (same store, same options, same fixture data — modeling an operator
+// re-running the identical `sorotrail backfill` invocation) and runs it
+// again. Because the completed run's backfill_state row has
+// completed_at set, resume() treats the second Run as a fresh start
+// (see Backfiller.resume), so it re-walks and re-extracts every page —
+// exactly what re-running the CLI command does. The fake store dedupes
+// on (ledger, id) exactly like the real Postgres ON CONFLICT clause, so
+// this only holds if the extraction step also reproduces identical
+// event IDs on both passes (it does: formatEventID is a pure function
+// of tx hash/ledger/op index/event index, all of which come from the
+// same fixture data on both runs).
+func TestRun_RunningTwiceDoesNotDuplicateRows(t *testing.T) {
+	targetContract := contractIDFromSeed("alpha")
+	body := scVec(scSymbol("transfer"), scU64(7))
+	meta := buildSimpleMeta(t, "alpha", body)
+
+	fixture := func() [][]horizon.Transaction {
+		return [][]horizon.Transaction{
+			{
+				{ID: "t1", Hash: "h1", Ledger: 100, ResultCode: "txSuccess", ResultMetaXDR: meta},
+				{ID: "t2", Hash: "h2", Ledger: 100, ResultCode: "txSuccess", ResultMetaXDR: meta},
+			},
+			{
+				{ID: "t3", Hash: "h3", Ledger: 101, ResultCode: "txSuccess", ResultMetaXDR: meta},
+			},
+			{}, // empty page → stop
+		}
+	}
+	opts := Options{ContractID: targetContract, FromLedger: 100, BatchSize: 2}
+	fs := &fakeStore{}
+
+	// First run.
+	b1 := New(&fakeHorizon{pageResponses: fixture()}, fs, decode.XDRDecoder{}, dummyLog(), opts)
+	sum1, err := b1.Run(context.Background())
+	require.NoError(t, err)
+	assert.True(t, sum1.Completed)
+	assert.True(t, fs.completeCalled)
+	require.EqualValues(t, 3, sum1.Inserted, "first run inserts all three distinct events")
+	require.Len(t, fs.rows, 3, "store holds exactly the three distinct events after run 1")
+
+	// Second run: identical options, identical Horizon fixture, same
+	// store instance — this is "run the same command again."
+	b2 := New(&fakeHorizon{pageResponses: fixture()}, fs, decode.XDRDecoder{}, dummyLog(), opts)
+	sum2, err := b2.Run(context.Background())
+	require.NoError(t, err)
+	assert.True(t, sum2.Completed)
+	// Every event the second run extracts already exists at the same
+	// (ledger, id) key, so nothing new gets counted as inserted.
+	assert.EqualValues(t, 3, sum2.Extracted, "second run re-extracts the same three events")
+	assert.EqualValues(t, 0, sum2.Inserted, "second run must not report any new rows")
+	assert.Len(t, fs.rows, 3, "store row count is unchanged after the second run")
+}
+
+// TestRun_ResumeDiscardsOverlapWithoutDuplicating proves the other half
+// of "fills gaps idempotently": when a run is interrupted mid-page and
+// resumed, Horizon re-serves its page sequence from the start (backfill
+// persists last_ledger, not the opaque paging_token — see resume()'s
+// doc comment and extractPage's overlap-discard comment), and the rows
+// already committed before the interruption must be discarded, not
+// re-counted or re-inserted, while ledgers past the resume point are
+// captured normally.
+func TestRun_ResumeDiscardsOverlapWithoutDuplicating(t *testing.T) {
+	targetContract := contractIDFromSeed("alpha")
+	body := scVec(scSymbol("x"), scU64(1))
+	meta := buildSimpleMeta(t, "alpha", body)
+
+	fixture := func() [][]horizon.Transaction {
+		return [][]horizon.Transaction{
+			{
+				{ID: "t1", Hash: "h1", Ledger: 100, ResultCode: "txSuccess", ResultMetaXDR: meta},
+				{ID: "t2", Hash: "h2", Ledger: 100, ResultCode: "txSuccess", ResultMetaXDR: meta},
+			},
+			{
+				{ID: "t3", Hash: "h3", Ledger: 101, ResultCode: "txSuccess", ResultMetaXDR: meta},
+			},
+			{}, // empty page → stop
+		}
+	}
+	opts := Options{ContractID: targetContract, FromLedger: 100, BatchSize: 2}
+	fs := &fakeStore{}
+
+	// First run: interrupted right after page 1 (the two ledger-100
+	// rows) commits, before page 2 (ledger 101) is ever fetched.
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	h1 := &cancelingHorizon{
+		fakeHorizon: fakeHorizon{pageResponses: fixture()},
+		cancelAfter: 1,
+		cancel:      cancel1,
+	}
+	b1 := New(h1, fs, decode.XDRDecoder{}, dummyLog(), opts)
+	sum1, err := b1.Run(ctx1)
+	require.NoError(t, err)
+	assert.False(t, sum1.Completed, "run is interrupted before the empty page")
+	assert.False(t, fs.completeCalled)
+	assert.EqualValues(t, 2, sum1.Transactions)
+	assert.EqualValues(t, 2, sum1.Extracted)
+	assert.EqualValues(t, 2, sum1.Inserted)
+	assert.EqualValues(t, 100, fs.state.LastLedger, "progress committed through the last processed ledger")
+	require.Len(t, fs.rows, 2)
+
+	// Second run: same options, Horizon re-serves its full page sequence
+	// from the start (page 1 again re-includes the ledger-100 rows).
+	// resume() picks start=101 from the saved state, so extractPage must
+	// discard the re-served ledger-100 rows rather than re-extracting or
+	// re-counting them, while still capturing the new ledger-101 row.
+	h2 := &fakeHorizon{pageResponses: fixture()}
+	b2 := New(h2, fs, decode.XDRDecoder{}, dummyLog(), opts)
+	sum2, err := b2.Run(context.Background())
+	require.NoError(t, err)
+	assert.True(t, sum2.Resumed)
+	assert.True(t, sum2.Completed)
+	assert.EqualValues(t, 1, sum2.Transactions, "the two re-served ledger-100 rows are discarded, not counted")
+	assert.EqualValues(t, 1, sum2.Extracted)
+	assert.EqualValues(t, 1, sum2.Inserted, "only the new ledger-101 row is a genuinely new insert")
+	assert.Len(t, fs.rows, 3, "store ends with exactly the three distinct events across both runs, no duplicates")
 }
 
 // avoid `errors` import flagging by referencing it once.

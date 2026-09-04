@@ -4,6 +4,7 @@
 // With no arguments it runs the indexer. Subcommands cover maintenance:
 //
 //	sorotrail replay --from-ledger N [--to-ledger M]
+//	sorotrail apikey create|list|revoke
 //	sorotrail backfill --contract C... --from-ledger N [--to-ledger M]
 package main
 
@@ -24,6 +25,7 @@ import (
 
 	"github.com/sorotrail/sorotrail/internal/api"
 	"github.com/sorotrail/sorotrail/internal/api/graphql"
+	"github.com/sorotrail/sorotrail/internal/archive"
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/config"
@@ -60,6 +62,8 @@ func dispatch(args []string) error {
 	switch args[0] {
 	case "replay":
 		return runReplay(args[1:])
+	case "apikey":
+		return runAPIKey(args[1:])
 	case "backfill":
 		return runBackfill(args[1:])
 	case "index-addresses":
@@ -94,6 +98,10 @@ func usage() {
 With no subcommand, runs the indexer (ingester + HTTP API).
 
 subcommands:
+  replay    re-decode stored events with the current decoder
+            (sorotrail replay --help)
+  apikey    issue, list, and revoke API keys
+            (sorotrail apikey --help)
   replay       re-decode stored events with the current decoder
                (sorotrail replay --help)
   backfill     ingest historical contract events from Horizon
@@ -227,7 +235,6 @@ func run() error {
 		spec.WithWasmHashResolver(specFetcher),
 	)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log, st)
-	specEnricher := spec.NewEnricher(specFetcher, specCache, log)
 
 	// Wrap the raw RPC client so per-method error totals are tracked and
 	// surfaced via /stats. specFetcher already holds a reference to the
@@ -265,6 +272,8 @@ func run() error {
 
 	ing := ingester.New(countingClient, st, decode.XDRDecoder{}, log, ingester.Options{
 		PollInterval:            cfg.PollInterval,
+		PollIntervalMin:         cfg.PollIntervalMin,
+		PollIntervalMax:         cfg.PollIntervalMax,
 		StartLedger:             cfg.StartLedger,
 		StartLedgerRaw:          cfg.StartLedgerRaw,
 		RetentionLedgers:        cfg.RetentionLedgers,
@@ -287,6 +296,10 @@ func run() error {
 	// decode/persist land in the dead_letters table instead of
 	// stalling the cycle (issue #131).
 	ing.SetDeadLetterSink(st)
+	// Exposes the adaptive poll interval via /stats (issue #146). Always
+	// registered — there is exactly one Ingester per process even when
+	// INGESTION_LOCK_ENABLED causes its Run loop to be skipped.
+	api.SetIngester(ing)
 
 	// SIGHUP config hot-reload (issue #148): re-reads and validates the
 	// full environment on every SIGHUP, then applies only the safe subset
@@ -347,7 +360,6 @@ func run() error {
 		})
 	}
 
-	prn := pruner.New(st, log, pruner.Options{
 	// The pruner is constructed lazily: when neither RETENTION_MAX_AGE nor
 	// RETENTION_MIN_LEDGER is set, the pruner is a no-op goroutine that
 	// returns immediately. Only when at least one retention policy is
@@ -392,13 +404,10 @@ func run() error {
 		Pause:              cfg.RetentionPause,
 		Interval:           cfg.RetentionInterval,
 		ArchiveBeforePrune: cfg.ArchiveBeforePrune,
-	})
+	}, arch)
 	if cfg.RetentionEnabled() {
 		api.SetPruner(prn)
 	}
-
-	// Expose spec-cache hit/miss metrics via /stats.
-	api.SetSpecCache(specCache)
 
 	// Per-client HTTP rate limiter. Disabled when RATE_LIMIT_RPS or
 	// RATE_LIMIT_BURST is unset; the limiter is then a pass-through and
@@ -429,6 +438,10 @@ func run() error {
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
 	apiServer.SetStatsTTL(cfg.StatsCacheTTL)
 	apiServer.SetRateLimiter(limiter)
+	if cfg.APIKeyAuthEnabled {
+		log.Info("api key authentication enabled", "gated", "write/streaming/subscriptions routes")
+	}
+	apiServer.WithAPIKeyAuth(cfg.APIKeyAuthEnabled)
 	apiServer.SetMetricsEnabled(cfg.MetricsEnabled)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 	apiServer.SetHTTPRequestBodyLimit(cfg.HTTPRequestBodyLimit)

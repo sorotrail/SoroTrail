@@ -19,24 +19,6 @@ func (f *fakeClock) Advance(d time.Duration) {
 	f.t = f.t.Add(d)
 }
 
-// stubSpecStore implements the cache's Store interface with an in-memory
-// map for tests.
-type stubSpecStore struct {
-	specs map[string][]byte
-}
-
-func (s *stubSpecStore) GetContractSpec(_ context.Context, wasmHash string) ([]byte, error) {
-	if data, ok := s.specs[wasmHash]; ok {
-		return data, nil
-	}
-	return nil, errors.New("not found")
-}
-
-func (s *stubSpecStore) SetContractSpec(_ context.Context, wasmHash, _ string, specJSON []byte) error {
-	s.specs[wasmHash] = specJSON
-	return nil
-}
-
 // stubResolver is a controllable WasmHashResolver.
 type stubResolver struct {
 	hashes map[string]string
@@ -67,6 +49,24 @@ func newTestSpec(wasmHash, contractID string) *ContractSpec {
 		ContractID: contractID,
 		Events:     []EventSpec{{Name: "transfer"}},
 	}
+}
+
+// stubSpecStore is an in-memory spec.Store for the DB-backed cache tests.
+type stubSpecStore struct {
+	specs map[string][]byte
+}
+
+func (s *stubSpecStore) GetContractSpec(_ context.Context, wasmHash string) ([]byte, error) {
+	b, ok := s.specs[wasmHash]
+	if !ok {
+		return nil, errors.New("not cached")
+	}
+	return b, nil
+}
+
+func (s *stubSpecStore) SetContractSpec(_ context.Context, wasmHash, _ string, specJSON []byte) error {
+	s.specs[wasmHash] = specJSON
+	return nil
 }
 
 func TestCache_TTLExpiry(t *testing.T) {

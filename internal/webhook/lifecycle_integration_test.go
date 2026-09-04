@@ -43,10 +43,10 @@ func TestWebhookSubscriptionLifecycle_EndToEnd(t *testing.T) {
 	defer server.Close()
 
 	subReq := store.Subscription{
-		URL:        server.URL,
-		Secret:     "test-secret-123",
-		ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-		Enabled:    true,
+		URL:     server.URL,
+		Secret:  "test-secret-123",
+		Filters: store.SubscriptionFilter{ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+		Enabled: true,
 	}
 
 	sub, err := st.CreateSubscription(ctx, subReq)
@@ -73,17 +73,17 @@ func TestWebhookSubscriptionLifecycle_EndToEnd(t *testing.T) {
 	_, err = st.RecordDeliveryAttempt(ctx, store.DeliveryAttempt{
 		SubscriptionID: sub.ID,
 		EventID:        event.ID,
-		StatusCode:     200,
-		Success:        true,
+		Status:         store.DeliverySuccess,
+		ResponseCode:   200,
 		DurationMs:     12,
 	})
 	require.NoError(t, err)
 
-	attempts, err := st.ListDeliveryAttempts(ctx, sub.ID, 10, store.SubscriptionOwner{}) 
+	attempts, err := st.ListDeliveryAttempts(ctx, sub.ID, 10, store.SubscriptionOwner{})
 	require.NoError(t, err)
 	require.Len(t, attempts, 1)
-	assert.True(t, attempts[0].Success)
-	assert.Equal(t, 200, attempts[0].StatusCode)
+	assert.Equal(t, store.DeliverySuccess, attempts[0].Status)
+	assert.Equal(t, 200, attempts[0].ResponseCode)
 
 	// ── 2. A non-matching event producing no delivery ──
 	nonMatchingEvent := store.Event{
@@ -103,7 +103,7 @@ func TestWebhookSubscriptionLifecycle_EndToEnd(t *testing.T) {
 	// Filtering checks ensure subscriptions with specific contract IDs skip non-matching events
 	retrievedSub, err := st.GetSubscription(ctx, sub.ID, store.SubscriptionOwner{})
 	require.NoError(t, err)
-	assert.Equal(t, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", retrievedSub.ContractID)
+	assert.Equal(t, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", retrievedSub.Filters.ContractID)
 
 	// ── 3. Filters honouring the tenant boundary ──
 	scope := store.NewScope([]string{"CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"})

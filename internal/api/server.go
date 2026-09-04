@@ -18,6 +18,7 @@ import (
 
 	"github.com/sorotrail/sorotrail/internal/audit"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
+	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/pruner"
 	"github.com/sorotrail/sorotrail/internal/rpc"
@@ -98,6 +99,13 @@ func getSpecCache() SpecCacheStatsSource {
 	specCacheMu.RLock()
 	defer specCacheMu.RUnlock()
 	return specCacheSource
+}
+
+// Enricher is the spec-based event enrichment interface used by the API.
+type Enricher interface {
+	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
+}
+
 // SetRPCCounter registers the CountingClient so /stats can expose
 // per-method RPC error totals. Call this before ListenAndServe.
 // The setter is guarded by a RWMutex so concurrent /stats readers
@@ -119,6 +127,30 @@ func getRPCCounter() *rpc.CountingClient {
 	return rpcCounter
 }
 
+// SetIngester registers the binary's Ingester so /stats can surface its
+// adaptive poll interval (issue #146). There is exactly one Ingester per
+// process, always constructed (even when INGESTION_LOCK_ENABLED causes
+// Run to be skipped on this instance) — main.go calls this unconditionally
+// right after building it.
+//
+// Like SetPruner this MUST be called BEFORE the API starts serving
+// requests, so the first /stats request observes a stable value rather
+// than a nil ingester.
+var (
+	ingesterMu sync.RWMutex
+	ing        *ingester.Ingester
+)
+
+func SetIngester(i *ingester.Ingester) {
+	ingesterMu.Lock()
+	ing = i
+	ingesterMu.Unlock()
+}
+
+func getIngester() *ingester.Ingester {
+	ingesterMu.RLock()
+	defer ingesterMu.RUnlock()
+	return ing
 // SpecCacheStatsSource supplies spec-cache metrics for /stats. Mirrors
 // the SetAuditor pattern: one setter, called before ListenAndServe.
 // nil (the default) leaves the /stats spec_cache field omitted.
@@ -144,12 +176,34 @@ func getSpecCache() SpecCacheStatsSource {
 }
 
 // Enricher is the spec-based event enrichment interface used by the API.
+// Defined here so the API package doesn't import internal/spec directly.
+// DecodeStats lets /stats surface the enrichment decode failure rate when a
+// concrete enricher is wired; nil servers (decoded=true unavailable) simply
+// leave the stats field empty.
 type Enricher interface {
 	EnrichEvents(ctx context.Context, events []store.Event) []store.EnrichedEvent
+	DecodeStats() store.DecodeStats
 }
 
 // Server holds the API's dependencies.
 type Server struct {
+	store    store.Store
+	rpc      rpc.Client
+	enricher Enricher
+	log      *slog.Logger
+	limiter  *RateLimiter
+	bcast    *broadcast.Broadcaster
+
+	// apiKeyAuth turns on API key authentication for the write,
+	// streaming, subscription-management, and key-management routes.
+	// Off by default: the API behaves exactly as before.
+	apiKeyAuth bool
+}
+
+// New builds the API server. rpcClient is only used by /health.
+// enricher is optional — pass nil to disable spec decoding.
+func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, enricher ...Enricher) *Server {
+	s := &Server{store: st, rpc: rpcClient, log: log}
 	store            store.Store
 	rpc              rpc.Client
 	log              *slog.Logger
@@ -317,6 +371,17 @@ func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
 	return s
 }
 
+// WithAPIKeyAuth turns on optional API key authentication (see
+// internal/api/auth.go). When enabled, requests to write, streaming,
+// subscription-management, and key-management endpoints must present a
+// valid API key; read-only endpoints stay public. The flag is off by
+// default, so deployments that don't set API_KEY_AUTH_ENABLED see no
+// behavior change.
+func (s *Server) WithAPIKeyAuth(enabled bool) *Server {
+	s.apiKeyAuth = enabled
+	return s
+}
+
 // SetExportMaxRange caps the ledger span a /contracts/{id}/export call
 // may request. Zero means no cap (the handler still validates range fits
 // the requested bound, but won't reject on span alone). The config layer
@@ -439,7 +504,6 @@ func (s *Server) router() chi.Router {
 	r.Get("/contracts/{id}/export", s.handleContractExport)
 	r.Get("/contracts/{id}/stats", s.handleContractStats)
 	r.Get("/stats", s.handleStats)
-	r.Get("/events/ws", s.handleEventStreamWS)
 
 	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.
 	adminMW := apiKeyAuth(s.apiKey)
@@ -487,6 +551,36 @@ func (s *Server) router() chi.Router {
 	r.With(watchedMW).Get("/dead-letters", s.handleListDeadLetters)
 	r.With(watchedMW).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)
 
+	// API key management is ALWAYS authenticated: an unauthenticated
+	// create endpoint would let anyone mint keys and walk around auth
+	// entirely. The CLI (`sorotrail apikey`) is the bootstrap path for
+	// the first key.
+	r.Group(func(r chi.Router) {
+		r.Use(s.requireAPIKey)
+		r.Post("/apikeys", s.handleCreateAPIKey)
+		r.Get("/apikeys", s.handleListAPIKeys)
+		r.Delete("/apikeys/{id}", s.handleRevokeAPIKey)
+	})
+
+	// The streaming and subscription routes are the surface that auth
+	// gates. Subscriptions carry webhook HMAC signing secrets, so the
+	// whole subtree (reads included) is protected once auth is on —
+	// leaking a subscription's secret would let an attacker forge
+	// webhook payloads.
+	protect := func(next http.Handler) http.Handler { return next }
+	if s.apiKeyAuth {
+		protect = s.requireAPIKey
+	}
+	r.Group(func(r chi.Router) {
+		r.Use(protect)
+		r.Get("/events/ws", s.handleEventStreamWS)
+		r.Post("/subscriptions", s.handleCreateSubscription)
+		r.Get("/subscriptions", s.handleListSubscriptions)
+		r.Get("/subscriptions/{id}", s.handleGetSubscription)
+		r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
+		r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
+		r.Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
+	})
 	// Subscription CRUD and delivery history.
 	r.Post("/subscriptions", s.handleCreateSubscription)
 	r.Put("/subscriptions/{id}", s.handleUpdateSubscription)

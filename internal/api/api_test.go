@@ -23,6 +23,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -344,6 +346,15 @@ func (s *stubStore) UpdateSubscription(_ context.Context, sub store.Subscription
 	return sub, nil
 }
 func (s *stubStore) DeleteSubscription(context.Context, int64, store.SubscriptionOwner) error {
+	return nil
+}
+func (s *stubStore) GetContractSpecOverride(context.Context, string) ([]byte, error) {
+	return nil, nil
+}
+func (s *stubStore) SetContractSpecOverride(context.Context, string, []byte) error {
+	return nil
+}
+func (s *stubStore) DeleteContractSpecOverride(context.Context, string) error {
 	return nil
 }
 func (s *stubStore) ListEnabledSubscriptions(context.Context) ([]store.Subscription, error) {
@@ -1584,6 +1595,42 @@ func TestStats(t *testing.T) {
 		assert.Contains(t, raw, "ingest_lag_ledgers")
 		assert.Nil(t, raw["ingest_lag_ledgers"])
 		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
+	})
+}
+
+// TestStats_IngesterEffectivePollInterval covers issue #146's acceptance
+// criterion "expose the current effective interval in /stats": once an
+// Ingester is registered via SetIngester, /stats must surface its live
+// adaptive poll interval, and must omit it (zero value) when none is
+// registered.
+func TestStats_IngesterEffectivePollInterval(t *testing.T) {
+	t.Cleanup(func() { SetIngester(nil) })
+
+	st := &stubStore{}
+	rc := &stubRPC{health: rpc.Health{Status: "healthy"}}
+
+	t.Run("absent when no ingester registered", func(t *testing.T) {
+		SetIngester(nil)
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Zero(t, got.Ingester.EffectivePollIntervalMs)
+	})
+
+	t.Run("reflects the registered ingester's live interval", func(t *testing.T) {
+		ing := ingester.New(nil, nil, decode.XDRDecoder{}, slog.New(slog.NewTextHandler(io.Discard, nil)), ingester.Options{
+			PollInterval:    5 * time.Second,
+			PollIntervalMin: time.Second,
+			PollIntervalMax: 30 * time.Second,
+		})
+		SetIngester(ing)
+
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, int64(5000), got.Ingester.EffectivePollIntervalMs)
 	})
 }
 
@@ -2935,4 +2982,78 @@ func (m *stubStore) CountDeliveryAttempts(context.Context, int64, store.Subscrip
 
 func (s *stubStore) CountEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
 	return 0, nil
+}
+
+// mockEnricher is a canned api.Enricher for testing that decode errors and
+// decode metrics propagate through the HTTP layer.
+type mockEnricher struct {
+	enriched []store.EnrichedEvent
+	stats    store.DecodeStats
+}
+
+func (m *mockEnricher) EnrichEvents(_ context.Context, events []store.Event) []store.EnrichedEvent {
+	if m.enriched != nil {
+		return m.enriched
+	}
+	out := make([]store.EnrichedEvent, len(events))
+	for i, e := range events {
+		out[i] = store.EnrichedEvent{Event: e, Decoded: false}
+	}
+	return out
+}
+
+func (m *mockEnricher) DecodeStats() store.DecodeStats { return m.stats }
+
+func TestListEvents_EnrichedResponseSurfaceDecodeError(t *testing.T) {
+	st := &stubStore{events: []store.Event{{
+		ID:     "0001-0001",
+		Topics: json.RawMessage(`[{"symbol":"transfer"}]`),
+		Value:  json.RawMessage(`{"i128":"5000"}`),
+	}}}
+	s := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		&mockEnricher{enriched: []store.EnrichedEvent{{
+			Event: store.Event{
+				ID:     "0001-0001",
+				Topics: json.RawMessage(`[{"symbol":"transfer"}]`),
+				Value:  json.RawMessage(`{"i128":"5000"}`),
+			},
+			Decoded:     false,
+			DecodeError: "decoding topic field \"from\": cannot decode",
+		}}})
+
+	resp, body := doGet(t, s, "/events?decoded=true")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	// A failed decode returns the raw event plus decode_error.
+	var got struct {
+		Events []struct {
+			ID          string          `json:"id"`
+			Topics      json.RawMessage `json:"topics"`
+			Decoded     bool            `json:"decoded"`
+			DecodeError string          `json:"decode_error"`
+		} `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal(body, &got))
+	require.Len(t, got.Events, 1)
+	assert.Equal(t, "0001-0001", got.Events[0].ID) // raw event preserved
+	assert.Equal(t, `[{"symbol":"transfer"}]`, string(got.Events[0].Topics))
+	assert.False(t, got.Events[0].Decoded)
+	assert.Contains(t, got.Events[0].DecodeError, "topic")
+}
+
+func TestStats_SurfaceDecodeMetrics(t *testing.T) {
+	st := &stubStore{stats: store.Stats{LastIngestedLedger: 512}}
+	s := New(st, &stubRPC{health: rpc.Health{Status: "healthy", LatestLedger: 1024}},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		&mockEnricher{stats: store.DecodeStats{Decodes: 100, DecodeFailures: 3}})
+
+	resp, body := doGet(t, s, "/stats")
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	got, ok := raw["decode"].(map[string]any)
+	require.True(t, ok, "expected decode block in /stats: %s", string(body))
+	assert.Equal(t, float64(100), got["decodes"])
+	assert.Equal(t, float64(3), got["decode_failures"])
 }

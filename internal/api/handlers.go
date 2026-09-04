@@ -152,6 +152,11 @@ type eventsWithXDRResponse struct {
 	Cursor string         `json:"cursor,omitempty"`
 }
 
+type addressEventsResponse struct {
+	Events []store.Event `json:"events"`
+	Cursor string        `json:"cursor,omitempty"`
+}
+
 // envelopeResponse is the JSON body returned when ?envelope=true is set on
 // any paginated list endpoint. It normalises the response shape across all
 // list endpoints so clients that prefer a consistent outer wrapper don't
@@ -1668,6 +1673,13 @@ func (s *Server) assembleStats(ctx context.Context) (store.Stats, error) {
 		}
 
 	}
+
+	if ing := getIngester(); ing != nil {
+		stats.Ingester = store.IngesterStats{
+			EffectivePollIntervalMs: ing.EffectivePollInterval().Milliseconds(),
+		}
+	}
+
 	return stats, nil
 }
 
@@ -1894,6 +1906,12 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 			return
 
+type enrichedEventWithXDR struct {
+	eventWithXDR
+	DecodedEvent *store.DecodedEventResponse `json:"decoded_event,omitempty"`
+	Decoded      bool                        `json:"decoded"`
+	DecodeError  string                      `json:"decode_error,omitempty"`
+}
 		}
 
 		s.log.Error("removing watched contract", "contract_id", id, "error", err)
@@ -1967,6 +1985,38 @@ func (s *Server) handleAddressEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, addressEventsResponse{Events: events, Cursor: cursor})
 }
 
+func (s *Server) addStatsFreshness(ctx context.Context, stats *store.Stats) {
+
+	if s.rpc == nil {
+
+		return
+
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+
+	defer cancel()
+
+	health, err := s.rpc.GetHealth(ctx)
+
+	if err != nil {
+
+		loggerFromContext(ctx).Warn("loading RPC health for stats", "error", err)
+
+		return
+
+	}
+
+	head := int64(health.LatestLedger)
+
+	lag := ingestLagLedgers(head, stats.LastIngestedLedger)
+
+	stats.ChainHeadLedger = &head
+
+	stats.IngestLagLedgers = &lag
+
+}
+
 // handleAddressSummary returns aggregate information about an address's
 // event history.
 func (s *Server) handleAddressSummary(w http.ResponseWriter, r *http.Request) {
@@ -1996,6 +2046,15 @@ func isValidAddress(s string) bool {
 	if len(s) != 56 {
 		return false
 	}
+	return out
+}
+
+func enrichEventWithXDR(e store.EnrichedEvent) enrichedEventWithXDR {
+	return enrichedEventWithXDR{
+		eventWithXDR: eventToXDRResponse(e.Event),
+		DecodedEvent: e.DecodedEvent,
+		Decoded:      e.Decoded,
+		DecodeError:  e.DecodeError,
 	prefix := s[0]
 	if prefix != 'G' && prefix != 'C' {
 		return false
@@ -2018,6 +2077,10 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.addStatsFreshness(r.Context(), &stats)
+	if s.enricher != nil {
+		d := s.enricher.DecodeStats()
+		stats.Decode = &d
+	}
 	if a := getAuditor(); a != nil {
 		m := a.Metrics()
 		stats.Auditor = store.AuditStats{

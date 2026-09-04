@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/sorotrail/sorotrail/internal/store"
-	"github.com/khaylebfortune/sorotrail/internal/store"
 )
 
 const (

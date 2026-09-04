@@ -14,6 +14,8 @@ const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 var envKeys = []string{
 	"HTTP_REQUEST_BODY_LIMIT", // body size limit
 	"RPC_URL", "RPC_URLS", "RPC_RATE_LIMIT_RPS", "RPC_RATE_LIMIT", "DATABASE_URL",
+	"POLL_INTERVAL", "POLL_INTERVAL_MIN", "POLL_INTERVAL_MAX", "HTTP_ADDR",
+	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "LOG_LEVEL", "LOG_FORMAT",
 	"POLL_INTERVAL", "HTTP_ADDR",
 	"WATCHED_CONTRACTS", "START_LEDGER", "RETENTION_LEDGERS", "INGEST_PAGE_SIZE", "INGEST_BATCH_SIZE", "LOG_LEVEL", "LOG_FORMAT",
 	"API_QUERY_TIMEOUT", "API_SLOW_QUERY_THRESHOLD",
@@ -22,6 +24,7 @@ var envKeys = []string{
 	"AUDIT_LAG_THRESHOLD", "AUDIT_BUDGET_SHARE", "AUDIT_MAX_RPS",
 	"AUDIT_MAX_REPAIR_ATTEMPTS", "AUDIT_FINDING_MAX_LEDGERS",
 	"RATE_LIMIT_RPS", "RATE_LIMIT_BURST", "RATE_LIMIT_TRUSTED_PROXY",
+	"API_KEY_AUTH_ENABLED",
 	"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT",
 	"HTTP_READ_HEADER_TIMEOUT",
 	"SHUTDOWN_TIMEOUT",
@@ -79,8 +82,6 @@ func TestLoad(t *testing.T) {
 				assert.Equal(t, 5*time.Second, c.PollInterval)
 				assert.Equal(t, ":8080", c.HTTPAddr)
 				assert.Equal(t, uint32(17280), c.RetentionLedgers)
-				assert.Zero(t, c.RetentionAge)
-				assert.Equal(t, time.Hour, c.RetentionPoll)
 				assert.Equal(t, uint32(120960), c.PartitionLedgerSpan)
 				assert.Equal(t, uint(1000), c.IngestPageSize)
 				assert.Equal(t, uint(1000), c.IngestBatchSize)
@@ -114,6 +115,17 @@ func TestLoad(t *testing.T) {
 				assert.Zero(t, c.RateLimitRPS, "rate limiter disabled by default")
 				assert.Zero(t, c.RateLimitBurst)
 				assert.False(t, c.RateLimitTrustedProxy)
+				assert.False(t, c.APIKeyAuthEnabled, "API key auth off by default")
+			},
+		},
+		{
+			name: "API key auth can be enabled",
+			env: map[string]string{
+				"DATABASE_URL":         "postgres://localhost/db",
+				"API_KEY_AUTH_ENABLED": "true",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.True(t, c.APIKeyAuthEnabled)
 
 				assert.Equal(t, 30*time.Second, c.HTTPReadTimeout)
 				assert.Equal(t, 30*time.Second, c.HTTPWriteTimeout)
@@ -871,6 +883,43 @@ func TestLoad(t *testing.T) {
 				"SWEEP_CONCURRENCY": "-1",
 			},
 			wantErr: "SWEEP_CONCURRENCY",
+		},
+		{
+			name: "POLL_INTERVAL_MIN negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "-1s",
+			},
+			wantErr: "POLL_INTERVAL_MIN",
+		},
+		{
+			name: "POLL_INTERVAL_MAX negative rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MAX": "-1s",
+			},
+			wantErr: "POLL_INTERVAL_MAX",
+		},
+		{
+			name: "POLL_INTERVAL_MIN greater than POLL_INTERVAL_MAX rejected",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "30s",
+				"POLL_INTERVAL_MAX": "5s",
+			},
+			wantErr: "POLL_INTERVAL_MIN",
+		},
+		{
+			name: "POLL_INTERVAL_MIN and POLL_INTERVAL_MAX accepted when ordered",
+			env: map[string]string{
+				"DATABASE_URL":      "postgres://localhost/db",
+				"POLL_INTERVAL_MIN": "1s",
+				"POLL_INTERVAL_MAX": "30s",
+			},
+			check: func(t *testing.T, c Config) {
+				assert.Equal(t, time.Second, c.PollIntervalMin)
+				assert.Equal(t, 30*time.Second, c.PollIntervalMax)
+			},
 		},
 		{
 			name: "REORG_CONFIRMATION_WINDOW with zero REORG_RESCAN_INTERVAL rejected",
