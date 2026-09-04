@@ -1673,6 +1673,13 @@ func (s *Server) assembleStats(ctx context.Context) (store.Stats, error) {
 		}
 
 	}
+
+	if ing := getIngester(); ing != nil {
+		stats.Ingester = store.IngesterStats{
+			EffectivePollIntervalMs: ing.EffectivePollInterval().Milliseconds(),
+		}
+	}
+
 	return stats, nil
 }
 

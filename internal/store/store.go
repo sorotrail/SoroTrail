@@ -718,6 +718,10 @@ type DecodeStats struct {
 	// Pruner counters are populated only when retention is configured;
 	// omitted from JSON when the pruner is a no-op.
 	Pruner PrunerStats `json:"pruner,omitempty"`
+	// Ingester surfaces adaptive-polling state (issue #146); populated
+	// only when an ingester is wired via api.SetIngester, omitted from
+	// JSON otherwise.
+	Ingester IngesterStats `json:"ingester,omitempty"`
 }
 
 // SpecCacheStats is a JSON-friendly view of spec.CacheStats. Defined here
@@ -735,6 +739,14 @@ type SpecCacheStats struct {
 type PrunerStats struct {
 	RunsCompleted   uint64 `json:"runs_completed"`
 	TotalRowsPurged int64  `json:"total_rows_purged"`
+}
+
+// IngesterStats is a JSON-friendly view of the ingester's adaptive
+// polling state (issue #146). EffectivePollIntervalMs follows the same
+// "_ms" millisecond-integer convention already used for durations in
+// this package (see DeliveryAttempt.DurationMs).
+type IngesterStats struct {
+	EffectivePollIntervalMs int64 `json:"effective_poll_interval_ms"`
 }
 
 // RPCErrorStats is a JSON-friendly snapshot of per-method RPC error counts.

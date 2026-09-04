@@ -66,6 +66,22 @@ type Config struct {
 	// public endpoint limit; raise it only against paid plans or
 	// self-hosted RPCs whose allowance actually permits it. Ignored while
 	// RPC_URLS is set (the failover path uses RPC_RATE_LIMIT_RPS).
+	RPCRateLimit float64       `env:"RPC_RATE_LIMIT" envDefault:"10"`
+	DatabaseURL  string        `env:"DATABASE_URL"`
+	PollInterval time.Duration `env:"POLL_INTERVAL" envDefault:"5s"`
+	// PollIntervalMin and PollIntervalMax bound the ingester's adaptive
+	// poll interval (issue #146): once caught up with the chain, the
+	// effective interval shrinks toward the min when backlog was just
+	// observed and grows toward the max on idle cycles, so a bursty
+	// chain gets polled quickly while a quiet one doesn't waste
+	// requests. Both default to 0, which the ingester treats as "no
+	// explicit bound — use POLL_INTERVAL", collapsing min == max ==
+	// POLL_INTERVAL. That makes the adaptive logic a no-op for any
+	// deployment that only sets POLL_INTERVAL, so existing deployments
+	// keep their exact pre-#146 fixed-interval behavior unless they
+	// opt in by setting these explicitly.
+	PollIntervalMin       time.Duration `env:"POLL_INTERVAL_MIN"`
+	PollIntervalMax       time.Duration `env:"POLL_INTERVAL_MAX"`
 	RPCRateLimit float64 `env:"RPC_RATE_LIMIT" envDefault:"10"`
 	DatabaseURL  string  `env:"DATABASE_URL"`
 	// DB pool sizing. Zero means "use the pgx default". These let an operator
@@ -503,6 +519,16 @@ func (c Config) Validate() error {
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("POLL_INTERVAL must be positive, got %s", c.PollInterval)
 	}
+	if c.PollIntervalMin < 0 {
+		return fmt.Errorf("POLL_INTERVAL_MIN must be non-negative, got %s", c.PollIntervalMin)
+	}
+	if c.PollIntervalMax < 0 {
+		return fmt.Errorf("POLL_INTERVAL_MAX must be non-negative, got %s", c.PollIntervalMax)
+	}
+	if c.PollIntervalMin > 0 && c.PollIntervalMax > 0 && c.PollIntervalMin > c.PollIntervalMax {
+		return fmt.Errorf("POLL_INTERVAL_MIN (%s) must be <= POLL_INTERVAL_MAX (%s)",
+			c.PollIntervalMin, c.PollIntervalMax)
+	}
 	if c.APIQueryTimeout <= 0 {
 		return fmt.Errorf("API_QUERY_TIMEOUT must be positive, got %s", c.APIQueryTimeout)
 	}
@@ -855,6 +881,8 @@ func (c Config) LoggableFields() []any {
 		"rpc_rate_limit", c.RPCRateLimit,
 		"database_url", dbURL,
 		"poll_interval", c.PollInterval,
+		"poll_interval_min", c.PollIntervalMin,
+		"poll_interval_max", c.PollIntervalMax,
 		"http_addr", c.HTTPAddr,
 		"watched_contracts", len(c.WatchedContracts),
 		"start_ledger", c.StartLedger,

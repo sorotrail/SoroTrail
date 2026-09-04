@@ -23,6 +23,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/sorotrail/sorotrail/internal/buildinfo"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -1593,6 +1595,42 @@ func TestStats(t *testing.T) {
 		assert.Contains(t, raw, "ingest_lag_ledgers")
 		assert.Nil(t, raw["ingest_lag_ledgers"])
 		assert.Equal(t, uint64(0), got.QueryErrors, "query_errors should be present and zero")
+	})
+}
+
+// TestStats_IngesterEffectivePollInterval covers issue #146's acceptance
+// criterion "expose the current effective interval in /stats": once an
+// Ingester is registered via SetIngester, /stats must surface its live
+// adaptive poll interval, and must omit it (zero value) when none is
+// registered.
+func TestStats_IngesterEffectivePollInterval(t *testing.T) {
+	t.Cleanup(func() { SetIngester(nil) })
+
+	st := &stubStore{}
+	rc := &stubRPC{health: rpc.Health{Status: "healthy"}}
+
+	t.Run("absent when no ingester registered", func(t *testing.T) {
+		SetIngester(nil)
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Zero(t, got.Ingester.EffectivePollIntervalMs)
+	})
+
+	t.Run("reflects the registered ingester's live interval", func(t *testing.T) {
+		ing := ingester.New(nil, nil, decode.XDRDecoder{}, slog.New(slog.NewTextHandler(io.Discard, nil)), ingester.Options{
+			PollInterval:    5 * time.Second,
+			PollIntervalMin: time.Second,
+			PollIntervalMax: 30 * time.Second,
+		})
+		SetIngester(ing)
+
+		resp, body := doGet(t, newTestServer(st, rc), "/stats")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var got store.Stats
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, int64(5000), got.Ingester.EffectivePollIntervalMs)
 	})
 }
 
