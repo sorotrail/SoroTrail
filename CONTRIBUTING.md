@@ -137,13 +137,31 @@ testable and replaceable.
   come with a note in the PR that operators need to run
   `sorotrail replay --from-ledger N`, otherwise the change only applies to
   events ingested from then on.
-- **New API endpoints** — add routes in `internal/api/server.go`. Keep
-  endpoints read-only unless you also add authentication.
+- **New API endpoints** — add routes in `internal/api/server.go` and document
+  them in `api/openapi.yaml` (see "API specification" below). Keep endpoints
+  read-only unless you also add authentication.
 - **Alternative storage** — implement `store.Store`. The contract is spelled
   out on the interface; note that `QueryEvents` must return events in
   ascending ID order for cursor pagination to work.
 - **RPC methods** — add to `rpc.Client` only what the ingester/API actually
   needs; the client deliberately isn't a full RPC SDK.
+
+## API specification
+
+`api/openapi.yaml` is the **source of truth** for the HTTP API — edit that
+file, never the generated files. Two committed artifacts are derived from it:
+
+| Generated file                 | Regenerate with | Drift test                                        |
+|--------------------------------|-----------------|---------------------------------------------------|
+| `internal/api/openapi.json`    | `make spec`     | `pkg/docs.TestSpecCopiesAreIdentical`             |
+| `pkg/client/client.gen.go`     | `make client`   | `pkg/client.TestGeneratedClientIsUpToDate`        |
+
+`internal/api/openapi.json` is the copy `internal/api` embeds and serves at
+`/openapi.json`; a spec edit that skips `make spec` ships documentation nobody
+sees. `make spec-check` regenerates the JSON into a temporary file and diffs it
+against the committed copy, and CI runs it, so a stale copy fails the build
+rather than drifting silently. After any change to `api/openapi.yaml`, run
+`make spec` (and `make client` if you touched operations or schemas).
 
 ## Conventions
 
@@ -251,5 +269,7 @@ to fix it.
 - Include tests for behavior changes; add a new integration test for any
   public API or schema change.
 - Update the README's API reference and config table when you touch either.
+- Touching `api/openapi.yaml`? Run `make spec` and `make client` so the
+  generated copies stay in step (see "API specification" above).
 - Include `Closes #[issue_id]` and summarize fuzz findings, including when no
   panics were found.
