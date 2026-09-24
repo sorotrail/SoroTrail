@@ -128,7 +128,7 @@ func (c *ClickHouse) QueryEvents(ctx context.Context, f EventFilter) ([]Event, s
 }
 
 func (c *ClickHouse) CountEvents(ctx context.Context, f EventFilter) (int64, error) {
-	return 0, nil
+	return 0, fmt.Errorf("CountEvents: not supported by the clickhouse backend")
 }
 
 func (c *ClickHouse) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error) {
@@ -264,7 +264,7 @@ func (c *ClickHouse) DeleteContractSpecOverride(ctx context.Context, contractID 
 }
 
 func (c *ClickHouse) DeleteEventsBeforeLedger(ctx context.Context, beforeLedger int64) (int64, error) {
-	return 0, nil
+	return 0, fmt.Errorf("DeleteEventsBeforeLedger: not supported by the clickhouse backend")
 }
 
 func (c *ClickHouse) MigrationVersion(ctx context.Context) (int, bool, error) {
@@ -272,7 +272,7 @@ func (c *ClickHouse) MigrationVersion(ctx context.Context) (int, bool, error) {
 }
 
 func (c *ClickHouse) Stats(ctx context.Context, sc Scope) (Stats, error) {
-	return Stats{}, nil
+	return Stats{}, fmt.Errorf("Stats: not supported by the clickhouse backend")
 }
 
 func (c *ClickHouse) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
@@ -309,12 +309,12 @@ func (c *ClickHouse) RevokeAPIKey(context.Context, int64) error {
 // DeleteEventsBefore is a stub: retention pruning is not implemented for
 // the ClickHouse backend yet.
 func (c *ClickHouse) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
-	return 0, nil
+	return 0, fmt.Errorf("DeleteEventsBefore: not supported by the clickhouse backend")
 }
 
 // CountEventsBefore is a stub: dry-run pruning is not implemented for the ClickHouse backend.
 func (c *ClickHouse) CountEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
-	return 0, nil
+	return 0, fmt.Errorf("CountEventsBefore: not supported by the clickhouse backend")
 }
 
 func (c *ClickHouse) DeadLetterEvent(context.Context, DeadLetterInput) (DeadLetter, error) {
