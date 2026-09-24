@@ -16,20 +16,27 @@ seams — most features should slot in behind an existing interface.
 1. Go 1.25+ (any Go ≥ 1.21 works too — the go toolchain auto-downloads the
    version pinned in go.mod) and Docker.
 2. Run `make help` to see every available target.
-3. `docker compose up -d postgres` for a local database (the integration
-   suite can also spin up its own ephemeral container — see "How the
-   integration test layer works" below).
+3. `make docker-up` is the quickest route to a local Postgres (starts
+   Postgres and the indexer via `docker compose up -d --build`). Alternatively,
+   run `docker compose up -d postgres` for a database-only service. The
+   integration suite can also spin up its own ephemeral container via Docker —
+   see "How the integration test layer works" below.
 4. `make test` for the unit suite, race-detector enabled
    (`go test -race ./...`) — the same race checking CI runs, so a data
-   race can't pass locally and fail in CI. The integration tests are
-   gated behind the `integration` build tag, so it stays a unit-only
-   run. `-race` requires cgo and a C toolchain; on Windows, install gcc
-   (e.g. MinGW-w64) or use `make test-fast` for the plain, non-race
-   run.
-5. `make test-integration` runs the integration suite against a real
-   Postgres — `go test -tags=integration -p 1 ./... -count=1`.
-6. `make test-db` runs everything, including integration tests, against
-   whatever `TEST_DATABASE_URL` points at — kept for backwards
+   race can't pass locally and fail in CI. Note that a plain `go test ./...`
+   (and `make test-fast`) skips the database-backed tests rather than failing.
+   The integration tests are gated behind the `integration` build tag, so it
+   stays a unit-only run. `-race` requires cgo and a C toolchain; on Windows,
+   install gcc (e.g. MinGW-w64) or use `make test-fast` for the plain,
+   non-race run.
+5. `make test-integration` runs the integration-tagged suite against a real
+   Postgres — `go test -tags=integration -p 1 ./... -count=1`. This additionally
+   needs Docker because the tagged suite starts an ephemeral container through
+   testcontainers when `TEST_DATABASE_URL` is unset.
+6. `make test-db` runs the full test suite against Postgres (requires
+   `DATABASE_URL`) — `TEST_DATABASE_URL=$(DATABASE_URL) go test -p 1 ./...`.
+   This target requires a live Postgres instance; without one, the tests will
+   fail with a connection error rather than skipping. Kept for backwards
    compatibility with the previous workflow.
 7. `make cover` / `make cover-html` for coverage.
 8. `make lint` (install [golangci-lint](https://golangci-lint.run/) locally).
@@ -73,9 +80,11 @@ Database resolution, in order:
   that points back here, so an integration run never fails loud for
   missing infra.
 
-`make test-integration` runs `go test -tags=integration -p 1 ./... -count=1`.
-Without the tag, the run is unit-suite-only: `make test` adds `-race`
-(CI's race checking) and `make test-fast` keeps the plain, fastest run.
+`make test-integration` runs `go test -tags=integration -p 1 ./... -count=1`
+(requires Docker running for testcontainers, or an explicit `TEST_DATABASE_URL`).
+Without the tag, the run is unit-suite-only: a plain `go test ./...` skips the
+database-backed tests rather than failing; `make test` adds `-race` (CI's race
+checking) and `make test-fast` keeps the plain, fastest run.
 
 ## Fuzz testing
 
@@ -189,7 +198,8 @@ For individual checks, run each step on its own:
 make build-all        # go build ./...
 make vet              # go vet ./...
 make test-ci          # CI test job's exact command; DB-backed tests skip without TEST_DATABASE_URL
-make test-integration # integration-tagged suite against a real Postgres
+make test-integration # integration-tagged suite against a real Postgres (requires Docker or TEST_DATABASE_URL)
+make test-db          # full test suite against Postgres (requires live DATABASE_URL)
 make bench-ci         # benchmark smoke run
 make lint             # golangci-lint run
 ```
