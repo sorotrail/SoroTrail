@@ -115,6 +115,9 @@ type Options struct {
 	RetentionLedgers uint32
 	// PageLimit is the getEvents pagination limit per request. Default 1000.
 	PageLimit uint
+	// MaxRetries bounds consecutive retries before resetting the backoff window.
+	// Default 0 (disabled).
+	MaxRetries int
 	// WriteBatchSize is the maximum number of events written in one store
 	// operation. Default 1000.
 	WriteBatchSize uint
@@ -329,11 +332,12 @@ type EventNotifier interface {
 
 // Ingester pages events out of the RPC and into the store.
 type Ingester struct {
-	client  rpc.Client
-	store   store.Store
-	decoder decode.Decoder
-	log     *slog.Logger
-	opts    Options
+	client               rpc.Client
+	store                store.Store
+	decoder              decode.Decoder
+	log                  *slog.Logger
+	opts                 Options
+	startOverrideApplied bool
 	// tracer emits OpenTelemetry spans around each ingest cycle. It is
 	// always non-nil (noop by default) so call sites never need a guard.
 	tracer trace.Tracer
@@ -520,11 +524,6 @@ func (ing *Ingester) backoffSleep(backoff time.Duration) time.Duration {
 // resumes from there with idempotent upserts covering any half-done
 // batch. There is no place in the loop where a partial state lands in
 // the store, so a tranquil Ctrl-C / SIGTERM never truncates a write.
-// Startup/shutdown logging: Run emits one "ingester started" line carrying
-// the effective (post-defaults) configuration, and one "ingester stopped"
-// line on every exit path — clean cancellation, RPC failure backoff exit,
-// or error return — so an operator correlating logs can see exactly when
-// the loop was live and with what knobs, without grepping config dumps.
 func (ing *Ingester) Run(ctx context.Context) (err error) {
 	ing.log.Info("ingester started", ing.opts.logAttrs()...)
 	defer func() {
@@ -536,6 +535,7 @@ func (ing *Ingester) Run(ctx context.Context) (err error) {
 	}()
 
 	backoff := ing.opts.MinBackoff
+	retries := 0
 	lastReorgRescanAt := time.Time{}
 	for {
 		caughtUp, err := ing.runOnce(ctx)
@@ -543,6 +543,11 @@ func (ing *Ingester) Run(ctx context.Context) (err error) {
 		case ctx.Err() != nil:
 			return ctx.Err()
 		case err != nil:
+			if ing.opts.MaxRetries > 0 && retries >= ing.opts.MaxRetries {
+				retries = 0
+				backoff = ing.opts.MinBackoff
+			}
+			retries++
 			// Lag alarm runs BEFORE the backoff so a stuck indexer
 			// doesn't wait out MaxBackoff before the operator sees
 			// it.
@@ -562,6 +567,7 @@ func (ing *Ingester) Run(ctx context.Context) (err error) {
 			// on the cycle that noticed the gap, not PollInterval
 			// later.
 			ing.checkLag(ctx)
+			retries = 0
 			backoff = ing.opts.MinBackoff
 			if caughtUp {
 				// PollInterval (not opts.PollInterval) so a live update via
@@ -1295,6 +1301,21 @@ func (bc *batchController) recordAndBackoff(rows int, latency time.Duration) tim
 }
 
 func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, cursor string, err error) {
+	if !ing.startOverrideApplied && ing.opts.StartLedger > 0 {
+		ing.startOverrideApplied = true // Apply override exactly once on startup
+		health, hErr := ing.client.GetHealth(ctx)
+		if hErr != nil {
+			return 0, "", fmt.Errorf("getHealth for override: %w", hErr)
+		}
+		if health.OldestLedger > 0 && ing.opts.StartLedger < health.OldestLedger {
+			return 0, "", fmt.Errorf(
+				"START_LEDGER %d is below the RPC's oldest retained ledger %d; events in the gap are unrecoverable",
+				ing.opts.StartLedger, health.OldestLedger)
+		}
+		ing.log.Info("resume override via config", "start_ledger", ing.opts.StartLedger)
+		return ing.opts.StartLedger, "", nil
+	}
+
 	state, err := ing.getIngestionState(ctx)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return 0, "", err
@@ -1306,6 +1327,7 @@ func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, c
 		return uint32(state.LastIngestedLedger) + 1, "", nil
 	}
 
+	// Cold start.
 	health, err := ing.client.GetHealth(ctx)
 	if err != nil {
 		return 0, "", fmt.Errorf("getHealth for cold start: %w", err)
@@ -1643,8 +1665,6 @@ func clampDuration(d, min, max time.Duration) time.Duration {
 	return d
 }
 
-// sleepCtx sleeps for d or until ctx is done; it reports whether the full
-// sleep completed.
 // indexEventAddresses extracts G.../C... addresses from each event's
 // decoded topics and value JSON, then persists them to the event_addresses
 // inverted index. Extraction is a best-effort derived index: errors are

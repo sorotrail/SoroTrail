@@ -20,9 +20,19 @@ type stubReingest struct {
 	ranges   []struct{ From, To uint32 }
 	filters  []rpc.EventFilter
 	reingest func(ctx context.Context, client rpc.Client, from, to uint32) (int, error)
+
+	// filtersErr, when set, is returned by BuildFilterBatches so tests
+	// can exercise the batch-construction failure path.
+	filtersErr error
+	// pageLimit overrides PageLimit() so tests can force small getEvents
+	// pages and drive the pagination loop through multiple round-trips.
+	pageLimit uint
 }
 
 func (s *stubReingest) BuildFilterBatches(context.Context) ([][]rpc.EventFilter, error) {
+	if s.filtersErr != nil {
+		return nil, s.filtersErr
+	}
 	return [][]rpc.EventFilter{s.filters}, nil
 }
 
@@ -36,9 +46,14 @@ func (s *stubReingest) ReingestRange(ctx context.Context, client rpc.Client, fro
 	return 0, nil
 }
 
-// PageLimit satisfies the audit.Reingester interface; tests don't
-// observe it directly.
-func (s *stubReingest) PageLimit() uint { return 1000 }
+// PageLimit satisfies the audit.Reingester interface; tests override the
+// value via stubReingest.pageLimit to exercise pagination.
+func (s *stubReingest) PageLimit() uint {
+	if s.pageLimit != 0 {
+		return s.pageLimit
+	}
+	return 1000
+}
 
 // Network returns the network name for the reingester.
 func (s *stubReingest) Network() string { return "default" }

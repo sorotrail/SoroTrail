@@ -324,6 +324,30 @@ func TestColdStart_ExplicitStartLedgerOverrides(t *testing.T) {
 	assert.Equal(t, uint32(1_234), client.eventsRequests[0].StartLedger)
 }
 
+func TestWarmStart_ExplicitStartLedgerOverrides(t *testing.T) {
+	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{
+		{LatestLedger: 10_000},
+		{LatestLedger: 10_000},
+	}}
+	st := newMockStore()
+	require.NoError(t, st.SaveIngestionState(context.Background(),
+		store.IngestionState{LastIngestedLedger: 500, LastCursor: "cursor-42"}))
+	ing := newTestIngester(client, st, Options{StartLedger: 1_234})
+
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+	// It should use StartLedger, ignoring the warm start cursor.
+	assert.Equal(t, uint32(1_234), client.eventsRequests[0].StartLedger)
+	if client.eventsRequests[0].Pagination != nil {
+		assert.Empty(t, client.eventsRequests[0].Pagination.Cursor)
+	}
+
+	// On the second runOnce, it should use the new warm state (the override was consumed).
+	_, err = ing.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.NotEqual(t, uint32(1_234), client.eventsRequests[1].StartLedger, "override should be consumed")
+}
+
 func TestWarmStart_ResumesAfterLastIngestedLedger(t *testing.T) {
 	client := &mockRPC{eventsResps: []rpc.GetEventsResponse{{LatestLedger: 1_000}}}
 	st := newMockStore()
