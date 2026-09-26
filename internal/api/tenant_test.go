@@ -1327,9 +1327,12 @@ func TestRevokedKeyRejectedOnNextRequest(t *testing.T) {
 	rec := f.get(t, f.keyA, "/events")
 	assert.Equal(t, http.StatusOK, rec.Code)
 
-	// Simulate revocation by removing the key from the lookup table.
-	delete(f.tenants.keys, f.keyA[:len(f.keyA)/2]) // remove the prefix entry
-	// The prefix-based lookup will no longer find this key.
+	// Revoke by removing the key's lookup entry. An API key is
+	// scheme_prefix_secret and the map is keyed on the middle segment, so
+	// slicing the plaintext by length deletes nothing and leaves the key live.
+	parts := strings.Split(f.keyA, "_")
+	require.Len(t, parts, 3, "API key must be scheme_prefix_secret")
+	delete(f.tenants.keys, parts[1])
 
 	// Next request must be rejected.
 	rec = f.get(t, f.keyA, "/events")
@@ -1341,7 +1344,6 @@ func TestRevokedKeyRejectedOnNextRequest(t *testing.T) {
 // only receive events for contracts it is granted.
 func TestWebSocketSubscriptionsHonourBoundary(t *testing.T) {
 	f := newTenantFixture(t)
-	st := f.st.(*scopedStore)
 
 	// Verify that the store's scope filtering applies to subscription
 	// paths the same way it does to read endpoints.

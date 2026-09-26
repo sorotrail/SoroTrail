@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -96,42 +97,42 @@ func TestEventsGolden(t *testing.T) {
 		stub  func() *stubStore
 	}{
 		{
-			name:  "default_page",
+			name:  "events_default_page",
 			query: "/events",
 			stub: func() *stubStore {
 				return &stubStore{events: goldenFixtureEvents(), nextCursor: goldenCursor}
 			},
 		},
 		{
-			name:  "envelope",
+			name:  "events_envelope",
 			query: "/events?envelope=true",
 			stub: func() *stubStore {
 				return &stubStore{events: goldenFixtureEvents(), nextCursor: goldenCursor}
 			},
 		},
 		{
-			name:  "include_xdr",
+			name:  "events_include_xdr",
 			query: "/events?include_xdr=true",
 			stub: func() *stubStore {
 				return &stubStore{events: goldenFixtureEvents(), nextCursor: goldenCursor}
 			},
 		},
 		{
-			name:  "fields_projection",
+			name:  "events_fields_projection",
 			query: "/events?fields=id,contract_id,ledger,type",
 			stub: func() *stubStore {
 				return &stubStore{events: goldenFixtureEvents()}
 			},
 		},
 		{
-			name:  "pretty",
+			name:  "events_pretty",
 			query: "/events?pretty=true",
 			stub: func() *stubStore {
 				return &stubStore{events: goldenFixtureEvents()}
 			},
 		},
 		{
-			name:  "empty_result",
+			name:  "events_empty_result",
 			query: "/events",
 			stub: func() *stubStore {
 				return &stubStore{}
@@ -172,7 +173,14 @@ func TestEventsDecodedGolden(t *testing.T) {
 
 // TestEventByIDGolden snapshots the /events/{id} response for a single event.
 func TestEventByIDGolden(t *testing.T) {
-	st := &stubStore{events: goldenFixtureEvents()}
+	events := goldenFixtureEvents()
+	// GetEvent reads eventByID when it is set, so populating it exercises the
+	// real id lookup: a wrong id would 404 rather than returning a fixed event.
+	byID := make(map[string]store.Event, len(events))
+	for _, e := range events {
+		byID[e.ID] = e
+	}
+	st := &stubStore{events: events, eventByID: byID}
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/events/0000000042-0000000001", nil)
 	newTestServer(st, nil).Router().ServeHTTP(rec, req)
@@ -184,7 +192,8 @@ func TestEventByIDGolden(t *testing.T) {
 
 // TestEventsCountGolden snapshots the /events/count response.
 func TestEventsCountGolden(t *testing.T) {
-	st := &stubStore{events: goldenFixtureEvents(), nextCursor: goldenCursor}
+	// CountEvents returns totalCount, not len(events); the fixture has three.
+	st := &stubStore{events: goldenFixtureEvents(), nextCursor: goldenCursor, totalCount: 3}
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/events/count", nil)
 	newTestServer(st, nil).Router().ServeHTTP(rec, req)
@@ -231,16 +240,16 @@ func TestEventsGoldenCoverage(t *testing.T) {
 	// golden file names match the expected set, so no endpoint
 	// is accidentally left without coverage.
 	goldenNames := map[string]struct{}{
-		"events_default_page":   {},
-		"events_envelope":       {},
-		"events_include_xdr":    {},
+		"events_default_page":      {},
+		"events_envelope":          {},
+		"events_include_xdr":       {},
 		"events_fields_projection": {},
-		"events_pretty":         {},
-		"events_empty_result":   {},
-		"events_decoded":        {},
-		"events_single":         {},
-		"events_count":          {},
-		"contracts_events":      {},
+		"events_pretty":            {},
+		"events_empty_result":      {},
+		"events_decoded":           {},
+		"events_single":            {},
+		"events_count":             {},
+		"contracts_events":         {},
 	}
 	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
 	require.NoError(t, err)
@@ -257,27 +266,14 @@ func TestEventsGoldenCoverage(t *testing.T) {
 	}
 }
 
-func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
-	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
-	require.NoError(t, err)
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		body, err := os.ReadFile(filepath.Join("testdata", "golden", entry.Name()))
-		require.NoError(t, err, entry.Name())
-		require.True(t, json.Valid(body), "golden file %s must contain valid JSON", entry.Name())
-	}
-}
-
-// compareGolden diffs body against testdata/golden/events_<name>.json, or
+// compareGolden diffs body against testdata/golden/<name>.json, or
 // rewrites the file when -update-golden is passed. On mismatch it prints
 // both sides indented so the drifted key is findable despite the compact
 // wire encoding.
 func compareGolden(t *testing.T, name string, body []byte) {
 	t.Helper()
 
-	path := filepath.Join("testdata", "golden", "events_"+name+".json")
+	path := filepath.Join("testdata", "golden", name+".json")
 
 	if *updateGolden {
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))

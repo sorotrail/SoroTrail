@@ -62,7 +62,7 @@ func (c *ClickHouse) GetContractSummary(ctx context.Context, contractID string) 
 // ContractEventTypeCounts returns per-type event counts from ClickHouse.
 func (c *ClickHouse) ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error) {
 	// TODO: implement ClickHouse-specific query
-	return nil, fmt.Errorf("ContractEventTypeCounts: not yet implemented for ClickHouse")
+	return nil, fmt.Errorf("ContractEventTypeCounts: not supported by the clickhouse backend")
 }
 
 func (c *ClickHouse) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
@@ -538,7 +538,10 @@ func (c *ClickHouse) Stats(ctx context.Context, sc Scope) (Stats, error) {
 }
 
 func (c *ClickHouse) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
-	return nil, "", nil
+	// Returning an empty page with a nil error was indistinguishable from
+	// "this instance has no contracts", so a caller could not tell the
+	// backend simply does not implement this.
+	return nil, "", fmt.Errorf("ListContracts: not supported by the clickhouse backend")
 }
 
 // CountContracts counts distinct contract_id values in events, matching
