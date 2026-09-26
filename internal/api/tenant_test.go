@@ -1341,7 +1341,7 @@ func TestRevokedKeyRejectedOnNextRequest(t *testing.T) {
 // only receive events for contracts it is granted.
 func TestWebSocketSubscriptionsHonourBoundary(t *testing.T) {
 	f := newTenantFixture(t)
-	st := f.st.(*scopedStore)
+	st := f.st
 
 	// Verify that the store's scope filtering applies to subscription
 	// paths the same way it does to read endpoints.

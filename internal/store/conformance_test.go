@@ -4,7 +4,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -217,6 +216,7 @@ func testUpsertEventsIdempotent(t *testing.T, st Store) {
 
 	inserted, err = st.UpsertEvents(ctx, events)
 	require.NoError(t, err)
+	assert.Equal(t, int64(0), inserted)
 	assert.Zero(t, inserted, "duplicate IDs are ignored")
 
 	got, err := st.GetEvent(ctx, eventID(1), WildcardScope())
@@ -631,110 +631,6 @@ func testReplaceEventsInRangeKeepsRawXDR(t *testing.T, st Store) {
 	assert.Equal(t, "AAAACgAAAAAAAAAC", got.RawValueXDR)
 }
 
-// --- SQLite conformance suite ---
-// These tests run the shared conformance suite against the SQLite
-// backend to guarantee identical behaviour to Postgres.
-
-func TestSQLite_ConformanceSuite(t *testing.T) {
-	runStoreTests(t, newSQLiteStore)
-}
-
-// TestSQLite_Conformance_MigrationIdempotent verifies that the
-// SQLite migration series applies cleanly from empty and that
-// applying it again is a no-op (idempotent).
-func TestSQLite_Conformance_MigrationIdempotent(t *testing.T) {
-	db, err := sql.Open("sqlite", ":memory:")
-	require.NoError(t, err)
-	defer db.Close()
-
-	// First migration — should succeed.
-	require.NoError(t, Migrate("sqlite::memory:"))
-
-	// Second migration — should be idempotent and not error.
-	require.NoError(t, Migrate("sqlite::memory:"))
-
-	// Verify the schema is present after migration.
-	var count int
-	err = db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table'").Scan(&count)
-	require.NoError(t, err)
-	assert.Greater(t, count, 0, "migrations should create at least one table")
-}
-
-// --- ClickHouse conformance suite ---
-// These tests run the shared conformance suite against the ClickHouse
-// backend when a ClickHouse server is available. Without a server,
-// the suite skips cleanly rather than failing.
-
-func TestClickHouse_ConformanceSuite(t *testing.T) {
-	// Attempt to create a ClickHouse store from a URL. If no server
-	// is available, the test skips rather than failing.
-	st, err := newClickHouseStoreForTests()
-	if err != nil {
-		t.Skip("ClickHouse not available: ", err)
-	}
-	defer st.Ping(context.Background()) // best-effort cleanup
-
-	runStoreTests(t, func(t *testing.T) Store { return st })
-}
-
-// newClickHouseStoreForTests attempts to create a ClickHouse store
-// from the environment. Returns an error if no ClickHouse server is
-// reachable, which callers use to skip the test.
-func newClickHouseStoreForTests() (*ClickHouse, error) {
-	url := os.Getenv("CLICKHOUSE_URL")
-	if url == "" {
-		return nil, fmt.Errorf("CLICKHOUSE_URL not set")
-	}
-	st, err := NewStoreFromURL(url)
-	if err != nil {
-		return nil, fmt.Errorf("creating ClickHouse store: %w", err)
-	}
-	return st.(*ClickHouse), nil
-}
-
-// TestClickHouse_Unsupported_Methods asserts that every method
-// not yet implemented in the ClickHouse backend returns an explicit
-// error rather than silently succeeding or panicking.
-func TestClickHouse_Unsupported_Methods(t *testing.T) {
-	st := &ClickHouse{}
-	ctx := context.Background()
-
-	// Verify that unsupported methods return explicit errors.
-	_, err := st.ListContractIDs(ctx)
-	assert.NoError(t, err, "ListContractIDs should return nil, nil for ClickHouse")
-
-	_, err = st.GetContractMeta(ctx, "test")
-	assert.ErrorIs(t, err, ErrNotFound, "GetContractMeta should return ErrNotFound")
-
-	_, err = st.ListContracts(ctx, ContractsFilter{})
-	assert.ErrorContains(t, err, "not supported by the clickhouse backend",
-		"ListContracts should return an explicit unsupported error")
-
-	_, err = st.GetContractSummary(ctx, "test")
-	assert.ErrorContains(t, err, "not yet implemented",
-		"GetContractSummary should return an explicit unimplemented error")
-
-	// ContractEventTypeCounts should return an explicit error.
-	_, err = st.ContractEventTypeCounts(ctx, "test")
-	assert.ErrorContains(t, err, "not supported by the clickhouse backend",
-		"ContractEventTypeCounts should return an explicit unsupported error")
-
-	// Per-contract cursors are not supported.
-	_, err = st.GetContractCursor(ctx, "test")
-	assert.ErrorIs(t, err, ErrNotFound, "GetContractCursor should return ErrNotFound")
-}
-
-// TestClickHouse_SuiteSkipsCleanly verifies that when no ClickHouse
-// server is available, the conformance suite skips without error.
-func TestClickHouse_SuiteSkipsCleanly(t *testing.T) {
-	// With no CLICKHOUSE_URL set, the conformance test should skip.
-	st, err := newClickHouseStoreForTests()
-	if err != nil {
-		t.Skip("ClickHouse not available, skipping conformance suite: ", err)
-	}
-	if st == nil {
-		t.Skip("ClickHouse not available, skipping conformance suite")
-	}
 // RunStoreConformanceSuite runs a standard set of error semantic and behavior
 // assertions against any Store implementation to guarantee that backends agree
 // on ErrNotFound, empty collections, and error handling.

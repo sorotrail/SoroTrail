@@ -264,3 +264,26 @@ func TestArgumentValue(t *testing.T) {
 		})
 	}
 }
+
+func TestFieldArguments_CoercionAndErrors(t *testing.T) {
+	// Verify fieldArguments orchestrates argument extraction and validation
+	// using the coercion routines.
+	// We construct an AST field with arguments and call fieldArguments directly.
+	selection := &ast.Field{
+		Arguments: ast.ArgumentList{
+			{
+				Name:  "limit",
+				Value: &ast.Value{Kind: ast.IntValue, Raw: "10"},
+			},
+		},
+	}
+	args, err := fieldArguments(selection, map[string]any{})
+	require.NoError(t, err)
+	require.NotNil(t, args)
+	var parsed struct {
+		Limit int64 `json:"limit"`
+	}
+	err = json.Unmarshal(args, &parsed)
+	require.NoError(t, err)
+	assert.Equal(t, int64(10), parsed.Limit)
+}

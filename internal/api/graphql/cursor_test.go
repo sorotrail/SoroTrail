@@ -50,3 +50,14 @@ func TestDecodeCursor_ValidBase64ButNotJSON(t *testing.T) {
 			strings.Contains(err.Error(), "missing id"),
 		"unexpected error: %v", err)
 }
+
+// TestDecodeCursor_TamperResistance verifies that modified or tampered cursors
+// are strictly rejected by the decoder.
+func TestDecodeCursor_TamperResistance(t *testing.T) {
+	valid := EncodeCursor("123-456", "id", "asc")
+
+	// Try decoding with appended garbage characters or arbitrary changes
+	tampered := valid + "malformed"
+	_, err := DecodeCursor(tampered)
+	require.Error(t, err, "tampered base64 should fail to decode")
+}

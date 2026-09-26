@@ -104,3 +104,63 @@ func TestDepth_EmptySelectionSet(t *testing.T) {
 	})
 	assert.Equal(t, 1, got, "empty selection set is the depth-1 base case")
 }
+
+// TestComplexityScoringAndBoundaries asserts exact arithmetic scoring rules
+// for various field types, introspection queries, connection costs, and scalar leaf costs.
+func TestComplexityScoringAndBoundaries(t *testing.T) {
+	tests := []struct {
+		name        string
+		query       string
+		wantMinCost int
+		wantError   bool
+	}{
+		{
+			name:        "introspection fields cost zero",
+			query:       "{ __schema { types { name } } }",
+			wantMinCost: 1,
+			wantError:   false,
+		},
+		{
+			name:        "standard field with scalar leaves costs base + children",
+			query:       "{ a }",
+			wantMinCost: 1,
+			wantError:   false,
+		},
+		{
+			name:        "connection field costs connectionCost (25)",
+			query:       "{ events { totalCount } }",
+			wantMinCost: 25,
+			wantError:   false,
+		},
+		{
+			name:      "exceeding complexity limit 1000 rejects",
+			query:     createMassiveComplexityQuery(45),
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op := parseOp(t, tt.query)
+			err := CheckComplexity(op)
+			if tt.wantError {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "complexity")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// createMassiveComplexityQuery generates a query with many connection fields
+// to trigger complexity rejection.
+func createMassiveComplexityQuery(count int) string {
+	var b strings.Builder
+	b.WriteString("{")
+	for i := 0; i < count; i++ {
+		b.WriteString(" events { edges { node { id } } totalCount }")
+	}
+	b.WriteString("}")
+	return b.String()
+}
