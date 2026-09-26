@@ -15,7 +15,7 @@
 //
 // Never point TEST_DATABASE_URL at a database you care about — the
 // shared path truncates the events / ingestion_state / watched_contracts
-// / replay_state / dead_letters / audit_* tables.
+// / replay_state / audit_* tables.
 //
 // The cycle that this helper would otherwise create — package store
 // tests importing testdb while testdb imports store for store.Migrate —
@@ -39,7 +39,7 @@ import (
 
 // Setup returns a migrated *pgxpool.Pool scoped to the test. If migrate is
 // nil the caller accepts responsibility for having migrated the database;
-// if it's set, run it before the (optional) troncation.
+// if it's set, run it before the (optional) truncation.
 //
 // On hosts without Docker / testcontainers support, t.Skip is called.
 func Setup(t *testing.T, migrate func(url string) error) *pgxpool.Pool {
@@ -161,7 +161,8 @@ func truncateAll(ctx context.Context, pool *pgxpool.Pool) error {
 		audit_findings,
 		watched_contracts,
 		replay_state,
-		dead_letters
+		dead_letters,
+		audit_verification_state
 		RESTART IDENTITY`)
 	if err != nil {
 		return fmt.Errorf("truncating tables: %w", err)
