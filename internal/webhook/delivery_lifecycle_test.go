@@ -16,13 +16,13 @@ import (
 
 func TestWebhookDeliveryLifecycle_Table(t *testing.T) {
 	tests := []struct {
-		name              string
-		serverHandler     http.HandlerFunc
-		expectedAttempts  int
-		expectDisabled    bool
-		expectReset       bool
-		expectSignature   bool
-		timeout           time.Duration
+		name             string
+		serverHandler    http.HandlerFunc
+		expectedAttempts int
+		expectDisabled   bool
+		expectReset      bool
+		expectSignature  bool
+		timeout          time.Duration
 	}{
 		{
 			name: "successful delivery resets the failure counter",
@@ -59,14 +59,14 @@ func TestWebhookDeliveryLifecycle_Table(t *testing.T) {
 			var callCount int
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				callCount++
-				
+
 				if tt.expectSignature {
 					assert.NotEmpty(t, r.Header.Get(SignatureHeader))
 					body, _ := io.ReadAll(r.Body)
 					expectedSig := Sign("secret123", body)
 					assert.Equal(t, expectedSig, r.Header.Get(SignatureHeader))
 				}
-				
+
 				tt.serverHandler(w, r)
 				if callCount == tt.expectedAttempts {
 					close(done)
@@ -105,7 +105,7 @@ func TestWebhookDeliveryLifecycle_Table(t *testing.T) {
 			defer st.mu.Unlock()
 
 			require.Len(t, st.attempts, tt.expectedAttempts, "unexpected number of delivery attempts")
-			
+
 			if tt.expectReset {
 				assert.Contains(t, st.resets, int64(1))
 			} else {

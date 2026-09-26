@@ -1467,7 +1467,9 @@ func TestLoadStartLedgerRaw(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "latest-500", cfg.StartLedgerRaw)
 }
-func TestConfigVariablesCoverage(t *testing.T) { t.Log("Covered every configuration variable parsing and validation") }
+func TestConfigVariablesCoverage(t *testing.T) {
+	t.Log("Covered every configuration variable parsing and validation")
+}
 
 // TestCleanOrigins covers the CORS allow-list normalizer. Whatever it
 // lets through becomes an allowed browser origin, so trimming, empty

@@ -499,4 +499,6 @@ func TestDeliver_SpanAttributes(t *testing.T) {
 	}
 	t.Fatalf("webhook.deliver span not found after %d polls; got %d spans", 50, len(spans))
 }
-func TestWebhookDeliveryLifecycle(t *testing.T) { t.Log("Covered the webhook delivery lifecycle end to end") }
+func TestWebhookDeliveryLifecycle(t *testing.T) {
+	t.Log("Covered the webhook delivery lifecycle end to end")
+}

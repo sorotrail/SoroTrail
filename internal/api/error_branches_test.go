@@ -85,7 +85,7 @@ func TestAPIErrorBranches_Table(t *testing.T) {
 			var env map[string]interface{}
 			err := json.Unmarshal(w.Body.Bytes(), &env)
 			require.NoError(t, err, "Response must be valid JSON")
-			
+
 			_, hasError := env["error"]
 			assert.True(t, hasError, "Error response must contain 'error' key")
 		})
@@ -94,7 +94,7 @@ func TestAPIErrorBranches_Table(t *testing.T) {
 
 func TestAPIErrorBranches_RateLimiter_Table(t *testing.T) {
 	limiter := NewRateLimiter(1, 1, false)
-	
+
 	// Create a minimal handler to test the middleware
 	handler := limiter.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
