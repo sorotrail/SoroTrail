@@ -8,6 +8,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"net/url"
 	"strconv"
 )
@@ -93,6 +94,38 @@ type APIKey struct {
 	RevokedAt string `json:"revoked_at,omitempty"`
 }
 
+type APIKeyRequest struct {
+	Name string `json:"name,omitempty"`
+}
+
+type AddressSummary struct {
+	Address           string   `json:"address"`
+	DistinctContracts []string `json:"distinct_contracts"`
+	EventCount        int64    `json:"event_count"`
+	FirstSeenLedger   int64    `json:"first_seen_ledger"`
+	LastSeenLedger    int64    `json:"last_seen_ledger"`
+}
+
+type AggregateBucket struct {
+	Bucket string `json:"bucket"`
+	Count  int64  `json:"count"`
+}
+
+type AggregateResponse struct {
+	Buckets []AggregateBucket `json:"buckets"`
+}
+
+type ContractListEnvelope struct {
+	Data       []ContractSummary `json:"data"`
+	NextCursor string            `json:"next_cursor,omitempty"`
+}
+
+type ContractListResponse = ContractsPage
+
+type ContractSpecOverrideRequest struct {
+	Spec map[string]any `json:"spec"`
+}
+
 type ContractSummary struct {
 	ContractID  string `json:"contract_id"`
 	EventCount  int64  `json:"event_count"`
@@ -114,6 +147,38 @@ type CreateSubscriptionRequest struct {
 	Url     string             `json:"url"`
 }
 
+type CurrentTenant struct {
+	GrantedContractIds []string `json:"granted_contract_ids,omitempty"`
+	Tenant             Tenant   `json:"tenant"`
+	Wildcard           bool     `json:"wildcard"`
+}
+
+type DeadLetter struct {
+	Attempts    int64    `json:"attempts"`
+	ContractID  string   `json:"contract_id"`
+	CreatedAt   string   `json:"created_at"`
+	Error       string   `json:"error"`
+	EventID     string   `json:"event_id"`
+	ID          int64    `json:"id"`
+	LastAttempt string   `json:"last_attempt"`
+	Ledger      int64    `json:"ledger"`
+	TopicXdr    []string `json:"topic_xdr,omitempty"`
+	TxHash      string   `json:"tx_hash"`
+	Type        string   `json:"type"`
+	ValueXdr    string   `json:"value_xdr,omitempty"`
+}
+
+type DeadLettersEnvelope struct {
+	Data       []DeadLetter `json:"data"`
+	NextCursor string       `json:"next_cursor,omitempty"`
+}
+
+type DeadLettersPage struct {
+	Count       int64        `json:"count"`
+	Cursor      string       `json:"cursor,omitempty"`
+	DeadLetters []DeadLetter `json:"dead_letters"`
+}
+
 type DeliveryAttempt struct {
 	CreatedAt      string `json:"created_at"`
 	DurationMs     int64  `json:"duration_ms"`
@@ -123,6 +188,11 @@ type DeliveryAttempt struct {
 	ResponseCode   int64  `json:"response_code"`
 	Status         string `json:"status"`
 	SubscriptionID int64  `json:"subscription_id"`
+}
+
+type DeliveryEnvelopeResponse struct {
+	Data       []DeliveryAttempt `json:"data"`
+	NextCursor string            `json:"next_cursor,omitempty"`
 }
 
 type EnrichedEvent map[string]any
@@ -137,7 +207,9 @@ type Event struct {
 	ID               string `json:"id"`
 	InSuccessfulCall bool   `json:"in_successful_call"`
 	Ledger           int64  `json:"ledger"`
+	Network          string `json:"network"`
 	OpIndex          int64  `json:"op_index"`
+	Sep41Event       any    `json:"sep41_event,omitempty"`
 	Topics           []any  `json:"topics"`
 	TxHash           string `json:"tx_hash"`
 	TxIndex          int64  `json:"tx_index"`
@@ -145,9 +217,31 @@ type Event struct {
 	Value            any    `json:"value"`
 }
 
+type EventEnvelopeResponse struct {
+	Data       []any  `json:"data"`
+	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+type EventListResponse = EventsResponse
+
+type EventResponse map[string]any
+
+type EventWithXDR struct {
+	TopicsXdr json.RawMessage `json:"topics_xdr"`
+	ValueXdr  json.RawMessage `json:"value_xdr,omitempty"`
+}
+
 type EventsResponse struct {
-	Cursor string  `json:"cursor,omitempty"`
-	Events []Event `json:"events"`
+	Cursor string `json:"cursor,omitempty"`
+	Events []any  `json:"events"`
+}
+
+type GrantContractRequest struct {
+	ContractID string `json:"contract_id"`
+}
+
+type GrantList struct {
+	ContractIds []string `json:"contract_ids"`
 }
 
 type HealthResponse struct {
@@ -155,18 +249,42 @@ type HealthResponse struct {
 	Status string         `json:"status"`
 }
 
+type ProjectedEvent map[string]any
+
 type Stats struct {
-	Auditor *struct {
-		FindingsOpened        int64 `json:"findings_opened,omitempty"`
-		FindingsRepaired      int64 `json:"findings_repaired,omitempty"`
-		FindingsUnrecoverable int64 `json:"findings_unrecoverable,omitempty"`
-		FindingsUnverifiable  int64 `json:"findings_unverifiable,omitempty"`
-		LedgersChecked        int64 `json:"ledgers_checked,omitempty"`
-		PassesRun             int64 `json:"passes_run,omitempty"`
-		RpcRequests           int64 `json:"rpc_requests,omitempty"`
-	} `json:"auditor,omitempty"`
-	ContractCount         int64 `json:"contract_count,omitempty"`
-	LastIngestedLedger    int64 `json:"last_ingested_ledger,omitempty"`
+	Auditor             json.RawMessage `json:"auditor,omitempty"`
+	ChainHeadLedger     json.RawMessage `json:"chain_head_ledger,omitempty"`
+	ContractCount       int64           `json:"contract_count,omitempty"`
+	Decode              json.RawMessage `json:"decode,omitempty"`
+	EventsIngestedTotal int64           `json:"events_ingested_total,omitempty"`
+	IngestLagLedgers    json.RawMessage `json:"ingest_lag_ledgers,omitempty"`
+	Ingester            struct {
+		EffectivePollIntervalMs int64 `json:"effective_poll_interval_ms,omitempty"`
+	} `json:"ingester,omitempty"`
+	LastIngestedLedger int64  `json:"last_ingested_ledger,omitempty"`
+	LastSuccessfulPoll string `json:"last_successful_poll,omitempty"`
+	OldestStoredLedger int64  `json:"oldest_stored_ledger,omitempty"`
+	PanicsRecovered    int64  `json:"panics_recovered,omitempty"`
+	Pruner             struct {
+		RunsCompleted   int64 `json:"runs_completed,omitempty"`
+		TotalRowsPurged int64 `json:"total_rows_purged,omitempty"`
+	} `json:"pruner,omitempty"`
+	QueryErrors int64 `json:"query_errors,omitempty"`
+	RpcErrors   struct {
+		GetEvents        int64 `json:"getEvents,omitempty"`
+		GetHealth        int64 `json:"getHealth,omitempty"`
+		GetLatestLedger  int64 `json:"getLatestLedger,omitempty"`
+		GetLedgerEntries int64 `json:"getLedgerEntries,omitempty"`
+	} `json:"rpc_errors,omitempty"`
+	SpecCache struct {
+		CachedSpecs   int64 `json:"cached_specs,omitempty"`
+		Expiries      int64 `json:"expiries,omitempty"`
+		Fetches       int64 `json:"fetches,omitempty"`
+		Hits          int64 `json:"hits,omitempty"`
+		Invalidations int64 `json:"invalidations,omitempty"`
+		Misses        int64 `json:"misses,omitempty"`
+	} `json:"spec_cache,omitempty"`
+	TableSizeBytes        int64 `json:"table_size_bytes,omitempty"`
 	TotalEvents           int64 `json:"total_events,omitempty"`
 	VerifiedThroughLedger int64 `json:"verified_through_ledger,omitempty"`
 	WatchedContracts      int64 `json:"watched_contracts,omitempty"`
@@ -179,15 +297,84 @@ type Subscription struct {
 	Filters      SubscriptionFilter `json:"filters"`
 	ID           int64              `json:"id"`
 	Secret       string             `json:"secret"`
+	TenantID     int64              `json:"tenant_id,omitempty"`
 	Url          string             `json:"url"`
 }
 
 type SubscriptionFilter struct {
 	ContractID string `json:"contract_id,omitempty"`
 	FromLedger int64  `json:"from_ledger,omitempty"`
+	Network    string `json:"network,omitempty"`
 	ToLedger   int64  `json:"to_ledger,omitempty"`
 	Topic      any    `json:"topic,omitempty"`
 	Type       string `json:"type,omitempty"`
+}
+
+type Tenant struct {
+	Admin               bool            `json:"admin"`
+	CreatedAt           string          `json:"created_at"`
+	Enabled             bool            `json:"enabled"`
+	ID                  int64           `json:"id"`
+	MaxWatchedContracts json.RawMessage `json:"max_watched_contracts,omitempty"`
+	Name                string          `json:"name"`
+	RateLimitBurst      json.RawMessage `json:"rate_limit_burst,omitempty"`
+	RateLimitRps        json.RawMessage `json:"rate_limit_rps,omitempty"`
+	Wildcard            bool            `json:"wildcard"`
+}
+
+type TenantAPIKey struct {
+	CreatedAt  string `json:"created_at"`
+	ID         int64  `json:"id"`
+	LastUsedAt string `json:"last_used_at,omitempty"`
+	Name       string `json:"name"`
+	Prefix     string `json:"prefix"`
+	RevokedAt  string `json:"revoked_at,omitempty"`
+	Secret     string `json:"secret,omitempty"`
+	TenantID   int64  `json:"tenant_id"`
+}
+
+type TenantAPIKeyRequest struct {
+	Name string `json:"name,omitempty"`
+}
+
+type TenantAPIKeysPage struct {
+	Keys []TenantAPIKey `json:"keys"`
+}
+
+type TenantCreateRequest struct {
+	Admin               bool    `json:"admin,omitempty"`
+	Enabled             bool    `json:"enabled,omitempty"`
+	MaxWatchedContracts int64   `json:"max_watched_contracts,omitempty"`
+	Name                string  `json:"name"`
+	RateLimitBurst      int64   `json:"rate_limit_burst,omitempty"`
+	RateLimitRps        float64 `json:"rate_limit_rps,omitempty"`
+	Wildcard            bool    `json:"wildcard,omitempty"`
+}
+
+type TenantList struct {
+	Tenants []Tenant `json:"tenants"`
+}
+
+type TenantUpdateRequest struct {
+	Admin               bool    `json:"admin,omitempty"`
+	Enabled             bool    `json:"enabled,omitempty"`
+	MaxWatchedContracts int64   `json:"max_watched_contracts,omitempty"`
+	Name                string  `json:"name,omitempty"`
+	RateLimitBurst      int64   `json:"rate_limit_burst,omitempty"`
+	RateLimitRps        float64 `json:"rate_limit_rps,omitempty"`
+	Wildcard            bool    `json:"wildcard,omitempty"`
+}
+
+type TenantUsage struct {
+	Day           string `json:"day"`
+	EventsServed  int64  `json:"events_served"`
+	Requests      int64  `json:"requests"`
+	StreamSeconds int64  `json:"stream_seconds"`
+	TenantID      int64  `json:"tenant_id"`
+}
+
+type TenantWatchList struct {
+	ContractIds []string `json:"contract_ids"`
 }
 
 type UpdateSubscriptionRequest struct {
@@ -197,17 +384,36 @@ type UpdateSubscriptionRequest struct {
 	Url     string             `json:"url,omitempty"`
 }
 
-type AddTenantWatchResponse map[string]any
+type UsagePage struct {
+	Usage []TenantUsage `json:"usage"`
+}
 
-type AddWatchedContractResponse map[string]any
+type WatchedContract struct {
+	AddedAt    string `json:"added_at"`
+	ContractID string `json:"contract_id"`
+}
 
-type AddressSummaryResponse map[string]any
+type WatchedContractAdded struct {
+	AddedAt           string `json:"added_at"`
+	ContractID        string `json:"contract_id"`
+	HistoryFromLedger int64  `json:"history_from_ledger"`
+	ModeTransition    string `json:"mode_transition,omitempty"`
+}
 
-type AggregateEventsResponse struct {
-	Buckets []struct {
-		Count int64  `json:"count,omitempty"`
-		Key   string `json:"key,omitempty"`
-	} `json:"buckets,omitempty"`
+type WatchedContractRemoved struct {
+	ContractID       string `json:"contract_id"`
+	HistoryPreserved bool   `json:"history_preserved"`
+	ModeTransition   string `json:"mode_transition,omitempty"`
+	RemovedAt        string `json:"removed_at"`
+}
+
+type WatchedContractRequest struct {
+	ContractID string `json:"contract_id"`
+}
+
+type WatchedContractsPage struct {
+	Contracts []WatchedContract `json:"contracts"`
+	Count     int64             `json:"count"`
 }
 
 type ContractStatsResponse struct {
@@ -226,19 +432,7 @@ type CountEventsResponse struct {
 	Count int64 `json:"count,omitempty"`
 }
 
-type CreateAPIKeyRequest struct {
-	Name string `json:"name,omitempty"`
-}
-
 type CreateAPIKeyResponse map[string]any
-
-type CreateTenantKeyResponse map[string]any
-
-type CreateTenantResponse map[string]any
-
-type CurrentTenantResponse map[string]any
-
-type CurrentTenantUsageResponse map[string]any
 
 type DeleteContractSpecOverrideResponse struct {
 	ContractID string `json:"contract_id"`
@@ -262,23 +456,9 @@ type GetContractSpecOverrideResponse struct {
 	Spec       map[string]any `json:"spec"`
 }
 
-type GetEventResponse = Event
+type ListDeadLettersResponse = DeadLettersPage
 
-type GetTenantResponse map[string]any
-
-type GrantContractResponse map[string]any
-
-type ListDeadLettersResponse map[string]any
-
-type ListTenantGrantsResponse map[string]any
-
-type ListTenantKeysResponse map[string]any
-
-type ListTenantsResponse map[string]any
-
-type ListWatchedContractsResponse map[string]any
-
-type PutContractSpecOverrideRequest map[string]any
+type ListDeliveriesResponse = DeliveryEnvelopeResponse
 
 type PutContractSpecOverrideResponse struct {
 	ContractID string         `json:"contract_id"`
@@ -290,18 +470,6 @@ type RawEventResponse struct {
 	ValueXdr  string   `json:"value_xdr,omitempty"`
 }
 
-type RemoveTenantWatchResponse map[string]any
-
-type RemoveWatchedContractResponse map[string]any
-
-type RevokeContractResponse map[string]any
-
-type TenantUsageResponse map[string]any
-
-type TenantWatchListResponse map[string]any
-
-type UpdateTenantResponse map[string]any
-
 type VersionResponse struct {
 	BuildDate string `json:"build_date,omitempty"`
 	Commit    string `json:"commit,omitempty"`
@@ -311,25 +479,37 @@ type VersionResponse struct {
 // AddressEvents List events involving an address.
 //
 // GET /addresses/{address}/events
-func (c *Client) AddressEvents(ctx context.Context, address string, params AddressEventsParams) (*EventsResponse, error) {
+func (c *Client) AddressEvents(ctx context.Context, address string, params AddressEventsParams) (*EventListResponse, error) {
 	path := urlEscapePath("/addresses/{address}/events", address)
 	query := params.values()
-	return do[EventsResponse](c, ctx, "GET", path, query, nil)
+	return do[EventListResponse](c, ctx, "GET", path, query, nil)
 }
 
 // AddressEventsParams are the query parameters for AddressEvents.
 type AddressEventsParams struct {
+	Type       string
+	ContractID string
 	FromLedger int64
 	ToLedger   int64
 	Limit      int64
 	Cursor     string
 	Order      string
+	OrderBy    string
+	Recent     string
+	Envelope   string
+	Pretty     string
 }
 
 // values renders the non-zero fields as query parameters, so an
 // unset field is omitted from the URL rather than sent as empty.
 func (p AddressEventsParams) values() url.Values {
 	v := url.Values{}
+	if p.Type != "" {
+		v.Set("type", p.Type)
+	}
+	if p.ContractID != "" {
+		v.Set("contract_id", p.ContractID)
+	}
 	if p.FromLedger != 0 {
 		v.Set("from_ledger", strconv.FormatInt(p.FromLedger, 10))
 	}
@@ -345,15 +525,27 @@ func (p AddressEventsParams) values() url.Values {
 	if p.Order != "" {
 		v.Set("order", p.Order)
 	}
+	if p.OrderBy != "" {
+		v.Set("order_by", p.OrderBy)
+	}
+	if p.Recent != "" {
+		v.Set("recent", p.Recent)
+	}
+	if p.Envelope != "" {
+		v.Set("envelope", p.Envelope)
+	}
+	if p.Pretty != "" {
+		v.Set("pretty", p.Pretty)
+	}
 	return v
 }
 
 // AddressSummary Summarise an address's event history.
 //
 // GET /addresses/{address}/summary
-func (c *Client) AddressSummary(ctx context.Context, address string) (*AddressSummaryResponse, error) {
+func (c *Client) AddressSummary(ctx context.Context, address string) (*AddressSummary, error) {
 	path := urlEscapePath("/addresses/{address}/summary", address)
-	return do[AddressSummaryResponse](c, ctx, "GET", path, nil, nil)
+	return do[AddressSummary](c, ctx, "GET", path, nil, nil)
 }
 
 // RevokeKey Revoke an API key.
@@ -367,17 +559,17 @@ func (c *Client) RevokeKey(ctx context.Context, keyID int64) error {
 // ListTenants List tenants.
 //
 // GET /admin/tenants
-func (c *Client) ListTenants(ctx context.Context) (*ListTenantsResponse, error) {
+func (c *Client) ListTenants(ctx context.Context) (*TenantList, error) {
 	path := "/admin/tenants"
-	return do[ListTenantsResponse](c, ctx, "GET", path, nil, nil)
+	return do[TenantList](c, ctx, "GET", path, nil, nil)
 }
 
 // CreateTenant Create a tenant.
 //
 // POST /admin/tenants
-func (c *Client) CreateTenant(ctx context.Context) (*CreateTenantResponse, error) {
+func (c *Client) CreateTenant(ctx context.Context, body TenantCreateRequest) (*Tenant, error) {
 	path := "/admin/tenants"
-	return do[CreateTenantResponse](c, ctx, "POST", path, nil, nil)
+	return do[Tenant](c, ctx, "POST", path, nil, body)
 }
 
 // DeleteTenant Delete a tenant.
@@ -391,66 +583,66 @@ func (c *Client) DeleteTenant(ctx context.Context, id int64) error {
 // GetTenant Get a tenant.
 //
 // GET /admin/tenants/{id}
-func (c *Client) GetTenant(ctx context.Context, id int64) (*GetTenantResponse, error) {
+func (c *Client) GetTenant(ctx context.Context, id int64) (*Tenant, error) {
 	path := urlEscapePath("/admin/tenants/{id}", strconv.FormatInt(id, 10))
-	return do[GetTenantResponse](c, ctx, "GET", path, nil, nil)
+	return do[Tenant](c, ctx, "GET", path, nil, nil)
 }
 
 // UpdateTenant Update a tenant.
 //
 // PATCH /admin/tenants/{id}
-func (c *Client) UpdateTenant(ctx context.Context, id int64) (*UpdateTenantResponse, error) {
+func (c *Client) UpdateTenant(ctx context.Context, id int64, body TenantUpdateRequest) (*Tenant, error) {
 	path := urlEscapePath("/admin/tenants/{id}", strconv.FormatInt(id, 10))
-	return do[UpdateTenantResponse](c, ctx, "PATCH", path, nil, nil)
+	return do[Tenant](c, ctx, "PATCH", path, nil, body)
 }
 
 // ListTenantGrants List a tenant's contract grants.
 //
 // GET /admin/tenants/{id}/grants
-func (c *Client) ListTenantGrants(ctx context.Context, id int64) (*ListTenantGrantsResponse, error) {
+func (c *Client) ListTenantGrants(ctx context.Context, id int64) (*GrantList, error) {
 	path := urlEscapePath("/admin/tenants/{id}/grants", strconv.FormatInt(id, 10))
-	return do[ListTenantGrantsResponse](c, ctx, "GET", path, nil, nil)
+	return do[GrantList](c, ctx, "GET", path, nil, nil)
 }
 
 // GrantContract Grant a contract to a tenant.
 //
 // POST /admin/tenants/{id}/grants
-func (c *Client) GrantContract(ctx context.Context, id int64) (*GrantContractResponse, error) {
+func (c *Client) GrantContract(ctx context.Context, id int64, body GrantContractRequest) (*GrantList, error) {
 	path := urlEscapePath("/admin/tenants/{id}/grants", strconv.FormatInt(id, 10))
-	return do[GrantContractResponse](c, ctx, "POST", path, nil, nil)
+	return do[GrantList](c, ctx, "POST", path, nil, body)
 }
 
 // RevokeContract Revoke a contract grant.
 //
 // DELETE /admin/tenants/{id}/grants/{contract_id}
-func (c *Client) RevokeContract(ctx context.Context, id int64, contractID string) (*RevokeContractResponse, error) {
+func (c *Client) RevokeContract(ctx context.Context, id int64, contractID string) (*GrantList, error) {
 	path := urlEscapePath("/admin/tenants/{id}/grants/{contract_id}", strconv.FormatInt(id, 10), contractID)
-	return do[RevokeContractResponse](c, ctx, "DELETE", path, nil, nil)
+	return do[GrantList](c, ctx, "DELETE", path, nil, nil)
 }
 
 // ListTenantKeys List a tenant's API keys.
 //
 // GET /admin/tenants/{id}/keys
-func (c *Client) ListTenantKeys(ctx context.Context, id int64) (*ListTenantKeysResponse, error) {
+func (c *Client) ListTenantKeys(ctx context.Context, id int64) (*TenantAPIKeysPage, error) {
 	path := urlEscapePath("/admin/tenants/{id}/keys", strconv.FormatInt(id, 10))
-	return do[ListTenantKeysResponse](c, ctx, "GET", path, nil, nil)
+	return do[TenantAPIKeysPage](c, ctx, "GET", path, nil, nil)
 }
 
 // CreateTenantKey Issue an API key for a tenant.
 //
 // POST /admin/tenants/{id}/keys
-func (c *Client) CreateTenantKey(ctx context.Context, id int64) (*CreateTenantKeyResponse, error) {
+func (c *Client) CreateTenantKey(ctx context.Context, id int64, body TenantAPIKeyRequest) (*TenantAPIKey, error) {
 	path := urlEscapePath("/admin/tenants/{id}/keys", strconv.FormatInt(id, 10))
-	return do[CreateTenantKeyResponse](c, ctx, "POST", path, nil, nil)
+	return do[TenantAPIKey](c, ctx, "POST", path, nil, body)
 }
 
 // TenantUsage Get a tenant's recorded usage.
 //
 // GET /admin/tenants/{id}/usage
-func (c *Client) TenantUsage(ctx context.Context, id int64, params TenantUsageParams) (*TenantUsageResponse, error) {
+func (c *Client) TenantUsage(ctx context.Context, id int64, params TenantUsageParams) (*UsagePage, error) {
 	path := urlEscapePath("/admin/tenants/{id}/usage", strconv.FormatInt(id, 10))
 	query := params.values()
-	return do[TenantUsageResponse](c, ctx, "GET", path, query, nil)
+	return do[UsagePage](c, ctx, "GET", path, query, nil)
 }
 
 // TenantUsageParams are the query parameters for TenantUsage.
@@ -479,7 +671,7 @@ func (c *Client) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 // CreateAPIKey Create an API key.
 //
 // POST /apikeys
-func (c *Client) CreateAPIKey(ctx context.Context, body CreateAPIKeyRequest) (*CreateAPIKeyResponse, error) {
+func (c *Client) CreateAPIKey(ctx context.Context, body APIKeyRequest) (*CreateAPIKeyResponse, error) {
 	path := "/apikeys"
 	return do[CreateAPIKeyResponse](c, ctx, "POST", path, nil, body)
 }
@@ -495,10 +687,10 @@ func (c *Client) RevokeAPIKey(ctx context.Context, id int64) error {
 // ListContracts List indexed contracts.
 //
 // GET /contracts
-func (c *Client) ListContracts(ctx context.Context, params ListContractsParams) (*ContractsPage, error) {
+func (c *Client) ListContracts(ctx context.Context, params ListContractsParams) (*ContractListResponse, error) {
 	path := "/contracts"
 	query := params.values()
-	return do[ContractsPage](c, ctx, "GET", path, query, nil)
+	return do[ContractListResponse](c, ctx, "GET", path, query, nil)
 }
 
 // ListContractsParams are the query parameters for ListContracts.
@@ -508,6 +700,8 @@ type ListContractsParams struct {
 	Sort       string
 	Order      string
 	ContractID string
+	Envelope   string
+	Pretty     string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -529,6 +723,12 @@ func (p ListContractsParams) values() url.Values {
 	if p.ContractID != "" {
 		v.Set("contract_id", p.ContractID)
 	}
+	if p.Envelope != "" {
+		v.Set("envelope", p.Envelope)
+	}
+	if p.Pretty != "" {
+		v.Set("pretty", p.Pretty)
+	}
 	return v
 }
 
@@ -543,29 +743,40 @@ func (c *Client) GetContract(ctx context.Context, id string) (*GetContractRespon
 // ContractEvents List events for a contract.
 //
 // GET /contracts/{id}/events
-func (c *Client) ContractEvents(ctx context.Context, id string, params ContractEventsParams) (*EventsResponse, error) {
+func (c *Client) ContractEvents(ctx context.Context, id string, params ContractEventsParams) (*EventListResponse, error) {
 	path := urlEscapePath("/contracts/{id}/events", id)
 	query := params.values()
-	return do[EventsResponse](c, ctx, "GET", path, query, nil)
+	return do[EventListResponse](c, ctx, "GET", path, query, nil)
 }
 
 // ContractEventsParams are the query parameters for ContractEvents.
 type ContractEventsParams struct {
-	Type       string
-	Topic      string
-	Topic0     string
-	Topic1     string
-	Topic2     string
-	Topic3     string
-	FromLedger int64
-	ToLedger   int64
-	FromTime   string
-	ToTime     string
-	Limit      int64
-	Cursor     string
-	Order      string
-	OrderBy    string
-	Decoded    string
+	Type             string
+	Topic            string
+	Topic0           string
+	Topic1           string
+	Topic2           string
+	Topic3           string
+	FromLedger       int64
+	ToLedger         int64
+	FromTime         string
+	ToTime           string
+	Limit            int64
+	Cursor           string
+	Order            string
+	OrderBy          string
+	Decoded          string
+	TopicContains    string
+	TxHash           string
+	TxIndex          int64
+	OpIndex          int64
+	InSuccessfulCall string
+	HasValue         string
+	Recent           string
+	Fields           string
+	IncludeXdr       string
+	Envelope         string
+	Pretty           string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -616,6 +827,39 @@ func (p ContractEventsParams) values() url.Values {
 	}
 	if p.Decoded != "" {
 		v.Set("decoded", p.Decoded)
+	}
+	if p.TopicContains != "" {
+		v.Set("topic_contains", p.TopicContains)
+	}
+	if p.TxHash != "" {
+		v.Set("tx_hash", p.TxHash)
+	}
+	if p.TxIndex != 0 {
+		v.Set("tx_index", strconv.FormatInt(p.TxIndex, 10))
+	}
+	if p.OpIndex != 0 {
+		v.Set("op_index", strconv.FormatInt(p.OpIndex, 10))
+	}
+	if p.InSuccessfulCall != "" {
+		v.Set("in_successful_call", p.InSuccessfulCall)
+	}
+	if p.HasValue != "" {
+		v.Set("has_value", p.HasValue)
+	}
+	if p.Recent != "" {
+		v.Set("recent", p.Recent)
+	}
+	if p.Fields != "" {
+		v.Set("fields", p.Fields)
+	}
+	if p.IncludeXdr != "" {
+		v.Set("include_xdr", p.IncludeXdr)
+	}
+	if p.Envelope != "" {
+		v.Set("envelope", p.Envelope)
+	}
+	if p.Pretty != "" {
+		v.Set("pretty", p.Pretty)
 	}
 	return v
 }
@@ -671,7 +915,7 @@ func (c *Client) GetContractSpecOverride(ctx context.Context, id string) (*GetCo
 // PutContractSpecOverride Upload a contract spec override.
 //
 // PUT /contracts/{id}/spec
-func (c *Client) PutContractSpecOverride(ctx context.Context, id string, body PutContractSpecOverrideRequest) (*PutContractSpecOverrideResponse, error) {
+func (c *Client) PutContractSpecOverride(ctx context.Context, id string, body ContractSpecOverrideRequest) (*PutContractSpecOverrideResponse, error) {
 	path := urlEscapePath("/contracts/{id}/spec", id)
 	return do[PutContractSpecOverrideResponse](c, ctx, "PUT", path, nil, body)
 }
@@ -698,6 +942,8 @@ type ListDeadLettersParams struct {
 	ContractID string
 	Limit      int64
 	Cursor     string
+	Envelope   string
+	Pretty     string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -712,6 +958,12 @@ func (p ListDeadLettersParams) values() url.Values {
 	}
 	if p.Cursor != "" {
 		v.Set("cursor", p.Cursor)
+	}
+	if p.Envelope != "" {
+		v.Set("envelope", p.Envelope)
+	}
+	if p.Pretty != "" {
+		v.Set("pretty", p.Pretty)
 	}
 	return v
 }
@@ -751,30 +1003,43 @@ func (p DeleteEventsParams) values() url.Values {
 // ListEvents List stored events.
 //
 // GET /events
-func (c *Client) ListEvents(ctx context.Context, params ListEventsParams) (*EventsResponse, error) {
+func (c *Client) ListEvents(ctx context.Context, params ListEventsParams) (*EventListResponse, error) {
 	path := "/events"
 	query := params.values()
-	return do[EventsResponse](c, ctx, "GET", path, query, nil)
+	return do[EventListResponse](c, ctx, "GET", path, query, nil)
 }
 
 // ListEventsParams are the query parameters for ListEvents.
 type ListEventsParams struct {
-	ContractID string
-	Type       string
-	Topic      string
-	Topic0     string
-	Topic1     string
-	Topic2     string
-	Topic3     string
-	FromLedger int64
-	ToLedger   int64
-	FromTime   string
-	ToTime     string
-	Limit      int64
-	Cursor     string
-	Order      string
-	OrderBy    string
-	Decoded    string
+	ContractID       string
+	Type             string
+	Topic            string
+	Topic0           string
+	Topic1           string
+	Topic2           string
+	Topic3           string
+	FromLedger       int64
+	ToLedger         int64
+	FromTime         string
+	ToTime           string
+	Limit            int64
+	Cursor           string
+	Order            string
+	OrderBy          string
+	Decoded          string
+	ContractIDPrefix string
+	TopicContains    string
+	TxHash           string
+	TxIndex          int64
+	OpIndex          int64
+	InSuccessfulCall string
+	HasValue         string
+	Recent           string
+	Fields           string
+	IncludeXdr       string
+	Stream           string
+	Envelope         string
+	Pretty           string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -829,6 +1094,45 @@ func (p ListEventsParams) values() url.Values {
 	if p.Decoded != "" {
 		v.Set("decoded", p.Decoded)
 	}
+	if p.ContractIDPrefix != "" {
+		v.Set("contract_id_prefix", p.ContractIDPrefix)
+	}
+	if p.TopicContains != "" {
+		v.Set("topic_contains", p.TopicContains)
+	}
+	if p.TxHash != "" {
+		v.Set("tx_hash", p.TxHash)
+	}
+	if p.TxIndex != 0 {
+		v.Set("tx_index", strconv.FormatInt(p.TxIndex, 10))
+	}
+	if p.OpIndex != 0 {
+		v.Set("op_index", strconv.FormatInt(p.OpIndex, 10))
+	}
+	if p.InSuccessfulCall != "" {
+		v.Set("in_successful_call", p.InSuccessfulCall)
+	}
+	if p.HasValue != "" {
+		v.Set("has_value", p.HasValue)
+	}
+	if p.Recent != "" {
+		v.Set("recent", p.Recent)
+	}
+	if p.Fields != "" {
+		v.Set("fields", p.Fields)
+	}
+	if p.IncludeXdr != "" {
+		v.Set("include_xdr", p.IncludeXdr)
+	}
+	if p.Stream != "" {
+		v.Set("stream", p.Stream)
+	}
+	if p.Envelope != "" {
+		v.Set("envelope", p.Envelope)
+	}
+	if p.Pretty != "" {
+		v.Set("pretty", p.Pretty)
+	}
 	return v
 }
 
@@ -843,19 +1147,27 @@ func (c *Client) EventsCSV(ctx context.Context, params EventsCSVParams) ([]byte,
 
 // EventsCSVParams are the query parameters for EventsCSV.
 type EventsCSVParams struct {
-	ContractID string
-	Type       string
-	Topic      string
-	Topic0     string
-	Topic1     string
-	Topic2     string
-	Topic3     string
-	FromLedger int64
-	ToLedger   int64
-	FromTime   string
-	ToTime     string
-	Order      string
-	OrderBy    string
+	ContractID       string
+	Type             string
+	Topic            string
+	Topic0           string
+	Topic1           string
+	Topic2           string
+	Topic3           string
+	FromLedger       int64
+	ToLedger         int64
+	FromTime         string
+	ToTime           string
+	ContractIDPrefix string
+	TopicContains    string
+	TxHash           string
+	TxIndex          int64
+	OpIndex          int64
+	InSuccessfulCall string
+	HasValue         string
+	Order            string
+	OrderBy          string
+	Recent           string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -895,11 +1207,35 @@ func (p EventsCSVParams) values() url.Values {
 	if p.ToTime != "" {
 		v.Set("to_time", p.ToTime)
 	}
+	if p.ContractIDPrefix != "" {
+		v.Set("contract_id_prefix", p.ContractIDPrefix)
+	}
+	if p.TopicContains != "" {
+		v.Set("topic_contains", p.TopicContains)
+	}
+	if p.TxHash != "" {
+		v.Set("tx_hash", p.TxHash)
+	}
+	if p.TxIndex != 0 {
+		v.Set("tx_index", strconv.FormatInt(p.TxIndex, 10))
+	}
+	if p.OpIndex != 0 {
+		v.Set("op_index", strconv.FormatInt(p.OpIndex, 10))
+	}
+	if p.InSuccessfulCall != "" {
+		v.Set("in_successful_call", p.InSuccessfulCall)
+	}
+	if p.HasValue != "" {
+		v.Set("has_value", p.HasValue)
+	}
 	if p.Order != "" {
 		v.Set("order", p.Order)
 	}
 	if p.OrderBy != "" {
 		v.Set("order_by", p.OrderBy)
+	}
+	if p.Recent != "" {
+		v.Set("recent", p.Recent)
 	}
 	return v
 }
@@ -907,26 +1243,34 @@ func (p EventsCSVParams) values() url.Values {
 // AggregateEvents Aggregate event counts.
 //
 // GET /events/aggregate
-func (c *Client) AggregateEvents(ctx context.Context, params AggregateEventsParams) (*AggregateEventsResponse, error) {
+func (c *Client) AggregateEvents(ctx context.Context, params AggregateEventsParams) (*AggregateResponse, error) {
 	path := "/events/aggregate"
 	query := params.values()
-	return do[AggregateEventsResponse](c, ctx, "GET", path, query, nil)
+	return do[AggregateResponse](c, ctx, "GET", path, query, nil)
 }
 
 // AggregateEventsParams are the query parameters for AggregateEvents.
 type AggregateEventsParams struct {
-	ContractID string
-	Type       string
-	Topic      string
-	Topic0     string
-	Topic1     string
-	Topic2     string
-	Topic3     string
-	FromLedger int64
-	ToLedger   int64
-	FromTime   string
-	ToTime     string
-	Bucket     string
+	ContractID       string
+	Type             string
+	Topic            string
+	Topic0           string
+	Topic1           string
+	Topic2           string
+	Topic3           string
+	FromLedger       int64
+	ToLedger         int64
+	FromTime         string
+	ToTime           string
+	ContractIDPrefix string
+	TopicContains    string
+	TxHash           string
+	TxIndex          int64
+	OpIndex          int64
+	InSuccessfulCall string
+	HasValue         string
+	Bucket           string
+	Pretty           string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -966,8 +1310,32 @@ func (p AggregateEventsParams) values() url.Values {
 	if p.ToTime != "" {
 		v.Set("to_time", p.ToTime)
 	}
+	if p.ContractIDPrefix != "" {
+		v.Set("contract_id_prefix", p.ContractIDPrefix)
+	}
+	if p.TopicContains != "" {
+		v.Set("topic_contains", p.TopicContains)
+	}
+	if p.TxHash != "" {
+		v.Set("tx_hash", p.TxHash)
+	}
+	if p.TxIndex != 0 {
+		v.Set("tx_index", strconv.FormatInt(p.TxIndex, 10))
+	}
+	if p.OpIndex != 0 {
+		v.Set("op_index", strconv.FormatInt(p.OpIndex, 10))
+	}
+	if p.InSuccessfulCall != "" {
+		v.Set("in_successful_call", p.InSuccessfulCall)
+	}
+	if p.HasValue != "" {
+		v.Set("has_value", p.HasValue)
+	}
 	if p.Bucket != "" {
 		v.Set("bucket", p.Bucket)
+	}
+	if p.Pretty != "" {
+		v.Set("pretty", p.Pretty)
 	}
 	return v
 }
@@ -983,17 +1351,25 @@ func (c *Client) CountEvents(ctx context.Context, params CountEventsParams) (*Co
 
 // CountEventsParams are the query parameters for CountEvents.
 type CountEventsParams struct {
-	ContractID string
-	Type       string
-	Topic      string
-	Topic0     string
-	Topic1     string
-	Topic2     string
-	Topic3     string
-	FromLedger int64
-	ToLedger   int64
-	FromTime   string
-	ToTime     string
+	ContractID       string
+	Type             string
+	Topic            string
+	Topic0           string
+	Topic1           string
+	Topic2           string
+	Topic3           string
+	FromLedger       int64
+	ToLedger         int64
+	FromTime         string
+	ToTime           string
+	ContractIDPrefix string
+	TopicContains    string
+	TxHash           string
+	TxIndex          int64
+	OpIndex          int64
+	InSuccessfulCall string
+	HasValue         string
+	Pretty           string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -1033,6 +1409,30 @@ func (p CountEventsParams) values() url.Values {
 	if p.ToTime != "" {
 		v.Set("to_time", p.ToTime)
 	}
+	if p.ContractIDPrefix != "" {
+		v.Set("contract_id_prefix", p.ContractIDPrefix)
+	}
+	if p.TopicContains != "" {
+		v.Set("topic_contains", p.TopicContains)
+	}
+	if p.TxHash != "" {
+		v.Set("tx_hash", p.TxHash)
+	}
+	if p.TxIndex != 0 {
+		v.Set("tx_index", strconv.FormatInt(p.TxIndex, 10))
+	}
+	if p.OpIndex != 0 {
+		v.Set("op_index", strconv.FormatInt(p.OpIndex, 10))
+	}
+	if p.InSuccessfulCall != "" {
+		v.Set("in_successful_call", p.InSuccessfulCall)
+	}
+	if p.HasValue != "" {
+		v.Set("has_value", p.HasValue)
+	}
+	if p.Pretty != "" {
+		v.Set("pretty", p.Pretty)
+	}
 	return v
 }
 
@@ -1050,14 +1450,11 @@ type EventStreamWSParams struct {
 	ContractID string
 	Type       string
 	Topic      string
-	Topic0     string
-	Topic1     string
-	Topic2     string
-	Topic3     string
 	FromLedger int64
 	ToLedger   int64
 	FromTime   string
 	ToTime     string
+	HasValue   string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -1073,18 +1470,6 @@ func (p EventStreamWSParams) values() url.Values {
 	if p.Topic != "" {
 		v.Set("topic", p.Topic)
 	}
-	if p.Topic0 != "" {
-		v.Set("topic0", p.Topic0)
-	}
-	if p.Topic1 != "" {
-		v.Set("topic1", p.Topic1)
-	}
-	if p.Topic2 != "" {
-		v.Set("topic2", p.Topic2)
-	}
-	if p.Topic3 != "" {
-		v.Set("topic3", p.Topic3)
-	}
 	if p.FromLedger != 0 {
 		v.Set("from_ledger", strconv.FormatInt(p.FromLedger, 10))
 	}
@@ -1097,21 +1482,27 @@ func (p EventStreamWSParams) values() url.Values {
 	if p.ToTime != "" {
 		v.Set("to_time", p.ToTime)
 	}
+	if p.HasValue != "" {
+		v.Set("has_value", p.HasValue)
+	}
 	return v
 }
 
 // GetEvent Get a single event by ID.
 //
 // GET /events/{id}
-func (c *Client) GetEvent(ctx context.Context, id string, params GetEventParams) (*GetEventResponse, error) {
+func (c *Client) GetEvent(ctx context.Context, id string, params GetEventParams) (*EventResponse, error) {
 	path := urlEscapePath("/events/{id}", id)
 	query := params.values()
-	return do[GetEventResponse](c, ctx, "GET", path, query, nil)
+	return do[EventResponse](c, ctx, "GET", path, query, nil)
 }
 
 // GetEventParams are the query parameters for GetEvent.
 type GetEventParams struct {
-	Decoded string
+	Decoded    string
+	Fields     string
+	IncludeXdr string
+	Pretty     string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -1120,6 +1511,15 @@ func (p GetEventParams) values() url.Values {
 	v := url.Values{}
 	if p.Decoded != "" {
 		v.Set("decoded", p.Decoded)
+	}
+	if p.Fields != "" {
+		v.Set("fields", p.Fields)
+	}
+	if p.IncludeXdr != "" {
+		v.Set("include_xdr", p.IncludeXdr)
+	}
+	if p.Pretty != "" {
+		v.Set("pretty", p.Pretty)
 	}
 	return v
 }
@@ -1135,15 +1535,18 @@ func (c *Client) RawEvent(ctx context.Context, id string) (*RawEventResponse, er
 // EventTransaction Get an event's sibling events.
 //
 // GET /events/{id}/transaction
-func (c *Client) EventTransaction(ctx context.Context, id string, params EventTransactionParams) ([]Event, error) {
+func (c *Client) EventTransaction(ctx context.Context, id string, params EventTransactionParams) (*EventsResponse, error) {
 	path := urlEscapePath("/events/{id}/transaction", id)
 	query := params.values()
-	return doSlice[Event](c, ctx, "GET", path, query, nil)
+	return do[EventsResponse](c, ctx, "GET", path, query, nil)
 }
 
 // EventTransactionParams are the query parameters for EventTransaction.
 type EventTransactionParams struct {
-	Decoded string
+	Decoded    string
+	Fields     string
+	IncludeXdr string
+	Pretty     string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -1152,6 +1555,15 @@ func (p EventTransactionParams) values() url.Values {
 	v := url.Values{}
 	if p.Decoded != "" {
 		v.Set("decoded", p.Decoded)
+	}
+	if p.Fields != "" {
+		v.Set("fields", p.Fields)
+	}
+	if p.IncludeXdr != "" {
+		v.Set("include_xdr", p.IncludeXdr)
+	}
+	if p.Pretty != "" {
+		v.Set("pretty", p.Pretty)
 	}
 	return v
 }
@@ -1239,15 +1651,17 @@ func (c *Client) UpdateSubscription(ctx context.Context, id int64, body UpdateSu
 // ListDeliveries List delivery attempts for a subscription.
 //
 // GET /subscriptions/{id}/deliveries
-func (c *Client) ListDeliveries(ctx context.Context, id int64, params ListDeliveriesParams) ([]DeliveryAttempt, error) {
+func (c *Client) ListDeliveries(ctx context.Context, id int64, params ListDeliveriesParams) (*ListDeliveriesResponse, error) {
 	path := urlEscapePath("/subscriptions/{id}/deliveries", strconv.FormatInt(id, 10))
 	query := params.values()
-	return doSlice[DeliveryAttempt](c, ctx, "GET", path, query, nil)
+	return do[ListDeliveriesResponse](c, ctx, "GET", path, query, nil)
 }
 
 // ListDeliveriesParams are the query parameters for ListDeliveries.
 type ListDeliveriesParams struct {
-	Limit int64
+	Limit    int64
+	Envelope string
+	Pretty   string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -1257,29 +1671,36 @@ func (p ListDeliveriesParams) values() url.Values {
 	if p.Limit != 0 {
 		v.Set("limit", strconv.FormatInt(p.Limit, 10))
 	}
+	if p.Envelope != "" {
+		v.Set("envelope", p.Envelope)
+	}
+	if p.Pretty != "" {
+		v.Set("pretty", p.Pretty)
+	}
 	return v
 }
 
 // CurrentTenant Describe the calling tenant.
 //
 // GET /tenant
-func (c *Client) CurrentTenant(ctx context.Context) (*CurrentTenantResponse, error) {
+func (c *Client) CurrentTenant(ctx context.Context) (*CurrentTenant, error) {
 	path := "/tenant"
-	return do[CurrentTenantResponse](c, ctx, "GET", path, nil, nil)
+	return do[CurrentTenant](c, ctx, "GET", path, nil, nil)
 }
 
 // CurrentTenantUsage Usage for the calling tenant.
 //
 // GET /tenant/usage
-func (c *Client) CurrentTenantUsage(ctx context.Context, params CurrentTenantUsageParams) (*CurrentTenantUsageResponse, error) {
+func (c *Client) CurrentTenantUsage(ctx context.Context, params CurrentTenantUsageParams) (*UsagePage, error) {
 	path := "/tenant/usage"
 	query := params.values()
-	return do[CurrentTenantUsageResponse](c, ctx, "GET", path, query, nil)
+	return do[UsagePage](c, ctx, "GET", path, query, nil)
 }
 
 // CurrentTenantUsageParams are the query parameters for CurrentTenantUsage.
 type CurrentTenantUsageParams struct {
-	Days int64
+	Days   int64
+	Pretty string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -1289,31 +1710,34 @@ func (p CurrentTenantUsageParams) values() url.Values {
 	if p.Days != 0 {
 		v.Set("days", strconv.FormatInt(p.Days, 10))
 	}
+	if p.Pretty != "" {
+		v.Set("pretty", p.Pretty)
+	}
 	return v
 }
 
 // TenantWatchList List the tenant's watched contracts.
 //
 // GET /tenant/watch
-func (c *Client) TenantWatchList(ctx context.Context) (*TenantWatchListResponse, error) {
+func (c *Client) TenantWatchList(ctx context.Context) (*TenantWatchList, error) {
 	path := "/tenant/watch"
-	return do[TenantWatchListResponse](c, ctx, "GET", path, nil, nil)
+	return do[TenantWatchList](c, ctx, "GET", path, nil, nil)
 }
 
 // AddTenantWatch Add a contract to the tenant's watch list.
 //
 // POST /tenant/watch
-func (c *Client) AddTenantWatch(ctx context.Context) (*AddTenantWatchResponse, error) {
+func (c *Client) AddTenantWatch(ctx context.Context, body WatchedContractRequest) (*TenantWatchList, error) {
 	path := "/tenant/watch"
-	return do[AddTenantWatchResponse](c, ctx, "POST", path, nil, nil)
+	return do[TenantWatchList](c, ctx, "POST", path, nil, body)
 }
 
 // RemoveTenantWatch Remove a contract from the tenant's watch list.
 //
 // DELETE /tenant/watch/{contract_id}
-func (c *Client) RemoveTenantWatch(ctx context.Context, contractID string) (*RemoveTenantWatchResponse, error) {
+func (c *Client) RemoveTenantWatch(ctx context.Context, contractID string) (*TenantWatchList, error) {
 	path := urlEscapePath("/tenant/watch/{contract_id}", contractID)
-	return do[RemoveTenantWatchResponse](c, ctx, "DELETE", path, nil, nil)
+	return do[TenantWatchList](c, ctx, "DELETE", path, nil, nil)
 }
 
 // Version Build version information.
@@ -1327,26 +1751,42 @@ func (c *Client) Version(ctx context.Context) (*VersionResponse, error) {
 // ListWatchedContracts List watched contracts.
 //
 // GET /watched-contracts
-func (c *Client) ListWatchedContracts(ctx context.Context) (*ListWatchedContractsResponse, error) {
+func (c *Client) ListWatchedContracts(ctx context.Context) (*WatchedContractsPage, error) {
 	path := "/watched-contracts"
-	return do[ListWatchedContractsResponse](c, ctx, "GET", path, nil, nil)
+	return do[WatchedContractsPage](c, ctx, "GET", path, nil, nil)
 }
 
 // AddWatchedContract Add a watched contract.
 //
 // POST /watched-contracts
-func (c *Client) AddWatchedContract(ctx context.Context) (*AddWatchedContractResponse, error) {
+func (c *Client) AddWatchedContract(ctx context.Context, params AddWatchedContractParams, body WatchedContractRequest) (*WatchedContractAdded, error) {
 	path := "/watched-contracts"
-	return do[AddWatchedContractResponse](c, ctx, "POST", path, nil, nil)
+	query := params.values()
+	return do[WatchedContractAdded](c, ctx, "POST", path, query, body)
+}
+
+// AddWatchedContractParams are the query parameters for AddWatchedContract.
+type AddWatchedContractParams struct {
+	Confirm string
+}
+
+// values renders the non-zero fields as query parameters, so an
+// unset field is omitted from the URL rather than sent as empty.
+func (p AddWatchedContractParams) values() url.Values {
+	v := url.Values{}
+	if p.Confirm != "" {
+		v.Set("confirm", p.Confirm)
+	}
+	return v
 }
 
 // RemoveWatchedContract Stop watching a contract.
 //
 // DELETE /watched-contracts/{id}
-func (c *Client) RemoveWatchedContract(ctx context.Context, id string, params RemoveWatchedContractParams) (*RemoveWatchedContractResponse, error) {
+func (c *Client) RemoveWatchedContract(ctx context.Context, id string, params RemoveWatchedContractParams) (*WatchedContractRemoved, error) {
 	path := urlEscapePath("/watched-contracts/{id}", id)
 	query := params.values()
-	return do[RemoveWatchedContractResponse](c, ctx, "DELETE", path, query, nil)
+	return do[WatchedContractRemoved](c, ctx, "DELETE", path, query, nil)
 }
 
 // RemoveWatchedContractParams are the query parameters for RemoveWatchedContract.

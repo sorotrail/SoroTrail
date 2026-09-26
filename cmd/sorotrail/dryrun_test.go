@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -216,12 +218,15 @@ func TestDispatchRoutesSubcommands(t *testing.T) {
 		name string
 		args []string
 	}{
+		{"ingester with dry-run", []string{"--dry-run"}},
+		{"ingester with dry-run=false", []string{"--dry-run=false"}},
 		{"replay with dry-run", []string{"replay", "--from-ledger", "1", "--dry-run"}},
 		{"replay without dry-run", []string{"replay", "--from-ledger", "1"}},
 		{"backfill with dry-run", []string{"backfill", "--contract", "CABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEF", "--from-ledger", "1", "--rps", "1", "--dry-run"}},
 		{"backfill without dry-run", []string{"backfill", "--contract", "CABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEFCABCDEF", "--from-ledger", "1", "--rps", "1"}},
 		{"index-addresses with dry-run", []string{"index-addresses", "--dry-run"}},
 		{"index-addresses without dry-run", []string{"index-addresses"}},
+		{"contracts with invalid ID", []string{"contracts", "add", "not-a-contract"}},
 	}
 
 	for _, tt := range tests {
@@ -247,6 +252,42 @@ func TestDispatchUnknownSubcommand(t *testing.T) {
 	err := dispatch([]string{"nonexistent"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unknown subcommand")
+}
+
+func TestParseIngesterFlags(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantDry bool
+		wantErr string
+		help    bool
+	}{
+		{name: "no options", wantDry: false},
+		{name: "dry run", args: []string{"--dry-run"}, wantDry: true},
+		{name: "explicit false", args: []string{"--dry-run=false"}, wantDry: false},
+		{name: "short spelling", args: []string{"-dry-run"}, wantDry: true},
+		{name: "help", args: []string{"--help"}, help: true},
+		{name: "unknown flag", args: []string{"--not-a-flag"}, wantErr: "flag provided but not defined"},
+		{name: "positional argument", args: []string{"replay"}, wantErr: "unexpected argument"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseIngesterFlags(tt.args)
+			if tt.help {
+				require.Error(t, err)
+				assert.True(t, errors.Is(err, flag.ErrHelp))
+				return
+			}
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantDry, got.dryRun)
+		})
+	}
 }
 
 // ---------- replay flag validation ----------
@@ -384,6 +425,14 @@ func TestDryRunFlagAccepted(t *testing.T) {
 		name string
 		args []string
 	}{
+		{
+			name: "ingester --dry-run",
+			args: []string{"--dry-run"},
+		},
+		{
+			name: "ingester --dry-run=false",
+			args: []string{"--dry-run=false"},
+		},
 		{
 			name: "replay --dry-run",
 			args: []string{"replay", "--from-ledger", "1", "--dry-run"},

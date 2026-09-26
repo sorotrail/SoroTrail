@@ -1,0 +1,159 @@
+{
+  "account_address": {
+    "address": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+  },
+  "bool_false": {
+    "bool": false
+  },
+  "bool_true": {
+    "bool": true
+  },
+  "bytes": {
+    "bytes": "deadbeef"
+  },
+  "contract_address": {
+    "address": "CAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSBFLM"
+  },
+  "contract_instance": {
+    "contract_instance": {
+      "executable": {
+        "wasm_hash": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+      },
+      "storage": [
+        {
+          "key": {
+            "symbol": "amount"
+          },
+          "val": {
+            "u64": 1000
+          }
+        }
+      ]
+    }
+  },
+  "contract_instance_external_ref": {
+    "contract_instance": {
+      "executable": {
+        "external_ref": {
+          "executable_owner": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          "tag": "v1"
+        }
+      },
+      "storage": []
+    }
+  },
+  "contract_instance_stellar_asset": {
+    "contract_instance": {
+      "executable": {
+        "stellar_asset": null
+      },
+      "storage": []
+    }
+  },
+  "duration": {
+    "duration": 456
+  },
+  "empty_map": {
+    "map": []
+  },
+  "empty_vec": {
+    "vec": []
+  },
+  "error_contract": {
+    "error": {
+      "contract_code": 7,
+      "type": "ScErrorTypeSceContract"
+    }
+  },
+  "executable_tag": {
+    "executable_tag": "soroban-tag"
+  },
+  "i128_negative": {
+    "i128": "-1"
+  },
+  "i256_negative": {
+    "i256": "-18446744073709551615"
+  },
+  "i32_negative": {
+    "i32": -7
+  },
+  "i64_negative": {
+    "i64": -42
+  },
+  "ledger_key_nonce": {
+    "ledger_key_nonce": {
+      "nonce": 42
+    }
+  },
+  "map": {
+    "map": [
+      {
+        "key": {
+          "symbol": "amount"
+        },
+        "val": {
+          "u64": 100
+        }
+      }
+    ]
+  },
+  "nested_vec_map": {
+    "vec": [
+      {
+        "u64": 1
+      },
+      {
+        "map": [
+          {
+            "key": {
+              "symbol": "key"
+            },
+            "val": {
+              "u64": 42
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "string": {
+    "string": "hello"
+  },
+  "symbol": {
+    "symbol": "transfer"
+  },
+  "timepoint": {
+    "timepoint": 123
+  },
+  "u128": {
+    "u128": "18446744073709551618"
+  },
+  "u256": {
+    "u256": "6277101735386680764516354157049543343084444891548699590660"
+  },
+  "u32": {
+    "u32": 7
+  },
+  "u64": {
+    "u64": 42
+  },
+  "unknown_ledger_key": {
+    "unknown": {
+      "base64": "AAAAFA==",
+      "type": "ScValTypeScvLedgerKeyContractInstance"
+    }
+  },
+  "vec": {
+    "vec": [
+      {
+        "symbol": "transfer"
+      },
+      {
+        "u64": 9
+      }
+    ]
+  },
+  "void": {
+    "void": null
+  }
+}

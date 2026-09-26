@@ -151,6 +151,12 @@ type mockStore struct {
 	upsertDelay time.Duration
 	// contractCursors backs the per-contract cursor methods.
 	contractCursors []store.ContractCursor
+
+	// Write counters make dry-run guarantees explicit in tests without
+	// inferring them from the resulting event map.
+	stateSaves     int
+	addressUpserts int
+	replaceCalls   int
 }
 
 func newMockStore() *mockStore {
@@ -193,6 +199,7 @@ func (m *mockStore) PruneEventsBefore(context.Context, time.Time) (int64, error)
 func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event, fromLedger, toLedger int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.replaceCalls++
 	for id, e := range m.events {
 		if e.Ledger >= fromLedger && e.Ledger <= toLedger {
 			delete(m.events, id)
@@ -290,6 +297,7 @@ func (m *mockStore) GetIngestionState(_ context.Context) (store.IngestionState, 
 func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.stateSaves++
 	m.state = &s
 	return nil
 }
@@ -465,7 +473,12 @@ func (m *mockStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (
 	return 0, nil
 }
 
-func (m *mockStore) UpsertAddressRefs(context.Context, []store.AddressRef) error { return nil }
+func (m *mockStore) UpsertAddressRefs(context.Context, []store.AddressRef) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.addressUpserts++
+	return nil
+}
 func (m *mockStore) QueryAddressEvents(context.Context, string, store.EventFilter) ([]store.Event, string, error) {
 	return nil, "", nil
 }

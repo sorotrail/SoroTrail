@@ -221,6 +221,11 @@ type Options struct {
 	// (e.g. "mainnet", "testnet"). Empty means callers should treat it as
 	// the store default ("default").
 	Network string
+	// DryRun fetches and decodes events, then logs the writes the normal
+	// ingester would perform without changing the store. It also keeps the
+	// preview frontier in memory, so draining multiple pages does not
+	// repeatedly fetch the first page.
+	DryRun bool
 }
 
 // LagMetrics is the optional sink for ingest-lag signals. The Ingester
@@ -329,6 +334,14 @@ func (o *Options) applyDefaults() {
 // systems (webhooks, SSE, etc.) can react without blocking ingestion.
 type EventNotifier interface {
 	NotifyEvents(ctx context.Context, events []store.Event)
+}
+
+// dryRunPosition is the ephemeral cursor used by a preview. It deliberately
+// lives on the Ingester rather than in the store: advancing it lets a
+// multi-page dry run continue without creating a durable resume point.
+type dryRunPosition struct {
+	cursor             string
+	lastIngestedLedger int64
 }
 
 // Ingester pages events out of the RPC and into the store.
@@ -538,6 +551,7 @@ func (o *Options) logAttrs() []any {
 		"jitter_max", o.JitterMax,
 		"lag_warn_ledgers", o.LagWarnLedgers,
 		"reorg_confirmation_window", o.ReorgConfirmationWindow,
+		"dry_run", o.DryRun,
 	}
 }
 
@@ -555,6 +569,9 @@ func (ing *Ingester) backoffSleep(backoff time.Duration) time.Duration {
 
 // Run polls until ctx is canceled. Errors are logged and retried with
 // exponential backoff; the only terminal condition is context cancellation.
+// When Options.DryRun is set, Run instead performs a bounded read-only
+// preview via RunDryRun and returns when the currently available data has
+// been walked.
 //
 // On a clean cycle the loop also performs an optional reorg re-scan over
 // the ledger range [frontier-confWindow, frontier-1] using the existing
@@ -648,6 +665,44 @@ func (ing *Ingester) Run(ctx context.Context) (err error) {
 	}
 }
 
+// RunDryRun performs a read-only preview of live ingestion. It walks pages
+// until the RPC says the current frontier is caught up, keeping its cursor
+// only in memory. No event, cursor, derived-index, dead-letter, broadcast,
+// or notifier write is performed. The method is intentionally separate
+// from the normal retrying loop so a CLI preview terminates instead of
+// leaving an operator with a second long-running process to supervise.
+func (ing *Ingester) RunDryRun(ctx context.Context) (err error) {
+	if !ing.opts.DryRun {
+		return errors.New("RunDryRun requires Options.DryRun")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	ing.log.Info("ingester dry-run started", ing.opts.logAttrs()...)
+	defer func() {
+		if err != nil {
+			ing.log.Info("ingester stopped", "reason", err.Error())
+			return
+		}
+		ing.log.Info("ingester stopped", "dry_run", true)
+	}()
+
+	for {
+		caughtUp, cycleErr := ing.runOnce(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if cycleErr != nil {
+			return cycleErr
+		}
+		if caughtUp {
+			ing.log.Info("ingester dry-run complete", "dry_run", true)
+			return nil
+		}
+	}
+}
+
 // rescanForReorg performs one reorg-detection pass over the recent
 // finalized window. It uses ReingestRange, which fans out across the
 // ingester's filter batches, re-fetches events for the closed range
@@ -658,6 +713,11 @@ func (ing *Ingester) Run(ctx context.Context) (err error) {
 // the caller. A no-op return is fine: it means there's not yet enough
 // history to have a finalized window.
 func (ing *Ingester) rescanForReorg(ctx context.Context) error {
+	if ing.opts.DryRun {
+		ing.log.Debug("dry-run: skipping reorg rescan (no database writes)")
+		return nil
+	}
+
 	state, err := ing.getIngestionState(ctx)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("loading ingestion state for reorg rescan: %w", err)
@@ -751,7 +811,13 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 		state.LastIngestedLedger = int64(startLedger) - 1
 	}
 	state.Network = ing.opts.Network
-	if err := ing.store.SaveIngestionState(ctx, state); err != nil {
+	if ing.opts.DryRun {
+		ing.setDryRunPosition(state.LastCursor, state.LastIngestedLedger)
+		ing.log.Info("dry-run: would update ingestion state",
+			"last_ingested_ledger", state.LastIngestedLedger,
+			"last_cursor", state.LastCursor,
+			"latest_ledger", resp.LatestLedger)
+	} else if err := ing.store.SaveIngestionState(ctx, state); err != nil {
 		return false, err
 	}
 	ing.setIngestionLag(int64(resp.LatestLedger), state.LastIngestedLedger)
@@ -835,6 +901,18 @@ func (ing *Ingester) reingestBatch(ctx context.Context, client rpc.Client, fromL
 		ev.Network = ing.opts.Network
 		storeEvents = append(storeEvents, ev)
 	}
+	if ing.opts.DryRun {
+		ids := make([]string, len(storeEvents))
+		for i, event := range storeEvents {
+			ids[i] = event.ID
+		}
+		ing.log.Info("dry-run: would replace events",
+			"from_ledger", fromLedger,
+			"to_ledger", toLedger,
+			"count", len(storeEvents),
+			"event_ids", ids)
+		return len(storeEvents), nil
+	}
 	if err := ing.store.ReplaceEventsInRange(ctx, storeEvents, int64(fromLedger), int64(toLedger)); err != nil {
 		return 0, fmt.Errorf("ReplaceEventsInRange [%d,%d]: %w", fromLedger, toLedger, err)
 	}
@@ -872,7 +950,12 @@ func (ing *Ingester) effectivePageLimit() uint {
 // window-sweep request chains. A nil return means no cap is configured
 // and every batch pages to completion as before.
 func (ing *Ingester) newCycleBudget() *atomic.Int64 {
-	if ing.opts.MaxEventsPerCycle == 0 {
+	// A preview is not a production ingestion cycle: the cap exists to
+	// bound live memory/latency, while a dry run should be able to walk the
+	// requested window and report the complete write plan. The single-page
+	// path still uses MaxEventsPerCycle as its page limit and advances via
+	// the ephemeral cursor.
+	if ing.opts.MaxEventsPerCycle == 0 || ing.opts.DryRun {
 		return nil
 	}
 	var budget atomic.Int64
@@ -1003,8 +1086,14 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 		lastIngested = int64(end) - 1
 	}
 	now := time.Now().UTC()
-	err = ing.store.SaveIngestionState(ctx, store.IngestionState{Network: ing.opts.Network, LastIngestedLedger: lastIngested, LastSuccessfulPoll: &now})
-	if err != nil {
+	state := store.IngestionState{Network: ing.opts.Network, LastIngestedLedger: lastIngested, LastSuccessfulPoll: &now}
+	if ing.opts.DryRun {
+		ing.setDryRunPosition("", lastIngested)
+		ing.log.Info("dry-run: would update ingestion state",
+			"last_ingested_ledger", lastIngested,
+			"last_cursor", "",
+			"latest_ledger", health.LatestLedger)
+	} else if err = ing.store.SaveIngestionState(ctx, state); err != nil {
 		return false, err
 	}
 	ing.setIngestionLag(int64(health.LatestLedger), lastIngested)
@@ -1141,7 +1230,15 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 			// through it and continue with the rest of the page; otherwise
 			// fall back to the legacy "abort the cycle" behavior so
 			// unconfigured deployments catch the bug instead of silently
-			// dropping events.
+			// dropping events. A dry run reports the same disposition but
+			// never creates the durable dead-letter row.
+			if ing.opts.DryRun {
+				ing.log.Warn("dry-run: would dead-letter event",
+					"event_id", re.ID,
+					"ledger", re.Ledger,
+					"error", err)
+				continue
+			}
 			if ing.deadLetterStore == nil {
 				return err
 			}
@@ -1179,6 +1276,20 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 }
 
 func (ing *Ingester) persistEventBatch(ctx context.Context, events []store.Event, throughLedger, latestLedger uint32) error {
+	if ing.opts.DryRun {
+		ids := make([]string, len(events))
+		for i, event := range events {
+			ids[i] = event.ID
+		}
+		ing.log.Info("dry-run: would write events",
+			"count", len(events),
+			"event_ids", ids,
+			"through_ledger", throughLedger,
+			"latest_ledger", latestLedger)
+		ing.logDryRunAddressRefs(events)
+		return nil
+	}
+
 	persistCtx, persistSpan := ing.tracer.Start(ctx, "ingester.persist_events")
 	_, err := ing.writeEventsPersist(persistCtx, events)
 	persistSpan.End()
@@ -1216,6 +1327,9 @@ func (ing *Ingester) persistEventBatch(ctx context.Context, events []store.Event
 // a page split into.
 func (ing *Ingester) writeEventsPersist(ctx context.Context, events []store.Event) (int64, error) {
 	if len(events) == 0 {
+		return 0, nil
+	}
+	if ing.opts.DryRun {
 		return 0, nil
 	}
 
@@ -1377,6 +1491,16 @@ func (bc *batchController) recordAndBackoff(rows int, latency time.Duration) tim
 	}
 }
 
+func (ing *Ingester) setDryRunPosition(cursor string, lastIngestedLedger int64) {
+	if !ing.opts.DryRun {
+		return
+	}
+	ing.dryRunPosition = &dryRunPosition{
+		cursor:             cursor,
+		lastIngestedLedger: lastIngestedLedger,
+	}
+}
+
 func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, cursor string, err error) {
 	if !ing.startOverrideApplied && ing.opts.StartLedger > 0 {
 		ing.startOverrideApplied = true // Apply override exactly once on startup
@@ -1398,9 +1522,15 @@ func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, c
 		return 0, "", err
 	}
 	if err == nil && state.LastCursor != "" {
+		if ing.opts.DryRun {
+			ing.setDryRunPosition(state.LastCursor, state.LastIngestedLedger)
+		}
 		return 0, state.LastCursor, nil
 	}
 	if err == nil && state.LastIngestedLedger > 0 {
+		if ing.opts.DryRun {
+			ing.setDryRunPosition("", state.LastIngestedLedger)
+		}
 		return uint32(state.LastIngestedLedger) + 1, "", nil
 	}
 
@@ -1438,6 +1568,9 @@ func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, c
 	if resolved < 2 {
 		resolved = 2
 	}
+	if ing.opts.DryRun {
+		ing.setDryRunPosition("", int64(resolved)-1)
+	}
 	ing.log.Info("cold start", "start_ledger", resolved, "latest_ledger", health.LatestLedger)
 	return resolved, "", nil
 }
@@ -1469,10 +1602,18 @@ func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) erro
 	}
 	ing.log.Warn("resume ledger fell outside RPC retention window; skipping ahead — events in the gap are lost",
 		"requested_ledger", requested, "oldest_retained", health.OldestLedger)
-	return ing.store.SaveIngestionState(ctx, store.IngestionState{
+	state := store.IngestionState{
 		Network:            ing.opts.Network,
 		LastIngestedLedger: int64(health.OldestLedger) - 1,
-	})
+	}
+	if ing.opts.DryRun {
+		ing.setDryRunPosition("", state.LastIngestedLedger)
+		ing.log.Info("dry-run: would update ingestion state",
+			"last_ingested_ledger", state.LastIngestedLedger,
+			"last_cursor", "")
+		return nil
+	}
+	return ing.store.SaveIngestionState(ctx, state)
 }
 
 // discardCursor reads the persisted ingestion state and re-saves it without
@@ -1484,6 +1625,15 @@ func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) erro
 // in that path — it guards against any future change that might persist a
 // cursor mid-sweep.
 func (ing *Ingester) discardCursor(ctx context.Context) {
+	if ing.opts.DryRun {
+		if ing.dryRunPosition == nil || ing.dryRunPosition.cursor == "" {
+			return
+		}
+		ing.setDryRunPosition("", ing.dryRunPosition.lastIngestedLedger)
+		ing.log.Info("dry-run: would discard ingestion cursor")
+		return
+	}
+
 	state, err := ing.getIngestionState(ctx)
 	if err != nil {
 		ing.log.Warn("discardCursor: could not read state", "error", err)
@@ -1521,6 +1671,9 @@ func (ing *Ingester) discardCursor(ctx context.Context) {
 // data we can't interpret; we leave hysteresis alone and republish the
 // current value so the gauge stays consistent.
 func (ing *Ingester) checkLag(ctx context.Context) {
+	if ing.opts.DryRun {
+		return
+	}
 	if ing.opts.LagWarnLedgers == 0 {
 		return // alarm disabled (operators opted out or test fixture)
 	}
@@ -1671,6 +1824,9 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 // setIngestionLag updates the Prometheus gauge for ingestion lag.
 // chainHead can be 0 when unknown (no-op in that case).
 func (ing *Ingester) setIngestionLag(chainHead, lastIngested int64) {
+	if ing.opts.DryRun {
+		return
+	}
 	if chainHead <= 0 || lastIngested <= 0 {
 		return
 	}
@@ -1748,6 +1904,9 @@ func clampDuration(d, min, max time.Duration) time.Duration {
 // logged but do not fail the ingest pass, because the index can be rebuilt
 // from stored events via the index-addresses backfill command.
 func (ing *Ingester) indexEventAddresses(ctx context.Context, events []store.Event) error {
+	if ing.opts.DryRun {
+		return nil
+	}
 	if len(events) == 0 {
 		return nil
 	}
