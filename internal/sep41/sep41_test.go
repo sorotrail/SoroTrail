@@ -109,6 +109,59 @@ func TestDecode_Transfer(t *testing.T) {
 	}
 }
 
+func TestParseTransferValue(t *testing.T) {
+	amount := func(value string) txVal {
+		return txVal{I128: &value}
+	}
+	symbol := func(value string) txVal {
+		return txVal{Symbol: &value}
+	}
+	corrupted := "corrupted"
+	toMuxedID := uint64(42)
+
+	tests := []struct {
+		name       string
+		value      txVal
+		wantAmount string
+		wantMuxID  *uint64
+	}{
+		{
+			name:       "basic i128 amount",
+			value:      amount("10000000"),
+			wantAmount: "10000000",
+		},
+		{
+			name: "full precision i128 amount in muxed transfer",
+			value: txVal{Map: []mapEntry{
+				{Key: symbol("amount"), Val: amount("170141183460469231731687303715884105727")},
+				{Key: symbol("to_muxed_id"), Val: txVal{U64: &toMuxedID}},
+			}},
+			wantAmount: "170141183460469231731687303715884105727",
+			wantMuxID:  &toMuxedID,
+		},
+		{
+			name:       "missing amount is rejected",
+			value:      txVal{Map: []mapEntry{{Key: symbol("amount"), Val: txVal{String: &corrupted}}}},
+		},
+		{
+			name:       "non-transfer envelope is rejected",
+			value:      txVal{Symbol: func() *string { value := "mint"; return &value }()},
+		},
+		{
+			name:  "empty value is rejected without panicking",
+			value: txVal{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotAmount, gotMuxID := parseTransferValue(tt.value)
+			assert.Equal(t, tt.wantAmount, gotAmount)
+			assert.Equal(t, tt.wantMuxID, gotMuxID)
+		})
+	}
+}
+
 func TestDecode_MintBurnClawbackApprove(t *testing.T) {
 	mint := decode(t,
 		`[{"symbol":"mint"},{"address":"GA1"},{"string":"native"}]`,
