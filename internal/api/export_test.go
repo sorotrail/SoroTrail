@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -48,26 +51,39 @@ type fakeExportStore struct {
 	// interface grows; unstubbed methods panic if a test calls them.
 	store.Store
 
-	events   []store.Event
-	position int
-	cursor   string
+	events    []store.Event
+	position  int
+	cursor    string
+	pageSize  int
+	callCount int
+	errOnCall int
+	queryErr  error
+	queries   []store.EventFilter
 }
 
 func newFakeExportStore(events []store.Event) *fakeExportStore {
 	return &fakeExportStore{events: events}
 }
 
-// QueryEvents returns a 2-row page so the export handler exercises its
+// QueryEvents returns a page so the export handler exercises its
 // cursor-walking loop instead of the single-page branch. It also
 // returns the cursor the handler will mirror back via filter.Cursor.
 func (f *fakeExportStore) QueryEvents(_ context.Context, fl store.EventFilter) ([]store.Event, string, error) {
+	f.callCount++
+	f.queries = append(f.queries, fl)
+	if f.errOnCall > 0 && f.callCount == f.errOnCall {
+		return nil, "", f.queryErr
+	}
+	if f.queryErr != nil && f.errOnCall == 0 {
+		return nil, "", f.queryErr
+	}
 	if f.cursor != "" && fl.Cursor != f.cursor {
 		return nil, "", fmt.Errorf("cursor mismatch: handler=%q store=%q", fl.Cursor, f.cursor)
 	}
 	// Filter by ledger range and contract (mirrors Postgres WHERE).
 	var matched []store.Event
 	for _, e := range f.events {
-		if e.ContractID != fl.ContractID {
+		if fl.ContractID != "" && e.ContractID != fl.ContractID {
 			continue
 		}
 		if fl.FromLedger > 0 && e.Ledger < fl.FromLedger {
@@ -88,8 +104,10 @@ func (f *fakeExportStore) QueryEvents(_ context.Context, fl store.EventFilter) (
 			}
 		}
 	}
-	// 2-row page: enforces the pagination loop in the handler.
-	const page = 2
+	page := f.pageSize
+	if page <= 0 {
+		page = 2
+	}
 	start := f.position
 	if start >= len(matched) {
 		return nil, "", nil
@@ -560,6 +578,606 @@ func TestEventsCSV_ResponseHeaders(t *testing.T) {
 		"CSV export must use no-store to prevent stale caching")
 }
 
+// testExportWriter is a test ResponseWriter that tracks Flush calls and can
+// simulate write failures (e.g. client disconnect or broken pipe).
+type testExportWriter struct {
+	header     http.Header
+	buf        bytes.Buffer
+	flushes    int
+	failAfter  int // fail write once total bytes written would exceed this (-1 = never)
+	writeErr   error
+	statusCode int
+}
+
+func newTestExportWriter() *testExportWriter {
+	return &testExportWriter{
+		header:    make(http.Header),
+		failAfter: -1,
+	}
+}
+
+func (w *testExportWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *testExportWriter) Write(p []byte) (int, error) {
+	if w.failAfter >= 0 && w.buf.Len()+len(p) > w.failAfter {
+		if w.writeErr != nil {
+			return 0, w.writeErr
+		}
+		return 0, errors.New("simulated write error")
+	}
+	return w.buf.Write(p)
+}
+
+func (w *testExportWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+}
+
+func (w *testExportWriter) Flush() {
+	w.flushes++
+}
+
+// testContextWithLogger creates a context carrying a test slog logger writing
+// to buf, which loggerFromContext will resolve.
+func testContextWithLogger(ctx context.Context, buf *bytes.Buffer) context.Context {
+	logger := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return context.WithValue(ctx, loggerCtxKey, logger)
+}
+
+// seedManyEvents generates count events in stable ascending order,
+// populated with all Event fields matching the JSON API representation.
+func seedManyEvents(contractID string, count int) []store.Event {
+	out := make([]store.Event, 0, count)
+	topics := json.RawMessage(`[{"symbol":"transfer,with,commas"},{"address":"GA\"quoted\""}]`)
+	value := json.RawMessage(`{"i128":"1000"}`)
+	for l := int64(1); l <= int64(count); l++ {
+		out = append(out, store.Event{
+			ID:               fmt.Sprintf("0000000001-%010d", l),
+			ContractID:       contractID,
+			Ledger:           100 + l,
+			Type:             "contract",
+			TxHash:           fmt.Sprintf("hash%d", l),
+			TxIndex:          int32(l),
+			OpIndex:          0,
+			InSuccessfulCall: true,
+			Topics:           topics,
+			Value:            value,
+			CreatedAt:        time.Date(2026, 9, 24, 12, 0, int(l%60), 0, time.UTC),
+			Network:          "testnet",
+		})
+	}
+	return out
+}
+
+func TestExportFilter(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st := newFakeExportStore(nil)
+	s := New(st, nil, logger, "")
+
+	tenantScope := store.NewScope([]string{testContractID})
+
+	tests := []struct {
+		name       string
+		ctx        context.Context
+		contractID string
+		fromLedger int64
+		toLedger   int64
+		want       store.EventFilter
+	}{
+		{
+			name:       "standard bounds with wildcard principal scope",
+			ctx:        WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}),
+			contractID: testContractID,
+			fromLedger: 100,
+			toLedger:   200,
+			want: store.EventFilter{
+				ContractID: testContractID,
+				FromLedger: 100,
+				ToLedger:   200,
+				Order:      "asc",
+				OrderBy:    store.OrderByLedger,
+				Limit:      exportQueryBatchSize,
+				Scope:      store.WildcardScope(),
+			},
+		},
+		{
+			name:       "tenant-scoped principal carried on export filter",
+			ctx:        WithPrincipal(context.Background(), Principal{Scope: tenantScope}),
+			contractID: testContractID,
+			fromLedger: 50,
+			toLedger:   150,
+			want: store.EventFilter{
+				ContractID: testContractID,
+				FromLedger: 50,
+				ToLedger:   150,
+				Order:      "asc",
+				OrderBy:    store.OrderByLedger,
+				Limit:      exportQueryBatchSize,
+				Scope:      tenantScope,
+			},
+		},
+		{
+			name:       "zero ledger bounds preserved",
+			ctx:        WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}),
+			contractID: testContractID,
+			fromLedger: 0,
+			toLedger:   0,
+			want: store.EventFilter{
+				ContractID: testContractID,
+				FromLedger: 0,
+				ToLedger:   0,
+				Order:      "asc",
+				OrderBy:    store.OrderByLedger,
+				Limit:      exportQueryBatchSize,
+				Scope:      store.WildcardScope(),
+			},
+		},
+		{
+			name:       "empty context without principal yields empty denying scope",
+			ctx:        context.Background(),
+			contractID: testContractID,
+			fromLedger: 10,
+			toLedger:   20,
+			want: store.EventFilter{
+				ContractID: testContractID,
+				FromLedger: 10,
+				ToLedger:   20,
+				Order:      "asc",
+				OrderBy:    store.OrderByLedger,
+				Limit:      exportQueryBatchSize,
+				Scope:      store.Scope{},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := s.exportFilter(tt.ctx, tt.contractID, tt.fromLedger, tt.toLedger)
+			assert.Equal(t, tt.want.ContractID, got.ContractID)
+			assert.Equal(t, tt.want.FromLedger, got.FromLedger)
+			assert.Equal(t, tt.want.ToLedger, got.ToLedger)
+			assert.Equal(t, tt.want.Order, got.Order)
+			assert.Equal(t, tt.want.OrderBy, got.OrderBy)
+			assert.Equal(t, tt.want.Limit, got.Limit)
+			assert.Equal(t, tt.want.Scope, got.Scope)
+		})
+	}
+}
+
+func TestStreamExportCSV(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	events := seedEvents(testContractID)
+
+	t.Run("header_matches_columns_and_data_rows", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
+
+		s.streamExportCSV(ctx, w, testContractID, 100, 103)
+
+		r := csv.NewReader(&w.buf)
+		header, err := r.Read()
+		require.NoError(t, err)
+		expectedHeader := []string{"id", "ledger", "type", "tx_hash", "topics", "value"}
+		assert.Equal(t, expectedHeader, header, "header row must match documented columns")
+
+		records, err := r.ReadAll()
+		require.NoError(t, err, "all CSV records must be validly formatted")
+		require.Len(t, records, len(events), "each event must produce one data row")
+
+		for i, row := range records {
+			require.Len(t, row, len(expectedHeader), "data row must have same number of columns as header")
+			ev := events[i]
+			assert.Equal(t, ev.ID, row[0], "column 0 must be event ID")
+			assert.Equal(t, fmt.Sprintf("%d", ev.Ledger), row[1], "column 1 must be ledger")
+			assert.Equal(t, ev.Type, row[2], "column 2 must be event type")
+			assert.Equal(t, ev.TxHash, row[3], "column 3 must be tx_hash")
+			assert.Equal(t, string(ev.Topics), row[4], "column 4 must be verbatim topics JSON")
+			assert.Equal(t, string(ev.Value), row[5], "column 5 must be verbatim value JSON")
+		}
+	})
+
+	t.Run("empty_result_produces_header_only_valid_export", func(t *testing.T) {
+		st := newFakeExportStore(nil)
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
+
+		s.streamExportCSV(ctx, w, testContractID, 100, 200)
+
+		r := csv.NewReader(&w.buf)
+		header, err := r.Read()
+		require.NoError(t, err)
+		assert.Equal(t, []string{"id", "ledger", "type", "tx_hash", "topics", "value"}, header)
+
+		// Next read must return EOF, confirming a valid empty CSV file, not truncated or 0-byte.
+		_, err = r.Read()
+		assert.Equal(t, io.EOF, err)
+	})
+
+	t.Run("mid_stream_store_error_is_surfaced", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		st.errOnCall = 2
+		st.queryErr = errors.New("database connection lost mid-stream")
+
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+
+		var logBuf bytes.Buffer
+		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
+
+		s.streamExportCSV(ctx, w, testContractID, 100, 103)
+
+		// Verify error was logged rather than swallowed silently.
+		assert.Contains(t, logBuf.String(), "export query")
+		assert.Contains(t, logBuf.String(), "database connection lost mid-stream")
+
+		// Output only contains header + page 1 (2 events).
+		r := csv.NewReader(&w.buf)
+		all, err := r.ReadAll()
+		require.NoError(t, err)
+		assert.Len(t, all, 3, "should contain header + first page of 2 rows before error")
+	})
+
+	t.Run("invalid_cursor_mid_stream_is_surfaced", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		st.errOnCall = 2
+		st.queryErr = store.ErrInvalidCursor
+
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+
+		var logBuf bytes.Buffer
+		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
+
+		s.streamExportCSV(ctx, w, testContractID, 100, 103)
+
+		assert.Contains(t, logBuf.String(), "export cursor")
+	})
+
+	t.Run("memory_does_not_scale_with_row_count", func(t *testing.T) {
+		const totalRows = 100
+		const pageSize = 10
+		bigEvents := seedManyEvents(testContractID, totalRows)
+		st := newFakeExportStore(bigEvents)
+		st.pageSize = pageSize
+
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
+
+		s.streamExportCSV(ctx, w, testContractID, 1, 1000)
+
+		// Verify flusher was called after header and after each of the 10 pages.
+		expectedFlushes := 1 + (totalRows / pageSize)
+		assert.Equal(t, expectedFlushes, w.flushes, "flusher must be called after header and every page")
+
+		r := csv.NewReader(&w.buf)
+		all, err := r.ReadAll()
+		require.NoError(t, err)
+		assert.Len(t, all, totalRows+1, "must stream all rows plus header")
+	})
+
+	t.Run("client_disconnect_terminates_early", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+
+		ctx, cancel := context.WithCancel(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}))
+		cancel() // already canceled
+
+		s.streamExportCSV(ctx, w, testContractID, 100, 103)
+
+		// After the first page, context check returns and does not query remaining pages.
+		assert.Equal(t, 1, st.callCount)
+	})
+
+	t.Run("write_failure_surfaces_error_and_halts", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+		headerLen := len("id,ledger,type,tx_hash,topics,value\n")
+		w.failAfter = headerLen
+		w.writeErr = errors.New("client connection dropped")
+
+		var logBuf bytes.Buffer
+		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
+
+		s.streamExportCSV(ctx, w, testContractID, 100, 103)
+
+		assert.Contains(t, logBuf.String(), "export csv write")
+	})
+}
+
+func TestStreamExportNDJSON(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	events := seedEvents(testContractID)
+
+	t.Run("emits_one_valid_json_document_per_line_matching_api_shape", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
+
+		s.streamExportNDJSON(ctx, w, testContractID, 100, 103)
+
+		lines := strings.Split(strings.TrimRight(w.buf.String(), "\n"), "\n")
+		require.Len(t, lines, len(events), "must emit exactly one line per event")
+
+		expectedFields := []string{
+			"id", "contract_id", "ledger", "type", "tx_hash",
+			"tx_index", "op_index", "in_successful_call", "topics",
+			"value", "created_at", "network",
+		}
+
+		for i, line := range lines {
+			assert.True(t, json.Valid([]byte(line)), "line %d must be valid JSON", i)
+
+			var rawMap map[string]any
+			require.NoError(t, json.Unmarshal([]byte(line), &rawMap))
+			for _, field := range expectedFields {
+				assert.Contains(t, rawMap, field, "line %d must contain JSON API field %q", i, field)
+			}
+
+			var decoded store.Event
+			require.NoError(t, json.Unmarshal([]byte(line), &decoded))
+			assert.Equal(t, events[i].ID, decoded.ID)
+			assert.Equal(t, events[i].Ledger, decoded.Ledger)
+			assert.Equal(t, events[i].ContractID, decoded.ContractID)
+			assert.Equal(t, events[i].Type, decoded.Type)
+			assert.Equal(t, events[i].TxHash, decoded.TxHash)
+		}
+	})
+
+	t.Run("empty_result_produces_valid_empty_ndjson", func(t *testing.T) {
+		st := newFakeExportStore(nil)
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
+
+		s.streamExportNDJSON(ctx, w, testContractID, 100, 200)
+
+		assert.Empty(t, w.buf.String(), "empty result set must produce 0 bytes of NDJSON output")
+	})
+
+	t.Run("mid_stream_store_error_is_surfaced", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		st.errOnCall = 2
+		st.queryErr = errors.New("ndjson store query failure")
+
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+
+		var logBuf bytes.Buffer
+		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
+
+		s.streamExportNDJSON(ctx, w, testContractID, 100, 103)
+
+		assert.Contains(t, logBuf.String(), "export query")
+		assert.Contains(t, logBuf.String(), "ndjson store query failure")
+
+		lines := strings.Split(strings.TrimRight(w.buf.String(), "\n"), "\n")
+		assert.Len(t, lines, 2, "must terminate with only first page of 2 events")
+	})
+
+	t.Run("invalid_cursor_mid_stream_is_surfaced", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		st.errOnCall = 2
+		st.queryErr = store.ErrInvalidCursor
+
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+
+		var logBuf bytes.Buffer
+		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
+
+		s.streamExportNDJSON(ctx, w, testContractID, 100, 103)
+
+		assert.Contains(t, logBuf.String(), "export cursor")
+	})
+
+	t.Run("memory_does_not_scale_with_row_count", func(t *testing.T) {
+		const totalRows = 100
+		const pageSize = 10
+		bigEvents := seedManyEvents(testContractID, totalRows)
+		st := newFakeExportStore(bigEvents)
+		st.pageSize = pageSize
+
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
+
+		s.streamExportNDJSON(ctx, w, testContractID, 1, 1000)
+
+		assert.Equal(t, totalRows/pageSize, w.flushes, "flusher must be called once per page")
+
+		lines := strings.Split(strings.TrimRight(w.buf.String(), "\n"), "\n")
+		assert.Len(t, lines, totalRows)
+	})
+
+	t.Run("client_disconnect_terminates_early", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+
+		ctx, cancel := context.WithCancel(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}))
+		cancel()
+
+		s.streamExportNDJSON(ctx, w, testContractID, 100, 103)
+
+		assert.Equal(t, 1, st.callCount)
+	})
+
+	t.Run("write_failure_surfaces_error_and_halts", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+		w.failAfter = 10
+		w.writeErr = errors.New("client closed connection")
+
+		var logBuf bytes.Buffer
+		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
+
+		s.streamExportNDJSON(ctx, w, testContractID, 100, 103)
+
+		assert.Contains(t, logBuf.String(), "export ndjson write")
+	})
+}
+
+func TestStreamEventsCSV(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	events := seedEvents(testContractID)
+
+	filter := store.EventFilter{
+		ContractID: testContractID,
+		FromLedger: 100,
+		ToLedger:   103,
+		Limit:      exportQueryBatchSize,
+		Scope:      store.WildcardScope(),
+	}
+
+	t.Run("header_matches_columns_and_data_rows", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
+
+		s.streamEventsCSV(ctx, w, filter)
+
+		r := csv.NewReader(&w.buf)
+		header, err := r.Read()
+		require.NoError(t, err)
+		expectedHeader := []string{"id", "ledger", "type", "tx_hash", "topics", "value"}
+		assert.Equal(t, expectedHeader, header, "header row must match documented columns")
+
+		records, err := r.ReadAll()
+		require.NoError(t, err)
+		require.Len(t, records, len(events))
+
+		for i, row := range records {
+			require.Len(t, row, len(expectedHeader))
+			ev := events[i]
+			assert.Equal(t, ev.ID, row[0])
+			assert.Equal(t, fmt.Sprintf("%d", ev.Ledger), row[1])
+			assert.Equal(t, ev.Type, row[2])
+			assert.Equal(t, ev.TxHash, row[3])
+			assert.Equal(t, string(ev.Topics), row[4])
+			assert.Equal(t, string(ev.Value), row[5])
+		}
+	})
+
+	t.Run("empty_result_produces_header_only_valid_export", func(t *testing.T) {
+		st := newFakeExportStore(nil)
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
+
+		s.streamEventsCSV(ctx, w, filter)
+
+		r := csv.NewReader(&w.buf)
+		header, err := r.Read()
+		require.NoError(t, err)
+		assert.Equal(t, []string{"id", "ledger", "type", "tx_hash", "topics", "value"}, header)
+
+		_, err = r.Read()
+		assert.Equal(t, io.EOF, err)
+	})
+
+	t.Run("mid_stream_store_error_is_surfaced", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		st.errOnCall = 2
+		st.queryErr = errors.New("events csv query error")
+
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+
+		var logBuf bytes.Buffer
+		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
+
+		s.streamEventsCSV(ctx, w, filter)
+
+		assert.Contains(t, logBuf.String(), "export query")
+		assert.Contains(t, logBuf.String(), "events csv query error")
+
+		r := csv.NewReader(&w.buf)
+		all, err := r.ReadAll()
+		require.NoError(t, err)
+		assert.Len(t, all, 3) // header + 2 events
+	})
+
+	t.Run("invalid_cursor_mid_stream_is_surfaced", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		st.errOnCall = 2
+		st.queryErr = store.ErrInvalidCursor
+
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+
+		var logBuf bytes.Buffer
+		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
+
+		s.streamEventsCSV(ctx, w, filter)
+
+		assert.Contains(t, logBuf.String(), "export cursor")
+	})
+
+	t.Run("memory_does_not_scale_with_row_count", func(t *testing.T) {
+		const totalRows = 100
+		const pageSize = 10
+		bigEvents := seedManyEvents(testContractID, totalRows)
+		st := newFakeExportStore(bigEvents)
+		st.pageSize = pageSize
+
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+		ctx := WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()})
+
+		bigFilter := store.EventFilter{
+			ContractID: testContractID,
+			Limit:      exportQueryBatchSize,
+			Scope:      store.WildcardScope(),
+		}
+		s.streamEventsCSV(ctx, w, bigFilter)
+
+		expectedFlushes := 1 + (totalRows / pageSize)
+		assert.Equal(t, expectedFlushes, w.flushes)
+
+		r := csv.NewReader(&w.buf)
+		all, err := r.ReadAll()
+		require.NoError(t, err)
+		assert.Len(t, all, totalRows+1)
+	})
+
+	t.Run("client_disconnect_terminates_early", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+
+		ctx, cancel := context.WithCancel(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}))
+		cancel()
+
+		s.streamEventsCSV(ctx, w, filter)
+
+		assert.Equal(t, 1, st.callCount)
+	})
+
+	t.Run("write_failure_surfaces_error_and_halts", func(t *testing.T) {
+		st := newFakeExportStore(events)
+		s := New(st, nil, logger, "")
+		w := newTestExportWriter()
+		headerLen := len("id,ledger,type,tx_hash,topics,value\n")
+		w.failAfter = headerLen
+		w.writeErr = errors.New("client connection dropped")
+
+		var logBuf bytes.Buffer
+		ctx := testContextWithLogger(WithPrincipal(context.Background(), Principal{Scope: store.WildcardScope()}), &logBuf)
+
+		s.streamEventsCSV(ctx, w, filter)
+
+		assert.Contains(t, logBuf.String(), "csv write")
+	})
 // TestEventsCSV_NDJSONFormat verifies that /events.csv — despite its
 // historical name — accepts ?format=ndjson exactly like
 // /contracts/{id}/export, closing the parity gap issue #578 tracks: a
