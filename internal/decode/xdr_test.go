@@ -2,6 +2,7 @@ package decode
 
 import (
 	"encoding/json"
+	"math/big"
 	"strings"
 	"testing"
 
