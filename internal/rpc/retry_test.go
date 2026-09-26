@@ -22,6 +22,7 @@ type retryMockClient struct {
 	getLatestLedger  func(ctx context.Context) (LatestLedger, error)
 	getHealth        func(ctx context.Context) (Health, error)
 	getLedgerEntries func(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error)
+	simulate         func(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error)
 }
 
 func (m *retryMockClient) GetEvents(ctx context.Context, req GetEventsRequest) (GetEventsResponse, error) {
@@ -53,6 +54,9 @@ func (m *retryMockClient) GetLedgerEntries(ctx context.Context, req GetLedgerEnt
 }
 
 func (m *retryMockClient) SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error) {
+	if m.simulate != nil {
+		return m.simulate(ctx, req)
+	}
 	return SimulateTransactionResponse{}, nil
 }
 
