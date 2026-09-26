@@ -90,7 +90,7 @@ POLL_INTERVAL	5s	Sleep between polls once caught up.
 HTTP_ADDR	:8080	API listen address.
 WATCHED_CONTRACTS	empty	Comma-separated contract IDs (C...). Empty = ingest all contract events.
 START_LEDGER	unset	Force cold-start ingestion from this ledger.
-RETENTION_LEDGERS	17280	Cold-start reach-back in ledgers (~24h at 5s/ledger).
+RETENTION_LEDGERS	17280	Cold-start reach-back in ledgers (~24h at 5s/ledger). See [Ingestion behavior](#ingestion-behavior).
 LOG_LEVEL	info	debug | info | warn | error.
 AUDIT_ENABLED	false	Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build.
 AUDIT_POLL_INTERVAL	30s	Sleep between audit passes.
@@ -160,7 +160,7 @@ SoroTrail is tested in CI against the following Postgres major versions:
 | `WATCHED_CONTRACTS` | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract automatically triggers a backfill from `latest − RETENTION_LEDGERS` (clamped to RPC retention), independent of other contracts. |
 | `SKIP_CONTRACTS` | empty | Comma-separated contract IDs (`C...`) to never index events from. |
 | `START_LEDGER` | unset | Force cold-start ingestion from this ledger. |
-| `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). |
+| `RETENTION_LEDGERS` | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). See [Ingestion behavior](#ingestion-behavior). |
 | `RETENTION_AGE` | `0` (disabled) | Delete events older than this duration. `0` disables age-based pruning. |
 | `RETENTION_POLL_INTERVAL` | `1h` | How often the age-based pruner re-examines events older than `RETENTION_AGE`. |
 | `PARTITION_LEDGER_SPAN` | `120960` | Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. |
@@ -248,7 +248,7 @@ the struct tags in `internal/config/config.go` to prevent drift.
 | `WATCHED_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract triggers a backfill from `latest − RETENTION_LEDGERS`. |
 | `START_LEDGER` | string | unset | Force cold-start ingestion from this ledger. Accepts an absolute number (≥ 2) or a relative offset like `latest-1000`. |
 | `START_LEDGER_RAW` | string | unset | Raw form of `START_LEDGER` before parsing. Used internally; operators should set `START_LEDGER` instead. |
-| `RETENTION_LEDGERS` | uint32 | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). Clamped to the RPC's oldest retained ledger. |
+| `RETENTION_LEDGERS` | uint32 | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). See [Ingestion behavior](#ingestion-behavior). Clamped to the RPC's oldest retained ledger. |
 | `INGEST_PAGE_SIZE` | uint | `1000` | Maximum number of events per `getEvents` RPC page. |
 | `INGEST_BATCH_SIZE` | uint | `1000` | Number of events per upsert batch during ingestion. |
 | `PARTITION_LEDGER_SPAN` | uint32 | `120960` | Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. |
@@ -579,7 +579,7 @@ POLL_INTERVAL	5s	Sleep between polls once caught up.
 HTTP_ADDR	:8080	API listen address.
 WATCHED_CONTRACTS	empty	Comma-separated contract IDs (C...). Empty = ingest all contract events.
 START_LEDGER	unset	Force cold-start ingestion from this ledger.
-RETENTION_LEDGERS	17280	Cold-start reach-back in ledgers (~24h at 5s/ledger).
+RETENTION_LEDGERS	17280	Cold-start reach-back in ledgers (~24h at 5s/ledger). See [Ingestion behavior](#ingestion-behavior).
 LOG_LEVEL	info	debug | info | warn | error.
 AUDIT_ENABLED	false	Enable the background auditor. When unset/false the binary behaves exactly like the pre-audit build.
 AUDIT_POLL_INTERVAL	30s	Sleep between audit passes.
