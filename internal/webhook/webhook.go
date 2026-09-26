@@ -52,6 +52,20 @@ const (
 	SignatureHeader = "X-SoroTrail-Signature"
 )
 
+// Clock abstracts the retry sleep. Production uses RealClock; tests inject a
+// recording clock so the backoff schedule is asserted without real timers —
+// mirroring ingester.Clock's single sleep seam.
+type Clock interface {
+	// SleepCtx sleeps for d or until ctx is done; it reports whether the
+	// full sleep completed.
+	SleepCtx(ctx context.Context, d time.Duration) bool
+}
+
+// RealClock is the wall-clock implementation of Clock.
+type RealClock struct{}
+
+func (RealClock) SleepCtx(ctx context.Context, d time.Duration) bool { return sleepCtx(ctx, d) }
+
 // Notifier receives events from the ingester and queues matching
 // subscriptions for delivery. It implements ingester.EventNotifier.
 type Notifier struct {
@@ -62,6 +76,7 @@ type Notifier struct {
 	client      *http.Client
 	maxAttempts int
 	backoffFunc func(attempt int) time.Duration
+	clock       Clock
 }
 
 // deliveryTask is one event destined for one subscription.
@@ -92,6 +107,7 @@ func NewNotifier(st store.Store, log *slog.Logger) *Notifier {
 		client:      client,
 		maxAttempts: MaxDeliveryAttempts,
 		backoffFunc: backoffDuration,
+		clock:       RealClock{},
 	}
 	return n
 }
@@ -203,7 +219,7 @@ func (n *Notifier) deliverWithRetry(ctx context.Context, task deliveryTask) {
 				"event_id", task.Event.ID,
 				"attempt", attempt+1,
 				"backoff", backoff)
-			if !sleepCtx(ctx, backoff) {
+			if !n.clock.SleepCtx(ctx, backoff) {
 				span.End()
 				return
 			}

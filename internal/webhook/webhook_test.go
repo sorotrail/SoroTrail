@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -153,13 +154,14 @@ func TestSubscriptionFilter_MatchesEvent(t *testing.T) {
 // stubSubscriptionStore records delivery attempts for verification.
 type stubSubscriptionStore struct {
 	store.Store
-	mu             sync.Mutex
-	attempts       []store.DeliveryAttempt
-	failures       map[int64]int
-	incremented    map[int64]int
-	resets         []int64
-	enabledSubs    []store.Subscription
-	enabledSubsErr error
+	mu                  sync.Mutex
+	attempts            []store.DeliveryAttempt
+	failures            map[int64]int
+	incremented         map[int64]int
+	incrementThresholds []int
+	resets              []int64
+	enabledSubs         []store.Subscription
+	enabledSubsErr      error
 }
 
 func newStubSubscriptionStore() *stubSubscriptionStore {
@@ -184,6 +186,7 @@ func (s *stubSubscriptionStore) RecordDeliveryAttempt(_ context.Context, a store
 func (s *stubSubscriptionStore) IncrementSubscriptionFailures(_ context.Context, id int64, maxFailures int) (int, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.incrementThresholds = append(s.incrementThresholds, maxFailures)
 	s.failures[id]++
 	s.incremented[id] = s.incremented[id] + 1
 	disabled := s.failures[id] >= maxFailures
@@ -498,4 +501,270 @@ func TestDeliver_SpanAttributes(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("webhook.deliver span not found after %d polls; got %d spans", 50, len(spans))
+}
+
+// --- Retry, backoff, and failure counting ---
+
+// recordingClock implements Clock by recording every backoff duration the
+// notifier asks to sleep for and returning immediately, so tests assert the
+// retry schedule without waiting on real timers.
+type recordingClock struct {
+	mu     sync.Mutex
+	sleeps []time.Duration
+}
+
+func (c *recordingClock) SleepCtx(_ context.Context, d time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sleeps = append(c.sleeps, d)
+	return true
+}
+
+func (c *recordingClock) recorded() []time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Duration(nil), c.sleeps...)
+}
+
+// scriptedServer answers with the given statuses in order, repeating the last
+// one once the script is exhausted.
+func scriptedServer(statuses ...int) *httptest.Server {
+	var mu sync.Mutex
+	calls := 0
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		i := calls
+		calls++
+		mu.Unlock()
+		if i >= len(statuses) {
+			i = len(statuses) - 1
+		}
+		w.WriteHeader(statuses[i])
+	}))
+}
+
+func TestDeliverWithRetry_RetryPolicyAndBackoff(t *testing.T) {
+	// The documented schedule doubles InitialBackoff on each retry, giving
+	// 2s/4s/8s/16s across a five-attempt delivery. The clock records the
+	// durations instead of sleeping, and the production backoffFunc is left in
+	// place, so a change to the schedule fails the exact-equality assertion.
+	tests := []struct {
+		name           string
+		statuses       []int
+		maxAttempts    int
+		wantAttempts   int
+		wantBackoffs   []time.Duration
+		wantResets     bool
+		wantIncrements int
+	}{
+		{
+			name:           "2xx on the first attempt does not retry",
+			statuses:       []int{http.StatusOK},
+			maxAttempts:    MaxDeliveryAttempts,
+			wantAttempts:   1,
+			wantResets:     true,
+			wantIncrements: 0,
+		},
+		{
+			name:           "retries with doubling backoff until success",
+			statuses:       []int{http.StatusInternalServerError, http.StatusServiceUnavailable, http.StatusOK},
+			maxAttempts:    MaxDeliveryAttempts,
+			wantAttempts:   3,
+			wantBackoffs:   []time.Duration{2 * time.Second, 4 * time.Second},
+			wantResets:     true,
+			wantIncrements: 0,
+		},
+		{
+			name:           "retryable 429 is retried",
+			statuses:       []int{http.StatusTooManyRequests, http.StatusOK},
+			maxAttempts:    MaxDeliveryAttempts,
+			wantAttempts:   2,
+			wantBackoffs:   []time.Duration{2 * time.Second},
+			wantResets:     true,
+			wantIncrements: 0,
+		},
+		{
+			name:           "an attempt cap of one disables retries",
+			statuses:       []int{http.StatusInternalServerError},
+			maxAttempts:    1,
+			wantAttempts:   1,
+			wantIncrements: 1,
+		},
+		{
+			name:           "exhausting every attempt increments once and never resets",
+			statuses:       []int{http.StatusInternalServerError},
+			maxAttempts:    3,
+			wantAttempts:   3,
+			wantBackoffs:   []time.Duration{2 * time.Second, 4 * time.Second},
+			wantIncrements: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			server := scriptedServer(tt.statuses...)
+			defer server.Close()
+
+			const subID int64 = 42
+			st := newStubSubscriptionStore()
+			st.enabledSubs = []store.Subscription{{
+				ID: subID, URL: server.URL, Secret: "secret", Enabled: true,
+			}}
+
+			n := NewNotifier(st, testLogger())
+			n.maxAttempts = tt.maxAttempts
+			clock := &recordingClock{}
+			n.clock = clock
+
+			n.deliverWithRetry(context.Background(), deliveryTask{
+				Subscription: st.enabledSubs[0],
+				Event:        testEvent("retry-1"),
+			})
+
+			st.mu.Lock()
+			attempts := len(st.attempts)
+			resets := len(st.resets)
+			increments := st.incremented[subID]
+			remainingFailures := st.failures[subID]
+			st.mu.Unlock()
+
+			assert.Equal(t, tt.wantAttempts, attempts, "recorded delivery attempts")
+			assert.Equal(t, tt.wantBackoffs, clock.recorded(), "backoff durations requested")
+			assert.Equal(t, tt.wantResets, resets > 0, "failure count reset on success")
+			assert.Equal(t, tt.wantIncrements, increments, "failure increments")
+			if tt.wantResets {
+				assert.Zero(t, remainingFailures, "a successful delivery clears the failure count")
+			}
+		})
+	}
+}
+
+func TestDeliverWithRetry_PersistentlyFailingSubscriptionIsDisabled(t *testing.T) {
+	// The notifier hands its attempt cap to the store as the failure threshold.
+	// Each exhausted delivery adds one, so trip it after that many deliveries.
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	server := scriptedServer(http.StatusInternalServerError)
+	defer server.Close()
+
+	const subID int64 = 7
+	st := newStubSubscriptionStore()
+	sub := store.Subscription{ID: subID, URL: server.URL, Secret: "secret", Enabled: true}
+	st.enabledSubs = []store.Subscription{sub}
+
+	n := NewNotifier(st, log)
+	n.maxAttempts = 2
+	n.clock = &recordingClock{}
+	task := deliveryTask{Subscription: sub, Event: testEvent("disable-1")}
+
+	n.deliverWithRetry(context.Background(), task)
+
+	st.mu.Lock()
+	require.Equal(t, 1, st.failures[subID], "one exhausted delivery increments once")
+	require.Equal(t, []int{2}, st.incrementThresholds,
+		"the notifier passes its attempt cap as the store's threshold")
+	st.mu.Unlock()
+	assert.NotContains(t, logs.String(), "subscription auto-disabled",
+		"the threshold is not reached after a single delivery")
+
+	n.deliverWithRetry(context.Background(), task)
+
+	st.mu.Lock()
+	failures := st.failures[subID]
+	st.mu.Unlock()
+	assert.Equal(t, 2, failures, "the counter keeps climbing across deliveries")
+	assert.Contains(t, logs.String(), "subscription auto-disabled",
+		"reaching the threshold disables the subscription")
+}
+
+// cancelingClock cancels the delivery context as its first sleep begins,
+// standing in for a shutdown that interrupts a backoff wait.
+type cancelingClock struct {
+	cancel context.CancelFunc
+	sleeps int
+}
+
+func (c *cancelingClock) SleepCtx(_ context.Context, _ time.Duration) bool {
+	c.sleeps++
+	c.cancel()
+	return false
+}
+
+func TestDeliverWithRetry_ContextCancellationDuringBackoffIsNotAFailure(t *testing.T) {
+	// Cancellation while waiting between attempts must stop the loop without
+	// counting a failure or disabling the subscription; that only happens when
+	// the attempts themselves are exhausted.
+	server := scriptedServer(http.StatusInternalServerError)
+	defer server.Close()
+
+	const subID int64 = 5
+	st := newStubSubscriptionStore()
+	st.enabledSubs = []store.Subscription{{ID: subID, URL: server.URL, Secret: "s", Enabled: true}}
+
+	n := NewNotifier(st, testLogger())
+	n.maxAttempts = MaxDeliveryAttempts
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clock := &cancelingClock{cancel: cancel}
+	n.clock = clock
+
+	n.deliverWithRetry(ctx, deliveryTask{Subscription: st.enabledSubs[0], Event: testEvent("cancel-1")})
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	assert.Equal(t, 1, clock.sleeps, "the loop entered the backoff wait exactly once")
+	require.Len(t, st.attempts, 1, "the first attempt was made before cancellation")
+	assert.Empty(t, st.resets, "no success to reset the counter")
+	assert.Empty(t, st.incremented, "cancellation is not a delivery failure")
+}
+
+func TestNotifyEvents_DeliversAsynchronouslyWithoutBlockingIngestion(t *testing.T) {
+	// NotifyEvents runs on the ingestion path, so it must hand the task to the
+	// worker pool and return without waiting for the subscriber. The endpoint
+	// here stalls until the test releases it; if dispatch ever became
+	// synchronous the call would time out instead of returning promptly.
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		started <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	defer close(release)
+
+	st := newStubSubscriptionStore()
+	st.enabledSubs = []store.Subscription{{ID: 1, URL: server.URL, Secret: "s", Enabled: true}}
+
+	n := NewNotifier(st, testLogger())
+	n.clock = &recordingClock{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go n.Run(ctx)
+
+	done := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		n.NotifyEvents(context.Background(), []store.Event{testEvent("async-1")})
+		done <- time.Since(start)
+	}()
+
+	select {
+	case elapsed := <-done:
+		assert.Less(t, elapsed, time.Second, "NotifyEvents must not wait for delivery")
+	case <-time.After(3 * time.Second):
+		t.Fatal("NotifyEvents blocked on a stalled subscriber")
+	}
+
+	// The event must still have reached a worker, proving the call handed it
+	// off rather than dropping it.
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("delivery was not dispatched to a worker")
+	}
 }
