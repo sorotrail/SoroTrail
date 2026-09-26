@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -201,6 +202,83 @@ func TestUpsertEvents_CreatesPartitionsAndIsIdempotent(t *testing.T) {
 	require.NoError(t, rows.Err())
 	assert.Contains(t, plan, "events_10_19")
 	assert.NotContains(t, plan, "events_20_29")
+}
+
+func TestEnsureEventPartitions(t *testing.T) {
+	tests := []struct {
+		name           string
+		ledgers        []int64
+		wantPartitions []string
+		concurrent     bool
+	}{
+		{
+			name:           "write inside an existing partition creates nothing new",
+			ledgers:        []int64{12, 15},
+			wantPartitions: []string{"events_10_19"},
+		},
+		{
+			name:           "write beyond the current range creates the next partition",
+			ledgers:        []int64{12, 25},
+			wantPartitions: []string{"events_10_19", "events_20_29"},
+		},
+		{
+			name:           "partition boundaries match the configured span",
+			ledgers:        []int64{10, 19, 20},
+			wantPartitions: []string{"events_10_19", "events_20_29"},
+		},
+		{
+			name:           "concurrent writers create partitions idempotently",
+			ledgers:        []int64{25, 25},
+			wantPartitions: []string{"events_20_29"},
+			concurrent:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := testStoreWithPartitionSpan(t, 10)
+			ctx := context.Background()
+			if tt.concurrent {
+				var wg sync.WaitGroup
+				errs := make(chan error, len(tt.ledgers))
+				for _, ledger := range tt.ledgers {
+					wg.Add(1)
+					go func(ledger int64) {
+						defer wg.Done()
+						errs <- st.ensureEventPartitions(ctx, []Event{{Ledger: ledger}})
+					}(ledger)
+				}
+				wg.Wait()
+				close(errs)
+				for err := range errs {
+					require.NoError(t, err)
+				}
+			} else {
+				require.NoError(t, st.ensureEventPartitions(ctx, []Event{{Ledger: tt.ledgers[0]}}))
+				if len(tt.ledgers) > 1 {
+					require.NoError(t, st.ensureEventPartitions(ctx, []Event{{Ledger: tt.ledgers[1]}}))
+				}
+			}
+
+			rows, err := st.pool.Query(ctx, `
+				SELECT c.relname
+				FROM pg_inherits i
+				JOIN pg_class c ON c.oid = i.inhrelid
+				JOIN pg_class p ON p.oid = i.inhparent
+				WHERE p.relname = 'events' AND c.relname <> 'events_default'
+				ORDER BY c.relname`)
+			require.NoError(t, err)
+			defer rows.Close()
+			var got []string
+			for rows.Next() {
+				var name string
+				require.NoError(t, rows.Scan(&name))
+				got = append(got, name)
+			}
+			require.NoError(t, rows.Err())
+			assert.Equal(t, tt.wantPartitions, got)
+		})
+	}
 }
 
 // TestPartialIndexForSuccessfulCalls covers the partial index over
