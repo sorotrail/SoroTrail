@@ -11,15 +11,15 @@ import (
 
 func TestRPCMatrix_Table(t *testing.T) {
 	tests := []struct {
-		name              string
-		errors            []error
-		maxErrors         int
-		expectedState     ProviderState
+		name          string
+		errors        []error
+		maxErrors     int
+		expectedState ProviderState
 	}{
 		{
-			name: "success on first attempt keeps healthy",
-			errors: []error{nil},
-			maxErrors: 3,
+			name:          "success on first attempt keeps healthy",
+			errors:        []error{nil},
+			maxErrors:     3,
 			expectedState: StateActive,
 		},
 		{
@@ -29,7 +29,7 @@ func TestRPCMatrix_Table(t *testing.T) {
 				fmt.Errorf("getEvents returned HTTP 502"),
 				fmt.Errorf("getEvents returned HTTP 503"),
 			},
-			maxErrors: 3,
+			maxErrors:     3,
 			expectedState: StateDegraded,
 		},
 		{
@@ -39,7 +39,7 @@ func TestRPCMatrix_Table(t *testing.T) {
 				fmt.Errorf("requested ledger is outside retention window"),
 				fmt.Errorf("requested ledger is outside retention window"),
 			},
-			maxErrors: 3,
+			maxErrors:     3,
 			expectedState: StateActive,
 		},
 	}
@@ -53,7 +53,7 @@ func TestRPCMatrix_Table(t *testing.T) {
 			)
 
 			mocks[0].getEventsErr = tt.errors
-			
+
 			// pad response to avoid index out of bounds
 			mocks[0].getEventsResp = make([]GetEventsResponse, len(tt.errors))
 

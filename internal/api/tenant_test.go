@@ -1327,9 +1327,12 @@ func TestRevokedKeyRejectedOnNextRequest(t *testing.T) {
 	rec := f.get(t, f.keyA, "/events")
 	assert.Equal(t, http.StatusOK, rec.Code)
 
-	// Simulate revocation by removing the key from the lookup table.
-	delete(f.tenants.keys, f.keyA[:len(f.keyA)/2]) // remove the prefix entry
-	// The prefix-based lookup will no longer find this key.
+	// Simulate revocation by dropping the key's record. Tenant lookup is
+	// keyed on the prefix segment of the plaintext key, so that entry is
+	// the single thing that has to disappear for the key to stop resolving.
+	prefix, _, ok := parseAPIKey(f.keyA)
+	require.True(t, ok, "fixture key must be well-formed")
+	delete(f.tenants.keys, prefix)
 
 	// Next request must be rejected.
 	rec = f.get(t, f.keyA, "/events")
@@ -1341,7 +1344,6 @@ func TestRevokedKeyRejectedOnNextRequest(t *testing.T) {
 // only receive events for contracts it is granted.
 func TestWebSocketSubscriptionsHonourBoundary(t *testing.T) {
 	f := newTenantFixture(t)
-	st := f.st.(*scopedStore)
 
 	// Verify that the store's scope filtering applies to subscription
 	// paths the same way it does to read endpoints.

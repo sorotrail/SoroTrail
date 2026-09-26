@@ -82,11 +82,11 @@ func TestBackfillerFetch(t *testing.T) {
 			resp, err := b.fetch(context.Background(), tt.cursor)
 
 			require.NoError(t, err)
-		assert.Len(t, resp.Embedded.Records, 1)
-		assert.Equal(t, contractID, h.lastContract)
-		assert.Equal(t, tt.cursor, h.lastCursor)
-		assert.Equal(t, tt.batchSize, h.lastLimit)
-		assert.Equal(t, tt.includeFailed, h.lastFailed)
+			assert.Len(t, resp.Embedded.Records, 1)
+			assert.Equal(t, contractID, h.lastContract)
+			assert.Equal(t, tt.cursor, h.lastCursor)
+			assert.Equal(t, tt.batchSize, h.lastLimit)
+			assert.Equal(t, tt.includeFailed, h.lastFailed)
 		})
 	}
 }
@@ -106,7 +106,7 @@ func TestBackfillerExtractPage(t *testing.T) {
 		wantSkipped      int64
 	}{
 		{
-			name:       "extracts rows at and above the resume ledger",
+			name:        "extracts rows at and above the resume ledger",
 			startLedger: 100,
 			rows: []horizon.Transaction{
 				{Hash: "before", Ledger: 99, ResultMetaXDR: meta},
@@ -118,9 +118,9 @@ func TestBackfillerExtractPage(t *testing.T) {
 			wantTransactions: 2,
 		},
 		{
-			name:       "counts but does not extract rows above the upper bound",
+			name:        "counts but does not extract rows above the upper bound",
 			startLedger: 100,
-			toLedger:   100,
+			toLedger:    100,
 			rows: []horizon.Transaction{
 				{Hash: "in-range", Ledger: 100, ResultMetaXDR: meta},
 				{Hash: "out-of-range", Ledger: 101, ResultMetaXDR: meta},
@@ -177,7 +177,10 @@ func TestBackfillerCommitPage_InterruptedCommitLeavesProgressUnchanged(t *testin
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, updateErr)
-	assert.EqualValues(t, 0, inserted)
+	// commitPage reports what the upsert actually wrote and only then fails on
+	// the progress write, so the count is the one row the fake confirms below.
+	// Callers discard it because they return on the error.
+	assert.EqualValues(t, 1, inserted)
 	assert.Len(t, fs.rows, 1, "the upsert completed before the progress write failed")
 	assert.Zero(t, fs.state.LastLedger, "failed progress must not claim the page")
 }
@@ -225,18 +228,18 @@ func TestBackfillerResume(t *testing.T) {
 		wantStartCall bool
 	}{
 		{
-			name: "matching unfinished state resumes after persisted ledger",
-			state: store.BackfillState{ContractID: contractID, FromLedger: 100, ToLedger: 200, LastLedger: 149},
+			name:      "matching unfinished state resumes after persisted ledger",
+			state:     store.BackfillState{ContractID: contractID, FromLedger: 100, ToLedger: 200, LastLedger: 149},
 			wantStart: 149 + 1, wantResumed: true,
 		},
 		{
-			name: "missing state starts a fresh run",
-			stateErr: store.ErrNotFound,
+			name:      "missing state starts a fresh run",
+			stateErr:  store.ErrNotFound,
 			wantStart: 100, wantStartCall: true,
 		},
 		{
-			name: "different bounds start a fresh run",
-			state: store.BackfillState{ContractID: contractID, FromLedger: 101, ToLedger: 200, LastLedger: 149},
+			name:      "different bounds start a fresh run",
+			state:     store.BackfillState{ContractID: contractID, FromLedger: 101, ToLedger: 200, LastLedger: 149},
 			wantStart: 100, wantStartCall: true,
 		},
 	}
