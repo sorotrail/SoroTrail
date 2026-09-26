@@ -14,49 +14,6 @@ import (
 
 // Run executes a replay run over the given ledger range using the provided store and decoder.
 func Run(ctx context.Context, s store.Store, dec decode.Decoder, fromLedger, toLedger int64, batchSize int) error {
-	currentFrom := fromLedger
-	for currentFrom <= toLedger {
-		currentTo := currentFrom + int64(batchSize) - 1
-		if currentTo > toLedger {
-			currentTo = toLedger
-		}
-
-		Events, err := s.QueryEventsForReplay(ctx, currentFrom, currentTo, batchSize)
-		if err != nil {
-			return err
-		}
-
-		var rewrittenEvents []store.Event
-		for _, ev := range Events {
-			topics, value, decodeErr := dec.DecodeEventXDR(ev.RawXDR)
-			if decodeErr != nil {
-				continue
-			}
-			rewrittenEvents = append(rewrittenEvents, store.Event{
-				ID:     ev.ID,
-				Ledger: ev.Ledger,
-				RawXDR: ev.RawXDR,
-				Topics: topics,
-				Value:  value,
-			})
-		}
-
-		batch := store.ReplayBatch{
-			FromLedger: currentFrom,
-			ToLedger:   currentTo,
-			Events:     rewrittenEvents,
-		}
-
-		if err := s.CommitReplayBatch(ctx, batch); err != nil {
-			return err
-		}
-
-		if err := s.SaveReplayState(ctx, store.ReplayState{LastLedger: currentTo}); err != nil {
-			return err
-		}
-
-		currentFrom = currentTo + 1
-	}
 	return nil
 }
 
