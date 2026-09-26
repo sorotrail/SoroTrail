@@ -735,34 +735,11 @@ func TestClickHouse_SuiteSkipsCleanly(t *testing.T) {
 	if st == nil {
 		t.Skip("ClickHouse not available, skipping conformance suite")
 	}
-// RunStoreConformanceSuite runs a standard set of error semantic and behavior
-// assertions against any Store implementation to guarantee that backends agree
-// on ErrNotFound, empty collections, and error handling.
+}
+
 func RunStoreConformanceSuite(t *testing.T, st Store) {
-	t.Helper()
-	ctx := context.Background()
-
-	t.Run("MissingSingleResourceReturnsErrNotFound", func(t *testing.T) {
-		// Querying a non-existent single resource or state must consistently return ErrNotFound.
-		_, err := st.GetEvent(ctx, "nonexistent-event-id", WildcardScope())
-		assert.ErrorIs(t, err, ErrNotFound)
-	})
-
-	t.Run("EmptyCollectionReturnsEmptySliceNeverErrNotFound", func(t *testing.T) {
-		// Querying collections with no matching records must return an empty result set and nil error.
-		contracts, err := st.ListWatchedContracts(ctx)
-		require.NoError(t, err)
-		assert.Empty(t, contracts)
-
-		// QueryEvents with a scope that matches nothing should return an empty slice and nil error.
-		events, _, err := st.QueryEvents(ctx, EventFilter{Scope: NewScope([]string{"nonexistent-contract-id"}), Limit: 10})
-		require.NoError(t, err)
-		assert.Empty(t, events)
-	})
-
-	t.Run("UnsupportedOrInvalidOperationReturnsExplicitError", func(t *testing.T) {
-		// Operations with invalid parameters or uninitialized states must return an explicit error, never nil.
-		err := st.AddWatchedContract(ctx, "")
-		assert.Error(t, err)
+	runStoreTests(t, conformanceBackend{
+		name:    "custom",
+		factory: func(t *testing.T) Store { return st },
 	})
 }
