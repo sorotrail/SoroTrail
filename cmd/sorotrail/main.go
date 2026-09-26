@@ -151,6 +151,8 @@ subcommands:
                    (sorotrail migrate-status --help)
   completion       print a shell completion script (bash, zsh, fish)
                    (sorotrail completion --help)
+  version          print the build version, commit, and build date
+                   (sorotrail version --help)
   stats            print store stats as a table
                    (sorotrail stats --help)
 `)

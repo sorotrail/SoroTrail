@@ -31,6 +31,7 @@ var completionCommands = []completionCommand{
 	{"schema-inspect", "report migration state, partitions, and table sizes"},
 	{"migrate-status", "report pending migrations without applying them"},
 	{"completion", "print a shell completion script"},
+	{"version", "print the build version, commit, and build date"},
 	{"help", "show this help message"},
 }
 
