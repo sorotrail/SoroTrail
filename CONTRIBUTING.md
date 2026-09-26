@@ -169,6 +169,12 @@ known-vulnerable code paths are surfaced before they ship. Review dependency
 PRs promptly — a green check on `vulncheck` is a good signal that the bump can
 be merged without deep audit.
 
+The golangci-lint pin in `.golangci-lint-version` is the exception. Dependabot
+keeps the `golangci/golangci-lint-action` **action** current but does not touch
+its `version:` input — which now comes from that file — so a human must bump the
+pin, and the Go version recorded beside it, whenever the Go version moves. See
+[Lint toolchain drift](#lint-toolchain-drift).
+
 ## Verification & Automated Checks
 
 Before submitting a pull request, run `make ci` — it reproduces the CI gate
@@ -192,8 +198,37 @@ make vet              # go vet ./...
 make test-ci          # CI test job's exact command; DB-backed tests skip without TEST_DATABASE_URL
 make test-integration # integration-tagged suite against a real Postgres
 make bench-ci         # benchmark smoke run
-make lint             # golangci-lint run
+make lint             # golangci-lint run, guarded against toolchain drift
 ```
+
+### Lint toolchain drift
+
+`golangci-lint` is compiled with a single Go version and refuses to run when the
+repository targets a newer one:
+
+```text
+the Go language version (go1.26) used to build golangci-lint is lower than the targeted Go version (1.27.1)
+```
+
+The "targeted" version is go.mod's `toolchain` directive when it has one and its
+`go` directive otherwise. A `toolchain` line is easy to pick up by accident: any
+`go get` or `go mod tidy` run under a newer local toolchain can add one. **Do not
+commit an unintended `toolchain` line** — if `git diff go.mod` shows one you did
+not mean to add, remove it. Otherwise the lint job fails while `make lint` stays
+green locally, because only CI runs the pinned binary.
+
+The pinned release lives in [`.golangci-lint-version`](../.golangci-lint-version)
+as `<version> <go-built-with>`; both the CI action and the guard read it, so they
+cannot disagree about which release runs. `make lint` runs
+`scripts/check_lint_toolchain.sh` first and fails with the fix spelled out when
+go.mod targets a newer Go than that release supports, so a `toolchain` bump is
+caught before you push rather than in CI.
+
+To move the project to a newer Go on purpose, bump all three together: the `go`
+(and `toolchain`) directives in go.mod, and the version plus Go field in
+`.golangci-lint-version` to a golangci-lint release built with that Go. A
+release's build Go is the wording after `built with` in `golangci-lint version`.
+Then run `make ci`.
 
 ## Migration safety
 

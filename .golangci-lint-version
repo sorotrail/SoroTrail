@@ -1,0 +1,10 @@
+# golangci-lint release pinned by CI and `make lint`: <version> <go-built-with>.
+#
+# The second field is the Go version the release binary was compiled with, which
+# is also the newest Go it can analyse. golangci-lint refuses to run when go.mod
+# targets a newer Go than that — most often because a `toolchain` line was added
+# as a side effect of running `go get` / `go mod tidy` under a newer local
+# toolchain. Keeping the version and this Go field together, and checking them
+# against go.mod, is what scripts/check_lint_toolchain.sh does; see
+# CONTRIBUTING.md#lint-toolchain-drift.
+v2.12.2 go1.26.2

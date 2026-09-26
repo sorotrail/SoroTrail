@@ -194,9 +194,27 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+      # A `toolchain` directive can land in go.mod by accident when a newer local
+      # Go runs `go get` / `go mod tidy`. The pinned linter below was built with
+      # an older Go and refuses to start when go.mod targets a newer one, so fail
+      # here with the fix spelled out rather than in golangci-lint's own words.
+      - name: Guard against golangci-lint / Go toolchain drift
+        run: ./scripts/check_lint_toolchain.sh
+      # The pin lives in .golangci-lint-version so the workflow and `make lint`
+      # cannot disagree about which release runs. Dependabot bumps this action's
+      # ref but not its `version:` input, so the pin is a manual bump.
+      - name: Read the pinned golangci-lint version
+        id: lint_pin
+        run: echo "version=$(./scripts/check_lint_toolchain.sh --print-version)" >> "$GITHUB_OUTPUT"
       - uses: golangci/golangci-lint-action@v9.3.0
         with:
-          version: v2.12.2
+          version: ${{ steps.lint_pin.outputs.version }}
+      # Confirm the Go version recorded alongside the pin matches the release the
+      # action actually installed, so the record cannot rot. always() so it still
+      # reports when the lint step above failed.
+      - name: Verify the pinned release matches the recorded Go version
+        if: always()
+        run: ./scripts/check_lint_toolchain.sh --verify-binary
 
   docker:
     runs-on: ubuntu-latest

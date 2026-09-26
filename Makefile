@@ -11,7 +11,7 @@ BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown
 
 LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$(COMMIT) -X github/sorotrail/sorotrail/internal/buildinfo.BuildDate=$(BUILD_DATE)"
 
-.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint bench bench-ci ci client cover cover-html migrate-up migrate-down seed docker-up docker-down spec clean
+.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint lint-guard bench bench-ci ci client cover cover-html migrate-up migrate-down seed docker-up docker-down spec clean
 
 # ── Self-documenting help ────────────────────────────────────────────────────
 # Every target that starts with a double-hash comment (##) is listed by
@@ -69,8 +69,14 @@ vet: ## Run go vet on all packages
 vet-integration: ## Vet integration-tagged code too
 	go vet -tags=integration ./...
 
-lint: ## Run golangci-lint
+# The guard runs first so a go.mod that outran the pinned linter fails with the
+# fix spelled out, instead of golangci-lint's "lower than the targeted Go
+# version" error. See CONTRIBUTING.md#lint-toolchain-drift.
+lint: lint-guard ## Run golangci-lint (guards go.mod/toolchain drift first)
 	golangci-lint run
+
+lint-guard: ## Fail fast when go.mod targets a newer Go than the pinned linter
+	@scripts/check_lint_toolchain.sh
 
 # ── Benchmarks ───────────────────────────────────────────────────────────────
 
