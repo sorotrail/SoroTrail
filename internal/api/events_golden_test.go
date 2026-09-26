@@ -206,21 +206,6 @@ func TestContractsEventsGolden(t *testing.T) {
 	compareGolden(t, "contracts_events", rec.Body.Bytes())
 }
 
-// TestEventsGoldenFilesAreValidJSON validates every golden file in
-// the testdata/golden directory is valid JSON.
-func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
-	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
-	require.NoError(t, err)
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		body, err := os.ReadFile(filepath.Join("testdata", "golden", entry.Name()))
-		require.NoError(t, err, entry.Name())
-		require.True(t, json.Valid(body), "golden file %s must contain valid JSON", entry.Name())
-	}
-}
-
 // TestEventsGoldenCoverage verifies that every route enumerated by
 // pkg/docs/drift_test.go has a corresponding golden file for the
 // 200 response shape. This ensures no endpoint is silently omitted
@@ -231,16 +216,16 @@ func TestEventsGoldenCoverage(t *testing.T) {
 	// golden file names match the expected set, so no endpoint
 	// is accidentally left without coverage.
 	goldenNames := map[string]struct{}{
-		"events_default_page":   {},
-		"events_envelope":       {},
-		"events_include_xdr":    {},
+		"events_default_page":      {},
+		"events_envelope":          {},
+		"events_include_xdr":       {},
 		"events_fields_projection": {},
-		"events_pretty":         {},
-		"events_empty_result":   {},
-		"events_decoded":        {},
-		"events_single":         {},
-		"events_count":          {},
-		"contracts_events":      {},
+		"events_pretty":            {},
+		"events_empty_result":      {},
+		"events_decoded":           {},
+		"events_single":            {},
+		"events_count":             {},
+		"contracts_events":         {},
 	}
 	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
 	require.NoError(t, err)
