@@ -1565,9 +1565,15 @@ func TestLoggableFieldsRedactsCredentials(t *testing.T) {
 		})
 		assert.NotContains(t, got["database_url"], "dbsecret")
 		assert.NotContains(t, got["rpc_url"], "rpckey")
+		// The username goes too, matching SoroBeacon's LogAttrs, which pins
+		// the same property. It is not a secret, but it is not diagnostic
+		// either, and this line can be shipped anywhere.
+		assert.NotContains(t, got["database_url"], "dbuser")
+		assert.NotContains(t, got["rpc_url"], "rpcuser")
 		// The host and database still have to be readable, or the line is
 		// useless for diagnosing which database the process came up against.
-		assert.Contains(t, got["database_url"], "db.internal:5432/sorotrail")
+		assert.Equal(t, "postgres://db.internal:5432/sorotrail", got["database_url"])
+		assert.Equal(t, "https://rpc.example.com", got["rpc_url"])
 	})
 
 	t.Run("unparseable urls are redacted rather than logged raw", func(t *testing.T) {

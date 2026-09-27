@@ -50,6 +50,28 @@ func redactURLPassword(raw string) string {
 	return u.String()
 }
 
+// redactURLCredentials drops the whole userinfo rather than masking only the
+// password, keeping the scheme, host and path so the line still says which
+// endpoint was configured. It is what LoggableFields uses: that line is
+// emitted once per startup into whatever ships the logs onward, so it does not
+// disclose a username either.
+//
+// Like redactURLPassword it fails closed. A valid credential is enough to
+// defeat url.Parse — a "%", a space or a "[" in the userinfo each do it — and
+// Load() does not reject an unparseable DATABASE_URL, so that value really can
+// reach here.
+func redactURLCredentials(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "<redacted>"
+	}
+	u.User = nil
+	return u.String()
+}
+
 // multiError aggregates several validation failures into a single error.
 type multiError []string
 
