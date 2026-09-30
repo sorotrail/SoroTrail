@@ -141,3 +141,5 @@ go test -race ./internal/ingester/... ./internal/decode/... ./internal/store/   
   workflows. They could be repointed at `sorotrail migrate` in a follow-up.
 - `deploy/helm/sorotrail` golden tests can differ locally with a mismatched
   local Helm version; the CI `helm` job is unaffected.
+
+  ...
