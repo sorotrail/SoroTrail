@@ -20,9 +20,9 @@ USER sorotrail
 COPY --from=build /out/sorotrail /usr/local/bin/sorotrail
 EXPOSE 8080
 
-# Container HEALTHCHECK runs against the same `/health` endpoint the
-# Helm chart's liveness/readiness probes target, so docker compose and
-# k8s both examine one consistent signal. The probe uses the binary
+# Container HEALTHCHECK runs against `/readyz`, so Docker reports the
+# service healthy only when its database and RPC dependencies are ready.
+# The probe uses the binary
 # already shipped in the image — alpine has no curl/wget, and we
 # deliberately do not install one to keep the image slim and the
 # forensic surface tiny (no shell access required to probe).
@@ -33,9 +33,9 @@ EXPOSE 8080
 #   timeout=5s     leaves ~2s above the in-binary 3s probe timeout so
 #                   docker can always reap the process even if the
 #                   probe hangs.
-#   start_period=10s gives the container time to bring up the Postgres
-#                   connection pool and run migrations before the
-#                   first probe is counted.
+#   start_period=30s gives the container time to connect to Postgres,
+#                   run migrations, and complete an initial RPC check
+#                   before the first probe is counted.
 #   retries=3      two hits allowed before marking unhealthy, which
 #                   tolerates one transient RPC blip without flapping.
 #
@@ -43,7 +43,7 @@ EXPOSE 8080
 # then 127.0.0.1:8080, so an operator who overrides HTTP_ADDR inside
 # this image (or in compose env) gets a probe that follows the same
 # port rather than silently failing on a stale hardcoded value.
-HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["sorotrail", "healthcheck", "--endpoint", "/health", "--timeout", "3s"]
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+	CMD ["sorotrail", "healthcheck", "--endpoint", "/readyz", "--timeout", "3s"]
 
 ENTRYPOINT ["sorotrail"]

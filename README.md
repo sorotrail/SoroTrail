@@ -45,27 +45,50 @@ the full list of environment variables.
 
 Brings up Postgres and the indexer together — no external database required:
 
-docker compose up --build
+docker compose --profile dev up --build
 This starts Postgres and the indexer against the public Stellar testnet RPC.
-The API is on http://localhost:8080; watch the logs to see events flow in.
+Jaeger is also available for local traces. The API is on http://localhost:8080;
+watch the logs to see events flow in.
+
+### Docker Compose profiles
+
+Compose services are isolated by environment profile. Choose one profile for
+each invocation:
+
+```sh
+# Development: Postgres, indexer, and Jaeger
+docker compose --profile dev up --build
+
+# Testing: Postgres only, for host-side integration tests
+docker compose --profile test up -d
+TEST_DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable' make test-integration
+
+# Production topology: Postgres and indexer, without Jaeger
+RPC_URL='https://your-production-rpc.example' docker compose --profile prod up -d --build
+```
+
+The `prod` profile defaults to the testnet RPC and the bundled Postgres
+service; set `RPC_URL` for the intended network.
+The indexer container's Docker healthcheck probes `/readyz` every 10 seconds with
+a 5-second timeout, a 30-second startup grace period, and three retries.
 
 To watch specific contracts instead of everything:
 
 Shell
 
 **Container health.** The published image ships with a `HEALTHCHECK` that
-probes `/health` via the in-binary `sorotrail healthcheck` subcommand
+probes `/readyz` via the in-binary `sorotrail healthcheck` subcommand
 (alpine has no curl/wget — installing curl or shipping a second binary
 would just grow the image; routing the probe through the existing
 binary reuses the `net/http` client that's already linked in for the
 server, so the cost is a few hundred bytes of flag-parsing and a probe
 function). Compose mirrors the same probe so `docker ps` shows an
 honest health status, and combined with `depends_on: condition:
-service_healthy` on Postgres, a fresh `docker compose up --build`
+service_healthy` on Postgres, a fresh `docker compose --profile dev up --build`
 brings the stack up in the right order instead of hoping the indexer
 wins a race against a half-up database.
 
-WATCHED_CONTRACTS=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC docker compose up --build
+WATCHED_CONTRACTS=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC docker compose --profile dev up --build
 Bare metal
 Shell
 

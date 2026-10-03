@@ -136,7 +136,7 @@ seed: ## Seed the database with sample events
 # ── Docker ───────────────────────────────────────────────────────────────────
 
 docker-up: ## Start Postgres and the indexer via docker compose
-	docker compose up -d --build
+	docker compose --profile dev up -d --build
 
 docker-down: ## Tear down docker compose services
 	docker compose down
