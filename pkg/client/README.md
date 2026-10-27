@@ -52,10 +52,25 @@ from, and release automation bumps that version with the API. See
 
 ```sh
 # 1. edit api/openapi.yaml
-make spec      # refresh the served openapi.json copy
-make client    # regenerate pkg/client/client.gen.go
-go test ./pkg/client/...
+make spec          # refresh the served openapi.json copy
+make client        # regenerate pkg/client/client.gen.go
+make client-check  # run the unified manifest-driven client & route drift gate
 ```
 
-Both files are committed; the drift tests in `pkg/docs` and `pkg/client`
-fail the build until `make spec` / `make client` are run.
+Both files are committed; the unified drift gate (`make client-check`, backed by `pkg/client/targets.yaml`, `pkg/client/drift_test.go`, and `pkg/docs/drift_test.go`) fails the build until `make spec` / `make client` are run, naming the affected language and OpenAPI `operationId` (`METHOD /path`).
+
+## Adding a new client language target
+
+All generated clients are registered in [`pkg/client/targets.yaml`](targets.yaml) so a single CI job (`client-drift`) regenerates, diffs, type-checks, and contract-tests every language together:
+
+1. **Add an entry under `targets:` in `pkg/client/targets.yaml`**:
+   - `language`: unique identifier (e.g., `typescript` or `python`).
+   - `generator`: generator package or binary name.
+   - `version`: **exact semantic version pin** (`vX.Y.Z`); floating tags such as `latest` or `main` are rejected by `clientgen.ValidateManifest`.
+   - `output`: repository-relative path to the committed generated file.
+   - `generate_cmd`: command array using `{spec}` and `{output}` placeholders.
+   - `typecheck_cmd`: command array that compiles or type-checks the generated client so a syntactically broken regeneration cannot pass.
+   - `contract_cmd`: command array that runs the cross-language contract suite.
+2. **Wire the contract adapter in `TestCrossLanguageContractHarness` (`pkg/client/drift_test.go`)**:
+   - Execute the same `GET /health`, `GET /events`, and `GET /events/{id}` requests against the shared `httptest.Server` through the new client and compare its normalized `contractSnapshot` JSON against `baseline`.
+3. **Run `make client-check`** to verify manifest validation, regeneration, compilation, route coverage, and cross-language contract parity.

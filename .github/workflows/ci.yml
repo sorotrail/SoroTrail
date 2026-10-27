@@ -41,6 +41,33 @@ jobs:
       - name: Check migration version numbers are unique
         run: make migrations-check
 
+  # Issue #1274: one manifest-driven drift gate covering every generated client
+  # alongside specification and route coverage. Driving all language targets
+  # from pkg/client/targets.yaml in a single job keeps adding a new language to
+  # one manifest entry rather than a duplicated workflow job.
+  client-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        id: go
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Restore Go and client generator caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-clientgen-${{ hashFiles('go.sum', 'pkg/client/targets.yaml') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-clientgen-
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-
+      - name: Verify OpenAPI spec, route coverage, and all generated client targets
+        run: make client-check
+
   test-matrix:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -155,7 +182,7 @@ jobs:
   # matrix later gains or drops a Postgres version.
   test:
     runs-on: ubuntu-latest
-    needs: [migrations, test-matrix]
+    needs: [migrations, client-drift, test-matrix]
     if: always()
     steps:
       - name: Report matrix result
@@ -176,6 +203,14 @@ jobs:
           echo "migrations result: $result"
           if [ "$result" != "success" ]; then
             echo "::error::the migration series is not loadable (see the migrations job)"
+            exit 1
+          fi
+      - name: Report client drift gate result
+        run: |
+          result='${{ needs.client-drift.result }}'
+          echo "client-drift result: $result"
+          if [ "$result" != "success" ]; then
+            echo "::error::one or more generated clients or spec routes drifted (see the client-drift job)"
             exit 1
           fi
 

@@ -14,7 +14,7 @@ LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Versio
 
 .PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint bench bench-ci ci cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check seed docker-up docker-down spec clean
 .PHONY: build build-all build-all-integration run test test-fast test-db test-integration vet vet-integration test-ci lint cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check docker-up docker-down simtest simtest-long clean bench bench-ci seed spec spec-check client ci
-.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint lint-guard bench bench-ci ci client cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check seed docker-up docker-down spec clean loadtest test-prereqs
+.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint lint-guard bench bench-ci ci client client-check cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check seed docker-up docker-down spec clean loadtest test-prereqs
 
 # ── Self-documenting help ────────────────────────────────────────────────────
 # Every target that starts with a double-hash comment (##) is listed by
@@ -148,7 +148,7 @@ bench-ci: ## Benchmark smoke run (CI-length, no DB required)
 # Composed from the existing targets so the two cannot drift.
 # Runs as sub-makes so the first failure stops the run.
 
-ci: build-all vet spec-check migrations-check test-ci bench-ci build-all-integration vet-integration test-integration lint ## Reproduce the full CI gate locally (first failure stops)
+ci: build-all vet spec-check client-check migrations-check test-ci bench-ci build-all-integration vet-integration test-integration lint ## Reproduce the full CI gate locally (first failure stops)
 
 # ── Client ───────────────────────────────────────────────────────────────────
 
@@ -157,6 +157,10 @@ ci: build-all vet spec-check migrations-check test-ci bench-ci build-all-integra
 # build (see pkg/client/README.md).
 client: ## Regenerate the versioned API client in pkg/client
 	go run ./cmd/clientgen
+
+client-check: spec-check ## Verify every client target in pkg/client/targets.yaml is current, compiles, and passes contract tests
+	go run ./cmd/clientgen -check -manifest pkg/client/targets.yaml
+	go test ./pkg/client/... ./pkg/docs/... -count=1
 
 # ── Coverage ─────────────────────────────────────────────────────────────────
 
