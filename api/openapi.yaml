@@ -9,7 +9,14 @@ info:
 
     JSON-producing operations accept the shared `pretty=true` query
     parameter to indent responses for human inspection; it does not change
-    the response data.
+    the response data. Request bodies are bounded by `HTTP_REQUEST_BODY_LIMIT`
+    (default 1 MiB, with a 2 MiB default override on `PUT /contracts/{id}/spec`),
+    applied to both raw wire bytes and decompressed `Content-Encoding: gzip` or
+    `deflate` streams. Non-streaming JSON responses are bounded by
+    `HTTP_RESPONSE_BODY_LIMIT` (default 16 MiB) and an optional tighter
+    caller-supplied `X-Max-Response-Bytes` request header; payloads exceeding
+    the bound return `413 Request Entity Too Large` and increment
+    `sorotrail_http_limit_rejections_total`.
   version: "0.2.0"
   license:
     name: Apache-2.0
@@ -4558,8 +4565,11 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     RequestEntityTooLarge:
       description: >-
-        The request body exceeds the instance's configured limit
-        (HTTP_REQUEST_BODY_LIMIT). Reduce the body size and retry.
+        The request or response body exceeds the configured size bound:
+        raw or decompressed (`gzip`/`deflate`) request bytes exceed the
+        endpoint or global `HTTP_REQUEST_BODY_LIMIT`, or a non-streaming JSON
+        response exceeds `HTTP_RESPONSE_BODY_LIMIT` / `X-Max-Response-Bytes`.
+        Reduce the payload or page size and retry.
       content:
         application/json:
           schema:

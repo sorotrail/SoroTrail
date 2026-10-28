@@ -201,6 +201,9 @@ type Config struct {
 	// HTTPRequestBodyLimit caps the max size accepted for any request body (all endpoints).
 	// Default 1048576 (1 MiB) protects against memory/resource exhaustion. Set higher if needed when trusting clients.
 	HTTPRequestBodyLimit int64 `env:"HTTP_REQUEST_BODY_LIMIT" envDefault:"1048576"`
+	// HTTPResponseBodyLimit caps the max size produced for any non-streaming JSON response body.
+	// Default 16777216 (16 MiB) bounds response memory while leaving streaming endpoints unaffected. 0 disables.
+	HTTPResponseBodyLimit int64 `env:"HTTP_RESPONSE_BODY_LIMIT" envDefault:"16777216"`
 
 	// APIKey, when set, gates the watched-contracts management endpoints
 	// via a constant-time comparison against the X-API-Key request header.
@@ -649,6 +652,9 @@ func (c Config) Validate() error {
 	}
 	if c.HTTPRequestBodyLimit < 0 {
 		return fmt.Errorf("HTTP_REQUEST_BODY_LIMIT must be non-negative, got %d", c.HTTPRequestBodyLimit)
+	}
+	if c.HTTPResponseBodyLimit < 0 {
+		return fmt.Errorf("HTTP_RESPONSE_BODY_LIMIT must be non-negative, got %d", c.HTTPResponseBodyLimit)
 	}
 	if c.APIMaxLimit < 1 {
 		return fmt.Errorf("API_MAX_LIMIT must be positive, got %d", c.APIMaxLimit)

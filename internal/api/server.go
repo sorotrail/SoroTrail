@@ -185,7 +185,9 @@ type Server struct {
 	// Off by default: the API behaves exactly as before.
 	apiKeyAuth bool
 
-	httpRequestBodyLimit int64 // max accepted request body size, in bytes
+	httpRequestBodyLimit      int64 // max accepted request body size, in bytes
+	httpResponseBodyLimit     int64 // max non-streaming JSON response body size, in bytes
+	endpointRequestBodyLimits map[string]int64
 
 	// specInvalidationPublisher tells the other replicas that a contract's
 	// cached spec must be evicted after a write. Optional: a single-process
@@ -457,9 +459,7 @@ func (s *Server) router() chi.Router {
 	// Limit request body size to prevent resource exhaustion.
 	// Applied after CORS so preflight requests (OPTIONS) pass through
 	// without body size restrictions.
-	if s.httpRequestBodyLimit > 0 {
-		r.Use(s.bodyLimitMiddleware)
-	}
+	r.Use(s.bodyLimitMiddleware)
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 	if s.limiter != nil {
@@ -476,10 +476,10 @@ func (s *Server) router() chi.Router {
 	// that authenticate installs, and counts one request per tenant.
 	r.Use(s.usageMiddleware)
 
-	// prettyMiddleware must be the innermost wrapper (closest to the handler)
-	// so the type assertion in writeJSON sees the prettyWriter interface.
-	// It reads ?pretty=true from the query and wraps the ResponseWriter.
-	r.Use(prettyMiddleware)
+	// responseMiddleware must be the innermost wrapper (closest to the handler)
+	// so the type assertions in writeJSON see the prettyWriter and
+	// responseLimitWriter interfaces.
+	r.Use(s.responseMiddleware)
 
 	// Non-list routes: health, metrics, writes — responses are always
 	// small, so compression is just overhead with no benefit.
@@ -730,14 +730,15 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 	})
 }
 
-// bodyLimitMiddleware wraps the request body with http.MaxBytesReader to
-// enforce a maximum request body size. This prevents resource exhaustion
-// from clients sending excessively large request bodies. A limit <= 0 means
-// no limit is enforced.
+// bodyLimitMiddleware wraps the request body to enforce a maximum request
+// body size (and decompressed size for gzip/deflate bodies). This prevents
+// resource exhaustion from clients sending excessively large request bodies
+// or compression bombs. A limit <= 0 means no size limit is enforced.
 func (s *Server) bodyLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.httpRequestBodyLimit > 0 {
-			r.Body = http.MaxBytesReader(w, r.Body, s.httpRequestBodyLimit)
+		limit := s.effectiveRequestBodyLimit(r)
+		if limit > 0 || r.Header.Get("Content-Encoding") != "" {
+			wrapBoundedRequestBody(w, r, limit)
 		}
 		next.ServeHTTP(w, r)
 	})

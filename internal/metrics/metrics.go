@@ -183,6 +183,21 @@ var (
 		Name: "sorotrail_spec_invalidations_received_total",
 		Help: "Total number of spec cache invalidations received from other replicas.",
 	})
+
+	// HTTPLimitRejectionsTotal counts HTTP requests or responses rejected
+	// for exceeding a configured size limit, labelled by reason
+	// (request_body | request_decompressed | response_body).
+	HTTPLimitRejectionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_http_limit_rejections_total",
+		Help: "Total number of HTTP requests or responses rejected for exceeding a configured size limit, labelled by reason (request_body | request_decompressed | response_body).",
+	}, []string{"reason"})
+)
+
+// Limit rejection reasons for HTTPLimitRejectionsTotal.
+const (
+	LimitReasonRequestBody         = "request_body"
+	LimitReasonRequestDecompressed = "request_decompressed"
+	LimitReasonResponseBody        = "response_body"
 )
 
 func init() {
@@ -204,6 +219,7 @@ func init() {
 		RPCCircuitBreakerState,
 		RPCProviderState,
 		SpecInvalidationsReceived,
+		HTTPLimitRejectionsTotal,
 	)
 }
 

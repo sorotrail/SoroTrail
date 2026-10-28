@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "SoroTrail API",
-    "description": "A contract event indexer for the Stellar/Soroban network. SoroTrail polls\na Stellar RPC endpoint, stores contract events durably in Postgres, and\nserves them back through a queryable HTTP API long after the RPC has\nforgotten them.\n\nJSON-producing operations accept the shared `pretty=true` query\nparameter to indent responses for human inspection; it does not change\nthe response data.\n",
+    "description": "A contract event indexer for the Stellar/Soroban network. SoroTrail polls\na Stellar RPC endpoint, stores contract events durably in Postgres, and\nserves them back through a queryable HTTP API long after the RPC has\nforgotten them.\n\nJSON-producing operations accept the shared `pretty=true` query\nparameter to indent responses for human inspection; it does not change\nthe response data. Request bodies are bounded by `HTTP_REQUEST_BODY_LIMIT`\n(default 1 MiB, with a 2 MiB default override on `PUT /contracts/{id}/spec`),\napplied to both raw wire bytes and decompressed `Content-Encoding: gzip` or\n`deflate` streams. Non-streaming JSON responses are bounded by\n`HTTP_RESPONSE_BODY_LIMIT` (default 16 MiB) and an optional tighter\ncaller-supplied `X-Max-Response-Bytes` request header; payloads exceeding\nthe bound return `413 Request Entity Too Large` and increment\n`sorotrail_http_limit_rejections_total`.\n",
     "version": "0.2.0",
     "license": {
       "name": "Apache-2.0",
@@ -6553,7 +6553,7 @@
         }
       },
       "RequestEntityTooLarge": {
-        "description": "The request body exceeds the instance's configured limit (HTTP_REQUEST_BODY_LIMIT). Reduce the body size and retry.",
+        "description": "The request or response body exceeds the configured size bound: raw or decompressed (`gzip`/`deflate`) request bytes exceed the endpoint or global `HTTP_REQUEST_BODY_LIMIT`, or a non-streaming JSON response exceeds `HTTP_RESPONSE_BODY_LIMIT` / `X-Max-Response-Bytes`. Reduce the payload or page size and retry.",
         "content": {
           "application/json": {
             "schema": {

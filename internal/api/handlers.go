@@ -58,7 +58,7 @@ var errBodyTooLarge = errors.New("request body exceeds the configured limit")
 // malformed request gets the same status and message no matter which route
 // serves it.
 func (s *Server) decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	body, err := readJSONBody(r, s.httpRequestBodyLimit)
+	body, err := readJSONBody(r, s.effectiveRequestBodyLimit(r))
 	if err != nil {
 		if errors.Is(err, errBodyTooLarge) {
 			writeError(w, http.StatusRequestEntityTooLarge, err)
@@ -85,26 +85,40 @@ func readJSONBody(r *http.Request, limit int64) ([]byte, error) {
 		return nil, errors.New("request body is empty")
 	}
 
+	var br *boundedRequestBody
+	if limit > 0 || r.Header.Get("Content-Encoding") != "" {
+		br = wrapBoundedRequestBody(nil, r, limit)
+	}
+
 	var body []byte
 	var err error
 	if limit > 0 {
 		// Read one byte past the cap so an oversized body is reported as too
 		// large instead of being truncated into a misleading "unexpected EOF".
-		// At most limit+1 bytes are ever buffered. The body-limit middleware
-		// wraps r.Body in http.MaxBytesReader with the same limit, so its own
-		// "request body too large" error is normalized here too.
+		// At most limit+1 bytes are ever buffered.
 		body, err = io.ReadAll(io.LimitReader(r.Body, limit+1))
 	} else {
 		body, err = io.ReadAll(r.Body)
 	}
 	if err != nil {
-		tooLarge := errors.Is(err, errBodyTooLarge) || strings.Contains(err.Error(), "request body too large")
-		if tooLarge {
+		if errors.Is(err, errBodyTooLarge) {
+			return nil, err
+		}
+		if strings.Contains(err.Error(), "request body too large") {
+			if br != nil {
+				return nil, br.recordWireLimitError()
+			}
 			return nil, fmt.Errorf("request body exceeds %d bytes: %w", limit, errBodyTooLarge)
 		}
 		return nil, fmt.Errorf("reading request body: %w", err)
 	}
 	if limit > 0 && int64(len(body)) > limit {
+		if br != nil {
+			if br.isCompressed() {
+				return nil, br.recordDecompressedLimitError()
+			}
+			return nil, br.recordWireLimitError()
+		}
 		return nil, fmt.Errorf("request body exceeds %d bytes: %w", limit, errBodyTooLarge)
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
@@ -3007,14 +3021,18 @@ type prettyWriter interface {
 }
 
 // prettyResponseWriter wraps an http.ResponseWriter to carry the ?pretty flag
-// through the middleware chain. All ResponseWriter methods delegate to the
-// embedded writer so compression, flushing, and hijacking still work.
+// and non-streaming response size cap through the middleware chain. All
+// ResponseWriter methods delegate to the embedded writer so compression,
+// flushing, and hijacking still work.
 type prettyResponseWriter struct {
 	http.ResponseWriter
-	pretty bool
+	pretty           bool
+	maxResponseBytes int64
 }
 
 func (w *prettyResponseWriter) Pretty() bool { return w.pretty }
+
+func (w *prettyResponseWriter) MaxResponseBytes() int64 { return w.maxResponseBytes }
 
 // Flush forwards to the embedded ResponseWriter if it supports flushing.
 // This is required because interface embedding does not promote optional
@@ -3046,17 +3064,43 @@ func prettyMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Server) responseMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pw := &prettyResponseWriter{
+			ResponseWriter:   w,
+			pretty:           r.URL.Query().Get("pretty") == "true",
+			maxResponseBytes: s.effectiveResponseBodyLimit(r),
+		}
+		next.ServeHTTP(pw, r)
+	})
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
-
-	w.Header().Set("Content-Type", "application/json")
-
-	w.WriteHeader(status)
-
-	enc := json.NewEncoder(w)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
 	if pw, ok := w.(prettyWriter); ok && pw.Pretty() {
 		enc.SetIndent("", "  ")
 	}
 	_ = enc.Encode(v)
+
+	if status < http.StatusBadRequest {
+		if rw, ok := w.(responseLimitWriter); ok && rw.MaxResponseBytes() > 0 && int64(buf.Len()) > rw.MaxResponseBytes() {
+			metrics.HTTPLimitRejectionsTotal.WithLabelValues(metrics.LimitReasonResponseBody).Inc()
+			w.Header().Del("ETag")
+			w.Header().Del("Link")
+			writeCacheHeaders(w, cacheNoStore, 0, "")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(errorResponse{
+				Error: fmt.Sprintf("response body exceeds %d bytes", rw.MaxResponseBytes()),
+			})
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(buf.Bytes())
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {

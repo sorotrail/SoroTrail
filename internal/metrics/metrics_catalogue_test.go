@@ -124,6 +124,15 @@ var metricCatalogue = []metricSpec{
 		Help:    "Total number of spec cache invalidations received from other replicas.",
 		Meaning: "Spec-cache invalidations this process applied because another replica said the contract's decoded shape changed. A non-zero value proves the cross-replica fan-out is working; a replica that never invalidates anything while its peers change specs is serving stale decodes. Stays at zero on a single-replica deployment, where there is nobody to hear from.",
 	},
+	{
+		Name: "sorotrail_http_limit_rejections_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "reason", Values: "request_body | request_decompressed | response_body"},
+		},
+		Help:    "Total number of HTTP requests or responses rejected for exceeding a configured size limit, labelled by reason (request_body | request_decompressed | response_body).",
+		Meaning: "Requests or responses refused with 413 Request Entity Too Large because they exceeded a configured size bound: request_body for raw request bytes over the endpoint or global HTTP_REQUEST_BODY_LIMIT, request_decompressed for gzip/deflate payloads whose decompressed stream expanded past the limit, and response_body for non-streaming JSON responses over HTTP_RESPONSE_BODY_LIMIT or the caller's X-Max-Response-Bytes bound.",
+		touch:   func() { HTTPLimitRejectionsTotal.WithLabelValues(LimitReasonRequestBody) },
+	},
 
 	// --- RPC ---
 	{

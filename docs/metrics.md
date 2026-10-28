@@ -84,6 +84,7 @@ it is documented. Regenerate it with:
 | Metric | Type | Labels | Help (as served) | Meaning |
 | --- | --- | --- | --- | --- |
 | `sorotrail_spec_invalidations_received_total` | counter | — | Total number of spec cache invalidations received from other replicas. | Spec-cache invalidations this process applied because another replica said the contract's decoded shape changed. A non-zero value proves the cross-replica fan-out is working; a replica that never invalidates anything while its peers change specs is serving stale decodes. Stays at zero on a single-replica deployment, where there is nobody to hear from. |
+| `sorotrail_http_limit_rejections_total` | counter | `reason` (request_body \| request_decompressed \| response_body) | Total number of HTTP requests or responses rejected for exceeding a configured size limit, labelled by reason (request_body \| request_decompressed \| response_body). | Requests or responses refused with 413 Request Entity Too Large because they exceeded a configured size bound: request_body for raw request bytes over the endpoint or global HTTP_REQUEST_BODY_LIMIT, request_decompressed for gzip/deflate payloads whose decompressed stream expanded past the limit, and response_body for non-streaming JSON responses over HTTP_RESPONSE_BODY_LIMIT or the caller's X-Max-Response-Bytes bound. |
 
 ## HTTP metrics (per-server registry)
 
@@ -102,7 +103,7 @@ predictable and alert rules can name a value with confidence:
 | `operation` | store.<Store method> — a fixed table of method names (store.UpsertEvents, store.QueryEvents, …), one per guarded Store operation | `sorotrail_db_query_duration_seconds`, `sorotrail_db_operations_total` |
 | `outcome` | success \| error | `sorotrail_rpc_call_duration_seconds`, `sorotrail_db_operations_total` |
 | `provider` | the hostname of one RPC_URLS entry — scheme, credentials, path and query are stripped, so nothing client-identifying is exported | `sorotrail_rpc_provider_state` |
-| `reason` | backoff \| retry_after | `sorotrail_rpc_retries_total`, `sorotrail_rpc_failovers_total` |
+| `reason` | request_body \| request_decompressed \| response_body | `sorotrail_http_limit_rejections_total`, `sorotrail_rpc_retries_total`, `sorotrail_rpc_failovers_total` |
 | `route` | the matched chi route pattern (e.g. /events/{id}), or "unmatched" for a path no route registered — never the raw path, so probes cannot grow cardinality | `http_request_duration_seconds` |
 | `state` | closed \| open \| half-open | `sorotrail_rpc_circuit_breaker_state`, `sorotrail_rpc_provider_state` |
 | `status` | the response status code as a decimal string (200 \| 404 \| 500 \| …) | `http_request_duration_seconds` |

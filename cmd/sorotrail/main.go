@@ -656,6 +656,10 @@ func runService(dryRun bool) error {
 	apiServer.SetMetricsEnabled(cfg.MetricsEnabled)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 	apiServer.SetHTTPRequestBodyLimit(cfg.HTTPRequestBodyLimit)
+	if cfg.HTTPRequestBodyLimit == api.DefaultHTTPRequestBodyLimit {
+		apiServer.SetEndpointRequestBodyLimit("PUT /contracts/{id}/spec", api.DefaultSpecOverrideBodyLimit)
+	}
+	apiServer.SetHTTPResponseBodyLimit(cfg.HTTPResponseBodyLimit)
 	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
 	apiServer.SetDefaultNetwork(cfg.Network)
 	apiServer.SetCORSConfig(api.CORSConfig{
