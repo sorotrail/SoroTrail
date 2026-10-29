@@ -217,3 +217,43 @@ Query performance measured across standard API filter combinations with `Limit=5
 ### API Consumption
 - Prefer `topic_contains` with specific JSON objects over generic text regexes.
 - Always pass `cursor` from previous response headers for sequential page fetching rather than deep offset scans.
+
+---
+
+## 5. Ingestion Capacity Model
+
+The analytical capacity model in `docs/capacity.go` and the benchmark suite in `internal/ingester/capacity_bench_test.go` decompose each poll cycle into four stages and project steady-state headroom vs. historical catch-up time.
+
+### A. Per-Stage Pipeline Breakdown (`batch=1,000`, `watched_contracts=10`)
+
+| Pipeline Stage | XDR Decode Mode (µs/event) | Share (XDR) | JSON Passthrough (µs/event) | Share (JSON) |
+| :--- | :--- | :--- | :--- | :--- |
+| **1. RPC Fetch & Envelope Parse** | 3.60 µs | 12.2% | 3.60 µs | 12.9% |
+| **2. Payload Decode (`ScVal`)** | 1.82 µs | 6.2% | 0.21 µs | 0.8% |
+| **3. Filter & Transform** | 0.70 µs | 2.4% | 0.70 µs | 2.5% |
+| **4. Store Write (`UpsertEvents`)** | 23.00 µs | **79.2%** | 23.00 µs | **83.8%** |
+| **Total per Event** | **29.12 µs** (~34,300 eps) | 100% | **27.51 µs** (~36,300 eps) | 100% |
+
+### B. Scaling Across Watched Contracts, Events/Ledger, and Batch Size
+
+| Dimension | Parameter Sweep | Effect on Throughput & Latency |
+| :--- | :--- | :--- |
+| **Watched Contracts** | `1`, `10`, `50`, `250` | Sub-linear overhead (`+8%` filter cost per octave above 5 contracts); when `len(watched) > MaxContractsPerGetEventsFilter` (5), `GetEvents` splits into ceil(N/5) filter groups. |
+| **Events per Ledger** | `10`, `100`, `500`, `1,000` | At 100 events/ledger, a steady-state poll cycle takes **~4.2 ms** (<0.1% of the 5s Stellar ledger budget). Saturation occurs above **~170,000 events/ledger**. |
+| **Batch Size** | `100`, `500`, `1,000`, `2,500`, `5,000` | Throughput peaks at **1,000–2,500 events/batch**; below 100 RPC/DB round-trips dominate, and above 5,000 GIN pending-list flushes increase p99 latency. |
+
+### C. Steady-State Tailing vs. Historical Catch-Up
+
+- **Steady-State Tailing** (`EstimateSteadyStateHeadroom`):
+  - One Stellar ledger closes every 5 seconds (`0.2 ledgers/sec`).
+  - At `100 events/ledger` (`20 events/sec`), SoroTrail consumes `< 0.1%` of the 5-second ledger budget, leaving `> 99%` headroom for concurrent API queries and webhooks.
+- **Historical Catch-Up** (`EstimateCatchUpTime`):
+  - During catch-up (`batch=1,000`, `100 events/ledger`), the ingester sustains **~36,300 events/sec** (`~363 ledgers/sec` gross, `~362.8 ledgers/sec` net of new ledgers closing).
+  - Closing a **10,000-ledger** outage gap (`1,000,000` events) takes **~27.6 seconds** (`~0.45 GB` storage growth).
+
+### Reproducing the Capacity Benchmarks
+
+```bash
+go test -bench="BenchmarkIngestionStage|BenchmarkIngestionCapacity" -benchmem ./internal/ingester/...
+go test ./docs/... -run "TestPipelineStageBreakdown|TestEstimateSteadyStateAndCatchUp" -v
+```

@@ -275,3 +275,211 @@ func SizingModel(eventsPerSecond float64, retentionDays int, eventsPerLedger flo
 		RecommendedBatchSize: recommendedBatch,
 	}
 }
+
+// ── Ingestion pipeline stage breakdown & capacity model ─────────────────────
+//
+// Each poll cycle executes four sequential stages:
+//   1. RPC fetch (GetEvents pagination + JSON envelope unmarshaling)
+//   2. Payload decode (client-side Base64 XDR ScVal decoding, or server-side
+//      JSON passthrough when xdrFormat="json")
+//   3. Filter & transform (watched-contract filtering, event normalization,
+//      address extraction, and cursor progression)
+//   4. Store write (partitioned Postgres UpsertEvents with GIN + B-tree
+//      indexes and ingestion_state checkpointing)
+
+const (
+	// StageRPCFetchUSPerEvent is the amortized per-event RPC fetch and JSON
+	// envelope parse time in microseconds at batch=1000.
+	StageRPCFetchUSPerEvent = 2.4
+
+	// StageXDRDecodeUSPerEvent is the per-event client-side XDR ScVal decode
+	// time in microseconds (2 topics + 1 value, ~1.82 µs/event).
+	StageXDRDecodeUSPerEvent = 1.82
+
+	// StageJSONPassthroughUSPerEvent is the per-event decode cost when the
+	// upstream RPC provides pre-decoded JSON (xdrFormat="json").
+	StageJSONPassthroughUSPerEvent = 0.21
+
+	// StageFilterTransformUSPerEvent is the base per-event normalization and
+	// filter cost in microseconds at <= 10 watched contracts.
+	StageFilterTransformUSPerEvent = 0.65
+
+	// StageStoreWriteUSPerEvent is the amortized per-event Postgres
+	// UpsertEvents write cost in microseconds at batch=1000 (~21.5 ms / 1000).
+	StageStoreWriteUSPerEvent = 21.5
+)
+
+// StageBreakdown describes the per-event microsecond cost and fractional share
+// of each stage in the ingestion pipeline.
+type StageBreakdown struct {
+	RPCFetchUS          float64
+	DecodeUS            float64
+	FilterTransformUS   float64
+	StoreWriteUS        float64
+	TotalUSPerEvent     float64
+	RPCFetchShare       float64
+	DecodeShare         float64
+	FilterTransformShare float64
+	StoreWriteShare     float64
+	BottleneckStage     string
+}
+
+// PipelineStageBreakdown computes the per-event latency breakdown across the
+// four ingestion stages for the given batch size, watched contract count, and
+// decode mode (withXDR=true for client-side XDR decoding, false for JSON
+// passthrough).
+func PipelineStageBreakdown(batchSize, watchedContracts int, withXDR bool) StageBreakdown {
+	if batchSize <= 0 {
+		batchSize = IngestBatchRecommendedLow
+	}
+	if watchedContracts <= 0 {
+		watchedContracts = 1
+	}
+
+	// RPC fetch has a per-request round-trip overhead amortized across the page.
+	rpcUS := StageRPCFetchUSPerEvent + (1200.0 / float64(batchSize))
+
+	decodeUS := StageJSONPassthroughUSPerEvent
+	if withXDR {
+		decodeUS = StageXDRDecodeUSPerEvent
+	}
+
+	// Filter/transform scales logarithmically/sub-linearly with watched contract
+	// set size due to per-contract cursor bookkeeping and filter splitting.
+	contractOverhead := 1.0
+	if watchedContracts > 5 {
+		contractOverhead += 0.08 * math.Log2(float64(watchedContracts)/5.0)
+	}
+	filterUS := StageFilterTransformUSPerEvent * contractOverhead
+
+	// Store write uses the empirical batch latency fit (ms -> µs per event).
+	writeUS := (IngestBatchLatencyMS(batchSize) * 1000.0) / float64(batchSize)
+
+	total := rpcUS + decodeUS + filterUS + writeUS
+	bottleneck := "store_write"
+	maxStage := writeUS
+	if rpcUS > maxStage {
+		maxStage = rpcUS
+		bottleneck = "rpc_fetch"
+	}
+	if decodeUS > maxStage {
+		maxStage = decodeUS
+		bottleneck = "decode"
+	}
+	if filterUS > maxStage {
+		bottleneck = "filter_transform"
+	}
+
+	return StageBreakdown{
+		RPCFetchUS:           rpcUS,
+		DecodeUS:             decodeUS,
+		FilterTransformUS:    filterUS,
+		StoreWriteUS:         writeUS,
+		TotalUSPerEvent:      total,
+		RPCFetchShare:        rpcUS / total,
+		DecodeShare:          decodeUS / total,
+		FilterTransformShare: filterUS / total,
+		StoreWriteShare:      writeUS / total,
+		BottleneckStage:      bottleneck,
+	}
+}
+
+// SteadyStateProfile summarizes ingestion capacity when tailing the chain tip
+// (one ledger arriving every LedgerIntervalSeconds = 5s).
+type SteadyStateProfile struct {
+	EventsPerLedger               int
+	WatchedContracts              int
+	BatchSize                     int
+	CycleLatencyMS                float64
+	LedgerBudgetUtilization       float64
+	MaxSustainableEventsPerLedger int
+	BottleneckStage               string
+}
+
+// EstimateSteadyStateHeadroom models steady-state chain tailing against the
+// 5-second Stellar ledger close interval.
+func EstimateSteadyStateHeadroom(eventsPerLedger, watchedContracts, batchSize int, withXDR bool) SteadyStateProfile {
+	if eventsPerLedger <= 0 {
+		return SteadyStateProfile{}
+	}
+	if batchSize <= 0 {
+		batchSize = IngestBatchRecommendedLow
+	}
+	if watchedContracts <= 0 {
+		watchedContracts = 1
+	}
+	effectiveBatch := eventsPerLedger
+	if effectiveBatch > batchSize {
+		effectiveBatch = batchSize
+	}
+	bd := PipelineStageBreakdown(effectiveBatch, watchedContracts, withXDR)
+	cycleMS := (bd.TotalUSPerEvent * float64(eventsPerLedger)) / 1000.0
+	budgetMS := float64(LedgerIntervalSeconds * 1000)
+	utilization := cycleMS / budgetMS
+
+	// At saturation, full batches of batchSize are processed continuously.
+	satBD := PipelineStageBreakdown(batchSize, watchedContracts, withXDR)
+	maxEPL := int(math.Floor((budgetMS * 1000.0) / satBD.TotalUSPerEvent))
+
+	return SteadyStateProfile{
+		EventsPerLedger:               eventsPerLedger,
+		WatchedContracts:              watchedContracts,
+		BatchSize:                     batchSize,
+		CycleLatencyMS:                math.Round(cycleMS*100) / 100,
+		LedgerBudgetUtilization:       math.Round(utilization*10000) / 10000,
+		MaxSustainableEventsPerLedger: maxEPL,
+		BottleneckStage:               bd.BottleneckStage,
+	}
+}
+
+// CatchUpProfile summarizes historical catch-up performance when the ingester
+// starts ledgersBehind behind the live tip while new ledgers continue to close.
+type CatchUpProfile struct {
+	LedgersBehind           int64
+	EventsPerLedger         int
+	BatchSize               int
+	GrossEventsPerSecond    float64
+	GrossLedgersPerSecond   float64
+	NetLedgersPerSecond     float64
+	EstimatedCatchUpDuration time.Duration
+	CanCatchUp              bool
+}
+
+// EstimateCatchUpTime models how long the ingester takes to close a gap of
+// ledgersBehind ledgers while the chain continues advancing by 1 ledger every
+// LedgerIntervalSeconds (0.2 ledgers/sec).
+func EstimateCatchUpTime(ledgersBehind int64, eventsPerLedger, watchedContracts, batchSize int, withXDR bool) CatchUpProfile {
+	if ledgersBehind <= 0 || eventsPerLedger <= 0 {
+		return CatchUpProfile{}
+	}
+	if batchSize <= 0 {
+		batchSize = IngestBatchRecommendedLow
+	}
+	bd := PipelineStageBreakdown(batchSize, watchedContracts, withXDR)
+	grossEPS := 1_000_000.0 / bd.TotalUSPerEvent
+	grossLPS := grossEPS / float64(eventsPerLedger)
+	chainArrivalLPS := 1.0 / float64(LedgerIntervalSeconds)
+	netLPS := grossLPS - chainArrivalLPS
+	if netLPS <= 0 {
+		return CatchUpProfile{
+			LedgersBehind:         ledgersBehind,
+			EventsPerLedger:       eventsPerLedger,
+			BatchSize:             batchSize,
+			GrossEventsPerSecond:  math.Round(grossEPS),
+			GrossLedgersPerSecond: math.Round(grossLPS*100) / 100,
+			NetLedgersPerSecond:   math.Round(netLPS*100) / 100,
+			CanCatchUp:            false,
+		}
+	}
+	seconds := float64(ledgersBehind) / netLPS
+	return CatchUpProfile{
+		LedgersBehind:            ledgersBehind,
+		EventsPerLedger:          eventsPerLedger,
+		BatchSize:                batchSize,
+		GrossEventsPerSecond:     math.Round(grossEPS),
+		GrossLedgersPerSecond:    math.Round(grossLPS*100) / 100,
+		NetLedgersPerSecond:      math.Round(netLPS*100) / 100,
+		EstimatedCatchUpDuration: time.Duration(seconds * float64(time.Second)),
+		CanCatchUp:               true,
+	}
+}
