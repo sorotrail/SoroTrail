@@ -1070,6 +1070,7 @@ func (c *Client) ContractExport(ctx context.Context, id string, params ContractE
 
 // ContractExportParams are the query parameters for ContractExport.
 type ContractExportParams struct {
+	Terminator string
 	FromLedger int64
 	ToLedger   int64
 	Format     string
@@ -1079,6 +1080,9 @@ type ContractExportParams struct {
 // unset field is omitted from the URL rather than sent as empty.
 func (p ContractExportParams) values() url.Values {
 	v := url.Values{}
+	if p.Terminator != "" {
+		v.Set("terminator", p.Terminator)
+	}
 	if p.FromLedger != 0 {
 		v.Set("from_ledger", strconv.FormatInt(p.FromLedger, 10))
 	}
@@ -1378,6 +1382,7 @@ func (c *Client) EventsCSV(ctx context.Context, params EventsCSVParams) ([]byte,
 
 // EventsCSVParams are the query parameters for EventsCSV.
 type EventsCSVParams struct {
+	Terminator       string
 	ContractID       string
 	Type             string
 	Topic            string
@@ -1405,6 +1410,9 @@ type EventsCSVParams struct {
 // unset field is omitted from the URL rather than sent as empty.
 func (p EventsCSVParams) values() url.Values {
 	v := url.Values{}
+	if p.Terminator != "" {
+		v.Set("terminator", p.Terminator)
+	}
 	if p.ContractID != "" {
 		v.Set("contract_id", p.ContractID)
 	}

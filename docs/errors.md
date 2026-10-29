@@ -40,14 +40,14 @@ they matter rather than on every path.
 | POST /apikeys names a key longer than the store allows | POST /apikeys | `name must be at most 100 characters` |
 | POST /apikeys cannot decode its JSON body | POST /apikeys | `invalid JSON: <json error>` |
 | DELETE /apikeys/{id} is given a path id that is not a positive integer | DELETE /apikeys/{id} | `API key id must be a positive integer, got %q` |
-| the export's format parameter names something other than csv or ndjson | GET /contracts/{id}/export | `invalid format %q (want csv or ndjson)` |
+| the export's format parameter names something other than csv or ndjson, or its terminator parameter is neither true nor false | GET /contracts/{id}/export | `invalid format %q (want csv or ndjson); invalid terminator (want true or false)` |
 | the export is requested without explicit ledger bounds | GET /contracts/{id}/export | `from_ledger and to_ledger are required for export` |
 | the export's ledger bounds are inverted | GET /contracts/{id}/export | `from_ledger %d is after to_ledger %d` |
 | the export's from_ledger bound is not a positive integer | GET /contracts/{id}/export | `from_ledger <detail>` |
 | the export is requested for a path contract id that is not a strkey | GET /contracts/{id}/export | `invalid contract id %q (want 56-char C... strkey)` |
 | the export's ledger range is wider than the operator's cap | GET /contracts/{id}/export | `ledger range [%d,%d] spans %d ledgers, exceeding EXPORT_MAX_RANGE=%d` |
 | the export's to_ledger bound is not a positive integer | GET /contracts/{id}/export | `to_ledger <detail>` |
-| the CSV export's format parameter names something other than csv or ndjson | GET /events.csv | `invalid format %q (want csv or ndjson)` |
+| the CSV export's format parameter names something other than csv or ndjson, or its terminator parameter is neither true nor false | GET /events.csv | `invalid format %q (want csv or ndjson); invalid terminator (want true or false)` |
 | the first watch would silently narrow ingestion from all contracts to a list, and the caller did not pass ?confirm=true | POST /watched-contracts | `adding the first watched contract would switch ingestion from 'all contract events' to a specific list — pass ?confirm=true to acknowledge` |
 | the body's contract_id is not a strkey | POST /watched-contracts | `invalid contract_id %q (want 56-char C... strkey)` |
 | the address-events filter fails shared validation | GET /addresses/{address}/events | `event-filter validation message (see "Event-filter validation messages" below)` |
@@ -177,6 +177,7 @@ they matter rather than on every path.
 | the store fails while listing API keys | GET /apikeys | `listing API keys failed` |
 | the store fails while revoking an API key | DELETE /apikeys/{id} | `revoking API key failed` |
 | the store fails while resolving the presented key (a backend fault, not a bad credential) | POST /apikeys, GET /apikeys, DELETE /apikeys/{id}, GET /events/ws, POST /subscriptions, PUT /subscriptions/{id}, DELETE /subscriptions/{id}, GET /subscriptions, GET /subscriptions/{id}, GET /subscriptions/{id}/deliveries | `checking API key failed` |
+| the store fails before the first byte of an NDJSON export has been written (after that the stream is aborted instead) | GET /events.csv, GET /contracts/{id}/export | `export failed` |
 | the store fails while adding the contract to the watch list | POST /watched-contracts | `adding watched contract failed` |
 | the store fails while reading where historical replay would start | POST /watched-contracts | `loading ingestion state failed` |
 | the store fails while reading the current watch list to decide the mode transition | POST /watched-contracts | `loading watched contracts failed` |

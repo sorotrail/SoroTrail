@@ -1562,10 +1562,29 @@ paths:
       operationId: eventsCSV
       summary: Export events as CSV
       description: >-
-        Streaming CSV export of matching events. Pagination controls are
-        intentionally ignored; the server walks the complete result set.
+        Streaming export of matching events, as CSV or NDJSON (`format`).
+        Pagination controls are intentionally ignored; the server walks the
+        complete result set one page at a time, so memory stays flat however
+        large it is.
+
+        The status is committed with the first row, so how an export ended is
+        reported separately. A complete export sets the `X-Export-Status`
+        trailer to `complete` and `X-Export-Rows` to the row count. An export
+        that stops after rows were sent (a store failure, the server's request
+        timeout, the client going away) aborts the connection instead of
+        ending the body, so the client sees a transport error rather than a
+        short file that looks whole. A failure before the first NDJSON row is
+        an ordinary 500. `terminator=true` adds the same end marker in-band.
+
+        CSV cells that a spreadsheet would execute as a formula (a leading
+        `=`, `+`, `@`, tab or carriage return, or a `-` that is not a JSON
+        number) are prefixed with a single quote. Columns are `id`, `ledger`,
+        `type`, `tx_hash`, `topics` and `value`; `topics` and `value` are JSON
+        documents written verbatim into one cell. Rows served count against
+        the tenant's events-served usage.
       tags: [Operations]
       parameters:
+        - $ref: "#/components/parameters/ExportTerminator"
         - $ref: "#/components/parameters/ContractID"
         - $ref: "#/components/parameters/EventType"
         - $ref: "#/components/parameters/Topic"
@@ -1888,9 +1907,15 @@ paths:
       operationId: contractExport
       summary: Export a contract's events
       description: >-
-        Streaming export of every stored event for one contract.
+        Streaming export of every stored event for one contract in a closed
+        ledger range, as CSV or NDJSON (`format`). It streams page by page and
+        reports how it ended exactly as `GET /events.csv` does: the
+        `X-Export-Status` and `X-Export-Rows` trailers on success, an aborted
+        connection when it stops early, and `terminator=true` for an in-band
+        end marker.
       tags: [Operations]
       parameters:
+        - $ref: "#/components/parameters/ExportTerminator"
         - name: id
           in: path
           required: true
@@ -3363,6 +3388,19 @@ components:
         type: string
         enum: ["true"]
       example: "true"
+    ExportTerminator:
+      name: terminator
+      in: query
+      description: >-
+        When "true", append an in-band end marker so a consumer that cannot
+        read HTTP trailers can still tell a complete export from a truncated
+        one: a final NDJSON line `{"export":{"complete":true,"rows":N}}`, or
+        a final CSV record `#export-complete,N`. Absent or "false" leaves the
+        rows exactly as before.
+      schema:
+        type: string
+        enum: ["true", "false"]
+        default: "false"
     Pretty:
       name: pretty
       in: query

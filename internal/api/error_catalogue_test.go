@@ -136,14 +136,15 @@ var errorCatalogue = []errorCondition{
 	{File: "auth.go", Func: "writeUnauthorized", Status: 401, Arg: `errors.New(msg)`, Message: "missing API key; malformed API key; unknown or revoked API key", Condition: "multi-tenant authentication rejects the credential, with the reason that lets a legitimate caller fix it", SpecExempt: true, AnyNonProbe: true, Notes: "WWW-Authenticate: Bearer realm=\"sorotrail\" per RFC 7235 §4.1"},
 
 	// --- export.go ---
-	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `err`, Message: "invalid format %q (want csv or ndjson)", Condition: "the export's format parameter names something other than csv or ndjson"},
+	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `err`, Count: 2, Message: "invalid format %q (want csv or ndjson); invalid terminator (want true or false)", Condition: "the export's format parameter names something other than csv or ndjson, or its terminator parameter is neither true nor false"},
 	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `errors.New("from_ledger and to_ledger are required for export")`, Message: "from_ledger and to_ledger are required for export", Condition: "the export is requested without explicit ledger bounds"},
 	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `fmt.Errorf("from_ledger %d is after to_ledger %d", fromLedger, toLedger)`, Message: "from_ledger %d is after to_ledger %d", Condition: "the export's ledger bounds are inverted"},
 	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `fmt.Errorf("from_ledger %s", err.Error())`, Message: "from_ledger <detail>", Condition: "the export's from_ledger bound is not a positive integer"},
 	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", contractID)`, Message: "invalid contract id %q (want 56-char C... strkey)", Condition: "the export is requested for a path contract id that is not a strkey"},
 	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `fmt.Errorf("ledger range [%d,%d] spans %d ledgers, exceeding EXPORT_MAX_RANGE=%d", fromLedger, toLedger, span, s.exportMaxRange)`, Message: "ledger range [%d,%d] spans %d ledgers, exceeding EXPORT_MAX_RANGE=%d", Condition: "the export's ledger range is wider than the operator's cap"},
 	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `fmt.Errorf("to_ledger %s", err.Error())`, Message: "to_ledger <detail>", Condition: "the export's to_ledger bound is not a positive integer"},
-	{File: "export.go", Func: "Server.handleEventsCSV", Status: 400, Arg: `err`, Message: "invalid format %q (want csv or ndjson)", Condition: "the CSV export's format parameter names something other than csv or ndjson"},
+	{File: "export.go", Func: "Server.handleEventsCSV", Status: 400, Arg: `err`, Count: 2, Message: "invalid format %q (want csv or ndjson); invalid terminator (want true or false)", Condition: "the CSV export's format parameter names something other than csv or ndjson, or its terminator parameter is neither true nor false"},
+	{File: "export_stream.go", Func: "Server.streamExportOpts", Status: 500, Arg: `errors.New("export failed")`, Message: "export failed", Condition: "the store fails before the first byte of an NDJSON export has been written (after that the stream is aborted instead)"},
 	// --- handlers.go ---
 	{File: "handlers.go", Func: "Server.handleAddWatchedChain", Status: 400, Arg: `errors.New( "adding the first watched contract would switch ingestion from "+ "'all contract events' to a specific list — pass ?confirm=true to acknowledge")`, Message: "adding the first watched contract would switch ingestion from 'all contract events' to a specific list — pass ?confirm=true to acknowledge", Condition: "the first watch would silently narrow ingestion from all contracts to a list, and the caller did not pass ?confirm=true"},
 	{File: "handlers.go", Func: "Server.handleAddWatchedChain", Status: 400, Arg: `fmt.Errorf("invalid contract_id %q (want 56-char C... strkey)", req.ContractID)`, Message: "invalid contract_id %q (want 56-char C... strkey)", Condition: "the body's contract_id is not a strkey"},
@@ -345,6 +346,7 @@ var funcRoutes = map[string][]string{
 	"Server.handleContractEvents":      {"GET /contracts/{id}/events"},
 	"Server.handleContractStats":       {"GET /contracts/{id}/stats"},
 	"Server.handleContractExport":      {"GET /contracts/{id}/export"},
+	"Server.streamExportOpts":          {"GET /events.csv", "GET /contracts/{id}/export"},
 	"Server.serveEvents":               {"GET /events", "GET /contracts/{id}/events"},
 	// writeFilterError is shared by every list-shaped filter build (and by
 	// the subscription filter authorizer); writeForbiddenContract is its

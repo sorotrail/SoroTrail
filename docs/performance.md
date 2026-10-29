@@ -103,6 +103,45 @@ the database query, because the validator is derived from the response, so the
 handler still runs. A validator that avoids the query would need a store-side
 change counter, which the store does not have today.
 
+## Bulk export
+
+`GET /events.csv` (any filter the listing takes) and
+`GET /contracts/{id}/export` (a closed ledger range, capped by
+`EXPORT_MAX_RANGE`) stream events as CSV or NDJSON.
+
+- **Streaming, bounded memory.** The handler walks the same cursor-paged query
+  the listing uses, 200 rows at a time, writes and flushes each page, and
+  holds nothing else. `TestExportMemoryIsFlatInTheSizeOfTheResult` streams
+  20k and 200k synthetic rows through each format: 85 MiB of NDJSON written at
+  a 3 MiB heap peak, the same peak as the 8 MiB run. Cursor paging was chosen
+  over one long server-side cursor so the database working set stays bounded
+  too and the filter code path is shared with the listing.
+- **Bounded or unbounded.** The contract export requires a ledger range. The
+  filtered `/events.csv` has no row cap by design; it is bounded by the
+  server's request timeout, which ends the walk (see below) and by the client
+  hanging up, which the loop notices between pages.
+- **A truncated export is detectable.** Once a row is sent the status is
+  `200`, so the end is reported separately. A complete export sets the
+  `X-Export-Status: complete` and `X-Export-Rows: N` trailers. An export that
+  stops after rows were sent aborts the connection, so the client sees a
+  transport error, never a short file that parses cleanly. Consumers that
+  cannot read trailers pass `terminator=true` to get an in-band marker: a last
+  NDJSON line `{"export":{"complete":true,"rows":N}}` or a last CSV record
+  `#export-complete,N`. A failure before any NDJSON row is an ordinary 500.
+- **Columns.** `id, ledger, type, tx_hash, topics, value`. `topics` and `value`
+  are JSON documents written verbatim into one cell (quoted by the CSV writer).
+- **CSV injection.** A cell that starts with `=`, `+`, `@`, a tab or a carriage
+  return, or a `-` that is not a JSON number, is prefixed with a single quote so
+  a spreadsheet shows it as text. Valid JSON cells (`topics`, `value`) are left
+  alone, so the column stays parseable.
+- **Cost.** Every exported row counts against the tenant's events-served usage,
+  the same counter the paged listing feeds. Exports are not otherwise rate
+  limited beyond the per-tenant request limiter.
+- **Why not an asynchronous job.** A job producing a downloadable artefact
+  would need somewhere to store it. Streaming needs nothing stored, and the
+  range cap and the timeout already bound the work, so it is the simpler shape
+  until an export larger than a request timeout is a real requirement.
+
 ## 1. Methodology
 
 All performance benchmarks are reproducible using the included benchmark suite and database seeding tool.
