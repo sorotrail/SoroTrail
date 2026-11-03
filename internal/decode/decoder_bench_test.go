@@ -196,3 +196,17 @@ func BenchmarkFullPageJSONSerialization(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkExtractAddresses_Transfer(b *testing.B) {
+	topics := json.RawMessage(`[{"symbol":"transfer"},{"address":"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"},{"address":"CCW67TSBWVENNVMTQPEXNGXYL6G5CZWKW563CYCPBQR27XMTC2AFAXXT"}]`)
+	value := json.RawMessage(`{"i128":"1000000000"}`)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		refs := ExtractAddresses(topics, value)
+		if len(refs) != 2 {
+			b.Fatalf("expected 2 address refs, got %d", len(refs))
+		}
+	}
+}
