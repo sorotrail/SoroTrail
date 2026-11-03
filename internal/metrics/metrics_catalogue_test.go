@@ -234,6 +234,16 @@ var metricCatalogue = []metricSpec{
 
 	// --- HTTP (per-server) ---
 	{
+		Name: "sorotrail_http_deprecated_requests_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "route", Values: "the matched chi route pattern (e.g. /events/{id}), or \"unmatched\" for a path no route registered — never the raw path, so probes cannot grow cardinality"},
+			{Name: "method", Values: "the HTTP method (GET | POST | PUT | PATCH | DELETE)"},
+		},
+		Help:    "Total HTTP requests to deprecated API endpoints, labelled by route and method.",
+		Meaning: "Calls to HTTP endpoints marked deprecated: true in the OpenAPI specification. Operators watch this counter approach zero during a deprecation window before removing the endpoint after its Sunset date.",
+		touch:   func() { DeprecatedHTTPRequestsTotal.WithLabelValues("/events", "GET") },
+	},
+	{
 		Name: "http_request_duration_seconds", Scope: scopeServer, Kind: "histogram",
 		Labels: []metricLabel{
 			{Name: "route", Values: "the matched chi route pattern (e.g. /events/{id}), or \"unmatched\" for a path no route registered — never the raw path, so probes cannot grow cardinality"},
