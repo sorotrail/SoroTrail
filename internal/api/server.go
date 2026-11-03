@@ -240,6 +240,10 @@ type Server struct {
 	deprecationMu     sync.RWMutex
 	deprecationPolicy *DeprecationPolicy
 	deprecatedCounts  map[string]uint64
+
+	// breaker is the optional database circuit breaker used to fast-fail
+	// database-backed endpoints when the store is unavailable.
+	breaker *store.StoreBreaker
 }
 
 // SetHTTPRequestBodyLimit sets the request body size limit, in bytes, for all handlers accepting a body.
@@ -472,6 +476,7 @@ func (s *Server) router() chi.Router {
 	if s.limiter != nil {
 		r.Use(s.limiter.Middleware)
 	}
+	r.Use(s.degradedMiddleware)
 	// authenticate must run before any handler that reads events: it is what
 	// puts a Principal (and therefore a Scope) on the request context. In
 	// single-tenant mode it injects a wildcard principal, so behavior is

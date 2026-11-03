@@ -15,12 +15,16 @@ type GuardedStoreOptions struct {
 	Timeout            time.Duration
 	SlowQueryThreshold time.Duration
 	Logger             *slog.Logger
+	Breaker            *StoreBreaker
+	Health             *DatabaseHealth
 }
 
 type guardedStore struct {
 	Store
 	options     GuardedStoreOptions
 	queryErrors atomic.Uint64
+	breaker     *StoreBreaker
+	health      *DatabaseHealth
 }
 
 type queryNameContextKey struct{}
@@ -38,7 +42,60 @@ func NewGuardedStore(base Store, opts GuardedStoreOptions) Store {
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &guardedStore{Store: base, options: opts}
+	breaker := opts.Breaker
+	if breaker == nil {
+		if bp, ok := base.(interface{ Breaker() *StoreBreaker }); ok {
+			breaker = bp.Breaker()
+		}
+	}
+	health := opts.Health
+	if health == nil {
+		if hp, ok := base.(interface{ Health() *DatabaseHealth }); ok && hp.Health() != nil {
+			health = hp.Health()
+		} else {
+			health = NewDatabaseHealth(opts.Logger)
+		}
+	}
+	return &guardedStore{
+		Store:   base,
+		options: opts,
+		breaker: breaker,
+		health:  health,
+	}
+}
+
+// Degraded implements DegradationReporter by combining the guarded store's
+// circuit breaker, health tracker, and any underlying DegradationReporter.
+func (s *guardedStore) Degraded() bool {
+	if s == nil {
+		return false
+	}
+	if s.breaker != nil && s.breaker.Degraded() {
+		return true
+	}
+	if s.health != nil && s.health.Degraded() {
+		return true
+	}
+	if rep, ok := s.Store.(DegradationReporter); ok && rep.Degraded() {
+		return true
+	}
+	return false
+}
+
+// Breaker returns the StoreBreaker attached to this guarded store, if any.
+func (s *guardedStore) Breaker() *StoreBreaker {
+	if s == nil {
+		return nil
+	}
+	return s.breaker
+}
+
+// Health returns the DatabaseHealth tracker attached to this guarded store.
+func (s *guardedStore) Health() *DatabaseHealth {
+	if s == nil {
+		return nil
+	}
+	return s.health
 }
 
 func (s *guardedStore) wrapContext(ctx context.Context, name string) (context.Context, context.CancelFunc) {
@@ -55,6 +112,12 @@ func (s *guardedStore) logSlowQuery(ctx context.Context, name string, start time
 	if err != nil {
 		outcome = "error"
 		s.queryErrors.Add(1)
+	}
+	if s.health != nil {
+		s.health.Observe(err)
+	}
+	if s.breaker != nil {
+		s.breaker.Observe(err)
 	}
 	duration := time.Since(start)
 	metrics.DBOperationsTotal.WithLabelValues(name, outcome).Inc()

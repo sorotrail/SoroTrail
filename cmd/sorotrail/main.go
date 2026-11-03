@@ -344,6 +344,7 @@ func runService(dryRun bool) error {
 		}
 		log.Info("postgres connection established")
 		pg = store.NewPostgresWithHealthCheck(ctx, pool, cfg.DatabaseURL, int64(cfg.PartitionLedgerSpan))
+		pg.SetLogger(log)
 		defer pg.StopHealthCheck()
 		st = pg
 	}

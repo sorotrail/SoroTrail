@@ -33,6 +33,29 @@ func NewTracingStore(base Store, tracer trace.Tracer) Store {
 	return &TracingStore{Store: base, tracer: tracer}
 }
 
+// Degraded forwards DegradationReporter checks to the underlying Store so
+// wrapping a store in TracingStore never hides its degraded state.
+func (s *TracingStore) Degraded() bool {
+	if s == nil || s.Store == nil {
+		return false
+	}
+	if rep, ok := s.Store.(DegradationReporter); ok {
+		return rep.Degraded()
+	}
+	return false
+}
+
+// Breaker forwards StoreBreaker lookup to the underlying Store when present.
+func (s *TracingStore) Breaker() *StoreBreaker {
+	if s == nil || s.Store == nil {
+		return nil
+	}
+	if bp, ok := s.Store.(interface{ Breaker() *StoreBreaker }); ok {
+		return bp.Breaker()
+	}
+	return nil
+}
+
 func (s *TracingStore) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
 	ctx, span := s.tracer.Start(ctx, "store.UpsertEvents")
 	defer span.End()

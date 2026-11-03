@@ -457,6 +457,35 @@ func (ing *Ingester) getIngestionState(ctx context.Context) (store.IngestionStat
 	return ing.store.GetIngestionState(ctx)
 }
 
+// checkStoreAvailable verifies that the backing store is reachable before a
+// poll cycle fetches RPC pages or mutates cursor state. When a StoreBreaker is
+// open during its cool-down window (or a DegradationReporter reports degraded
+// state), the cycle fast-fails with store.ErrUnavailable so Run backs off with
+// jitter without advancing the cursor.
+func (ing *Ingester) checkStoreAvailable(ctx context.Context) error {
+	if ing.store == nil {
+		return nil
+	}
+	if bp, ok := ing.store.(interface{ Breaker() *store.StoreBreaker }); ok {
+		if b := bp.Breaker(); b != nil {
+			if !b.Allow() {
+				return store.ErrUnavailable
+			}
+			if b.State() == store.BreakerHalfOpen {
+				if err := ing.store.Ping(ctx); err != nil {
+					b.RecordFailure(err)
+					return fmt.Errorf("store recovery probe: %w", err)
+				}
+				b.RecordSuccess()
+			}
+		}
+	}
+	if rep, ok := ing.store.(store.DegradationReporter); ok && rep.Degraded() {
+		return store.ErrUnavailable
+	}
+	return nil
+}
+
 // New wires an Ingester.
 func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger, opts Options) *Ingester {
 	opts.applyDefaults()
@@ -776,6 +805,12 @@ func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
 	defer func() {
 		ing.logCycleSummary(caughtUp, err, time.Since(cycleStart))
 	}()
+
+	if !ing.opts.DryRun {
+		if err := ing.checkStoreAvailable(ctx); err != nil {
+			return false, err
+		}
+	}
 
 	watched, err := ing.store.ListWatchedContracts(ctx)
 	if err != nil {

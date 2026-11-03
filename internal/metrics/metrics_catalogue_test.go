@@ -209,6 +209,15 @@ var metricCatalogue = []metricSpec{
 		Meaning: "Count of guarded Store calls. Errors are counted separately from successes so a failing backend is a direct query rather than something inferred by subtracting histograms.",
 		touch:   func() { DBOperationsTotal.WithLabelValues("store.QueryEvents", "success") },
 	},
+	{
+		Name: "sorotrail_db_circuit_breaker_state", Scope: scopeGlobal, Kind: "gauge",
+		Labels: []metricLabel{
+			{Name: "state", Values: "closed | open | half-open"},
+		},
+		Help:    "Database circuit breaker state as a 0/1 gauge per state (closed | open | half-open).",
+		Meaning: "Exactly one state series is 1 at a time. Alert on {state=\"open\"} == 1: the database circuit breaker is open, database-backed API routes are fast-failing with 503 Service Unavailable, and the ingester is backing off until the recovery probe succeeds.",
+		touch:   func() { DBCircuitBreakerState.WithLabelValues("closed") },
+	},
 
 	// --- Batching ---
 	{

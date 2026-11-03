@@ -19,6 +19,7 @@ database, API and replay errors by their text.
 - [Poisoned event](#poisoned-event)
 - [API returning stale or missing data](#api-returning-stale-or-missing-data)
 - [Database connection exhaustion](#database-connection-exhaustion)
+- [Database unavailable / degraded mode](#database-unavailable--degraded-mode)
 - [RPC rate limiting / 429 errors](#rpc-rate-limiting--429-errors)
 - [Gap in ingested data (retention window missed)](#gap-in-ingested-data-retention-window-missed)
 - [Bulk event deletion (`DELETE /events`)](#bulk-event-deletion-delete-events)
@@ -388,6 +389,46 @@ to error.
   the lock is on a single pooled connection. If you see connection pressure,
   check for external consumers.
 - Restart the SoroTrail process to reset the connection pool.
+
+---
+
+## Database unavailable / degraded mode
+
+When Postgres is temporarily unreachable (failover, maintenance window, or
+network partition), SoroTrail enters **degraded mode** rather than crashing or
+timing out on every request.
+
+**Behavior while degraded**
+
+- **Liveness (`GET /livez`)** continues to return `200 OK` (`{"status":"ok"}`)
+  so container orchestrators (Kubernetes, Docker) do not restart the process in
+  a crash loop while waiting for the database.
+- **Readiness (`GET /readyz`) and health (`GET /health`)** return
+  `503 Service Unavailable` with `checks.database.status: "unready"`, removing
+  the instance from load-balancer rotation until the store recovers.
+- **Non-database endpoints** (`GET /version`, `GET /metrics`,
+  `GET /openapi.json`, `GET /docs`) continue to respond normally (`200 OK`).
+- **Database-backed endpoints** (`GET /events`, `GET /stats`, `GET /contracts`,
+  etc.) fast-fail immediately with `503 Service Unavailable`, a `Retry-After`
+  header (default `5` seconds, or the remaining circuit-breaker cool-down), and
+  body `{"error":"database unavailable: service operating in degraded mode","code":"service_unavailable"}`
+  without queuing queries against the unreachable pool.
+- **Background workers (ingester)** pause RPC page fetches and database writes,
+  preserve the last committed `last_ingested_ledger` / `last_cursor`, and retry
+  with jittered exponential backoff.
+- **Bounded logging & metrics**: Entering degraded mode logs a single
+  `WARN` (`"database unavailable; entering degraded mode"`) and sets
+  `sorotrail_db_circuit_breaker_state{state="open"} 1`. Repeated per-query
+  connection errors are suppressed until recovery, which logs a single `INFO`
+  (`"database reachable again"`) with the total outage duration and suppressed
+  error count.
+
+**Recovery**
+
+- No manual restart is required. Once Postgres accepts connections again, the
+  periodic pool health check / half-open circuit-breaker probe succeeds, closes
+  the breaker (`sorotrail_db_circuit_breaker_state{state="closed"} 1`), returns
+  `/readyz` to `200 OK`, and resumes ingestion from the last committed ledger.
 
 ---
 

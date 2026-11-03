@@ -195,7 +195,30 @@ var (
 		},
 		[]string{"route", "method"},
 	)
+
+	// DBCircuitBreakerState exposes the database circuit breaker's state
+	// machine as a 0/1 gauge per state ("closed", "open", "half-open") so
+	// operators can alert on {state="open"} == 1 when the store is degraded.
+	DBCircuitBreakerState = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sorotrail_db_circuit_breaker_state",
+			Help: "Database circuit breaker state as a 0/1 gauge per state (closed | open | half-open).",
+		},
+		[]string{"state"},
+	)
 )
+
+// SetDBCircuitBreakerState sets the active database circuit-breaker state
+// gauge to 1 and sets the remaining states to 0.
+func SetDBCircuitBreakerState(active string) {
+	for _, s := range []string{"closed", "open", "half-open"} {
+		if s == active {
+			DBCircuitBreakerState.WithLabelValues(s).Set(1)
+		} else {
+			DBCircuitBreakerState.WithLabelValues(s).Set(0)
+		}
+	}
+}
 
 func init() {
 	prometheus.MustRegister(
@@ -205,6 +228,7 @@ func init() {
 		DBWriteLatency,
 		DBQueryDuration,
 		DBOperationsTotal,
+		DBCircuitBreakerState,
 		IngestionLag,
 		EventBatchWrites,
 		EventBatchSize,
@@ -218,6 +242,7 @@ func init() {
 		SpecInvalidationsReceived,
 		DeprecatedHTTPRequestsTotal,
 	)
+	SetDBCircuitBreakerState("closed")
 }
 
 // Handler returns an http.Handler that serves the /metrics endpoint in

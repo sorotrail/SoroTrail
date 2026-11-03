@@ -102,8 +102,24 @@ func (s *Server) readinessChecks() []namedCheck {
 }
 
 func (s *Server) checkDatabase(ctx context.Context) (string, string) {
+	b := s.StoreBreaker()
+	if b != nil && !b.Allow() {
+		if last := b.LastError(); last != nil {
+			return healthUnready, last.Error()
+		}
+		return healthUnready, store.ErrUnavailable.Error()
+	}
 	if err := s.store.Ping(ctx); err != nil {
+		if b != nil {
+			b.RecordFailure(err)
+		}
 		return healthUnready, err.Error()
+	}
+	if b != nil {
+		b.RecordSuccess()
+	}
+	if s.isDegraded() {
+		return healthUnready, store.ErrUnavailable.Error()
 	}
 	return healthOK, ""
 }

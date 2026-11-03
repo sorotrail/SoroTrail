@@ -73,12 +73,14 @@ type Postgres struct {
 	pool          *pgxpool.Pool
 	partitionSpan int64
 
-	// Health monitoring
+	// Health monitoring and circuit breaker
 	healthMu      sync.RWMutex
 	healthyAtomic atomic.Bool
 	lastHealthErr error
 	databaseURL   string
 	stopHealthCk  context.CancelFunc
+	health        *DatabaseHealth
+	breaker       *StoreBreaker
 }
 
 // Compile-time assertion that *Postgres implements Store.
@@ -90,9 +92,63 @@ func NewPostgres(pool *pgxpool.Pool, partitionSpan ...int64) *Postgres {
 	if len(partitionSpan) > 0 && partitionSpan[0] > 0 {
 		span = partitionSpan[0]
 	}
-	pg := &Postgres{pool: pool, partitionSpan: span}
+	pg := &Postgres{
+		pool:          pool,
+		partitionSpan: span,
+		health:        NewDatabaseHealth(slog.Default()),
+		breaker:       NewStoreBreaker(WithBreakerLogger(slog.Default())),
+	}
 	pg.healthyAtomic.Store(true)
 	return pg
+}
+
+// Degraded implements DegradationReporter. It returns true when the periodic
+// pool health check, the DatabaseHealth tracker, or the StoreBreaker indicates
+// that Postgres is currently unavailable.
+func (p *Postgres) Degraded() bool {
+	if p == nil {
+		return false
+	}
+	if !p.healthyAtomic.Load() {
+		return true
+	}
+	if p.health != nil && p.health.Degraded() {
+		return true
+	}
+	if p.breaker != nil && p.breaker.Degraded() {
+		return true
+	}
+	return false
+}
+
+// Breaker returns the StoreBreaker governing this Postgres store.
+func (p *Postgres) Breaker() *StoreBreaker {
+	if p == nil {
+		return nil
+	}
+	return p.breaker
+}
+
+// Health returns the DatabaseHealth tracker attached to this Postgres store.
+func (p *Postgres) Health() *DatabaseHealth {
+	if p == nil {
+		return nil
+	}
+	return p.health
+}
+
+// SetLogger attaches a structured logger to the store's health tracker and
+// circuit breaker.
+func (p *Postgres) SetLogger(logger *slog.Logger) {
+	if p == nil {
+		return
+	}
+	if p.health != nil {
+		p.health.SetLogger(logger)
+	}
+	if p.breaker != nil {
+		p.breaker.SetLogger(logger)
+	}
 }
 
 // NewPostgresWithHealthCheck creates a Postgres instance with health monitoring.
@@ -147,6 +203,12 @@ func (p *Postgres) performHealthCheck(ctx context.Context, logger *slog.Logger, 
 	p.healthMu.Unlock()
 
 	if err == nil {
+		if p.health != nil {
+			p.health.Observe(nil)
+		}
+		if p.breaker != nil {
+			p.breaker.RecordSuccess()
+		}
 		if !wasHealthy {
 			p.healthMu.Lock()
 			p.healthyAtomic.Store(true)
@@ -156,6 +218,13 @@ func (p *Postgres) performHealthCheck(ctx context.Context, logger *slog.Logger, 
 			logger.Info("postgres pool recovered")
 		}
 		return
+	}
+
+	if p.health != nil {
+		p.health.Observe(err)
+	}
+	if p.breaker != nil {
+		p.breaker.RecordFailure(err)
 	}
 
 	p.healthMu.Lock()
@@ -198,6 +267,12 @@ func (p *Postgres) performHealthCheck(ctx context.Context, logger *slog.Logger, 
 	p.lastHealthErr = nil
 	*reconnectAttempt = 0
 	p.healthMu.Unlock()
+	if p.health != nil {
+		p.health.Observe(nil)
+	}
+	if p.breaker != nil {
+		p.breaker.RecordSuccess()
+	}
 	logger.Info("postgres pool reconnected successfully",
 		"attempts", *reconnectAttempt,
 	)
@@ -1565,17 +1640,26 @@ func (p *Postgres) DeleteEventsBefore(ctx context.Context, maxLedger int64, befo
 
 func (p *Postgres) Ping(ctx context.Context) error {
 	p.healthMu.RLock()
-	defer p.healthMu.RUnlock()
+	healthy := p.healthyAtomic.Load()
+	lastErr := p.lastHealthErr
+	pool := p.pool
+	p.healthMu.RUnlock()
 
-	if !p.healthyAtomic.Load() {
-		if p.lastHealthErr != nil {
-			return fmt.Errorf("pool unhealthy: %w", p.lastHealthErr)
+	if !healthy {
+		if lastErr != nil {
+			return fmt.Errorf("pool unhealthy: %w", lastErr)
 		}
 		return errors.New("pool unhealthy")
 	}
 
-	pool := p.pool
-	return pool.Ping(ctx)
+	err := pool.Ping(ctx)
+	if p.health != nil {
+		p.health.Observe(err)
+	}
+	if p.breaker != nil {
+		p.breaker.Observe(err)
+	}
+	return err
 }
 
 // AdvisoryLockKey hashes an RPC URL into an int64 suitable for use with

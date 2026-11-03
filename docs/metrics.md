@@ -69,6 +69,7 @@ it is documented. Regenerate it with:
 | `sorotrail_db_write_duration_seconds` | histogram | — | Database write latency in seconds (batch insert/upsert/repair). | Write path only: batch upserts, replace-in-range repairs. Compared against the ingester's write-latency budget it tells you whether backpressure is justified by the database or by our own accounting. |
 | `sorotrail_db_query_duration_seconds` | histogram | `operation` (store.<Store method> — a fixed table of method names (store.UpsertEvents, store.QueryEvents, …), one per guarded Store operation) | Store operation duration in seconds, labelled by operation. | Every guarded Store operation, reads and writes alike, so a slow database is attributable to a specific operation rather than showing up only as a slow API. |
 | `sorotrail_db_operations_total` | counter | `operation` (store.<Store method> — the same fixed table as sorotrail_db_query_duration_seconds); `outcome` (success \| error) | Total store operations, labelled by operation and outcome (success \| error). | Count of guarded Store calls. Errors are counted separately from successes so a failing backend is a direct query rather than something inferred by subtracting histograms. |
+| `sorotrail_db_circuit_breaker_state` | gauge | `state` (closed \| open \| half-open) | Database circuit breaker state as a 0/1 gauge per state (closed \| open \| half-open). | Exactly one state series is 1 at a time. Alert on {state="open"} == 1: the database circuit breaker is open, database-backed API routes are fast-failing with 503 Service Unavailable, and the ingester is backing off until the recovery probe succeeds. |
 
 ## Batching metrics
 
@@ -105,7 +106,7 @@ predictable and alert rules can name a value with confidence:
 | `provider` | the hostname of one RPC_URLS entry — scheme, credentials, path and query are stripped, so nothing client-identifying is exported | `sorotrail_rpc_provider_state` |
 | `reason` | backoff \| retry_after | `sorotrail_rpc_retries_total`, `sorotrail_rpc_failovers_total` |
 | `route` | the matched chi route pattern (e.g. /events/{id}), or "unmatched" for a path no route registered — never the raw path, so probes cannot grow cardinality | `sorotrail_http_deprecated_requests_total`, `http_request_duration_seconds` |
-| `state` | closed \| open \| half-open | `sorotrail_rpc_circuit_breaker_state`, `sorotrail_rpc_provider_state` |
+| `state` | closed \| open \| half-open | `sorotrail_rpc_circuit_breaker_state`, `sorotrail_rpc_provider_state`, `sorotrail_db_circuit_breaker_state` |
 | `status` | the response status code as a decimal string (200 \| 404 \| 500 \| …) | `http_request_duration_seconds` |
 
 The `unmatched` route value and the hostname-only `provider` value
