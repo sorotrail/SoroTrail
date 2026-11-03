@@ -234,6 +234,12 @@ type Server struct {
 	// /readyz. The zero value means healthCheckTimeout; only tests set it,
 	// so the timeout paths don't sleep through the production budget.
 	checkTimeout time.Duration
+
+	// deprecationPolicy holds the OpenAPI-driven Deprecation / Sunset header
+	// rules. When nil, DefaultDeprecationPolicy() is used.
+	deprecationMu     sync.RWMutex
+	deprecationPolicy *DeprecationPolicy
+	deprecatedCounts  map[string]uint64
 }
 
 // SetHTTPRequestBodyLimit sets the request body size limit, in bytes, for all handlers accepting a body.
@@ -448,6 +454,7 @@ func (s *Server) router() chi.Router {
 	if s.metrics != nil {
 		r.Use(s.metrics.Middleware)
 	}
+	r.Use(s.deprecationMiddleware)
 	// CORS runs before Recoverer/Timeout so a preflight never blocks
 	// nor panics inside the recovery middleware, and so the same-origin
 	// contract (no Origin header) is forwarded as-is. Mounted
