@@ -193,6 +193,7 @@ paths:
             format: int64
             minimum: 1
           example: 256000
+        - $ref: "#/components/parameters/IdempotencyKey"
       security:
         - ManagementKey: []
       responses:
@@ -212,6 +213,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -550,6 +553,8 @@ paths:
         and gated behind the admin credential. A name is required; quota
         overrides are optional and inherit the instance defaults when omitted.
       tags: [Admin]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -657,6 +662,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -716,6 +722,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "204":
           description: Deleted
@@ -863,6 +870,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -894,6 +902,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -926,6 +936,7 @@ paths:
             type: string
             pattern: "^C[A-Z2-7]{55}$"
           example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
           description: >-
@@ -946,6 +957,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -1025,6 +1038,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -1057,6 +1071,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -1082,6 +1098,7 @@ paths:
             format: int64
             minimum: 1
           example: 7
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "204":
           description: Deleted
@@ -1093,6 +1110,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -1148,6 +1167,8 @@ paths:
       tags: [Auth]
       security:
         - InstanceAPIKey: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: false
         content:
@@ -1186,6 +1207,8 @@ paths:
           $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -1216,6 +1239,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "204":
           description: Revoked
@@ -1225,6 +1249,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2011,6 +2037,7 @@ paths:
             type: string
             pattern: "^C[A-Z2-7]{55}$"
           example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -2041,6 +2068,8 @@ paths:
           $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2110,6 +2139,7 @@ paths:
             type: string
             pattern: "^C[A-Z2-7]{55}$"
           example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
           description: The deletion result
@@ -2127,6 +2157,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2217,6 +2249,7 @@ paths:
             type: string
             pattern: "^C[A-Z2-7]{55}$"
           example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -2244,6 +2277,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2380,6 +2415,8 @@ paths:
         Adds a contract to the calling tenant's watch list. The contract must
         be a valid Stellar contract ID; the response is the refreshed list.
       tags: [Operations]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -2411,6 +2448,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2434,6 +2473,7 @@ paths:
             type: string
             pattern: "^C[A-Z2-7]{55}$"
           example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
           description: >-
@@ -2454,6 +2494,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2524,6 +2566,7 @@ paths:
             type: string
             enum: ["true"]
           example: "true"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
           description: The newly watched contract and its ingestion frontier.
@@ -2542,6 +2585,8 @@ paths:
           $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2583,6 +2628,7 @@ paths:
           schema:
             type: string
           example: testnet
+        - $ref: "#/components/parameters/IdempotencyKey"
       security:
         - ManagementKey: []
       responses:
@@ -2603,6 +2649,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2693,6 +2741,7 @@ paths:
             format: int64
             minimum: 1
           example: 42
+        - $ref: "#/components/parameters/IdempotencyKey"
       security:
         - ManagementKey: []
       responses:
@@ -2704,6 +2753,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2789,6 +2840,8 @@ paths:
         Register a callback and an event filter. The signing secret is
         returned in the response and must be stored by the caller.
       tags: [Webhooks]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -2827,6 +2880,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2929,6 +2984,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -2964,6 +3020,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2983,6 +3041,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "204":
           description: Deleted successfully
@@ -2992,6 +3051,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -3420,6 +3481,21 @@ components:
       schema:
         type: string
       example: '"0001099511627776-0000000001"'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: >-
+        Optional caller-supplied token (up to 255 printable ASCII characters)
+        for safe retries of write operations. Within the 24-hour retention
+        window, repeating the same request with the same key replays the
+        original status and body (`Idempotency-Replayed: true`) without
+        re-running the mutation; reusing the key with a different method,
+        path, or request body returns 409 Conflict (`CONFLICT`).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+      example: "550e8400-e29b-41d4-a716-446655440000"
   headers:
     ETag:
       description: Entity tag for conditional requests and cache validation.
@@ -4622,8 +4698,9 @@ components:
     Conflict:
       description: >-
         The request collides with the current state (`CONFLICT`) — a duplicate
-        tenant name, or a tenant attempting to delete the account it is
-        authenticated as.
+        tenant name, a tenant attempting to delete the account it is
+        authenticated as, or an `Idempotency-Key` reused with a different
+        method, path, or request body within its retention window.
       x-error-codes:
         - CONFLICT
       content:
