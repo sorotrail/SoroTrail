@@ -196,6 +196,35 @@ type Options struct {
 	// zero value — that's deliberate so tests/MSG-built Ingester instances
 	// honor an explicit "0 = off" without surprise.
 	LagWarnLedgers uint32
+	// LagRecoverLedgers is the lower hysteresis bound at or below which
+	// the ingester exits the lagging state once entered. Requiring the gap
+	// to close below LagRecoverLedgers (rather than merely dropping one
+	// ledger below LagWarnLedgers) prevents oscillation when ingestion
+	// hovers near the threshold. When zero, it defaults to 75% of
+	// LagWarnLedgers when LagBackpressureEnabled is true (or when a
+	// LagCoordinator is attached), and to LagWarnLedgers otherwise so
+	// legacy log-only callers see unchanged single-threshold behavior.
+	LagRecoverLedgers uint32
+	// LagBackpressureEnabled turns the lag signal from a passive gauge/log
+	// into active backpressure: background tasks (pruner, archiver,
+	// auditor) yield up to LagMaxDeferral while lagging, and the ingester
+	// widens its sweep window by LagCatchUpSweepMultiplier and holds its
+	// poll interval at PollIntervalMin until caught up. False (the default)
+	// preserves pre-#1275 behavior as a single setting.
+	LagBackpressureEnabled bool
+	// LagMaxDeferral is the maximum continuous duration background tasks
+	// may defer while the ingester is lagging before a pass is forced
+	// through anyway. Default 15m (DefaultMaxLagDeferral).
+	LagMaxDeferral time.Duration
+	// LagCatchUpSweepMultiplier scales SweepWindow while lag backpressure
+	// is active (clamped to [1, MaxCatchUpSweepMultiplier]). Default 2 when
+	// LagBackpressureEnabled is true.
+	LagCatchUpSweepMultiplier int
+	// LagCoordinator is an optional shared coordinator consulted by
+	// background tasks (pruner, archiver, auditor). When nil, New builds
+	// one from the Lag* options above and exposes it via
+	// Ingester.LagCoordinator().
+	LagCoordinator *LagCoordinator
 	// LagMetrics is the optional sink for ingest-lag signals. The default
 	// is a no-op so the alarm works end-to-end as log-only today, and a
 	// future Prometheus /metrics endpoint can opt in by passing a real
@@ -374,6 +403,9 @@ type Ingester struct {
 	// mutex/atomic or document that the new caller is also single-
 	// threaded relative to Run().
 	lagging bool
+	// lagCoordinator coordinates lag-driven background job deferral and
+	// catch-up sizing across goroutines. Always non-nil after New.
+	lagCoordinator *LagCoordinator
 	// pollInterval is the current effective poll interval, in nanoseconds
 	// (time.Duration's underlying unit). It is initialized in New to the
 	// post-defaults Options.PollInterval and thereafter mutated either by
@@ -476,8 +508,31 @@ func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger
 		skipContracts: skipMap,
 		tracer:        noop.NewTracerProvider().Tracer("github.com/sorotrail/sorotrail/internal/ingester"),
 	}
+	if opts.LagCoordinator != nil {
+		ing.lagCoordinator = opts.LagCoordinator
+	} else {
+		recoverLedgers := opts.LagRecoverLedgers
+		if recoverLedgers == 0 && !opts.LagBackpressureEnabled {
+			recoverLedgers = opts.LagWarnLedgers
+		}
+		ing.lagCoordinator = NewLagCoordinator(LagBackpressureOptions{
+			Enabled:                opts.LagBackpressureEnabled,
+			EnterLagLedgers:        opts.LagWarnLedgers,
+			RecoverLagLedgers:      recoverLedgers,
+			MaxDeferral:            opts.LagMaxDeferral,
+			CatchUpSweepMultiplier: opts.LagCatchUpSweepMultiplier,
+			Downstream:             opts.LagMetrics,
+			Logger:                 ing.log,
+		})
+	}
 	ing.pollInterval.Store(int64(opts.PollInterval))
 	return ing
+}
+
+// LagCoordinator returns the ingester's lag backpressure coordinator so
+// background tasks (pruner, archiver, auditor) can share it directly.
+func (ing *Ingester) LagCoordinator() *LagCoordinator {
+	return ing.lagCoordinator
 }
 
 // PollInterval returns the poll interval Run currently sleeps for between
@@ -1106,6 +1161,16 @@ func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState
 //     mid-sweep leaves the frontier at the last fully-completed window so
 //     restart resumes from there (idempotent upserts cover the in-flight
 //     rows on the next pass).
+func (ing *Ingester) effectiveSweepWindow() uint32 {
+	mult := uint32(1)
+	if ing.lagCoordinator != nil {
+		if m := ing.lagCoordinator.EffectiveSweepMultiplier(); m > 1 {
+			mult = uint32(m)
+		}
+	}
+	return ing.opts.SweepWindow * mult
+}
+
 func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]rpc.EventFilter) (bool, error) {
 	health, err := ing.client.GetHealth(ctx)
 	if err != nil {
@@ -1114,7 +1179,7 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	if start > health.LatestLedger {
 		return true, nil
 	}
-	end := min(start+ing.opts.SweepWindow-1, health.LatestLedger)
+	end := min(start+ing.effectiveSweepWindow()-1, health.LatestLedger)
 
 	// Per-cycle event cap: all batches share one budget. capHit is set
 	// out-of-band (same pattern as ledgerOutOfRange) because errgroup
@@ -1202,7 +1267,7 @@ func (ing *Ingester) windowSweepWatched(ctx context.Context, batches [][]rpc.Eve
 	if start > health.LatestLedger {
 		return true, nil // nothing new yet
 	}
-	end := min(start+ing.opts.SweepWindow-1, health.LatestLedger)
+	end := min(start+ing.effectiveSweepWindow()-1, health.LatestLedger)
 
 	remaining := ing.newCycleBudget()
 	var capHit atomic.Bool
@@ -1900,6 +1965,26 @@ func (ing *Ingester) discardCursor(ctx context.Context) {
 // what the store already has — RPC reorg or stale cache) is ambiguous
 // data we can't interpret; we leave hysteresis alone and republish the
 // current value so the gauge stays consistent.
+func (ing *Ingester) effectiveLagRecoverLedgers() uint32 {
+	if ing.opts.LagRecoverLedgers > 0 {
+		if ing.opts.LagRecoverLedgers > ing.opts.LagWarnLedgers {
+			return ing.opts.LagWarnLedgers
+		}
+		return ing.opts.LagRecoverLedgers
+	}
+	if ing.opts.LagBackpressureEnabled || ing.opts.LagCoordinator != nil {
+		return (ing.opts.LagWarnLedgers * 3) / 4
+	}
+	return ing.opts.LagWarnLedgers
+}
+
+func (ing *Ingester) publishLagging(lagging bool) {
+	if ing.opts.LagCoordinator != nil {
+		ing.opts.LagCoordinator.SetLagging(lagging)
+	}
+	ing.opts.LagMetrics.SetLagging(lagging)
+}
+
 func (ing *Ingester) checkLag(ctx context.Context) {
 	if ing.opts.DryRun {
 		return
@@ -1928,7 +2013,11 @@ func (ing *Ingester) checkLag(ctx context.Context) {
 			// is "ingestion_state row never gets deleted", so any
 			// prior ing.lagging=true flips to false on the next
 			// non-ErrNotFound cycle, realigning gauge and memory.
-			ing.opts.LagMetrics.SetLagging(false)
+			if ing.lagCoordinator != nil && ing.opts.LagCoordinator == nil {
+				ing.lagCoordinator.ObserveLag(int64(latest.Sequence), 0)
+			} else {
+				ing.publishLagging(false)
+			}
 			return
 		}
 		// Other store errors leave the alarm silent too: gaps in
@@ -1951,17 +2040,32 @@ func (ing *Ingester) checkLag(ctx context.Context) {
 			// hysteresis (don't flip to "recovered" on data we
 			// can't trust) and republish the gauge so scrapers
 			// see a consistent value.
-			ing.opts.LagMetrics.SetLagging(ing.lagging)
+			if ing.lagCoordinator != nil && ing.opts.LagCoordinator == nil {
+				ing.lagCoordinator.ObserveLag(int64(latest.Sequence), state.LastIngestedLedger)
+			} else {
+				ing.publishLagging(ing.lagging)
+			}
 			return
 		}
-		lagging = rawLag > int64(ing.opts.LagWarnLedgers)
+		if !ing.lagging {
+			lagging = rawLag > int64(ing.opts.LagWarnLedgers)
+		} else {
+			lagging = rawLag > int64(ing.effectiveLagRecoverLedgers())
+		}
 	}
 
 	// Publish BEFORE the early-return below so the gauge stays fresh
 	// on every cycle (a freshly-attached scraper sees 0 right away
 	// and a restart never leaks a stale value). The hysteresis
 	// transition check still gates the log line.
-	ing.opts.LagMetrics.SetLagging(lagging)
+	if ing.lagCoordinator != nil {
+		ing.lagCoordinator.ObserveLag(int64(latest.Sequence), state.LastIngestedLedger)
+		if ing.opts.LagCoordinator != nil {
+			ing.opts.LagMetrics.SetLagging(lagging)
+		}
+	} else {
+		ing.opts.LagMetrics.SetLagging(lagging)
+	}
 	if lagging == ing.lagging {
 		return // no edge → no log (this is the spam-suppression rule)
 	}
@@ -2128,6 +2232,9 @@ func (ing *Ingester) EffectivePollInterval() time.Duration {
 // [PollIntervalMin, PollIntervalMax], so the interval can never escape
 // its configured range no matter how long the process has been running.
 func (ing *Ingester) adjustPollInterval(caughtUp bool) {
+	if ing.lagCoordinator != nil && ing.lagCoordinator.Enabled() && ing.lagCoordinator.IsLagging() {
+		caughtUp = false
+	}
 	current := time.Duration(ing.pollInterval.Load())
 	var next time.Duration
 	if caughtUp {

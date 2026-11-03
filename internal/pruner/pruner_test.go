@@ -669,3 +669,46 @@ func TestPrunerPolicyMatrix(t *testing.T) {
 		assert.Error(t, err)
 	})
 }
+
+type stubLagYieldController struct {
+	yield  bool
+	reason string
+}
+
+func (s *stubLagYieldController) ShouldYield(string) (bool, string) {
+	return s.yield, s.reason
+}
+
+func TestPrunerLagBackpressureAndMaxDeferral(t *testing.T) {
+	now := time.Now()
+	ms := newMockStore()
+	_, err := ms.UpsertEvents(context.Background(), []store.Event{
+		{ID: "e1", Ledger: 1, CreatedAt: now},
+		{ID: "e2", Ledger: 2, CreatedAt: now},
+	})
+	require.NoError(t, err)
+	ms.setIngestionState(100)
+
+	lagCtrl := &stubLagYieldController{yield: true, reason: "ingest_lagging"}
+	p := New(ms, slog.Default(), Options{
+		MinLedger:     50,
+		BatchSize:     10,
+		LagController: lagCtrl,
+	})
+
+	// While lagging below max deferral, pruneOnce yields without deleting.
+	deleted, err := p.pruneOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted)
+	assert.Equal(t, uint64(1), p.Metrics().LagYields)
+	assert.Len(t, ms.events, 2)
+
+	// When max deferral is reached, pruneOnce runs and records the override.
+	lagCtrl.yield = false
+	lagCtrl.reason = "max_deferral_reached"
+	deleted, err = p.pruneOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), deleted)
+	assert.Equal(t, uint64(1), p.Metrics().MaxDeferralOverrides)
+	assert.Empty(t, ms.events)
+}
