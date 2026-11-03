@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -686,6 +687,19 @@ func TestErrorCatalogueEntriesAreWellFormed(t *testing.T) {
 				assert.NotEmptyf(t, routes, "%s has no routes and is not SpecExempt", where)
 			}
 		}
+		codes := catalogueEntryCodes(e)
+		assert.NotEmptyf(t, codes, "%s produced no ErrorCode", where)
+		for _, c := range codes {
+			matched := false
+			for _, spec := range allErrorCodeSpecs {
+				if spec.Code == c {
+					matched = true
+					assert.Equalf(t, e.Status, spec.Status, "%s mapped to %s (status %d)", where, c, spec.Status)
+					break
+				}
+			}
+			assert.Truef(t, matched, "%s mapped to unknown ErrorCode %q", where, c)
+		}
 	}
 }
 
@@ -903,19 +917,49 @@ func TestErrorCatalogueDocumentation(t *testing.T) {
 			"\tgo test ./internal/api -run TestErrorCatalogueDocumentation -update-error-catalogue")
 }
 
-// renderErrorCatalogue produces docs/errors.md: header, conventions, one
-// table per status, the filter-validation family, then the responses that
-// are not the shared envelope at all.
+// catalogueEntryCodes returns the stable ErrorCode(s) produced by a
+// catalogued writeError condition.
+func catalogueEntryCodes(e errorCondition) []ErrorCode {
+	if strings.HasPrefix(e.Message, "event-filter validation message") {
+		return []ErrorCode{CodeInvalidParameter, CodeInvalidCursor, CodeLimitExceeded}
+	}
+	parts := strings.Split(e.Message, "; ")
+	seen := make(map[ErrorCode]bool, len(parts))
+	var out []ErrorCode
+	for _, part := range parts {
+		code, _, _ := classifyError(e.Status, errors.New(strings.TrimSpace(part)))
+		if !seen[code] {
+			seen[code] = true
+			out = append(out, code)
+		}
+	}
+	return out
+}
+
+func formatCatalogueCodes(codes []ErrorCode) string {
+	parts := make([]string, len(codes))
+	for i, c := range codes {
+		parts[i] = "`" + string(c) + "`"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// renderErrorCatalogue produces docs/errors.md: header, conventions, the
+// stable error-code taxonomy, one table per status, the filter-validation
+// family, then the responses that are not the shared envelope at all.
 func renderErrorCatalogue() string {
 	var b strings.Builder
 
 	b.WriteString(`# API error catalogue
 
 Every failure the SoroTrail API can return, in one place: the condition
-that produces it, the HTTP status, and the exact message a client sees.
-Error bodies are the shared JSON envelope {"error": "<message>"} (the
-ErrorResponse schema in ` + "`api/openapi.yaml`" + `, with ` + "`Cache-Control: no-store`" + `) — the exceptions
-are listed under "Responses outside the shared envelope" at the end.
+that produces it, the HTTP status, its stable machine-readable ` + "`code`" + `, and
+the exact message a client sees. Error bodies are the shared JSON
+envelope ` + "`{\"error\": \"<message>\", \"code\": \"<CODE>\"}`" + ` (with optional
+` + "`\"field\": \"<param>\"`" + ` when a specific parameter or body field caused a
+validation or conflict failure; see the ` + "`ErrorResponse`" + ` schema in
+` + "`api/openapi.yaml`" + `, with ` + "`Cache-Control: no-store`" + `) — the exceptions are
+listed under "Responses outside the shared envelope" at the end.
 
 This file is generated from the catalogue in
 ` + "`internal/api/error_catalogue_test.go`" + `, which is itself checked against
@@ -935,13 +979,26 @@ they matter rather than on every path.
 
 - Every envelope error carries ` + "`Cache-Control: no-store`" + ` so a CDN cannot pool
   a 4xx/5xx behind a success response's validator.
+- Every envelope error carries a stable ` + "`code`" + ` from the taxonomy below so
+  clients can branch on ` + "`code`" + ` rather than matching human-readable prose.
 - 429 carries ` + "`Retry-After`" + ` (delta-seconds, at least 1) plus the
   ` + "`X-RateLimit-*`" + ` family.
 - 401 carries ` + "`WWW-Authenticate`" + `: ` + "`Bearer realm=\"sorotrail\"`" + ` on the tenant
   credential, ` + "`Bearer`" + ` on the instance key — both per RFC 7235 §4.1.
-- 500 messages are deliberately generic; the specifics are logged
-  against the request's ` + "`X-Request-ID`" + `.
+- 500 messages are deliberately generic (` + "`code: \"INTERNAL_ERROR\"`" + `); the
+  specifics are logged against the request's ` + "`X-Request-ID`" + `.
 
+## Error codes
+
+| Code | HTTP Status | Description |
+| --- | --- | --- |
+`)
+
+	for _, spec := range allErrorCodeSpecs {
+		fmt.Fprintf(&b, "| `%s` | %d | %s |\n", spec.Code, spec.Status, catalogueCell(spec.Description))
+	}
+
+	b.WriteString(`
 ## Errors by status
 
 `)
@@ -962,13 +1019,14 @@ they matter rather than on every path.
 
 	for _, status := range statuses {
 		fmt.Fprintf(&b, "### %d %s\n\n", status, http.StatusText(status))
-		b.WriteString("| Condition | Operations | Message |\n")
-		b.WriteString("| --- | --- | --- |\n")
+		b.WriteString("| Code | Condition | Operations | Message |\n")
+		b.WriteString("| --- | --- | --- | --- |\n")
 		for _, e := range errorCatalogue {
 			if e.Builtin || e.Status != status {
 				continue
 			}
-			fmt.Fprintf(&b, "| %s | %s | `%s` |\n",
+			fmt.Fprintf(&b, "| %s | %s | %s | `%s` |\n",
+				formatCatalogueCodes(catalogueEntryCodes(e)),
 				catalogueCell(e.Condition), catalogueCell(catalogueOperations(e)),
 				catalogueCell(e.Message))
 		}
@@ -1221,11 +1279,16 @@ func TestErrorCatalogueRuntimeMessages(t *testing.T) {
 					"an empty body gets no Content-Type")
 			} else if tc.wantMsg != "" {
 				var env struct {
-					Error string `json:"error"`
+					Error string    `json:"error"`
+					Code  ErrorCode `json:"code"`
+					Field string    `json:"field"`
 				}
 				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env),
 					"envelope errors are JSON: %s", rec.Body.String())
 				assert.Equal(t, tc.wantMsg, env.Error)
+				wantCode, wantField, _ := classifyError(tc.wantStatus, errors.New(tc.wantMsg))
+				assert.Equal(t, wantCode, env.Code)
+				assert.Equal(t, wantField, env.Field)
 			}
 			if tc.after != nil {
 				tc.after(t, rec)

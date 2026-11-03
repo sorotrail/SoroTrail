@@ -72,11 +72,37 @@ func New(baseURL string, opts ...Option) *Client {
 	return c
 }
 
-// APIError is returned for every non-2xx response. Message is the
-// server's standard error envelope when the body carried one.
+// ErrorCode is a stable, machine-readable error code returned in the "code"
+// property of every SoroTrail JSON error envelope.
+type ErrorCode string
+
+const (
+	CodeInvalidParameter     ErrorCode = "INVALID_PARAMETER"
+	CodeInvalidCursor        ErrorCode = "INVALID_CURSOR"
+	CodeRangeTooWide         ErrorCode = "RANGE_TOO_WIDE"
+	CodeLimitExceeded        ErrorCode = "LIMIT_EXCEEDED"
+	CodeInvalidBody          ErrorCode = "INVALID_BODY"
+	CodeConfirmationRequired ErrorCode = "CONFIRMATION_REQUIRED"
+	CodeUnauthorized         ErrorCode = "UNAUTHORIZED"
+	CodeForbidden            ErrorCode = "FORBIDDEN"
+	CodeNotFound             ErrorCode = "NOT_FOUND"
+	CodeConflict             ErrorCode = "CONFLICT"
+	CodePayloadTooLarge      ErrorCode = "PAYLOAD_TOO_LARGE"
+	CodeQuotaExceeded        ErrorCode = "QUOTA_EXCEEDED"
+	CodeRateLimited          ErrorCode = "RATE_LIMITED"
+	CodeInternalError        ErrorCode = "INTERNAL_ERROR"
+	CodeUnsupportedOperation ErrorCode = "UNSUPPORTED_OPERATION"
+	CodeServiceUnavailable   ErrorCode = "SERVICE_UNAVAILABLE"
+)
+
+// APIError is returned for every non-2xx response. Message, Code, and Field
+// are populated from the server's standard error envelope when the body
+// carried one.
 type APIError struct {
 	StatusCode int
+	Code       ErrorCode
 	Message    string
+	Field      string
 }
 
 func (e *APIError) Error() string {
@@ -180,12 +206,19 @@ func (c *Client) send(ctx context.Context, method, path string, query url.Values
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
 		var errResp struct {
-			Error string `json:"error"`
+			Error string    `json:"error"`
+			Code  ErrorCode `json:"code"`
+			Field string    `json:"field"`
 		}
 		// The envelope is small; limit the read so a misbehaving server
 		// cannot balloon the error path.
 		_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&errResp)
-		return nil, &APIError{StatusCode: resp.StatusCode, Message: errResp.Error}
+		return nil, &APIError{
+			StatusCode: resp.StatusCode,
+			Code:       errResp.Code,
+			Message:    errResp.Error,
+			Field:      errResp.Field,
+		}
 	}
 	return resp, nil
 }

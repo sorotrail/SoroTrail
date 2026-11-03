@@ -193,7 +193,9 @@ const (
 )
 
 type errorResponse struct {
-	Error string `json:"error"`
+	Error string    `json:"error"`
+	Code  ErrorCode `json:"code"`
+	Field string    `json:"field,omitempty"`
 }
 
 type eventsResponse struct {
@@ -3061,7 +3063,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, err error) {
 	writeCacheHeaders(w, cacheNoStore, 0, "")
-
-	writeJSON(w, status, errorResponse{Error: err.Error()})
-
+	code, field, msg := classifyError(status, err)
+	writeJSON(w, status, errorResponse{
+		Error: msg,
+		Code:  code,
+		Field: field,
+	})
 }

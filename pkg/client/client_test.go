@@ -92,10 +92,37 @@ func TestClientMapsHTTPFailuresToAPIError(t *testing.T) {
 		statusCode int
 		body       string
 		wantMsg    string
+		wantCode   client.ErrorCode
+		wantField  string
 	}{
-		{name: "client error", statusCode: http.StatusBadRequest, body: `{"error":"invalid limit"}`, wantMsg: "invalid limit"},
-		{name: "server error", statusCode: http.StatusInternalServerError, body: `{"error":"database unavailable"}`, wantMsg: "database unavailable"},
-		{name: "error without envelope", statusCode: http.StatusBadGateway, body: "upstream unavailable", wantMsg: "sorotrail: HTTP 502"},
+		{
+			name:       "client error with code and field",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error":"limit must be an integer in [1,1000]","code":"LIMIT_EXCEEDED","field":"limit"}`,
+			wantMsg:    "limit must be an integer in [1,1000]",
+			wantCode:   client.CodeLimitExceeded,
+			wantField:  "limit",
+		},
+		{
+			name:       "not found error with code",
+			statusCode: http.StatusNotFound,
+			body:       `{"error":"event \"0001\" not found","code":"NOT_FOUND"}`,
+			wantMsg:    `event "0001" not found`,
+			wantCode:   client.CodeNotFound,
+		},
+		{
+			name:       "server error",
+			statusCode: http.StatusInternalServerError,
+			body:       `{"error":"database unavailable","code":"INTERNAL_ERROR"}`,
+			wantMsg:    "database unavailable",
+			wantCode:   client.CodeInternalError,
+		},
+		{
+			name:       "error without envelope",
+			statusCode: http.StatusBadGateway,
+			body:       "upstream unavailable",
+			wantMsg:    "sorotrail: HTTP 502",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -109,6 +136,8 @@ func TestClientMapsHTTPFailuresToAPIError(t *testing.T) {
 			var apiErr *client.APIError
 			require.ErrorAs(t, err, &apiErr)
 			assert.Equal(t, tt.statusCode, apiErr.StatusCode)
+			assert.Equal(t, tt.wantCode, apiErr.Code)
+			assert.Equal(t, tt.wantField, apiErr.Field)
 			if tt.wantMsg == "sorotrail: HTTP 502" {
 				assert.Equal(t, tt.wantMsg, apiErr.Error())
 			} else {
