@@ -1655,7 +1655,11 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		stats.SpecCache = sc.SpecCacheStats()
 	}
 
-	s.getStatsCache().Put(key, stats, time.Now())
+	var tenantID int64
+	if p, ok := PrincipalFrom(r.Context()); ok && !p.Untenanted {
+		tenantID = p.Tenant.ID
+	}
+	s.getStatsCache().PutForTenant(tenantID, key, stats, time.Now())
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
 }
@@ -2832,44 +2836,74 @@ func (s *Server) syncStreamScope(ctx context.Context, sub *broadcast.Subscriptio
 	if every <= 0 {
 		every = DefaultStreamScopeSync
 	}
+	watchCh, unregister := s.registerStreamWatcher(p.Tenant.ID, p.KeyID)
 	go func() {
+		defer unregister()
 		ticker := time.NewTicker(every)
 		defer ticker.Stop()
+		refresh := func() bool {
+			if p.KeyID > 0 {
+				keys, err := s.tenants.ListTenantAPIKeys(ctx, p.Tenant.ID)
+				if err != nil {
+					loggerFromContext(ctx).Warn("refreshing stream api key", "tenant", p.Tenant.ID, "error", err)
+					return true
+				}
+				keyActive := false
+				for _, k := range keys {
+					if k.ID == p.KeyID && k.RevokedAt == nil {
+						keyActive = true
+						break
+					}
+				}
+				if !keyActive {
+					sub.SetScope(store.Scope{})
+					return false
+				}
+			}
+			// Re-read the tenant too, so a suspension (enabled=false)
+			// or a switch away from wildcard takes effect on open
+			// streams and not just on new requests.
+			tenant, err := s.tenants.GetTenant(ctx, p.Tenant.ID)
+			if errors.Is(err, store.ErrNotFound) {
+				// Deleted mid-stream: revoke everything. The read loop
+				// sees an empty scope and the connection goes quiet
+				// rather than continuing to serve a tenant that no
+				// longer exists.
+				sub.SetScope(store.Scope{})
+				return false
+			}
+			if err != nil {
+				// Leave the existing scope in place on a transient
+				// database error: it was correct as of the last
+				// successful resolve, and widening or narrowing on a
+				// failed read would be guessing.
+				loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
+				return true
+			}
+			if !tenant.Enabled {
+				sub.SetScope(store.Scope{})
+				return false
+			}
+			scope, err := s.tenants.ScopeForTenant(ctx, tenant)
+			if err != nil {
+				loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
+				return true
+			}
+			sub.SetScope(scope)
+			return true
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-watchCh:
+				if !refresh() {
+					return
+				}
 			case <-ticker.C:
-				// Re-read the tenant too, so a suspension (enabled=false)
-				// or a switch away from wildcard takes effect on open
-				// streams and not just on new requests.
-				tenant, err := s.tenants.GetTenant(ctx, p.Tenant.ID)
-				if errors.Is(err, store.ErrNotFound) {
-					// Deleted mid-stream: revoke everything. The read loop
-					// sees an empty scope and the connection goes quiet
-					// rather than continuing to serve a tenant that no
-					// longer exists.
-					sub.SetScope(store.Scope{})
+				if !refresh() {
 					return
 				}
-				if err != nil {
-					// Leave the existing scope in place on a transient
-					// database error: it was correct as of the last
-					// successful resolve, and widening or narrowing on a
-					// failed read would be guessing.
-					loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
-					continue
-				}
-				if !tenant.Enabled {
-					sub.SetScope(store.Scope{})
-					return
-				}
-				scope, err := s.tenants.ScopeForTenant(ctx, tenant)
-				if err != nil {
-					loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
-					continue
-				}
-				sub.SetScope(scope)
 			}
 		}
 	}()

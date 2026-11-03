@@ -914,6 +914,60 @@ surface at a glance.
 See the [README caching section](../README.md#caching) for the full
 rationale, including the `CACHE_PRIVATE` flag for auth'd deployments.
 
+### Authoritative in-process cache inventory & cross-replica invalidation
+
+Every in-process cache across the repository is catalogued in
+`store.AuthoritativeCacheInventory` (`internal/store/cache_inventory.go`) and
+guarded by `TestCacheInventoryCoversAllRepoCaches`
+(`internal/store/cache_inventory_test.go`), which walks the Go AST and fails CI
+whenever a new cache struct, cache-bearing field, or `sync.Map` is introduced
+without an inventory entry.
+
+All security- and correctness-relevant caches share a single PostgreSQL
+`LISTEN`/`NOTIFY` invalidation channel (`sorotrail_spec_invalidation`, defined
+in `internal/store/invalidation.go`) rather than opening separate listener
+connections per cache:
+
+- `spec:<contract_id>` (or bare `<contract_id>` for wire backward compatibility)
+  evicts the contract's cached spec and spec-hash mapping (`spec.Cache`).
+- `tenant:<tenant_id>` evicts only that tenant's cached API credentials,
+  `Tenant` status/quotas, and contract `Scope` (`api.AuthCache`), evicts that
+  tenant's cached `/stats` entries (`api.StatsCache`), evicts that tenant's
+  rate-limiter token bucket (`api.RateLimiter`), and immediately wakes open SSE
+  and WebSocket stream scope watchers (`api.Server.syncStreamScope`).
+- `apikey:<key_id>` evicts that single API key (`api.AuthCache`) and
+  immediately wakes any open SSE/WebSocket streams authenticated with that key
+  so revoked keys stop receiving events immediately.
+- `persisted:<id|*>` triggers a manifest reload on `graphql.PersistedRegistry`
+  when persisted GraphQL operations are backed by a shared manifest.
+
+| Cache ID | Package & Symbol | What It Holds | Lifetime / TTL | Invalidation Trigger | Cross-Replica Channel | Max Revocation / Staleness Latency |
+|---|---|---|---|---|---|---|
+| `spec.Cache` | `internal/spec` (`Cache`) | Parsed contract specs (by spec hash) and `contractID -> specHash` mappings | Spec TTL (`1h` default) and mapping TTL (`5m` default) | Spec override upsert/delete, WASM upgrade detection, or `Invalidate(contractID)` | Yes (`spec:<contract_id>`) | Immediate (`<100ms` via `LISTEN`/`NOTIFY`); `5m` fallback if disconnected |
+| `api.AuthCache` | `internal/api` (`AuthCache`) | Tenant API key digests, `Tenant` records (`Enabled`, `Admin`, `Wildcard`, quotas), and resolved `Scope` | Bounded short TTL (`DefaultAuthCacheTTL = 5s`) | Tenant update/suspension/deletion, contract grant/revocation, or API key revocation | Yes (`tenant:<id>`, `apikey:<id>`) | Immediate (`<100ms` via `LISTEN`/`NOTIFY`); hard upper bound `5s` TTL |
+| `api.StatsCache` | `internal/api` (`StatsCache`) | Assembled `/stats` responses keyed by `Scope.Fingerprint()` and indexed by tenant ID | `STATS_CACHE_TTL` (`5s` default) | TTL expiry or tenant update/delete/contract grant/revocation | Yes (`tenant:<id>`) | Immediate (`<100ms` via `LISTEN`/`NOTIFY`); hard upper bound `5s` TTL |
+| `api.RateLimiter` | `internal/api` (`RateLimiter`) | Per-client IP and per-tenant (`tenant:<id>`) token-bucket rate limiters | `5m` idle TTL (swept every `1m`) | Idle eviction or tenant quota update/deletion | Yes (`tenant:<id>`) | Immediate (`<100ms` via `LISTEN`/`NOTIFY`); re-seeded from updated `Tenant` quota on next request |
+| `api.syncStreamScope` | `internal/api` (`syncStreamScope`) | Open SSE/WebSocket `broadcast.Subscription` tenant `Scope` snapshot and active API key liveness | Periodic refresh (`StreamScopeSync = 30s` default) + immediate wake channel | Cross-replica `tenant:<id>` or `apikey:<id>` signal, or `30s` refresh ticker | Yes (`tenant:<id>`, `apikey:<id>`) | Immediate (`<100ms` via `LISTEN`/`NOTIFY` wake channel); fallback `30s` `StreamScopeSync` |
+| `graphql.PersistedRegistry` | `internal/api/graphql` (`PersistedRegistry`) | Registered persisted GraphQL operations (`SHA-256 -> validated query`) | Process lifetime or manifest reload | Admin `PUT`/`POST`/`DELETE` on `/graphql/persisted` or cross-replica invalidation | Yes (`persisted:<id\|*>`) | Immediate (`<100ms` via `LISTEN`/`NOTIFY` when backed by shared manifest) |
+| `api.LagTracker` | `internal/api` (`LagTracker`) | Latest Stellar RPC chain head ledger number (`cachedLedger`) for `/stats` and `/metrics` | Bounded short TTL (`5s` default) | `5s` TTL expiry on next `LatestLedger(ctx)` call | No (telemetry-only) | `5s` TTL (read-only external RPC chain head telemetry) |
+| `decode.CachingDecoder` | `internal/decode` (`CachingDecoder`) | Bounded LRU (`4096` entries) memoizing pure base64 `ScVal` XDR -> decoded JSON | Process lifetime with `4096`-entry LRU eviction | LRU capacity eviction (pure deterministic XDR decoding) | No (pure memoization) | `0ms` (pure deterministic function of immutable XDR input) |
+| `meta.workerSingleFlightMap` | `internal/meta` (`workerSingleFlightMap`) | Process-local singleflight deduplication map for concurrent metadata fetches | Process lifetime | None (coordinates concurrent RPC metadata lookups) | No (non-security metadata) | N/A (singleflight helper) |
+
+#### Missed-invalidation observability and reconnect recovery
+
+If a replica's dedicated `LISTEN` connection drops (`SpecInvalidationListener`),
+the disconnection is never silent:
+- `SpecInvalidationListener.RecordDisconnect` logs a structured `WARN` line with
+  `channel`, `error`, `backoff`, and cumulative `disconnect_errors`, and
+  increments `InvalidationListenerStats.DisconnectErrors`.
+- Failed `NOTIFY` publishes on any replica log a structured `WARN` line and
+  increment `Server.InvalidationPublishFailures()`.
+- Upon re-subscribing, `SpecInvalidationListener.RecordReconnect` invokes
+  `OnReconnect` (`Server.OnInvalidationReconnect` and `spec.Cache.Clear`),
+  flushing `AuthCache`, `StatsCache`, `RateLimiter` buckets, `spec.Cache`, and
+  waking all open stream watchers so any invalidation missed during the
+  disconnect window is reconciled immediately.
+
 ## Data integrity
 
 The background auditor provides the strongest trust signal SoroTrail can

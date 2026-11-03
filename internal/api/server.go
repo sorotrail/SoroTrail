@@ -469,15 +469,15 @@ func (s *Server) router() chi.Router {
 	}
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
-	if s.limiter != nil {
-		r.Use(s.limiter.Middleware)
-	}
 	// authenticate must run before any handler that reads events: it is what
 	// puts a Principal (and therefore a Scope) on the request context. In
 	// single-tenant mode it injects a wildcard principal, so behavior is
 	// unchanged; without it mounted, scopeFrom returns the zero Scope and
 	// every scoped query silently matches nothing.
 	r.Use(s.authenticate)
+	if s.limiter != nil {
+		r.Use(s.limiter.Middleware)
+	}
 
 	// usageMiddleware must run after authenticate: it reads the Principal
 	// that authenticate installs, and counts one request per tenant.
