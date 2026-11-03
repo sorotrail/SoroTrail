@@ -54,7 +54,16 @@ func CheckDepth(op *ast.OperationDefinition) error {
 // multi-page query stays under the cap, while a pathological
 // "select everything" query is rejected before storage is touched.
 func CheckComplexity(op *ast.OperationDefinition) error {
-	c := complexity(op.SelectionSet) + operationCost
+	return CheckComplexityWithVariables(op, nil)
+}
+
+// CheckComplexityWithVariables computes operation complexity taking into
+// account runtime variable values that scale page sizes (such as page.first
+// or contracts(first: ...)). When a connection field requests more than the
+// default page size (50 rows), its connectionCost scales proportionally by
+// ceil(first / 50).
+func CheckComplexityWithVariables(op *ast.OperationDefinition, vars map[string]any) error {
+	c := complexityWithVars(op.SelectionSet, vars) + operationCost
 	if c > ComplexityLimit {
 		return fmt.Errorf("query complexity %d exceeds complexity limit %d", c, ComplexityLimit)
 	}
@@ -86,6 +95,10 @@ func depth(sel []ast.Selection, current int) int {
 }
 
 func complexity(sel []ast.Selection) int {
+	return complexityWithVars(sel, nil)
+}
+
+func complexityWithVars(sel []ast.Selection, vars map[string]any) int {
 	total := 0
 	for _, s := range sel {
 		switch t := s.(type) {
@@ -96,18 +109,99 @@ func complexity(sel []ast.Selection) int {
 			// the schema's field typeref to identify exact list returns.
 			cost := leafFieldCost
 			if isConnectionField(t.Name) {
-				cost = connectionCost
+				cost = connectionFieldCost(t, vars)
 			}
 			total += cost
-			total += complexity(t.SelectionSet)
+			total += complexityWithVars(t.SelectionSet, vars)
 		case *ast.InlineFragment:
-			total += complexity(t.SelectionSet)
+			total += complexityWithVars(t.SelectionSet, vars)
 		case *ast.FragmentSpread:
 			// Fragment bodies are scored when CheckComplexity walks the
 			// document. Skip here to avoid double-counting.
 		}
 	}
 	return total
+}
+
+const defaultComplexityPageSize = 50
+
+func connectionFieldCost(f *ast.Field, vars map[string]any) int {
+	if len(vars) == 0 || f == nil || len(f.Arguments) == 0 {
+		return connectionCost
+	}
+	first := extractRequestedFirst(f, vars)
+	if first <= defaultComplexityPageSize {
+		return connectionCost
+	}
+	multiplier := (first + defaultComplexityPageSize - 1) / defaultComplexityPageSize
+	return connectionCost * multiplier
+}
+
+func extractRequestedFirst(f *ast.Field, vars map[string]any) int {
+	for _, arg := range f.Arguments {
+		switch arg.Name {
+		case "first":
+			if n, ok := resolveIntArg(arg.Value, vars); ok {
+				return n
+			}
+		case "page":
+			if arg.Value == nil {
+				continue
+			}
+			switch arg.Value.Kind {
+			case ast.Variable:
+				if pageMap, ok := vars[arg.Value.Raw].(map[string]any); ok {
+					if rawFirst, exists := pageMap["first"]; exists {
+						if n, ok := coerceInt(rawFirst); ok {
+							return n
+						}
+					}
+				}
+			case ast.ObjectValue:
+				for _, child := range arg.Value.Children {
+					if child.Name == "first" {
+						if n, ok := resolveIntArg(child.Value, vars); ok {
+							return n
+						}
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func resolveIntArg(v *ast.Value, vars map[string]any) (int, bool) {
+	if v == nil {
+		return 0, false
+	}
+	if v.Kind == ast.Variable {
+		if vars == nil {
+			return 0, false
+		}
+		return coerceInt(vars[v.Raw])
+	}
+	val, err := argumentValue(v, vars)
+	if err != nil {
+		return 0, false
+	}
+	return coerceInt(val)
+}
+
+func coerceInt(val any) (int, bool) {
+	switch n := val.(type) {
+	case int:
+		return n, true
+	case int32:
+		return int(n), true
+	case int64:
+		return int(n), true
+	case float64:
+		if float64(int(n)) == n {
+			return int(n), true
+		}
+	}
+	return 0, false
 }
 
 // isConnectionField returns true for top-level fields that return a

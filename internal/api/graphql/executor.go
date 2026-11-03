@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/vektah/gqlparser/v2/ast"
@@ -38,8 +39,9 @@ func validateAndCount(op *ast.OperationDefinition) error {
 type errorsSlice []graphQLError
 
 type graphQLError struct {
-	Message string   `json:"message"`
-	Path    []string `json:"path,omitempty"`
+	Message    string         `json:"message"`
+	Path       []string       `json:"path,omitempty"`
+	Extensions map[string]any `json:"extensions,omitempty"`
 }
 
 // responseEnvelope is the GraphQL POST response shape. The
@@ -114,13 +116,22 @@ func executeOperation(ctx context.Context, req *GraphQLRequest) (*responseEnvelo
 	if op.Operation != ast.Query {
 		return nil, fmt.Errorf("only Query operations are supported (got %s)", op.Operation)
 	}
-	if err := validateAndCount(op); err != nil {
+	if req.OperationName != "" && op.Name != "" && req.OperationName != op.Name {
+		return nil, fmt.Errorf("operation %q not found in document", req.OperationName)
+	}
+	if err := CheckDepth(op); err != nil {
 		return nil, err
 	}
 
 	vars := map[string]any{}
 	for k, v := range req.Variables {
 		vars[k] = v
+	}
+	if err := prepareAndValidateVariables(op, vars); err != nil {
+		return nil, err
+	}
+	if err := CheckComplexityWithVariables(op, vars); err != nil {
+		return nil, err
 	}
 
 	r := currentResolver()
@@ -249,7 +260,131 @@ func argumentValue(v *ast.Value, vars map[string]any) (any, error) {
 
 // GraphQLRequest is the wire shape for a POST /graphql body.
 type GraphQLRequest struct {
-	Query         string         `json:"query"`
-	OperationName string         `json:"operationName,omitempty"`
-	Variables     map[string]any `json:"variables,omitempty"`
+	Query         string             `json:"query"`
+	OperationName string             `json:"operationName,omitempty"`
+	Variables     map[string]any     `json:"variables,omitempty"`
+	ID            string             `json:"id,omitempty"`
+	DocumentID    string             `json:"documentId,omitempty"`
+	PersistedID   string             `json:"persistedId,omitempty"`
+	SHA256Hash    string             `json:"sha256Hash,omitempty"`
+	Extensions    *GraphQLExtensions `json:"extensions,omitempty"`
+}
+
+// GraphQLExtensions carries protocol extensions on a GraphQL request,
+// including the Apollo Automatic Persisted Queries (APQ) extension.
+type GraphQLExtensions struct {
+	PersistedQuery *PersistedQueryExtension `json:"persistedQuery,omitempty"`
+}
+
+// PersistedQueryExtension is the standard APQ request extension payload.
+type PersistedQueryExtension struct {
+	Version    int    `json:"version,omitempty"`
+	SHA256Hash string `json:"sha256Hash,omitempty"`
+}
+
+// persistedID returns the caller-supplied persisted operation identifier from
+// extensions.persistedQuery.sha256Hash or any of the top-level identifier
+// aliases (id, documentId, persistedId, sha256Hash).
+func (r *GraphQLRequest) persistedID() string {
+	if r == nil {
+		return ""
+	}
+	if r.Extensions != nil && r.Extensions.PersistedQuery != nil {
+		if h := strings.TrimSpace(r.Extensions.PersistedQuery.SHA256Hash); h != "" {
+			return h
+		}
+	}
+	for _, candidate := range []string{r.ID, r.DocumentID, r.PersistedID, r.SHA256Hash} {
+		if s := strings.TrimSpace(candidate); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// prepareAndValidateVariables applies declared default values and validates
+// runtime variable values against the operation's VariableDefinitions.
+func prepareAndValidateVariables(op *ast.OperationDefinition, vars map[string]any) error {
+	if op == nil || len(op.VariableDefinitions) == 0 {
+		return nil
+	}
+	for _, vdef := range op.VariableDefinitions {
+		val, exists := vars[vdef.Variable]
+		if (!exists || val == nil) && vdef.DefaultValue != nil {
+			defVal, err := argumentValue(vdef.DefaultValue, nil)
+			if err != nil {
+				return fmt.Errorf("variable $%s default value: %w", vdef.Variable, err)
+			}
+			vars[vdef.Variable] = defVal
+			val = defVal
+			exists = true
+		}
+		if vdef.Type == nil {
+			continue
+		}
+		if vdef.Type.NonNull && (!exists || val == nil) {
+			return fmt.Errorf("variable $%s of non-null type %s must not be null", vdef.Variable, vdef.Type.String())
+		}
+		if exists && val != nil {
+			if err := validateVariableType(vdef.Variable, val, vdef.Type); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateVariableType(name string, val any, typ *ast.Type) error {
+	if typ == nil || val == nil {
+		if typ != nil && typ.NonNull {
+			return fmt.Errorf("variable $%s of non-null type %s must not be null", name, typ.String())
+		}
+		return nil
+	}
+	if typ.Elem != nil {
+		switch slice := val.(type) {
+		case []any:
+			for i, item := range slice {
+				if err := validateVariableType(fmt.Sprintf("%s[%d]", name, i), item, typ.Elem); err != nil {
+					return err
+				}
+			}
+			return nil
+		case []string:
+			for i, item := range slice {
+				if err := validateVariableType(fmt.Sprintf("%s[%d]", name, i), item, typ.Elem); err != nil {
+					return err
+				}
+			}
+			return nil
+		default:
+			return fmt.Errorf("variable $%s expected list type %s", name, typ.String())
+		}
+	}
+
+	switch typ.NamedType {
+	case "Int", "Int64":
+		if _, ok := coerceInt(val); !ok {
+			return fmt.Errorf("variable $%s expected %s, got %T", name, typ.NamedType, val)
+		}
+	case "Float":
+		switch val.(type) {
+		case float64, float32, int, int32, int64:
+		default:
+			return fmt.Errorf("variable $%s expected Float, got %T", name, val)
+		}
+	case "Boolean":
+		if _, ok := val.(bool); !ok {
+			return fmt.Errorf("variable $%s expected Boolean, got %T", name, val)
+		}
+	case "String", "ID", "Cursor", "DateTime", "SortOrder", "EventOrderBy":
+		if _, ok := val.(string); !ok {
+			return fmt.Errorf("variable $%s expected %s (string), got %T", name, typ.NamedType, val)
+		}
+	case "EventFilterInput", "PageInput", "TopicPositionFilterInput":
+		if _, ok := val.(map[string]any); !ok {
+			return fmt.Errorf("variable $%s expected input object %s, got %T", name, typ.NamedType, val)
+		}
+	}
+	return nil
 }
