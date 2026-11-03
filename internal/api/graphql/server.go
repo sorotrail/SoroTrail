@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vektah/gqlparser/v2/ast"
@@ -27,6 +29,42 @@ type Handler struct {
 	log      *slog.Logger
 	// playground, when true, serves GraphiQL at /graphiql.
 	playground bool
+
+	persisted    *PersistedRegistry
+	manifestFile string
+
+	mu            sync.RWMutex
+	allowlistOnly bool
+	apiKey        string
+}
+
+// Option configures optional features on the GraphQL Handler.
+type Option func(*Handler)
+
+// WithAllowlistOnly enables or disables persisted-query allowlist mode.
+// When enabled, ad-hoc queries and unauthenticated on-the-fly APQ
+// registrations are refused.
+func WithAllowlistOnly(enabled bool) Option {
+	return func(h *Handler) {
+		h.SetAllowlistOnly(enabled)
+	}
+}
+
+// WithAPIKey sets the operator API key used to authenticate persisted
+// operation management requests (/graphql/persisted) and authenticated
+// on-the-fly registrations in allowlist mode.
+func WithAPIKey(apiKey string) Option {
+	return func(h *Handler) {
+		h.SetAPIKey(apiKey)
+	}
+}
+
+// WithPersistedOperationsFile configures a JSON manifest file of persisted
+// GraphQL operations to load at startup and update on registration changes.
+func WithPersistedOperationsFile(path string) Option {
+	return func(h *Handler) {
+		h.manifestFile = strings.TrimSpace(path)
+	}
 }
 
 // New builds a Handler from the API server's dependencies plus a flag
@@ -37,7 +75,7 @@ type Handler struct {
 // error — clients would otherwise see inconsistent behavior. The
 // depth/complexity guards run independently of SDL validity since
 // they only inspect the operation.
-func New(s api.ServerDeps, log *slog.Logger, enablePlayground bool) (*Handler, error) {
+func New(s api.ServerDeps, log *slog.Logger, enablePlayground bool, opts ...Option) (*Handler, error) {
 	sdl, err := loadSDL()
 	if err != nil {
 		return nil, fmt.Errorf("loading schema: %w", err)
@@ -54,12 +92,95 @@ func New(s api.ServerDeps, log *slog.Logger, enablePlayground bool) (*Handler, e
 			store:    s.Store,
 			enricher: s.Enricher,
 		},
-		log:        log,
-		playground: enablePlayground,
+		log:          log,
+		playground:   enablePlayground,
+		persisted:    NewPersistedRegistry(),
+		manifestFile: strings.TrimSpace(os.Getenv("GRAPHQL_PERSISTED_OPERATIONS_FILE")),
+		apiKey:       os.Getenv("API_KEY"),
+	}
+	if rawAllowlist := strings.TrimSpace(os.Getenv("GRAPHQL_PERSISTED_ONLY")); rawAllowlist != "" {
+		enabled, err := strconv.ParseBool(rawAllowlist)
+		if err != nil {
+			return nil, fmt.Errorf("parsing GRAPHQL_PERSISTED_ONLY %q: %w", rawAllowlist, err)
+		}
+		h.allowlistOnly = enabled
 	}
 	UseResolver(h.resolver)
 	registerRoutes(h.resolver)
+	for _, opt := range opts {
+		if opt != nil {
+			opt(h)
+		}
+	}
+	if h.manifestFile != "" {
+		if err := h.persisted.LoadManifestFile(h.manifestFile); err != nil {
+			return nil, err
+		}
+	}
 	return h, nil
+}
+
+// SetAllowlistOnly enables or disables persisted-query allowlist mode at runtime.
+func (h *Handler) SetAllowlistOnly(enabled bool) {
+	h.mu.Lock()
+	h.allowlistOnly = enabled
+	h.mu.Unlock()
+}
+
+// AllowlistOnly reports whether persisted-query allowlist mode is active.
+func (h *Handler) AllowlistOnly() bool {
+	h.mu.RLock()
+	v := h.allowlistOnly
+	h.mu.RUnlock()
+	return v
+}
+
+// SetAPIKey configures the operator API key required for persisted operation
+// management endpoints.
+func (h *Handler) SetAPIKey(apiKey string) {
+	h.mu.Lock()
+	h.apiKey = apiKey
+	h.mu.Unlock()
+}
+
+func (h *Handler) getAPIKey() string {
+	h.mu.RLock()
+	v := h.apiKey
+	h.mu.RUnlock()
+	return v
+}
+
+// PersistedRegistry returns the handler's persisted operations registry.
+func (h *Handler) PersistedRegistry() *PersistedRegistry {
+	return h.persisted
+}
+
+// RegisterPersistedOperation validates and registers a single persisted query
+// document in the handler's allowlist.
+func (h *Handler) RegisterPersistedOperation(suppliedID, query string) (PersistedOperation, error) {
+	return h.persisted.Register(suppliedID, query)
+}
+
+// ReplacePersistedOperations validates all entries and atomically replaces the
+// handler's persisted query allowlist.
+func (h *Handler) ReplacePersistedOperations(entries []PersistedRegistrationInput) ([]PersistedOperation, error) {
+	return h.persisted.RegisterBatch(entries, true)
+}
+
+// DeletePersistedOperation removes a persisted query by its SHA-256 identifier.
+func (h *Handler) DeletePersistedOperation(id string) (bool, error) {
+	return h.persisted.Delete(id)
+}
+
+// ListPersistedOperations returns all registered persisted operations sorted by ID.
+func (h *Handler) ListPersistedOperations() []PersistedOperation {
+	return h.persisted.List()
+}
+
+// LoadPersistedOperationsFile loads and validates a JSON persisted-operations
+// manifest from path.
+func (h *Handler) LoadPersistedOperationsFile(path string) error {
+	return h.persisted.LoadManifestFile(path)
 }
 
 // loadSDL reads the schema file from the package's data directory.
@@ -151,8 +272,14 @@ func registerRoutes(r *Resolver) {
 
 // ServeHTTP is the http.Handler entry point for POST /graphql. GET
 // /graphql with no body returns a JSON message so accidental browser
-// hits don't surface as cryptic request errors.
+// hits don't surface as cryptic request errors. Requests targeting
+// /graphql/persisted (or /graphql/persisted/{id}) are routed to the
+// persisted-operations management handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL != nil && isPersistedManagementPath(r.URL.Path) {
+		h.handlePersisted(w, r)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		h.handleGet(w, r)
@@ -169,16 +296,46 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleGet handles GET /graphql — uses the `query` URL parameter so
-// browser playground GETs work without a body.
+func isPersistedManagementPath(path string) bool {
+	return path == "/graphql/persisted" ||
+		strings.HasPrefix(path, "/graphql/persisted/") ||
+		path == "/persisted" ||
+		strings.HasPrefix(path, "/persisted/")
+}
+
+// handleGet handles GET /graphql — uses the `query` URL parameter (or
+// persisted query identifier + optional `variables` / `extensions` JSON)
+// so browser playground GETs and HTTP GET APQ requests work without a body.
 func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query().Get("query")
-	if q == "" {
+	qp := r.URL.Query()
+	req := GraphQLRequest{
+		Query:         qp.Get("query"),
+		OperationName: qp.Get("operationName"),
+		ID:            qp.Get("id"),
+		DocumentID:    qp.Get("documentId"),
+		PersistedID:   qp.Get("persistedId"),
+		SHA256Hash:    qp.Get("sha256Hash"),
+	}
+	if rawVars := qp.Get("variables"); rawVars != "" {
+		if err := json.Unmarshal([]byte(rawVars), &req.Variables); err != nil {
+			writeErrorEnvelope(w, http.StatusBadRequest, fmt.Sprintf("invalid variables JSON: %s", err.Error()), nil)
+			return
+		}
+	}
+	if rawExt := qp.Get("extensions"); rawExt != "" {
+		var ext GraphQLExtensions
+		if err := json.Unmarshal([]byte(rawExt), &ext); err != nil {
+			writeErrorEnvelope(w, http.StatusBadRequest, fmt.Sprintf("invalid extensions JSON: %s", err.Error()), nil)
+			return
+		}
+		req.Extensions = &ext
+	}
+	if req.Query == "" && req.persistedID() == "" && !h.AllowlistOnly() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"message":"POST {\"query\":\"…\"} to this endpoint"}`))
 		return
 	}
-	h.runQuery(w, r.Context(), &GraphQLRequest{Query: q})
+	h.runQueryWithRequest(w, r, &req)
 }
 
 // handlePost handles POST /graphql — accepts a JSON body matching
@@ -194,7 +351,18 @@ func (h *Handler) handlePost(w http.ResponseWriter, r *http.Request) {
 		writeErrorEnvelope(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON: %s", err.Error()), nil)
 		return
 	}
-	h.runQuery(w, r.Context(), &req)
+	h.runQueryWithRequest(w, r, &req)
+}
+
+func (h *Handler) runQueryWithRequest(w http.ResponseWriter, r *http.Request, req *GraphQLRequest) {
+	if h.persisted == nil {
+		h.persisted = NewPersistedRegistry()
+	}
+	if gerr := h.resolvePersistedRequest(r, req); gerr != nil {
+		writeGraphQLError(w, http.StatusOK, *gerr)
+		return
+	}
+	h.runQuery(w, r.Context(), req)
 }
 
 // runQuery is the common path: parse, validate, dispatch, serialize.
@@ -216,11 +384,15 @@ func (h *Handler) runQuery(w http.ResponseWriter, ctx context.Context, req *Grap
 }
 
 func writeErrorEnvelope(w http.ResponseWriter, status int, msg string, path []string) {
+	writeGraphQLError(w, status, graphQLError{Message: msg, Path: path})
+}
+
+func writeGraphQLError(w http.ResponseWriter, status int, gerr graphQLError) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(responseEnvelope{
 		Data:   map[string]any{},
-		Errors: errorsSlice{{Message: msg, Path: path}},
+		Errors: errorsSlice{gerr},
 	})
 }
 

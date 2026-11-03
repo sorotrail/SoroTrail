@@ -520,6 +520,8 @@ func (s *Server) router() chi.Router {
 	// shows up as a 404 instead of a confusing 500.
 	if s.graphqlHandler != nil {
 		r.Handle("/graphql", s.graphqlHandler)
+		r.Handle("/graphql/persisted", s.graphqlHandler)
+		r.Handle("/graphql/persisted/{id}", s.graphqlHandler)
 	}
 	if s.graphqlPlayground != nil {
 		r.Get("/graphiql", func(w http.ResponseWriter, req *http.Request) {
@@ -782,5 +784,8 @@ func RequestIDFrom(ctx context.Context) string {
 func (s *Server) SetGraphQLHandler(handler, playground http.Handler) *Server {
 	s.graphqlHandler = handler
 	s.graphqlPlayground = playground
+	if keyAware, ok := handler.(interface{ SetAPIKey(string) }); ok && s.apiKey != "" {
+		keyAware.SetAPIKey(s.apiKey)
+	}
 	return s
 }
