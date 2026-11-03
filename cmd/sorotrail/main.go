@@ -42,7 +42,30 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 	"github.com/sorotrail/sorotrail/internal/telemetry"
 	"github.com/sorotrail/sorotrail/internal/webhook"
+	"github.com/sorotrail/sorotrail/internal/workerhealth"
 )
+
+const (
+	exitOK           = 0
+	exitRuntimeError = 1
+	exitConfigError  = 2
+)
+
+type exitError struct {
+	code int
+	err  error
+}
+
+func (e *exitError) Error() string {
+	if e.err == nil {
+		return fmt.Sprintf("exit %d", e.code)
+	}
+	return e.err.Error()
+}
+
+func (e *exitError) Unwrap() error {
+	return e.err
+}
 
 var errInterrupted = errors.New("interrupted")
 
@@ -52,26 +75,28 @@ func main() {
 	if code == 0 {
 		return
 	}
-	if code == 1 {
+	if err != nil && !errors.Is(err, errInterrupted) {
 		fmt.Fprintln(os.Stderr, "sorotrail:", err)
 	}
 	os.Exit(code)
 }
 
 // exitCode maps dispatch's result onto the process exit status: 0 on
-// success, 2 when a one-shot run was interrupted (scripts re-run to
-// resume, so the distinction from a genuine failure is part of the
-// interface), and 1 for every other error. It is a separate function
+// success, 2 when a one-shot run was interrupted or failed configuration
+// validation, and 1 for runtime/dependency errors. It is a separate function
 // so the mapping is testable without os.Exit.
 func exitCode(err error) int {
-	switch {
-	case err == nil:
-		return 0
-	case errors.Is(err, errInterrupted):
-		return 2
-	default:
-		return 1
+	if err == nil {
+		return exitOK
 	}
+	var coded *exitError
+	if errors.As(err, &coded) {
+		return coded.code
+	}
+	if errors.Is(err, errInterrupted) {
+		return 2
+	}
+	return exitRuntimeError
 }
 
 // dispatch routes to a subcommand, defaulting to the indexer so existing
@@ -144,6 +169,8 @@ func dispatch(args []string) error {
 		return runStats(args[1:])
 	case "config":
 		return runConfig(args[1:])
+	case "preflight", "self-check":
+		return runPreflight(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -196,6 +223,8 @@ subcommands:
                    (sorotrail stats --help)
   config           print the effective configuration with secrets redacted
                    (sorotrail config --help)
+  preflight        run startup self-checks (config, database, migrations, RPC, archive, retention)
+                   (sorotrail preflight --help)
 `)
 }
 
@@ -269,6 +298,10 @@ func runService(dryRun bool) error {
 	}()
 	_ = provider
 	defer stop()
+
+	if err := workerhealth.VerifyRPCNetworkOnStartup(ctx, nil, workerhealth.EffectiveRPCURLs(cfg), cfg.Network); err != nil {
+		return err
+	}
 
 	// A dry-run must not mutate the database merely to make the preview
 	// possible. The normal startup path still migrates before opening the

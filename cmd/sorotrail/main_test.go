@@ -582,6 +582,10 @@ func TestDispatch_RoutesDocumentedSubcommands(t *testing.T) {
 			name: "config routes to runConfig and handles help flag cleanly",
 			args: []string{"config", "--help"},
 		},
+		{
+			name: "preflight routes to runPreflight and handles help flag cleanly",
+			args: []string{"preflight", "--help"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -863,6 +867,7 @@ func TestUsage_ListsEverySubcommand(t *testing.T) {
 		{"version", "print the build version, commit, and build date"},
 		{"stats", "print store stats as a table"},
 		{"config", "print the effective configuration with secrets redacted"},
+		{"preflight", "run startup self-checks"},
 	}
 
 	for _, tt := range knownSubcommands {
