@@ -4973,10 +4973,37 @@
           "error": {
             "type": "string",
             "description": "Human-readable error message"
+          },
+          "code": {
+            "type": "string",
+            "description": "Stable machine-readable error code",
+            "enum": [
+              "INVALID_PARAMETER",
+              "INVALID_CURSOR",
+              "RANGE_TOO_WIDE",
+              "LIMIT_EXCEEDED",
+              "INVALID_BODY",
+              "CONFIRMATION_REQUIRED",
+              "UNAUTHORIZED",
+              "FORBIDDEN",
+              "NOT_FOUND",
+              "CONFLICT",
+              "PAYLOAD_TOO_LARGE",
+              "QUOTA_EXCEEDED",
+              "RATE_LIMITED",
+              "INTERNAL_ERROR",
+              "UNSUPPORTED_OPERATION",
+              "SERVICE_UNAVAILABLE"
+            ]
+          },
+          "field": {
+            "type": "string",
+            "description": "Request parameter or JSON field that caused a validation error"
           }
         },
         "required": [
-          "error"
+          "error",
+          "code"
         ]
       },
       "HealthResponse": {
@@ -6496,7 +6523,15 @@
         }
       },
       "BadRequest": {
-        "description": "The request could not be parsed or violates a documented constraint — a malformed identifier, an out-of-range limit, an unparseable cursor, or a JSON body the endpoint cannot decode. The message names the offending parameter.",
+        "description": "The request could not be parsed or violates a documented constraint — a malformed identifier (`INVALID_PARAMETER`), an out-of-range limit (`LIMIT_EXCEEDED`), an overly wide export span (`RANGE_TOO_WIDE`), an unparseable or mismatched cursor (`INVALID_CURSOR`), a missing ingestion-mode confirmation (`CONFIRMATION_REQUIRED`), or a JSON body the endpoint cannot decode (`INVALID_BODY`). The `field` property names the offending parameter when applicable.",
+        "x-error-codes": [
+          "INVALID_PARAMETER",
+          "INVALID_CURSOR",
+          "RANGE_TOO_WIDE",
+          "LIMIT_EXCEEDED",
+          "INVALID_BODY",
+          "CONFIRMATION_REQUIRED"
+        ],
         "content": {
           "application/json": {
             "schema": {
@@ -6506,7 +6541,10 @@
         }
       },
       "Unauthorized": {
-        "description": "No credential was presented, or the one presented is malformed,\nunknown or revoked.\n\nWhich credential is missing depends on the endpoint's security\nrequirement: endpoints requiring ManagementKey want the operator's\n`X-API-Key`, while everything else wants the tenant key and only\nrejects when the instance runs with MULTI_TENANT=true.\n",
+        "description": "No credential was presented, or the one presented is malformed,\nunknown or revoked (`UNAUTHORIZED`).\n\nWhich credential is missing depends on the endpoint's security\nrequirement: endpoints requiring ManagementKey want the operator's\n`X-API-Key`, while everything else wants the tenant key and only\nrejects when the instance runs with MULTI_TENANT=true.\n",
+        "x-error-codes": [
+          "UNAUTHORIZED"
+        ],
         "headers": {
           "WWW-Authenticate": {
             "description": "The authentication challenge, per RFC 7235 §4.1 — for example `Bearer realm=\"sorotrail\"`. Present on the tenant-authentication failures; the ManagementKey path answers without a challenge because it accepts no Bearer token.",
@@ -6527,7 +6565,10 @@
         }
       },
       "Forbidden": {
-        "description": "The credential is valid but does not entitle the caller to what it asked for: a disabled tenant, a non-admin calling an admin endpoint, or a request naming a contract outside the tenant's grants. Contract IDs are public on-chain identifiers, so a request for an ungranted contract is answered 403 rather than 404.",
+        "description": "The credential is valid but does not entitle the caller to what it asked for (`FORBIDDEN`): a disabled tenant, a non-admin calling an admin endpoint, or a request naming a contract outside the tenant's grants. Contract IDs are public on-chain identifiers, so a request for an ungranted contract is answered 403 rather than 404.",
+        "x-error-codes": [
+          "FORBIDDEN"
+        ],
         "content": {
           "application/json": {
             "schema": {
@@ -6537,7 +6578,10 @@
         }
       },
       "NotFound": {
-        "description": "The addressed resource does not exist, or is not visible to the caller. Event lookups answer 404 rather than 403 for an event the caller may not read, so the endpoint cannot be used as an existence oracle. The tenant and admin endpoints also answer 404 when the instance runs single-tenant and those routes are therefore inert.",
+        "description": "The addressed resource does not exist, or is not visible to the caller (`NOT_FOUND`). Event lookups answer 404 rather than 403 for an event the caller may not read, so the endpoint cannot be used as an existence oracle. The tenant and admin endpoints also answer 404 when the instance runs single-tenant and those routes are therefore inert.",
+        "x-error-codes": [
+          "NOT_FOUND"
+        ],
         "content": {
           "application/json": {
             "schema": {
@@ -6547,7 +6591,10 @@
         }
       },
       "Conflict": {
-        "description": "The request collides with the current state — a duplicate tenant name, or a tenant attempting to delete the account it is authenticated as.",
+        "description": "The request collides with the current state (`CONFLICT`) — a duplicate tenant name, or a tenant attempting to delete the account it is authenticated as.",
+        "x-error-codes": [
+          "CONFLICT"
+        ],
         "content": {
           "application/json": {
             "schema": {
@@ -6570,7 +6617,11 @@
         }
       },
       "TooManyRequests": {
-        "description": "The caller exceeded its request quota, or asked to watch more\ncontracts than its quota allows.\n\nRate limiting is per client — keyed on the authenticated tenant where\none exists and on the client IP otherwise — and is only active when\nthe operator configured RATE_LIMIT_RPS or a per-tenant override. The\nprobe and scrape endpoints (/health, /livez, /readyz, /metrics) are\nnever rate limited, so throttling cannot blind an operator to the\nthrottling itself.\n",
+        "description": "The caller exceeded its request quota (`RATE_LIMITED`), or asked to\nwatch more contracts than its quota allows (`QUOTA_EXCEEDED`).\n\nRate limiting is per client — keyed on the authenticated tenant where\none exists and on the client IP otherwise — and is only active when\nthe operator configured RATE_LIMIT_RPS or a per-tenant override. The\nprobe and scrape endpoints (/health, /livez, /readyz, /metrics) are\nnever rate limited, so throttling cannot blind an operator to the\nthrottling itself.\n",
+        "x-error-codes": [
+          "QUOTA_EXCEEDED",
+          "RATE_LIMITED"
+        ],
         "headers": {
           "Retry-After": {
             "description": "Whole seconds to wait before retrying, per RFC 7231 §7.1.3. Always at least 1, and rounded up from the limiter's own wait-to-next-token estimate.",
@@ -6622,7 +6673,10 @@
         }
       },
       "RequestEntityTooLarge": {
-        "description": "The request body exceeds the instance's configured limit (HTTP_REQUEST_BODY_LIMIT). Reduce the body size and retry.",
+        "description": "The request body exceeds the instance's configured limit (HTTP_REQUEST_BODY_LIMIT, `PAYLOAD_TOO_LARGE`). Reduce the body size and retry.",
+        "x-error-codes": [
+          "PAYLOAD_TOO_LARGE"
+        ],
         "content": {
           "application/json": {
             "schema": {
@@ -6632,7 +6686,10 @@
         }
       },
       "InternalError": {
-        "description": "The request failed for a reason the caller cannot act on — a store or RPC failure, or a panic caught by the recovery middleware. The message is deliberately generic; the specifics are logged against the request's X-Request-ID rather than returned.",
+        "description": "The request failed for a reason the caller cannot act on (`INTERNAL_ERROR`) — a store or RPC failure, or a panic caught by the recovery middleware. The message is deliberately generic; the specifics are logged against the request's X-Request-ID rather than returned.",
+        "x-error-codes": [
+          "INTERNAL_ERROR"
+        ],
         "content": {
           "application/json": {
             "schema": {
@@ -6642,7 +6699,10 @@
         }
       },
       "NotImplemented": {
-        "description": "The endpoint exists but the feature behind it is not configured on this instance. Returned by the live event stream when the broadcaster is disabled.",
+        "description": "The endpoint exists but the feature behind it is not configured on this instance (`UNSUPPORTED_OPERATION`). Returned by the live event stream when the broadcaster is disabled, or when the store backend does not implement the capability.",
+        "x-error-codes": [
+          "UNSUPPORTED_OPERATION"
+        ],
         "content": {
           "application/json": {
             "schema": {
@@ -6652,7 +6712,10 @@
         }
       },
       "ServiceUnavailable": {
-        "description": "The endpoint is temporarily unusable or not configured on this instance. The management endpoints answer this when API_KEY is unset, failing closed so writes are never open on a misconfigured instance; /metrics answers it when no metrics collector is wired in.",
+        "description": "The endpoint is temporarily unusable or not configured on this instance (`SERVICE_UNAVAILABLE`). The management endpoints answer this when API_KEY is unset, failing closed so writes are never open on a misconfigured instance; /metrics answers it when no metrics collector is wired in.",
+        "x-error-codes": [
+          "SERVICE_UNAVAILABLE"
+        ],
         "content": {
           "application/json": {
             "schema": {

@@ -267,8 +267,12 @@ type EnrichedEvent map[string]any
 
 // ErrorResponse Standard error envelope
 type ErrorResponse struct {
+	// Code Stable machine-readable error code
+	Code string `json:"code"`
 	// Error Human-readable error message
 	Error string `json:"error"`
+	// Field Request parameter or JSON field that caused a validation error
+	Field string `json:"field,omitempty"`
 }
 
 // Event A Stellar/Soroban contract event
