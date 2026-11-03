@@ -272,3 +272,25 @@ Query performance measured across standard API filter combinations with `Limit=5
 ### API Consumption
 - Prefer `topic_contains` with specific JSON objects over generic text regexes.
 - Always pass `cursor` from previous response headers for sequential page fetching rather than deep offset scans.
+
+---
+
+## 5. Lag-Aware Backpressure & Catch-Up Mode
+
+When the ingester falls behind the chain head by more than `LagWarnLedgers`, reporting the lag metric (`SetLagging(true)`) is combined with an opt-in lag-aware backpressure coordinator (`ingester.LagCoordinator` in `internal/ingester/backpressure.go`) that actively helps the ingester catch up while yielding competing background store I/O:
+
+1. **Hysteresis Band (No Oscillation at the Threshold Boundary)**:
+   - Entering the lagging state requires `lag > EnterLagLedgers` (`Options.LagWarnLedgers`).
+   - Clearing the lagging state requires `lag <= RecoverLagLedgers` (`Options.LagRecoverLedgers`, defaulting to `75%` of `LagWarnLedgers`).
+   - While lag fluctuates inside the hysteresis deadband (`RecoverLagLedgers < lag <= EnterLagLedgers`), the coordinator preserves its current state instead of toggling catch-up mode or background job deferral on every ledger.
+
+2. **Ingester Catch-Up Acceleration & Closing-Rate Telemetry**:
+   - While lagging with `LagBackpressureEnabled: true`, `effectiveSweepWindow()` scales `SweepWindow` by `CatchUpSweepMultiplier` (default `2x`) so each multi-contract sweep covers a wider ledger range per RPC round-trip.
+   - `adjustPollInterval` keeps shrinking the poll interval toward `PollIntervalMin` until the hysteresis recovery watermark is crossed.
+   - `LagCoordinator.ObserveLag` tracks the lag closing rate in `ledgers/sec` (`LagBackpressureStats.ClosingRateLedgersPerSec`) and logs structured transition events (`ingester lag backpressure engaged` / `ingester lag backpressure cleared`).
+
+3. **Bounded Background Job Yielding (`pruner`, `archive`, `audit`)**:
+   - Background jobs that compete with ingestion for database write IOPS and buffer cache (`pruner.Pruner`, `archive.Archiver`, and `audit.Auditor`) accept a `LagYieldController` (`ShouldYield(job string) (yield bool, reason string)`).
+   - While the ingester is lagging, background passes and batch loops yield early (`reason="ingest_lagging"`) and increment per-component yield counters (`LagYields`).
+   - To prevent indefinite starvation of retention pruning, cold-storage archiving, or audit-log verification during prolonged chain catch-up, each job has a configurable maximum deferral window (`LagMaxDeferral`, default `15m`). Once a job has been continuously deferred for `>= MaxDeferral`, `ShouldYield(job)` returns `(false, "max_deferral_reached")`, allowing one bounded maintenance pass to run and resetting that job's deferral timer.
+

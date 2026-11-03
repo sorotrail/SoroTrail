@@ -26,6 +26,12 @@ type Reingester interface {
 	Network() string
 }
 
+// LagYieldController reports whether the auditor should defer its pass while
+// ingestion is lagging behind the chain head.
+type LagYieldController interface {
+	ShouldYield(job string) (yield bool, reason string)
+}
+
 // Options configure an Auditor.
 type Options struct {
 	PollInterval      time.Duration
@@ -35,6 +41,11 @@ type Options struct {
 	FindingMaxLedgers uint32
 	// Network is the logical network name the auditor is responsible for.
 	Network string
+	// LagController is an optional lag backpressure coordinator. When set,
+	// PassOnce yields while ingestion is lagging (up to the coordinator's
+	// maximum deferral window) so RPC and DB budgets are reserved for
+	// catching up.
+	LagController LagYieldController
 }
 
 const (
@@ -82,9 +93,17 @@ type Metrics struct {
 	FindingsUnrecoverable uint64
 	FindingsUnverifiable  uint64
 	RPCRequests           uint64
+	LagYields             uint64
+	MaxDeferralOverrides  uint64
 }
 
 func (a *Auditor) Metrics() Metrics { return a.metrics }
+
+// WithLagController attaches a LagYieldController to the Auditor.
+func (a *Auditor) WithLagController(c LagYieldController) *Auditor {
+	a.opts.LagController = c
+	return a
+}
 
 // New wires an Auditor.
 func New(client rpc.Client, st store.Store, reingest Reingester, log *slog.Logger, opts Options) *Auditor {
@@ -145,6 +164,19 @@ func auditTracer() trace.Tracer { return otel.Tracer("sorotrail/audit") }
 func (a *Auditor) PassOnce(ctx context.Context) (worked bool, err error) {
 	ctx, span := auditTracer().Start(ctx, "audit.pass")
 	defer span.End()
+
+	if a.opts.LagController != nil {
+		if yield, reason := a.opts.LagController.ShouldYield("auditor"); yield {
+			a.metrics.LagYields++
+			a.log.Info("audit pass deferred due to ingestion lag",
+				"network", a.opts.Network,
+				"reason", reason,
+			)
+			return false, nil
+		} else if reason == "max_deferral_reached" {
+			a.metrics.MaxDeferralOverrides++
+		}
+	}
 
 	// 1. Pull state.
 	state, err := a.store.GetAuditState(ctx, a.opts.Network)

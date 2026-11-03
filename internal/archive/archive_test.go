@@ -444,3 +444,39 @@ func sortedObjectKeys(objects map[string][]byte) []string {
 	sort.Strings(keys)
 	return keys
 }
+
+type stubArchiveLagController struct {
+	yield  bool
+	reason string
+}
+
+func (s *stubArchiveLagController) ShouldYield(string) (bool, string) {
+	return s.yield, s.reason
+}
+
+func TestArchiveRangeLagBackpressureAndMaxDeferral(t *testing.T) {
+	st := &archiveStore{
+		pages: [][]store.Event{
+			{{ID: "ev-1", Ledger: 10, ContractID: "C1"}},
+		},
+	}
+	client := newArchiveObjectClient()
+	lagCtrl := &stubArchiveLagController{yield: true, reason: "ingest_lagging"}
+	a := newTestArchiver(st, client).WithLagController(lagCtrl)
+
+	uri, sha, err := a.ArchiveRange(context.Background(), 0, 50)
+	require.ErrorIs(t, err, ErrDeferredToLag)
+	assert.Empty(t, uri)
+	assert.Empty(t, sha)
+	assert.Equal(t, uint64(1), a.Metrics().LagYields)
+	assert.Empty(t, client.objects)
+
+	// Once max deferral elapses, ArchiveRange proceeds and records the override.
+	lagCtrl.yield = false
+	lagCtrl.reason = "max_deferral_reached"
+	uri, sha, err = a.ArchiveRange(context.Background(), 0, 50)
+	require.NoError(t, err)
+	assert.NotEmpty(t, uri)
+	assert.NotEmpty(t, sha)
+	assert.Equal(t, uint64(1), a.Metrics().MaxDeferralOverrides)
+}

@@ -5,6 +5,7 @@ package pruner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -15,6 +16,13 @@ import (
 	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
+
+// LagYieldController reports whether the pruner should defer its retention
+// sweep (or yield between batches) while ingestion is lagging behind the
+// chain head.
+type LagYieldController interface {
+	ShouldYield(job string) (yield bool, reason string)
+}
 
 // Options configure the pruner. Zero values disable the corresponding
 // policy dimension (e.g. MaxAge == 0 means "no age-based pruning").
@@ -42,6 +50,10 @@ type Options struct {
 	// in the Metrics snapshot so operators can validate retention policy
 	// before enabling actual deletion.
 	DryRun bool
+	// LagController is an optional lag backpressure coordinator. When set,
+	// pruneOnce defers sweeps (and yields between batches) while ingestion
+	// is lagging, up to the coordinator's maximum deferral window.
+	LagController LagYieldController
 }
 
 // DefaultValues used when Options fields are zero.
@@ -68,10 +80,12 @@ func (o *Options) applyDefaults() {
 // atomics on the Pruner so the JSON serialization sees plain values without
 // touching any internals.
 type Metrics struct {
-	RunsCompleted      uint64 `json:"runs_completed"`
-	TotalRowsPurged    int64  `json:"total_rows_purged"`
-	ArchivedRanges     int64  `json:"archived_ranges,omitempty"`
-	DryRunEligibleRows int64  `json:"dry_run_eligible_rows,omitempty"`
+	RunsCompleted        uint64 `json:"runs_completed"`
+	TotalRowsPurged      int64  `json:"total_rows_purged"`
+	ArchivedRanges       int64  `json:"archived_ranges,omitempty"`
+	DryRunEligibleRows   int64  `json:"dry_run_eligible_rows,omitempty"`
+	LagYields            uint64 `json:"lag_yields,omitempty"`
+	MaxDeferralOverrides uint64 `json:"max_deferral_overrides,omitempty"`
 }
 
 // Pruner is the background retention-policy job.
@@ -88,10 +102,12 @@ type Pruner struct {
 	arch  *archive.Archiver // nil when archival is disabled
 
 	// Atomics: written by Run, read by HTTP handlers via Metrics().
-	runsCompleted  atomic.Uint64
-	rowsPurged     atomic.Int64
-	archivedRanges atomic.Int64
-	dryRunEligible atomic.Int64
+	runsCompleted        atomic.Uint64
+	rowsPurged           atomic.Int64
+	archivedRanges       atomic.Int64
+	dryRunEligible       atomic.Int64
+	lagYields            atomic.Uint64
+	maxDeferralOverrides atomic.Uint64
 }
 
 // Metrics returns a value-copy snapshot of the pruner's counters.
@@ -99,11 +115,23 @@ type Pruner struct {
 // forcing callers to take a lock.
 func (p *Pruner) Metrics() Metrics {
 	return Metrics{
-		RunsCompleted:      p.runsCompleted.Load(),
-		TotalRowsPurged:    p.rowsPurged.Load(),
-		ArchivedRanges:     p.archivedRanges.Load(),
-		DryRunEligibleRows: p.dryRunEligible.Load(),
+		RunsCompleted:        p.runsCompleted.Load(),
+		TotalRowsPurged:      p.rowsPurged.Load(),
+		ArchivedRanges:       p.archivedRanges.Load(),
+		DryRunEligibleRows:   p.dryRunEligible.Load(),
+		LagYields:            p.lagYields.Load(),
+		MaxDeferralOverrides: p.maxDeferralOverrides.Load(),
 	}
+}
+
+// WithLagController attaches a LagYieldController to the Pruner (and its
+// Archiver when present).
+func (p *Pruner) WithLagController(c LagYieldController) *Pruner {
+	p.opts.LagController = c
+	if p.arch != nil {
+		p.arch.WithLagController(c)
+	}
+	return p
 }
 
 // New wires a Pruner. When both MaxAge and MinLedger are zero the pruner
@@ -186,6 +214,16 @@ func (p *Pruner) Run(ctx context.Context) error {
 // deleted without a successful archive, ensuring pruned ranges are
 // always recoverable.
 func (p *Pruner) pruneOnce(ctx context.Context) (int64, error) {
+	if p.opts.LagController != nil {
+		if yield, reason := p.opts.LagController.ShouldYield("pruner"); yield {
+			p.lagYields.Add(1)
+			p.log.Info("prune sweep deferred due to ingestion lag", "reason", reason)
+			return 0, nil
+		} else if reason == "max_deferral_reached" {
+			p.maxDeferralOverrides.Add(1)
+		}
+	}
+
 	ing, err := p.store.GetIngestionState(ctx)
 	if err != nil {
 		if err == store.ErrNotFound {
@@ -226,6 +264,12 @@ func (p *Pruner) pruneOnce(ctx context.Context) (int64, error) {
 	if p.opts.ArchiveBeforePrune && p.arch != nil {
 		archiveStart := time.Now()
 		_, _, err := p.arch.ArchiveRange(ctx, 0, maxLedger)
+		if errors.Is(err, archive.ErrDeferredToLag) {
+			p.lagYields.Add(1)
+			p.log.Info("prune sweep deferred because archiver yielded to ingestion lag",
+				"max_ledger", maxLedger)
+			return 0, nil
+		}
 		if err != nil {
 			return 0, fmt.Errorf("archiving events before prune: %w", err)
 		}
@@ -244,6 +288,18 @@ func (p *Pruner) pruneOnce(ctx context.Context) (int64, error) {
 
 	var total int64
 	for {
+		if total > 0 && p.opts.LagController != nil {
+			if yield, reason := p.opts.LagController.ShouldYield("pruner"); yield {
+				p.lagYields.Add(1)
+				p.log.Info("prune batch loop yielding to ingestion lag",
+					"rows_deleted_so_far", total,
+					"reason", reason,
+				)
+				break
+			} else if reason == "max_deferral_reached" {
+				p.maxDeferralOverrides.Add(1)
+			}
+		}
 		affected, err := p.store.DeleteEventsBefore(ctx, maxLedger, beforeTime, p.opts.BatchSize)
 		if err != nil {
 			return total, fmt.Errorf("delete batch: %w", err)

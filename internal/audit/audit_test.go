@@ -728,3 +728,36 @@ func TestClusterIsClean(t *testing.T) {
 		})
 	}
 }
+
+type stubAuditLagController struct {
+	yield  bool
+	reason string
+}
+
+func (s *stubAuditLagController) ShouldYield(string) (bool, string) {
+	return s.yield, s.reason
+}
+
+func TestAuditorPassOnceLagBackpressureAndMaxDeferral(t *testing.T) {
+	a, cli, st, _ := setup(t, Options{})
+	primeIngest(st, 500)
+	cli.health = rpc.Health{Status: "healthy", OldestLedger: 1, LatestLedger: 600}
+
+	lagCtrl := &stubAuditLagController{yield: true, reason: "ingest_lagging"}
+	a.WithLagController(lagCtrl)
+
+	// While lagging, PassOnce defers before issuing any RPC requests.
+	worked, err := a.PassOnce(context.Background())
+	require.NoError(t, err)
+	assert.False(t, worked)
+	assert.Equal(t, uint64(1), a.Metrics().LagYields)
+	assert.Equal(t, uint64(0), a.Metrics().RPCRequests)
+
+	// Once max deferral is reached, PassOnce runs and records the override.
+	lagCtrl.yield = false
+	lagCtrl.reason = "max_deferral_reached"
+	_, err = a.PassOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), a.Metrics().MaxDeferralOverrides)
+	assert.GreaterOrEqual(t, a.Metrics().RPCRequests, uint64(1))
+}

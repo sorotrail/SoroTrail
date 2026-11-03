@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -72,16 +73,38 @@ type ChunkInfo struct {
 	RowCount    int64 `json:"row_count"`
 }
 
+// ErrDeferredToLag is returned by ArchiveRange when the configured
+// LagYieldController signals that archival should yield to a lagging ingester.
+// Callers such as the pruner treat this as a clean deferral rather than an
+// operational failure.
+var ErrDeferredToLag = errors.New("archive deferred due to ingestion lag")
+
+// LagYieldController reports whether the archiver should defer work while
+// ingestion is lagging behind the chain head.
+type LagYieldController interface {
+	ShouldYield(job string) (yield bool, reason string)
+}
+
+// Metrics is a snapshot of the archiver's backpressure counters.
+type Metrics struct {
+	LagYields            uint64 `json:"lag_yields,omitempty"`
+	MaxDeferralOverrides uint64 `json:"max_deferral_overrides,omitempty"`
+}
+
 // Archiver handles exporting events to S3-compatible storage as
 // compressed NDJSON. It is safe for concurrent use by a single
 // goroutine (the pruner).
 type Archiver struct {
-	client     objectClient
-	bucket     string
-	prefix     string
-	store      store.Store
-	log        *slog.Logger
-	maxRetries int
+	client        objectClient
+	bucket        string
+	prefix        string
+	store         store.Store
+	log           *slog.Logger
+	maxRetries    int
+	lagController LagYieldController
+
+	lagYields            atomic.Uint64
+	maxDeferralOverrides atomic.Uint64
 }
 
 type objectClient interface {
@@ -129,6 +152,10 @@ type Options struct {
 	MaxRetries int
 	// Logger is the structured logger. When nil a discard logger is used.
 	Logger *slog.Logger
+	// LagController is an optional lag backpressure coordinator. When set,
+	// ArchiveRange yields while ingestion is lagging (up to the
+	// coordinator's maximum deferral window).
+	LagController LagYieldController
 }
 
 // Enabled reports whether the archiver should be active (i.e. a bucket
@@ -193,13 +220,33 @@ func New(st store.Store, opts Options) (*Archiver, error) {
 	}
 
 	return &Archiver{
-		client:     minioObjectClient{client: client},
-		bucket:     opts.Bucket,
-		prefix:     opts.Prefix,
-		store:      st,
-		log:        log.With("component", "archiver"),
-		maxRetries: maxRetries,
+		client:        minioObjectClient{client: client},
+		bucket:        opts.Bucket,
+		prefix:        opts.Prefix,
+		store:         st,
+		log:           log.With("component", "archiver"),
+		maxRetries:    maxRetries,
+		lagController: opts.LagController,
 	}, nil
+}
+
+// WithLagController attaches a LagYieldController to the Archiver.
+func (a *Archiver) WithLagController(c LagYieldController) *Archiver {
+	if a != nil {
+		a.lagController = c
+	}
+	return a
+}
+
+// Metrics returns a value-copy snapshot of the archiver's backpressure counters.
+func (a *Archiver) Metrics() Metrics {
+	if a == nil {
+		return Metrics{}
+	}
+	return Metrics{
+		LagYields:            a.lagYields.Load(),
+		MaxDeferralOverrides: a.maxDeferralOverrides.Load(),
+	}
 }
 
 // IsArchived reports whether a compatible manifest declares coverage for the
@@ -255,6 +302,19 @@ func (a *Archiver) IsArchived(ctx context.Context, ledgerStart, ledgerEnd int64)
 func (a *Archiver) ArchiveRange(ctx context.Context, fromLedger, toLedger int64) (string, string, error) {
 	if a == nil {
 		return "", "", nil
+	}
+	if a.lagController != nil {
+		if yield, reason := a.lagController.ShouldYield("archiver"); yield {
+			a.lagYields.Add(1)
+			a.log.Info("archive range deferred due to ingestion lag",
+				"from_ledger", fromLedger,
+				"to_ledger", toLedger,
+				"reason", reason,
+			)
+			return "", "", ErrDeferredToLag
+		} else if reason == "max_deferral_reached" {
+			a.maxDeferralOverrides.Add(1)
+		}
 	}
 
 	// Idempotency check: already archived?
