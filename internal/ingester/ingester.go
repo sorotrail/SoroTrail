@@ -1382,11 +1382,14 @@ func (ing *Ingester) sweepBatch(ctx context.Context, ledgerOutOfRange *atomic.Bo
 // due to RPC quirks or re-fetches), the ingester does not write duplicates
 // in a single batch before the store's own idempotent upserts can absorb them.
 func removeDuplicateEvents(events []store.Event) []store.Event {
-	seen := make(map[string]bool, len(events))
+	if len(events) <= 1 {
+		return events
+	}
+	seen := make(map[string]struct{}, len(events))
 	result := events[:0]
 	for _, ev := range events {
-		if !seen[ev.ID] {
-			seen[ev.ID] = true
+		if _, exists := seen[ev.ID]; !exists {
+			seen[ev.ID] = struct{}{}
 			result = append(result, ev)
 		}
 	}
@@ -1682,9 +1685,11 @@ func (ing *Ingester) setDryRunPosition(cursor string, lastIngestedLedger int64) 
 }
 
 func (ing *Ingester) logDryRunAddressRefs(events []store.Event) {
-	var refs []store.AddressRef
+	refs := make([]store.AddressRef, 0, len(events)*2)
+	decoded := make([]decode.AddressRef, 0, 8)
 	for _, ev := range events {
-		for _, ref := range decode.ExtractAddresses(ev.Topics, ev.Value) {
+		decoded = decode.AppendAddresses(decoded[:0], ev.ID, ev.Topics, ev.Value)
+		for _, ref := range decoded {
 			refs = append(refs, store.AddressRef{Address: ref.Address, EventID: ev.ID, Role: ref.Role})
 		}
 	}
@@ -2158,9 +2163,10 @@ func (ing *Ingester) indexEventAddresses(ctx context.Context, events []store.Eve
 	if len(events) == 0 {
 		return nil
 	}
-	var refs []store.AddressRef
+	refs := make([]store.AddressRef, 0, len(events)*2)
+	decoded := make([]decode.AddressRef, 0, 8)
 	for _, ev := range events {
-		decoded := decode.ExtractAddresses(ev.Topics, ev.Value)
+		decoded = decode.AppendAddresses(decoded[:0], ev.ID, ev.Topics, ev.Value)
 		for _, r := range decoded {
 			refs = append(refs, store.AddressRef{
 				Address: r.Address,

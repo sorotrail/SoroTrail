@@ -1,12 +1,19 @@
 package decode
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/big"
+	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 
 	"github.com/stellar/go-stellar-sdk/xdr"
 )
@@ -32,28 +39,98 @@ type XDRDecoder struct{}
 
 var _ Decoder = XDRDecoder{}
 
+// decodeScratch holds reusable byte buffers and a bytes.Reader for base64 XDR
+// decoding and JSON rendering.
+//
+// Lifetime rule: a decodeScratch is acquired from decodeScratchPool at the
+// start of DecodeScVal or decodeTopicsXDR and returned via defer before the
+// call returns. All returned json.RawMessage slices are copied into freshly
+// allocated slices before the scratch struct is returned to the pool, so a
+// pooled buffer never escapes into store.Event or across goroutines.
+type decodeScratch struct {
+	rawBuf  []byte
+	jsonBuf []byte
+	reader  bytes.Reader
+	val     xdr.ScVal
+}
+
+var decodeScratchPool = sync.Pool{
+	New: func() any {
+		return &decodeScratch{
+			rawBuf:  make([]byte, 0, 256),
+			jsonBuf: make([]byte, 0, 256),
+		}
+	},
+}
+
 func (XDRDecoder) DecodeScVal(base64XDR string) (json.RawMessage, error) {
-	var val xdr.ScVal
-	if err := xdr.SafeUnmarshalBase64(base64XDR, &val); err != nil {
+	sc := decodeScratchPool.Get().(*decodeScratch)
+	defer decodeScratchPool.Put(sc)
+
+	sc.jsonBuf = sc.jsonBuf[:0]
+	out, err := sc.decodeScValAppend(sc.jsonBuf, base64XDR)
+	if err != nil {
+		return nil, err
+	}
+	sc.jsonBuf = out
+
+	res := make(json.RawMessage, len(out))
+	copy(res, out)
+	return res, nil
+}
+
+func (sc *decodeScratch) decodeScValAppend(dst []byte, base64XDR string) ([]byte, error) {
+	sc.val = xdr.ScVal{}
+	if err := sc.unmarshalScValBase64(base64XDR, &sc.val); err != nil {
 		decodeErrors.Add(1)
 		slog.Warn("decode: unmarshaling ScVal XDR", "error", err, "base64_len", len(base64XDR))
 		// Preserve the raw value in a lossless fallback so ingestion
 		// never stalls on a single un-decodable value.
-		return fallbackDecode(base64XDR, err), nil
+		return appendFallbackDecode(dst, base64XDR, err), nil
 	}
-	v, err := scValToGo(val)
+	startLen := len(dst)
+	out, err := appendScValJSON(dst, sc.val)
 	if err != nil {
 		decodeErrors.Add(1)
-		slog.Warn("decode: converting ScVal", "type", val.Type.String(), "error", err)
-		return fallbackDecode(base64XDR, err), nil
-	}
-	out, err := json.Marshal(v)
-	if err != nil {
-		decodeErrors.Add(1)
-		slog.Warn("decode: marshaling ScVal", "error", err)
-		return fallbackDecode(base64XDR, err), nil
+		slog.Warn("decode: converting ScVal", "type", sc.val.Type.String(), "error", err)
+		return appendFallbackDecode(dst[:startLen], base64XDR, err), nil
 	}
 	return out, nil
+}
+
+func (sc *decodeScratch) unmarshalScValBase64(base64XDR string, val *xdr.ScVal) error {
+	if len(base64XDR) == 0 {
+		return io.EOF
+	}
+	// Delegate inputs containing newlines or carriage returns to the SDK helper
+	// so multi-line base64 edge cases behave identically.
+	if strings.IndexByte(base64XDR, '\n') >= 0 || strings.IndexByte(base64XDR, '\r') >= 0 {
+		return xdr.SafeUnmarshalBase64(base64XDR, val)
+	}
+	maxDecoded := base64.StdEncoding.DecodedLen(len(base64XDR))
+	if cap(sc.rawBuf) < maxDecoded {
+		sc.rawBuf = make([]byte, maxDecoded)
+	} else {
+		sc.rawBuf = sc.rawBuf[:maxDecoded]
+	}
+	nDecoded, err := base64.StdEncoding.Decode(sc.rawBuf, []byte(base64XDR))
+	if err != nil {
+		return err
+	}
+	// Check that the base64 input had no unconsumed trailing characters after padding.
+	if base64.StdEncoding.EncodedLen(nDecoded) != len(base64XDR) {
+		return xdr.SafeUnmarshalBase64(base64XDR, val)
+	}
+	rawBytes := sc.rawBuf[:nDecoded]
+	sc.reader.Reset(rawBytes)
+	nRead, err := xdr.Unmarshal(&sc.reader, val)
+	if err != nil {
+		return err
+	}
+	if nRead != nDecoded {
+		return fmt.Errorf("input not fully consumed. expected to read: %d, actual: %d", nDecoded, nRead)
+	}
+	return nil
 }
 
 // fallbackDecode returns a lossless {"unknown": ...} wrapper for a value
@@ -61,22 +138,263 @@ func (XDRDecoder) DecodeScVal(base64XDR string) (json.RawMessage, error) {
 // decoder version can reprocess it. The error is embedded in the metadata
 // so the operator can inspect what went wrong.
 func fallbackDecode(base64XDR string, decodeErr error) json.RawMessage {
-	fallback, _ := json.Marshal(map[string]any{
-		"unknown": map[string]any{
-			"type":   "decode_error",
-			"base64": base64XDR,
-			"error":  decodeErr.Error(),
-		},
-	})
-	return fallback
+	return appendFallbackDecode(nil, base64XDR, decodeErr)
+}
+
+func appendFallbackDecode(dst []byte, base64XDR string, decodeErr error) json.RawMessage {
+	// Keys in alphabetical order to match encoding/json map marshaling:
+	// "base64", "error", "type".
+	dst = append(dst, `{"unknown":{"base64":`...)
+	dst = appendJSONString(dst, base64XDR)
+	dst = append(dst, `,"error":`...)
+	dst = appendJSONString(dst, decodeErr.Error())
+	dst = append(dst, `,"type":"decode_error"}}`...)
+	return dst
+}
+
+// appendScValJSON appends the JSON representation of val directly to dst,
+// producing byte-for-byte identical output to json.Marshal(scValToGo(val))
+// without allocating intermediate map[string]any wrappers or invoking reflection.
+func appendScValJSON(dst []byte, val xdr.ScVal) ([]byte, error) {
+	switch val.Type {
+	case xdr.ScValTypeScvBool:
+		if *val.B {
+			return append(dst, `{"bool":true}`...), nil
+		}
+		return append(dst, `{"bool":false}`...), nil
+	case xdr.ScValTypeScvVoid:
+		return append(dst, `{"void":null}`...), nil
+	case xdr.ScValTypeScvU32:
+		dst = append(dst, `{"u32":`...)
+		dst = strconv.AppendUint(dst, uint64(*val.U32), 10)
+		return append(dst, '}'), nil
+	case xdr.ScValTypeScvI32:
+		dst = append(dst, `{"i32":`...)
+		dst = strconv.AppendInt(dst, int64(*val.I32), 10)
+		return append(dst, '}'), nil
+	case xdr.ScValTypeScvU64:
+		dst = append(dst, `{"u64":`...)
+		dst = strconv.AppendUint(dst, uint64(*val.U64), 10)
+		return append(dst, '}'), nil
+	case xdr.ScValTypeScvI64:
+		dst = append(dst, `{"i64":`...)
+		dst = strconv.AppendInt(dst, int64(*val.I64), 10)
+		return append(dst, '}'), nil
+	case xdr.ScValTypeScvTimepoint:
+		dst = append(dst, `{"timepoint":`...)
+		dst = strconv.AppendUint(dst, uint64(*val.Timepoint), 10)
+		return append(dst, '}'), nil
+	case xdr.ScValTypeScvDuration:
+		dst = append(dst, `{"duration":`...)
+		dst = strconv.AppendUint(dst, uint64(*val.Duration), 10)
+		return append(dst, '}'), nil
+	case xdr.ScValTypeScvU128:
+		dst = append(dst, `{"u128":"`...)
+		dst = appendUint128(dst, *val.U128)
+		return append(dst, `"}`...), nil
+	case xdr.ScValTypeScvI128:
+		dst = append(dst, `{"i128":"`...)
+		dst = appendInt128(dst, *val.I128)
+		return append(dst, `"}`...), nil
+	case xdr.ScValTypeScvU256:
+		dst = append(dst, `{"u256":"`...)
+		dst = appendUint256(dst, *val.U256)
+		return append(dst, `"}`...), nil
+	case xdr.ScValTypeScvI256:
+		dst = append(dst, `{"i256":"`...)
+		dst = appendInt256(dst, *val.I256)
+		return append(dst, `"}`...), nil
+	case xdr.ScValTypeScvBytes:
+		raw := *val.Bytes
+		dst = append(dst, `{"bytes":"`...)
+		hexLen := hex.EncodedLen(len(raw))
+		start := len(dst)
+		if cap(dst)-start < hexLen {
+			grown := make([]byte, start+hexLen, max(cap(dst)*2, start+hexLen+16))
+			copy(grown, dst)
+			dst = grown
+		} else {
+			dst = dst[:start+hexLen]
+		}
+		hex.Encode(dst[start:start+hexLen], raw)
+		return append(dst, `"}`...), nil
+	case xdr.ScValTypeScvString:
+		dst = append(dst, `{"string":`...)
+		dst = appendJSONString(dst, string(*val.Str))
+		return append(dst, '}'), nil
+	case xdr.ScValTypeScvSymbol:
+		dst = append(dst, `{"symbol":`...)
+		dst = appendJSONString(dst, string(*val.Sym))
+		return append(dst, '}'), nil
+	case xdr.ScValTypeScvAddress:
+		addr, err := val.Address.String()
+		if err != nil {
+			return nil, fmt.Errorf("rendering address: %w", err)
+		}
+		dst = append(dst, `{"address":"`...)
+		dst = append(dst, addr...)
+		return append(dst, `"}`...), nil
+	case xdr.ScValTypeScvVec:
+		dst = append(dst, `{"vec":[`...)
+		if val.Vec != nil && *val.Vec != nil {
+			for i, item := range **val.Vec {
+				if i > 0 {
+					dst = append(dst, ',')
+				}
+				var err error
+				dst, err = appendScValJSON(dst, item)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		return append(dst, `]}`...), nil
+	case xdr.ScValTypeScvMap:
+		dst = append(dst, `{"map":[`...)
+		if val.Map != nil && *val.Map != nil {
+			var err error
+			dst, err = appendScMapEntriesJSON(dst, **val.Map)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return append(dst, `]}`...), nil
+	case xdr.ScValTypeScvContractInstance:
+		inst := *val.Instance
+		dst = append(dst, `{"contract_instance":{"executable":`...)
+		var err error
+		dst, err = appendContractExecutableJSON(dst, inst.Executable)
+		if err != nil {
+			return nil, err
+		}
+		dst = append(dst, `,"storage":[`...)
+		if inst.Storage != nil {
+			dst, err = appendScMapEntriesJSON(dst, *inst.Storage)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return append(dst, `]}}`...), nil
+	case xdr.ScValTypeScvLedgerKeyNonce:
+		dst = append(dst, `{"ledger_key_nonce":{"nonce":`...)
+		dst = strconv.AppendInt(dst, int64(val.NonceKey.Nonce), 10)
+		return append(dst, `}}`...), nil
+	case xdr.ScValTypeScvExecutableTag:
+		dst = append(dst, `{"executable_tag":`...)
+		dst = appendJSONString(dst, string(*val.ExecutableTag))
+		return append(dst, '}'), nil
+	case xdr.ScValTypeScvError:
+		// Keys sorted alphabetically to match encoding/json map ordering:
+		// "code", "contract_code", "type".
+		dst = append(dst, `{"error":{`...)
+		needComma := false
+		if val.Error.Code != nil {
+			dst = append(dst, `"code":`...)
+			dst = appendJSONString(dst, val.Error.Code.String())
+			needComma = true
+		}
+		if val.Error.ContractCode != nil {
+			if needComma {
+				dst = append(dst, ',')
+			}
+			dst = append(dst, `"contract_code":`...)
+			dst = strconv.AppendUint(dst, uint64(*val.Error.ContractCode), 10)
+			needComma = true
+		}
+		if needComma {
+			dst = append(dst, ',')
+		}
+		dst = append(dst, `"type":`...)
+		dst = appendJSONString(dst, val.Error.Type.String())
+		return append(dst, `}}`...), nil
+	default:
+		raw, err := xdr.MarshalBase64(val)
+		if err != nil {
+			return nil, fmt.Errorf("re-encoding unhandled ScVal type %s: %w", val.Type, err)
+		}
+		// Alphabetical key order: "base64", "type".
+		dst = append(dst, `{"unknown":{"base64":`...)
+		dst = appendJSONString(dst, raw)
+		dst = append(dst, `,"type":`...)
+		dst = appendJSONString(dst, val.Type.String())
+		return append(dst, `}}`...), nil
+	}
+}
+
+func appendScMapEntriesJSON(dst []byte, m xdr.ScMap) ([]byte, error) {
+	for i, entry := range m {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = append(dst, `{"key":`...)
+		var err error
+		dst, err = appendScValJSON(dst, entry.Key)
+		if err != nil {
+			return nil, err
+		}
+		dst = append(dst, `,"val":`...)
+		dst, err = appendScValJSON(dst, entry.Val)
+		if err != nil {
+			return nil, err
+		}
+		dst = append(dst, '}')
+	}
+	return dst, nil
+}
+
+func appendContractExecutableJSON(dst []byte, exec xdr.ContractExecutable) ([]byte, error) {
+	switch exec.Type {
+	case xdr.ContractExecutableTypeContractExecutableWasm:
+		dst = append(dst, `{"wasm_hash":"`...)
+		dst = append(dst, exec.WasmHash.HexString()...)
+		return append(dst, `"}`...), nil
+	case xdr.ContractExecutableTypeContractExecutableStellarAsset:
+		return append(dst, `{"stellar_asset":null}`...), nil
+	case xdr.ContractExecutableTypeContractExecutableExternalRef:
+		owner, err := exec.ExternalRef.ExecutableOwner.String()
+		if err != nil {
+			return nil, fmt.Errorf("rendering external-ref owner: %w", err)
+		}
+		dst = append(dst, `{"external_ref":{"executable_owner":`...)
+		dst = appendJSONString(dst, owner)
+		dst = append(dst, `,"tag":`...)
+		dst = appendJSONString(dst, string(exec.ExternalRef.Tag))
+		return append(dst, `}}`...), nil
+	default:
+		raw, err := xdr.MarshalBase64(exec)
+		if err != nil {
+			return nil, fmt.Errorf("re-encoding unhandled ContractExecutable type %s: %w", exec.Type, err)
+		}
+		dst = append(dst, `{"unknown":{"base64":`...)
+		dst = appendJSONString(dst, raw)
+		dst = append(dst, `,"type":`...)
+		dst = appendJSONString(dst, exec.Type.String())
+		return append(dst, `}}`...), nil
+	}
+}
+
+// appendJSONString appends s as a JSON string literal matching encoding/json's
+// escaping rules (including HTML escaping of '<', '>', '&'). Pure printable
+// ASCII strings without special characters take a zero-allocation fast path.
+func appendJSONString(dst []byte, s string) []byte {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c >= utf8.RuneSelf || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			b, _ := json.Marshal(s)
+			return append(dst, b...)
+		}
+	}
+	dst = append(dst, '"')
+	dst = append(dst, s...)
+	return append(dst, '"')
 }
 
 // scValToGo maps one ScVal onto plain Go values that marshal to the JSON
 // shapes documented on XDRDecoder.
 //
-// contributors: add new ScVal type handling here. Unhandled types fall
-// through to a lossless {"unknown": {...}} wrapper rather than an error, so
-// ingestion never stalls on exotic values.
+// contributors: add new ScVal type handling here and in appendScValJSON.
+// Unhandled types fall through to a lossless {"unknown": {...}} wrapper rather
+// than an error, so ingestion never stalls on exotic values.
 func scValToGo(val xdr.ScVal) (any, error) {
 	switch val.Type {
 	case xdr.ScValTypeScvBool:
@@ -239,34 +557,88 @@ func contractExecutableToGo(exec xdr.ContractExecutable) (any, error) {
 	}
 }
 
+func appendUint128(dst []byte, p xdr.UInt128Parts) []byte {
+	if p.Hi == 0 {
+		return strconv.AppendUint(dst, uint64(p.Lo), 10)
+	}
+	var n, lo big.Int
+	n.SetUint64(uint64(p.Hi))
+	n.Lsh(&n, 64)
+	n.Or(&n, lo.SetUint64(uint64(p.Lo)))
+	return n.Append(dst, 10)
+}
+
+func appendInt128(dst []byte, p xdr.Int128Parts) []byte {
+	if p.Hi == 0 {
+		return strconv.AppendUint(dst, uint64(p.Lo), 10)
+	}
+	if p.Hi == -1 && int64(p.Lo) < 0 {
+		return strconv.AppendInt(dst, int64(p.Lo), 10)
+	}
+	var n, lo big.Int
+	n.SetInt64(int64(p.Hi))
+	n.Lsh(&n, 64)
+	n.Or(&n, lo.SetUint64(uint64(p.Lo)))
+	return n.Append(dst, 10)
+}
+
+func appendUint256(dst []byte, p xdr.UInt256Parts) []byte {
+	if p.HiHi == 0 && p.HiLo == 0 && p.LoHi == 0 {
+		return strconv.AppendUint(dst, uint64(p.LoLo), 10)
+	}
+	var n, tmp big.Int
+	n.SetUint64(uint64(p.HiHi))
+	for _, part := range [3]uint64{uint64(p.HiLo), uint64(p.LoHi), uint64(p.LoLo)} {
+		n.Lsh(&n, 64)
+		n.Or(&n, tmp.SetUint64(part))
+	}
+	return n.Append(dst, 10)
+}
+
+func appendInt256(dst []byte, p xdr.Int256Parts) []byte {
+	if p.HiHi == 0 && p.HiLo == 0 && p.LoHi == 0 {
+		return strconv.AppendUint(dst, uint64(p.LoLo), 10)
+	}
+	var n, tmp big.Int
+	n.SetInt64(int64(p.HiHi))
+	for _, part := range [3]uint64{uint64(p.HiLo), uint64(p.LoHi), uint64(p.LoLo)} {
+		n.Lsh(&n, 64)
+		n.Or(&n, tmp.SetUint64(part))
+	}
+	return n.Append(dst, 10)
+}
+
 func uint128String(p xdr.UInt128Parts) string {
-	n := new(big.Int).SetUint64(uint64(p.Hi))
-	n.Lsh(n, 64)
-	n.Or(n, new(big.Int).SetUint64(uint64(p.Lo)))
-	return n.String()
+	if p.Hi == 0 {
+		return strconv.FormatUint(uint64(p.Lo), 10)
+	}
+	var buf [40]byte
+	return string(appendUint128(buf[:0], p))
 }
 
 func int128String(p xdr.Int128Parts) string {
-	n := big.NewInt(int64(p.Hi))
-	n.Lsh(n, 64)
-	n.Or(n, new(big.Int).SetUint64(uint64(p.Lo)))
-	return n.String()
+	if p.Hi == 0 {
+		return strconv.FormatUint(uint64(p.Lo), 10)
+	}
+	if p.Hi == -1 && int64(p.Lo) < 0 {
+		return strconv.FormatInt(int64(p.Lo), 10)
+	}
+	var buf [40]byte
+	return string(appendInt128(buf[:0], p))
 }
 
 func uint256String(p xdr.UInt256Parts) string {
-	n := new(big.Int).SetUint64(uint64(p.HiHi))
-	for _, part := range []uint64{uint64(p.HiLo), uint64(p.LoHi), uint64(p.LoLo)} {
-		n.Lsh(n, 64)
-		n.Or(n, new(big.Int).SetUint64(part))
+	if p.HiHi == 0 && p.HiLo == 0 && p.LoHi == 0 {
+		return strconv.FormatUint(uint64(p.LoLo), 10)
 	}
-	return n.String()
+	var buf [80]byte
+	return string(appendUint256(buf[:0], p))
 }
 
 func int256String(p xdr.Int256Parts) string {
-	n := big.NewInt(int64(p.HiHi))
-	for _, part := range []uint64{uint64(p.HiLo), uint64(p.LoHi), uint64(p.LoLo)} {
-		n.Lsh(n, 64)
-		n.Or(n, new(big.Int).SetUint64(part))
+	if p.HiHi == 0 && p.HiLo == 0 && p.LoHi == 0 {
+		return strconv.FormatUint(uint64(p.LoLo), 10)
 	}
-	return n.String()
+	var buf [80]byte
+	return string(appendInt256(buf[:0], p))
 }
