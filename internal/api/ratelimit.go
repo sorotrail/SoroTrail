@@ -303,6 +303,32 @@ func (l *RateLimiter) quotaSize() int {
 	return len(l.quotas)
 }
 
+// InvalidateTenant evicts the rate-limiter token bucket for tenantID so a
+// quota change or tenant deletion on another replica takes effect immediately
+// without waiting for idleTTL eviction. Fixed-window quota usage counters in
+// l.quotas are deliberately retained so a tenant cannot reset a spent hourly
+// or daily quota via an admin update.
+func (l *RateLimiter) InvalidateTenant(tenantID int64) {
+	if l == nil || tenantID <= 0 {
+		return
+	}
+	key := "tenant:" + strconv.FormatInt(tenantID, 10)
+	l.mu.Lock()
+	delete(l.buckets, key)
+	l.mu.Unlock()
+}
+
+// ClearBuckets drops all cached token buckets (called when the cross-replica
+// invalidation listener reconnects and may have missed tenant updates).
+func (l *RateLimiter) ClearBuckets() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.buckets = make(map[string]*bucketEntry)
+	l.mu.Unlock()
+}
+
 // Middleware wraps next with the limiter. Returns next unchanged when
 // the limiter is disabled, so wiring can stay in place regardless of
 // configuration.

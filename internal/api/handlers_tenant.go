@@ -168,6 +168,7 @@ func (s *Server) handleUpdateTenant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("updating tenant failed"))
 		return
 	}
+	s.notifyTenantInvalidation(r.Context(), updated.ID)
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -195,6 +196,7 @@ func (s *Server) handleDeleteTenant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("deleting tenant failed"))
 		return
 	}
+	s.notifyTenantInvalidation(r.Context(), id)
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -222,6 +224,7 @@ func (s *Server) handleGrantContract(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("granting contract failed"))
 		return
 	}
+	s.notifyTenantInvalidation(r.Context(), t.ID)
 	s.writeGrants(w, r, t.ID)
 }
 
@@ -236,9 +239,7 @@ func (s *Server) handleRevokeContract(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("revoking contract failed"))
 		return
 	}
-	// A revoked grant stops mattering for new requests immediately, because
-	// scope is resolved per request. Open streams pick it up within one
-	// StreamScopeSync interval; see syncStreamScope.
+	s.notifyTenantInvalidation(r.Context(), t.ID)
 	s.writeGrants(w, r, t.ID)
 }
 
@@ -329,6 +330,7 @@ func (s *Server) handleRevokeTenantKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("revoking api key failed"))
 		return
 	}
+	s.notifyAPIKeyInvalidation(r.Context(), id)
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	w.WriteHeader(http.StatusNoContent)
 }

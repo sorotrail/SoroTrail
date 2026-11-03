@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -78,16 +79,22 @@ func (s *Server) requireAPIKey(next http.Handler) http.Handler {
 			s.writeUnauthorized(w)
 			return
 		}
-		stored, err := s.store.LookupAPIKeyByPrefix(r.Context(), prefix)
-		if errors.Is(err, store.ErrNotFound) {
-			s.writeUnauthorized(w)
-			return
-		}
-		if err != nil {
-			s.log.Error("looking up API key", "error", err)
-			writeError(w, http.StatusInternalServerError,
-				errors.New("checking API key failed"))
-			return
+		now := time.Now()
+		stored, cached := s.AuthCache().GetAPIKey(prefix, now)
+		if !cached {
+			var err error
+			stored, err = s.store.LookupAPIKeyByPrefix(r.Context(), prefix)
+			if errors.Is(err, store.ErrNotFound) {
+				s.writeUnauthorized(w)
+				return
+			}
+			if err != nil {
+				s.log.Error("looking up API key", "error", err)
+				writeError(w, http.StatusInternalServerError,
+					errors.New("checking API key failed"))
+				return
+			}
+			s.AuthCache().PutAPIKey(stored, now)
 		}
 		if !apikey.VerifySecret(secret, stored.KeyHash) {
 			s.writeUnauthorized(w)
@@ -193,6 +200,7 @@ func (s *Server) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("revoking API key failed"))
 		return
 	}
+	s.notifyAPIKeyInvalidation(r.Context(), id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -396,15 +404,20 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 
-		key, storedDigest, tenant, err := s.tenants.LookupTenantAPIKey(r.Context(), prefix)
-		if errors.Is(err, store.ErrNotFound) {
-			writeUnauthorized(w, "unknown or revoked API key")
-			return
-		}
-		if err != nil {
-			loggerFromContext(r.Context()).Error("looking up api key", "error", err)
-			writeError(w, http.StatusInternalServerError, errors.New("authentication failed"))
-			return
+		now := time.Now()
+		key, storedDigest, tenant, scope, cached := s.AuthCache().GetTenantAuth(prefix, now)
+		if !cached {
+			var err error
+			key, storedDigest, tenant, err = s.tenants.LookupTenantAPIKey(r.Context(), prefix)
+			if errors.Is(err, store.ErrNotFound) {
+				writeUnauthorized(w, "unknown or revoked API key")
+				return
+			}
+			if err != nil {
+				loggerFromContext(r.Context()).Error("looking up api key", "error", err)
+				writeError(w, http.StatusInternalServerError, errors.New("authentication failed"))
+				return
+			}
 		}
 		// Constant-time: a byte-by-byte comparison would let an attacker
 		// who already knows a valid prefix recover the secret through
@@ -421,11 +434,18 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 
-		scope, err := s.tenants.ScopeForTenant(r.Context(), tenant)
-		if err != nil {
-			loggerFromContext(r.Context()).Error("resolving tenant scope", "tenant", tenant.ID, "error", err)
-			writeError(w, http.StatusInternalServerError, errors.New("authentication failed"))
-			return
+		if !cached {
+			var err error
+			scope, err = s.tenants.ScopeForTenant(r.Context(), tenant)
+			if err != nil {
+				loggerFromContext(r.Context()).Error("resolving tenant scope", "tenant", tenant.ID, "error", err)
+				writeError(w, http.StatusInternalServerError, errors.New("authentication failed"))
+				return
+			}
+			if key.Prefix == "" {
+				key.Prefix = prefix
+			}
+			s.AuthCache().PutTenantAuth(key, storedDigest, tenant, scope, now)
 		}
 
 		// Advisory; a failure here must not deny an otherwise valid request.
