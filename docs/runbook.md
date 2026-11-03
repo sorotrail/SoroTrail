@@ -11,6 +11,7 @@ database, API and replay errors by their text.
 
 ## Table of Contents
 
+- [Pre-deployment preflight self-check](#pre-deployment-preflight-self-check)
 - [Quick health check](#quick-health-check)
 - [Ingestion stalled](#ingestion-stalled)
 - [Dead-letter / error log filling up](#dead-letter--error-log-filling-up)
@@ -25,6 +26,38 @@ database, API and replay errors by their text.
 - [Backup and restore](#backup-and-restore)
 - [Useful queries](#useful-queries)
 - [Configuration reference](#configuration-reference)
+
+---
+
+## Pre-deployment preflight self-check
+
+Run `sorotrail preflight` before rolling out a new version or as a Kubernetes
+`initContainer` to verify that configuration, credentials, network reachability,
+and remote state are coherent before starting the indexer:
+
+```sh
+# Run all startup self-checks (human-readable table).
+sorotrail preflight
+
+# Emit machine-readable JSON for CI/CD gates or initContainers.
+sorotrail preflight --json
+
+# Run only a subset of checks when staging dependencies incrementally.
+sorotrail preflight --check config,database,rpc --timeout 5s
+
+# Allow pending migrations when the runtime role will apply them on startup.
+sorotrail preflight --allow-pending-migrations
+```
+
+`sorotrail preflight` validates:
+- **`config`**: runs the full startup configuration validator and checks relative `START_LEDGER` syntax with all secrets redacted.
+- **`database`**: connects and pings the configured PostgreSQL or SQLite backend.
+- **`migrations`**: inspects `schema_migrations` without mutating the database, catching dirty schemas, unapplied migrations, or missing `CREATE` privileges on the target schema.
+- **`rpc`**: probes each configured Soroban RPC endpoint (`getNetwork` and `getHealth`), verifying that the node's network passphrase matches `NETWORK` (`testnet`, `mainnet`, `futurenet`) and that `START_LEDGER` falls within the node's retention window.
+- **`archive`**: when `ARCHIVE_BUCKET` is set, verifies S3 bucket reachability and write/delete permissions using a temporary probe object (or read-only with `--read-only`).
+- **`retention`**: verifies coherence between `RETENTION_*` and `ARCHIVE_*` settings so pruning cannot delete unarchived events.
+
+Exit codes: `0` when all selected checks pass, `1` when any dependency check fails, and `2` on configuration validation or CLI flag errors.
 
 ---
 

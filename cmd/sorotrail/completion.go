@@ -34,6 +34,7 @@ var completionCommands = []completionCommand{
 	{"completion", "print a shell completion script"},
 	{"version", "print the build version, commit, and build date"},
 	{"config", "print the effective configuration with secrets redacted"},
+	{"preflight", "run startup self-checks (config, database, migrations, RPC, archive, retention)"},
 	{"help", "show this help message"},
 }
 
