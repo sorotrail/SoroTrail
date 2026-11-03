@@ -183,6 +183,18 @@ var (
 		Name: "sorotrail_spec_invalidations_received_total",
 		Help: "Total number of spec cache invalidations received from other replicas.",
 	})
+
+	// DeprecatedHTTPRequestsTotal counts requests to HTTP endpoints marked
+	// deprecated in the OpenAPI specification, labelled by route pattern and
+	// HTTP method so operators can verify traffic has reached zero before
+	// removing an endpoint after its Sunset date.
+	DeprecatedHTTPRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sorotrail_http_deprecated_requests_total",
+			Help: "Total HTTP requests to deprecated API endpoints, labelled by route and method.",
+		},
+		[]string{"route", "method"},
+	)
 )
 
 func init() {
@@ -204,6 +216,7 @@ func init() {
 		RPCCircuitBreakerState,
 		RPCProviderState,
 		SpecInvalidationsReceived,
+		DeprecatedHTTPRequestsTotal,
 	)
 }
 

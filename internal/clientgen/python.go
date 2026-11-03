@@ -37,14 +37,15 @@ func GeneratePython(src []byte) ([]byte, error) {
 }
 
 type pyField struct {
-	WireName    string
-	PyName      string
-	PyType      string
-	DefaultExpr string
-	FromDict    string
-	ToDictExpr  string
-	Optional    bool
-	Description string
+	WireName         string
+	PyName           string
+	PyType           string
+	DefaultExpr      string
+	FromDict         string
+	ToDictExpr       string
+	Optional         bool
+	Description      string
+	DeprecatedNotice string
 }
 
 type pyGenerator struct {
@@ -399,6 +400,9 @@ func (pg *pyGenerator) emitPyDataclass(buf *bytes.Buffer, name string, s *rawSch
 		if f.Description != "" {
 			fmt.Fprintf(buf, "    # %s\n", f.Description)
 		}
+		if f.DeprecatedNotice != "" {
+			fmt.Fprintf(buf, "    # Deprecated: %s\n", f.DeprecatedNotice)
+		}
 		fmt.Fprintf(buf, "    %s: %s = %s\n", f.PyName, f.PyType, f.DefaultExpr)
 	}
 	buf.WriteString("\n    @classmethod\n")
@@ -463,6 +467,7 @@ func (pg *pyGenerator) buildPyFields(owner string, s *rawSchema) []pyField {
 
 		f := pg.classifyPyField(owner, wireName, pyName, prop, optional, nullable)
 		f.Description = desc
+		f.DeprecatedNotice = deprecationNotice(prop.Deprecated, prop.DeprecationNotice, prop.SunsetDate, prop.DeprecationReplacement, fmt.Sprintf("%s is deprecated.", pyName))
 		out = append(out, f)
 	}
 	return out
@@ -779,8 +784,12 @@ func (pg *pyGenerator) emitPyOperationMethod(buf *bytes.Buffer, op genOperation)
 	}
 
 	doc := cleanDoc(op.Summary, op.GoName)
+	docLine := fmt.Sprintf("%s (%s %s).", strings.TrimSuffix(doc, "."), op.Method, op.Path)
+	if op.DeprecatedNotice != "" {
+		docLine += " Deprecated: " + op.DeprecatedNotice
+	}
 	fmt.Fprintf(buf, "    def %s(%s) -> %s:\n", methodName, strings.Join(args, ", "), retType)
-	fmt.Fprintf(buf, "        %s\n", pyDocstring(fmt.Sprintf("%s (%s %s).", strings.TrimSuffix(doc, "."), op.Method, op.Path)))
+	fmt.Fprintf(buf, "        %s\n", pyDocstring(docLine))
 
 	// Path construction.
 	if len(op.PathArgs) == 0 {

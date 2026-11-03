@@ -61,10 +61,14 @@ type rawSpec struct {
 }
 
 type rawOperation struct {
-	OperationID string          `yaml:"operationId"`
-	Summary     string          `yaml:"summary"`
-	Parameters  []*rawParameter `yaml:"parameters"`
-	RequestBody *struct {
+	OperationID            string          `yaml:"operationId"`
+	Summary                string          `yaml:"summary"`
+	Deprecated             bool            `yaml:"deprecated"`
+	DeprecationNotice      string          `yaml:"x-deprecation-notice"`
+	SunsetDate             string          `yaml:"x-sunset-date"`
+	DeprecationReplacement string          `yaml:"x-deprecation-replacement"`
+	Parameters             []*rawParameter `yaml:"parameters"`
+	RequestBody            *struct {
 		Content map[string]struct {
 			Schema *rawSchema `yaml:"schema"`
 		} `yaml:"content"`
@@ -84,17 +88,21 @@ type rawParameter struct {
 }
 
 type rawSchema struct {
-	Type                 string                `yaml:"type"`
-	Format               string                `yaml:"format"`
-	Description          string                `yaml:"description"`
-	Ref                  string                `yaml:"$ref"`
-	Nullable             bool                  `yaml:"nullable"`
-	Properties           map[string]*rawSchema `yaml:"properties"`
-	Items                *rawSchema            `yaml:"items"`
-	AllOf                []*rawSchema          `yaml:"allOf"`
-	OneOf                []*rawSchema          `yaml:"oneOf"`
-	Required             []string              `yaml:"required"`
-	AdditionalProperties any                   `yaml:"additionalProperties"`
+	Type                   string                `yaml:"type"`
+	Format                 string                `yaml:"format"`
+	Description            string                `yaml:"description"`
+	Deprecated             bool                  `yaml:"deprecated"`
+	DeprecationNotice      string                `yaml:"x-deprecation-notice"`
+	SunsetDate             string                `yaml:"x-sunset-date"`
+	DeprecationReplacement string                `yaml:"x-deprecation-replacement"`
+	Ref                    string                `yaml:"$ref"`
+	Nullable               bool                  `yaml:"nullable"`
+	Properties             map[string]*rawSchema `yaml:"properties"`
+	Items                  *rawSchema            `yaml:"items"`
+	AllOf                  []*rawSchema          `yaml:"allOf"`
+	OneOf                  []*rawSchema          `yaml:"oneOf"`
+	Required               []string              `yaml:"required"`
+	AdditionalProperties   any                   `yaml:"additionalProperties"`
 }
 
 type queryParam struct {
@@ -104,14 +112,15 @@ type queryParam struct {
 }
 
 type genOperation struct {
-	GoName   string
-	Method   string
-	Path     string
-	Summary  string
-	PathArgs []queryParam // positional args (ctx first, then these)
-	Query    []queryParam
-	HasBody  bool
-	BodyType string // schema name or synthesized name
+	GoName           string
+	Method           string
+	Path             string
+	Summary          string
+	DeprecatedNotice string
+	PathArgs         []queryParam // positional args (ctx first, then these)
+	Query            []queryParam
+	HasBody          bool
+	BodyType         string // schema name or synthesized name
 	// Response handling: exactly one of the shapes below is set.
 	RespRef   string // named schema (pointer return) or ""
 	RespArray string // element type for `[]T` returns or ""
@@ -290,6 +299,9 @@ func (g *generator) structFields(owner string, s *rawSchema, depth int) []string
 			description = strings.Join(strings.Fields(description), " ")
 			out = append(out, fmt.Sprintf("// %s %s", field, description))
 		}
+		if dep := deprecationNotice(prop.Deprecated, prop.DeprecationNotice, prop.SunsetDate, prop.DeprecationReplacement, fmt.Sprintf("%s is deprecated.", field)); dep != "" {
+			out = append(out, "// Deprecated: "+dep)
+		}
 		out = append(out, fmt.Sprintf("%s %s %s", field, ftype, tag))
 	}
 	return out
@@ -361,11 +373,13 @@ func (g *generator) buildOperations() []genOperation {
 }
 
 func (g *generator) buildOperation(method, path string, op *rawOperation) genOperation {
+	goName := goFieldName(op.OperationID)
 	gen := genOperation{
-		GoName:  goFieldName(op.OperationID),
-		Method:  method,
-		Path:    path,
-		Summary: op.Summary,
+		GoName:           goName,
+		Method:           method,
+		Path:             path,
+		Summary:          op.Summary,
+		DeprecatedNotice: deprecationNotice(op.Deprecated, op.DeprecationNotice, op.SunsetDate, op.DeprecationReplacement, fmt.Sprintf("%s (%s %s) is deprecated.", goName, method, path)),
 	}
 	for _, raw := range op.Parameters {
 		p := g.resolveParam(raw)
@@ -451,6 +465,9 @@ func (g *generator) emitOperation(buf *bytes.Buffer, op genOperation) {
 		buf.WriteString("// " + op.GoName + " " + strings.TrimSuffix(op.Summary, ".") + ".\n")
 	}
 	fmt.Fprintf(buf, "//\n// %s %s\n", op.Method, op.Path)
+	if op.DeprecatedNotice != "" {
+		fmt.Fprintf(buf, "//\n// Deprecated: %s\n", op.DeprecatedNotice)
+	}
 	if retType != "" {
 		fmt.Fprintf(buf, "func (c *Client) %s(%s) (%s, error) {\n", op.GoName, strings.Join(args, ", "), retType)
 	} else {
@@ -657,4 +674,27 @@ func contains(ss []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// deprecationNotice formats a single-line deprecation notice for generated Go
+// and Python clients when deprecated is true. When deprecated is false it
+// returns "" so non-deprecated specs remain byte-identical.
+func deprecationNotice(deprecated bool, notice, sunset, replacement, fallback string) string {
+	if !deprecated {
+		return ""
+	}
+	msg := strings.Join(strings.Fields(strings.TrimSpace(notice)), " ")
+	if msg == "" {
+		msg = fallback
+	}
+	if !strings.HasSuffix(msg, ".") {
+		msg += "."
+	}
+	if rep := strings.TrimSpace(replacement); rep != "" && !strings.Contains(msg, rep) {
+		msg += fmt.Sprintf(" Use %s instead.", rep)
+	}
+	if sun := strings.TrimSpace(sunset); sun != "" && !strings.Contains(msg, sun) {
+		msg += fmt.Sprintf(" Sunset: %s.", sun)
+	}
+	return msg
 }
