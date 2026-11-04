@@ -17,6 +17,7 @@ database, API and replay errors by their text.
 - [Dead-letter / error log filling up](#dead-letter--error-log-filling-up)
 - [Audit findings piling up](#audit-findings-piling-up)
 - [Dirty migration recovery](#dirty-migration-recovery)
+- [Live-database schema migrations](#live-database-schema-migrations)
 - [Poisoned event](#poisoned-event)
 - [API returning stale or missing data](#api-returning-stale-or-missing-data)
 - [Database connection exhaustion](#database-connection-exhaustion)
@@ -298,6 +299,69 @@ The migrations use `golang-migrate` which tracks applied versions in
 **Prevention**: Always back up the database before upgrading the binary in
 production. Migrations are designed to be forward-only (no down migrations
 in production).
+
+---
+
+## Live-database schema migrations
+
+SoroTrail enforces live-database DDL safety rules via `store.LintEmbeddedMigrations`
+(`TestMigrate_LiveDatabaseSafetyRules`) and applies bounded session lock/statement
+timeouts (`DefaultMigrationLockTimeout = 5s`, `DefaultMigrationStatementTimeout = 30s`)
+on every migration connection so schema upgrades do not stall live ingestion or
+API reads during rolling deployments.
+
+### Allowed vs. forbidden DDL operations on live tables
+
+| Operation | Live-DB Impact | Policy & CI Rule |
+| --- | --- | --- |
+| `CREATE TABLE IF NOT EXISTS ...` + `CREATE INDEX ...` on that same new table | Safe (new empty table has no live traffic) | Allowed |
+| `CREATE [UNIQUE] INDEX` on an existing table without `CONCURRENTLY` | Acquires `SHARE` lock, blocking all `INSERT`/`UPDATE`/`DELETE` traffic for the full scan | **Forbidden** (`concurrent-index-required`). Use `CREATE INDEX CONCURRENTLY IF NOT EXISTS` with `-- sorotrail:no-transaction` (or `-- sorotrail:allow-partitioned-parent-index:` when defining metadata on partitioned parent `events`). |
+| `CREATE/DROP INDEX CONCURRENTLY` inside a transaction or without `-- sorotrail:no-transaction` | Fails in PostgreSQL (`cannot run inside a transaction block`) | **Forbidden** (`concurrent-index-no-tx`). Add `-- sorotrail:no-transaction` at the top of the `.sql` file and omit `BEGIN`/`COMMIT`. |
+| `ALTER TABLE ... ADD COLUMN` (nullable, or `NOT NULL` with a constant `DEFAULT`) | Fast metadata-only catalog update in PostgreSQL 11+ | Allowed |
+| `ALTER TABLE ... ADD COLUMN ... NOT NULL` without `DEFAULT` | Fails on non-empty tables or forces an `ACCESS EXCLUSIVE` scan | **Forbidden** (`not-null-needs-default`). Add the column as nullable or with a constant `DEFAULT`. |
+| `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` directly | Scans the entire table under `ACCESS EXCLUSIVE` | **Forbidden** (`not-null-needs-default`). First add `CHECK (col IS NOT NULL) NOT VALID`, then `VALIDATE CONSTRAINT` (`SHARE UPDATE EXCLUSIVE`), then `SET NOT NULL`. |
+| `ALTER TABLE ... DROP COLUMN` | Breaks running instances from the previous release that still `SELECT` or `INSERT` the column | **Forbidden** (`no-drop-column`) until Stage 5 of expand-and-contract (`-- sorotrail:allow-contract-drop-column: <reason>`). |
+| `ALTER TABLE ... RENAME COLUMN` / `RENAME TO` | Immediately breaks live instances referencing the old name | **Forbidden** (`no-rename-column-or-table`). Use the 5-stage expand-and-contract pattern. |
+| `ALTER TABLE ... ALTER COLUMN ... TYPE` | Rewrites the entire table under `ACCESS EXCLUSIVE` lock | **Forbidden** (`no-alter-column-type`). Use the 5-stage expand-and-contract pattern. |
+| Unbounded `UPDATE` / `DELETE` / `INSERT INTO ... SELECT` in `.up.sql` | Holds row locks across the whole table and hits `statement_timeout` | **Forbidden** (`no-unbounded-data-backfill`). Use `store.RunBatchedMigration` with cursor checkpointing in `migration_backfill_state`. |
+
+### 5-stage expand-and-contract rollout pattern
+
+Any breaking column change (rename, type change, format migration, or column removal) must be rolled out across releases in five non-blocking stages:
+
+1. **Stage 1 — Expand (DDL)**: Add the new nullable column (and any `CREATE INDEX CONCURRENTLY` with `-- sorotrail:no-transaction`). Existing instances ignore the new column.
+2. **Stage 2 — Dual-write (App)**: Deploy application code that writes to both the old and new columns while continuing to read from the old column (falling back to the new column if needed).
+3. **Stage 3 — Resumable batched backfill (`store.RunBatchedMigration`)**: Backfill historical rows in bounded transactions (`DefaultBatchedMigrationSize = 1000`). Each batch commits its high-water cursor to `migration_backfill_state` and logs structured progress (`"batched migration progress"` with `migration_name`, `batch`, `batch_rows`, `total_rows`, `cursor`, `completed`, `elapsed_ms`). If interrupted by a timeout or restart, re-running `RunBatchedMigration` resumes from `last_cursor`.
+4. **Stage 4 — Switch reads & validate (App + DDL)**: Deploy application code that reads exclusively from the new column and stops writing the old column. If `NOT NULL` is required on the new column, add `CHECK (new_col IS NOT NULL) NOT VALID` followed by `VALIDATE CONSTRAINT`.
+5. **Stage 5 — Contract (DDL)**: Once no running instance references the old column, drop it in a dedicated migration annotated with `-- sorotrail:allow-contract-drop-column: <reason>`.
+
+### Safely aborting a blocked migration or invalid `CONCURRENTLY` index
+
+If a migration statement waits longer than `DefaultMigrationLockTimeout` (`5s`) for a lock or exceeds `DefaultMigrationStatementTimeout` (`30s`), PostgreSQL aborts the statement automatically. If you need to cancel an in-flight migration manually or clean up a failed `CREATE INDEX CONCURRENTLY`:
+
+```sh
+# 1. Inspect active migration or index-build queries and lock waits.
+psql "$DATABASE_URL" -c "
+  SELECT pid, state, wait_event_type, wait_event, now() - query_start AS duration, query
+  FROM pg_stat_activity
+  WHERE datname = current_database()
+    AND state != 'idle'
+  ORDER BY query_start"
+
+# 2. Gracefully cancel the blocked migration query (never use pg_terminate_backend first).
+psql "$DATABASE_URL" -c "SELECT pg_cancel_backend(<pid>)"
+
+# 3. Check for any INVALID index left behind by an interrupted CREATE INDEX CONCURRENTLY.
+psql "$DATABASE_URL" -c "
+  SELECT c.relname AS index_name, i.indisvalid
+  FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE NOT i.indisvalid"
+
+# 4. Drop the invalid index non-blockingly and clear the dirty flag before retrying.
+psql "$DATABASE_URL" -c "DROP INDEX CONCURRENTLY IF EXISTS <index_name>"
+psql "$DATABASE_URL" -c "UPDATE schema_migrations SET dirty = false WHERE dirty = true"
+```
 
 ---
 
