@@ -17,15 +17,55 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 )
 
+// BackfillRangeStatus describes the lifecycle of a single ledger sub-range
+// during a parallel backfill run (#1237).
+type BackfillRangeStatus string
+
+const (
+	BackfillRangePending   BackfillRangeStatus = "pending"
+	BackfillRangeInFlight  BackfillRangeStatus = "in_flight"
+	BackfillRangeCompleted BackfillRangeStatus = "completed"
+	BackfillRangeFailed    BackfillRangeStatus = "failed"
+)
+
+// BackfillRange tracks persisted progress for one contiguous ledger sub-range
+// [FromLedger, ToLedger] within a backfill run.
+type BackfillRange struct {
+	FromLedger int64               `json:"from_ledger"`
+	ToLedger   int64               `json:"to_ledger"`
+	LastLedger int64               `json:"last_ledger"`
+	Status     BackfillRangeStatus `json:"status"`
+	Error      string              `json:"error,omitempty"`
+	UpdatedAt  time.Time           `json:"updated_at"`
+}
+
+// Completed reports whether this sub-range finished cleanly.
+func (r BackfillRange) Completed() bool {
+	return r.Status == BackfillRangeCompleted
+}
+
+// ResumeStartLedger returns the inclusive ledger where a resumed worker should
+// pick up this sub-range.
+func (r BackfillRange) ResumeStartLedger() int64 {
+	if r.LastLedger >= r.FromLedger {
+		return r.LastLedger + 1
+	}
+	return r.FromLedger
+}
+
 // BackfillState is the single persisted progress row for the backfill
 // command. LastLedger is the inclusive highest ledger whose events have
-// been committed to the events table; resume picks up at LastLedger+1.
+// been committed to the events table; resume picks up at LastLedger+1
+// when Ranges is empty, or resumes incomplete entries in Ranges when
+// range-level state has been recorded.
 type BackfillState struct {
 	ContractID  string
 	FromLedger  int64
@@ -34,6 +74,33 @@ type BackfillState struct {
 	StartedAt   time.Time
 	UpdatedAt   time.Time
 	CompletedAt *time.Time
+	Ranges      []BackfillRange
+}
+
+// ContiguousWatermark computes the highest contiguous ledger committed from
+// fromLedger across sorted sub-ranges. It stops advancing as soon as it
+// encounters an incomplete sub-range so single-cursor readers never skip an
+// unfinished gap.
+func ContiguousWatermark(fromLedger int64, ranges []BackfillRange) int64 {
+	var watermark int64
+	expectedStart := fromLedger
+	for _, r := range ranges {
+		if r.FromLedger > expectedStart {
+			break
+		}
+		if r.Status == BackfillRangeCompleted {
+			if r.ToLedger > watermark {
+				watermark = r.ToLedger
+			}
+			expectedStart = r.ToLedger + 1
+			continue
+		}
+		if r.LastLedger >= r.FromLedger && r.LastLedger > watermark {
+			watermark = r.LastLedger
+		}
+		break
+	}
+	return watermark
 }
 
 // Done reports whether the recorded run covered the whole range it was
@@ -55,13 +122,15 @@ var ErrBackfillInProgress = errors.New("backfill state already exists for a diff
 func (p *Postgres) GetBackfillState(ctx context.Context) (BackfillState, error) {
 	var s BackfillState
 	var completedAt *time.Time
+	var rangesJSON []byte
 	err := p.pool.QueryRow(ctx, `
 		SELECT contract_id, from_ledger, to_ledger, last_ledger,
-		       started_at, updated_at, completed_at
+		       started_at, updated_at, completed_at,
+		       COALESCE(ranges_json, '[]'::jsonb)
 		FROM backfill_state
 		WHERE id = 1`,
 	).Scan(&s.ContractID, &s.FromLedger, &s.ToLedger, &s.LastLedger,
-		&s.StartedAt, &s.UpdatedAt, &completedAt)
+		&s.StartedAt, &s.UpdatedAt, &completedAt, &rangesJSON)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return BackfillState{}, ErrNotFound
 	}
@@ -69,6 +138,11 @@ func (p *Postgres) GetBackfillState(ctx context.Context) (BackfillState, error) 
 		return BackfillState{}, err
 	}
 	s.CompletedAt = completedAt
+	if len(rangesJSON) > 0 {
+		if err := json.Unmarshal(rangesJSON, &s.Ranges); err != nil {
+			return BackfillState{}, fmt.Errorf("decoding backfill ranges_json: %w", err)
+		}
+	}
 	return s, nil
 }
 
@@ -80,8 +154,8 @@ func (p *Postgres) StartBackfillState(ctx context.Context, contractID string, fr
 	_, err := p.pool.Exec(ctx, `
 		INSERT INTO backfill_state
 			(id, contract_id, from_ledger, to_ledger, last_ledger,
-			 started_at, updated_at, completed_at)
-		VALUES (1, $1, $2, $3, 0, now(), now(), NULL)
+			 started_at, updated_at, completed_at, ranges_json)
+		VALUES (1, $1, $2, $3, 0, now(), now(), NULL, '[]'::jsonb)
 		ON CONFLICT (id) DO UPDATE SET
 			contract_id  = EXCLUDED.contract_id,
 			from_ledger  = EXCLUDED.from_ledger,
@@ -89,12 +163,40 @@ func (p *Postgres) StartBackfillState(ctx context.Context, contractID string, fr
 			last_ledger  = 0,
 			started_at   = now(),
 			updated_at   = now(),
-			completed_at = NULL`,
+			completed_at = NULL,
+			ranges_json  = '[]'::jsonb`,
 		contractID, fromLedger, toLedger)
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+// SaveBackfillRanges persists the per-range progress snapshot and advances
+// last_ledger monotonically to the contiguous committed watermark so single-row
+// and range-aware readers remain consistent.
+func (p *Postgres) SaveBackfillRanges(ctx context.Context, ranges []BackfillRange) error {
+	payload := []byte("[]")
+	if len(ranges) > 0 {
+		encoded, err := json.Marshal(ranges)
+		if err != nil {
+			return fmt.Errorf("encoding backfill ranges: %w", err)
+		}
+		payload = encoded
+	}
+	var fromLedger int64
+	if len(ranges) > 0 {
+		fromLedger = ranges[0].FromLedger
+	}
+	watermark := ContiguousWatermark(fromLedger, ranges)
+	_, err := p.pool.Exec(ctx, `
+		UPDATE backfill_state SET
+			ranges_json = $1::jsonb,
+			last_ledger = GREATEST(last_ledger, $2),
+			updated_at  = now()
+		WHERE id = 1`,
+		string(payload), watermark)
+	return err
 }
 
 // UpdateBackfillState advances the persisted progress to lastLedger. It
