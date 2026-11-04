@@ -326,6 +326,7 @@ func runService(dryRun bool) error {
 		pool *pgxpool.Pool
 		pg   *store.Postgres
 	)
+	sizing := cfg.ResolvePoolSizing()
 	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
 		if cfg.RetentionEnabled() {
 			return fmt.Errorf("clickhouse: retention pruning is not supported by the clickhouse backend")
@@ -347,7 +348,7 @@ func runService(dryRun bool) error {
 		if tlsErr != nil {
 			return fmt.Errorf("configuring postgres TLS: %w", tlsErr)
 		}
-		pool, err = store.NewPoolWithTLS(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns, cfg.DBMaxConnLifetime, cfg.DBMaxConnIdleTime, dbTLS)
+		pool, err = store.NewPoolWithTLS(ctx, cfg.DatabaseURL, sizing.TotalConns, cfg.DBMinConns, cfg.DBMaxConnLifetime, cfg.DBMaxConnIdleTime, dbTLS)
 		if err != nil {
 			return fmt.Errorf("connecting to postgres: %w", err)
 		}
@@ -441,7 +442,24 @@ func runService(dryRun bool) error {
 
 	// Shared broadcaster for live event streaming across all networks.
 	bcast := broadcast.New(broadcast.DefaultBufferSize)
-	wh := webhook.NewNotifier(st, log)
+	poolBudget := store.NewPoolBudget(store.PoolBudgetConfig{
+		TotalConns:        int(sizing.TotalConns),
+		IngesterReserved:  int(sizing.IngesterReserved),
+		APIReadMax:        int(sizing.APIReadMax),
+		GraphQLMax:        int(sizing.GraphQLMax),
+		SubscriptionMax:   int(sizing.SubscriptionMax),
+		MaintenanceMax:    int(sizing.MaintenanceMax),
+		AcquireTimeout:    sizing.AcquireTimeout,
+		PressureThreshold: sizing.PressureThreshold,
+	})
+	budgetedRoot := store.NewBudgetedStore(st, poolBudget, store.SubsystemAPIRead)
+	ingesterStore := budgetedRoot.ForSubsystem(store.SubsystemIngester)
+	subStore := budgetedRoot.ForSubsystem(store.SubsystemSubscription)
+	maintStore := budgetedRoot.ForSubsystem(store.SubsystemMaintenance)
+	apiReadStore := budgetedRoot.ForSubsystem(store.SubsystemAPIRead)
+	gqlBudgetStore := budgetedRoot.ForSubsystem(store.SubsystemGraphQL)
+
+	wh := webhook.NewNotifier(subStore, log)
 
 	// Wire the spec cache and enricher for spec-decoded event views.
 	// The cache is keyed by wasm hash with a TTL; the fetcher doubles as
@@ -529,7 +547,7 @@ func runService(dryRun bool) error {
 	// The decoder is wrapped in a memoizing cache: ingestion re-decodes the
 	// same topic symbols and values constantly, so hashing the raw XDR and
 	// serving repeats from an LRU removes that redundant work.
-	ing := ingester.New(countingClient, st, decode.NewCachingDecoder(decode.XDRDecoder{}, 0), log, ingester.Options{
+	ing := ingester.New(countingClient, ingesterStore, decode.NewCachingDecoder(decode.XDRDecoder{}, 0), log, ingester.Options{
 		PollInterval:            cfg.PollInterval,
 		PollIntervalMin:         cfg.PollIntervalMin,
 		PollIntervalMax:         cfg.PollIntervalMax,
@@ -555,11 +573,12 @@ func runService(dryRun bool) error {
 	// Wire the same store as the dead-letter sink: events that fail to
 	// decode/persist land in the dead_letters table instead of
 	// stalling the cycle (issue #131).
-	ing.SetDeadLetterSink(st)
+	ing.SetDeadLetterSink(ingesterStore)
 	// Exposes the adaptive poll interval via /stats (issue #146). Always
 	// registered — there is exactly one Ingester per process even when
 	// INGESTION_LOCK_ENABLED causes its Run loop to be skipped.
 	api.SetIngester(ing)
+	yieldCtl := store.CombineYieldControllers(ing.LagCoordinator(), poolBudget)
 
 	// SIGHUP config hot-reload (issue #148): re-reads and validates the
 	// full environment on every SIGHUP, then applies only the safe subset
@@ -601,12 +620,13 @@ func runService(dryRun bool) error {
 			return err
 		}
 		auditClient := audit.NewBudgetedClient(countingClient, budget)
-		aud = audit.New(auditClient, st, ing, log, audit.Options{
+		aud = audit.New(auditClient, maintStore, ing, log, audit.Options{
 			PollInterval:      cfg.AuditPollInterval,
 			BatchLedgers:      cfg.AuditBatchLedgers,
 			LagThreshold:      cfg.AuditLagThreshold,
 			MaxRepairAttempts: cfg.AuditMaxRepair,
 			FindingMaxLedgers: cfg.AuditFindingMaxLgrs,
+			LagController:     yieldCtl,
 		})
 		// Expose the auditor's counters via /stats so operators don't need
 		// to parse logs to see pass/finding rates.
@@ -614,7 +634,7 @@ func runService(dryRun bool) error {
 	}
 	var retPruner *store.RetentionPruner
 	if cfg.RetentionAge > 0 {
-		retPruner = store.NewRetentionPruner(pg, log, store.RetentionOptions{
+		retPruner = store.NewRetentionPruner(maintStore, log, store.RetentionOptions{
 			Age:          cfg.RetentionAge,
 			PollInterval: cfg.RetentionPoll,
 		})
@@ -647,8 +667,9 @@ func runService(dryRun bool) error {
 			TLSConfig:       archTLS,
 			MaxRetries:      cfg.ArchiveMaxRetries,
 			Logger:          log,
+			LagController:   yieldCtl,
 		}
-		arch, err = archive.New(st, aArchiverOpts)
+		arch, err = archive.New(maintStore, aArchiverOpts)
 		if err != nil {
 			return fmt.Errorf("initializing archive: %w", err)
 		}
@@ -662,13 +683,14 @@ func runService(dryRun bool) error {
 	// Expose spec-cache hit/miss metrics via /stats.
 	api.SetSpecCache(specCache)
 
-	prn := pruner.NewWithArchiver(st, log, pruner.Options{
+	prn := pruner.NewWithArchiver(maintStore, log, pruner.Options{
 		MaxAge:             cfg.RetentionMaxAge,
 		MinLedger:          cfg.RetentionMinLedger,
 		BatchSize:          cfg.RetentionBatchSize,
 		Pause:              cfg.RetentionPause,
 		Interval:           cfg.RetentionInterval,
 		ArchiveBeforePrune: cfg.ArchiveBeforePrune,
+		LagController:      yieldCtl,
 	}, arch)
 	if cfg.RetentionEnabled() {
 		api.SetPruner(prn)
@@ -693,11 +715,13 @@ func runService(dryRun bool) error {
 	defer limiter.Stop()
 
 	// Guarded store for API-originated reads with timeout and slow-query logging.
-	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
+	guardOpts := store.GuardedStoreOptions{
 		Timeout:            cfg.APIQueryTimeout,
 		SlowQueryThreshold: cfg.APISlowQueryThreshold,
 		Logger:             log,
-	})
+	}
+	apiStore := store.NewGuardedStore(apiReadStore, guardOpts)
+	gqlStore := store.NewGuardedStore(gqlBudgetStore, guardOpts)
 	api.SetMaxLimit(cfg.APIMaxLimit)
 
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
@@ -728,11 +752,11 @@ func runService(dryRun bool) error {
 		ExposedHeaders: cfg.CORSExposedHeaders,
 	})
 
-	// GraphQL transport: reads against the same store + spec enricher
+	// GraphQL transport: reads against the GraphQL-budgeted store + spec enricher
 	// the REST handlers use. Dev-mode playground is gated on
 	// GRAPHQL_PLAYGROUND. The schema is the same shape as
 	// internal/api/graphql/schema.graphqls.
-	gqlHandler, gqlErr := graphql.New(graphqlServerDeps(apiStore, specEnricher), log, cfg.GraphQLPlayground)
+	gqlHandler, gqlErr := graphql.New(graphqlServerDeps(gqlStore, specEnricher), log, cfg.GraphQLPlayground)
 	if gqlErr != nil {
 		return fmt.Errorf("constructing graphql handler: %w", gqlErr)
 	}

@@ -88,6 +88,16 @@ type Config struct {
 	DBMinConns        int32         `env:"DB_MIN_CONNS" envDefault:"0"`
 	DBMaxConnLifetime time.Duration `env:"DB_MAX_CONN_LIFETIME" envDefault:"0"`
 	DBMaxConnIdleTime time.Duration `env:"DB_MAX_CONN_IDLE_TIME" envDefault:"0"`
+	// Per-subsystem connection pool budget overrides (#1231). Zero applies the
+	// default sizing formula in ResolvePoolSizing() (25% reserved floor for
+	// ingester, bounded caps for api_read, graphql, subscription, maintenance).
+	DBIngesterReservedConns int32         `env:"-"`
+	DBAPIReadMaxConns       int32         `env:"-"`
+	DBGraphQLMaxConns       int32         `env:"-"`
+	DBSubscriptionMaxConns  int32         `env:"-"`
+	DBMaintenanceMaxConns   int32         `env:"-"`
+	DBPoolAcquireTimeout    time.Duration `env:"-"`
+	DBPoolPressureThreshold float64       `env:"-"`
 	// HTTPAddr is the address the HTTP server listens on (host:port), e.g.
 	// ":8080" or "0.0.0.0:9090". See HTTP_ADDR in .env.example. It must be a
 	// valid host:port pair.
@@ -429,6 +439,9 @@ func Load() (Config, error) {
 	if err := cfg.loadBodySizeEnvOverrides(); err != nil {
 		return Config{}, err
 	}
+	if err := cfg.loadPoolBudgetEnvOverrides(); err != nil {
+		return Config{}, err
+	}
 	if err := cfg.ValidateAll(); err != nil {
 		return Config{}, err
 	}
@@ -533,6 +546,139 @@ func (c *Config) loadBodySizeEnvOverrides() error {
 	return nil
 }
 
+// DefaultDBMaxConns is the default total connection pool size used by the
+// pool budget sizing formula when DB_MAX_CONNS is 0 (#1231).
+const DefaultDBMaxConns int32 = 20
+
+// PoolSizing holds the resolved connection pool budget parameters derived from
+// Config (#1231).
+//
+// Sizing formula (for total pool N = max(DB_MAX_CONNS, DefaultDBMaxConns)):
+//   - IngesterReserved = max(2, floor(0.25 * N))  (reserved floor, never touchable by read/maintenance traffic)
+//   - SharedMax        = N - IngesterReserved     (shared ceiling across non-ingester subsystems)
+//   - APIReadMax       = min(SharedMax, max(1, floor(0.50 * N)))
+//   - GraphQLMax       = min(SharedMax, max(1, floor(0.30 * N)))
+//   - SubscriptionMax  = min(SharedMax, max(1, floor(0.20 * N)))
+//   - MaintenanceMax   = min(SharedMax, max(1, floor(0.15 * N)))
+type PoolSizing struct {
+	TotalConns        int32
+	MinConns          int32
+	IngesterReserved  int32
+	SharedMax         int32
+	APIReadMax        int32
+	GraphQLMax        int32
+	SubscriptionMax   int32
+	MaintenanceMax    int32
+	AcquireTimeout    time.Duration
+	PressureThreshold float64
+}
+
+// ResolvePoolSizing computes the effective pool sizing and per-subsystem caps
+// using the documented sizing formula and any explicit operator overrides.
+func (c Config) ResolvePoolSizing() PoolSizing {
+	total := c.DBMaxConns
+	if total <= 0 {
+		total = DefaultDBMaxConns
+	}
+	if total < 4 {
+		total = 4
+	}
+	minConns := c.DBMinConns
+	if minConns <= 0 {
+		minConns = max(int32(2), total/4)
+	}
+	if minConns > total {
+		minConns = total
+	}
+
+	ingesterReserved := c.DBIngesterReservedConns
+	if ingesterReserved <= 0 {
+		ingesterReserved = max(int32(2), (total*25)/100)
+	}
+	if ingesterReserved >= total {
+		ingesterReserved = total - 1
+	}
+	sharedMax := total - ingesterReserved
+
+	clampShared := func(explicit, def int32) int32 {
+		v := explicit
+		if v <= 0 {
+			v = max(int32(1), def)
+		}
+		if v > sharedMax {
+			v = sharedMax
+		}
+		return v
+	}
+
+	acquireTimeout := c.DBPoolAcquireTimeout
+	if acquireTimeout <= 0 {
+		acquireTimeout = 50 * time.Millisecond
+	}
+	pressure := c.DBPoolPressureThreshold
+	if pressure <= 0 {
+		pressure = 0.75
+	}
+
+	return PoolSizing{
+		TotalConns:        total,
+		MinConns:          minConns,
+		IngesterReserved:  ingesterReserved,
+		SharedMax:         sharedMax,
+		APIReadMax:        clampShared(c.DBAPIReadMaxConns, (total*50)/100),
+		GraphQLMax:        clampShared(c.DBGraphQLMaxConns, (total*30)/100),
+		SubscriptionMax:   clampShared(c.DBSubscriptionMaxConns, (total*20)/100),
+		MaintenanceMax:    clampShared(c.DBMaintenanceMaxConns, (total*15)/100),
+		AcquireTimeout:    acquireTimeout,
+		PressureThreshold: pressure,
+	}
+}
+
+func (c *Config) loadPoolBudgetEnvOverrides() error {
+	parseInt32Env := func(key string, dst *int32) error {
+		raw, ok := os.LookupEnv(key)
+		if !ok || strings.TrimSpace(raw) == "" {
+			return nil
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 32)
+		if err != nil {
+			return fmt.Errorf("parsing %s: %w", key, err)
+		}
+		*dst = int32(n)
+		return nil
+	}
+	if err := parseInt32Env("DB_INGESTER_RESERVED_CONNS", &c.DBIngesterReservedConns); err != nil {
+		return err
+	}
+	if err := parseInt32Env("DB_API_READ_MAX_CONNS", &c.DBAPIReadMaxConns); err != nil {
+		return err
+	}
+	if err := parseInt32Env("DB_GRAPHQL_MAX_CONNS", &c.DBGraphQLMaxConns); err != nil {
+		return err
+	}
+	if err := parseInt32Env("DB_SUBSCRIPTION_MAX_CONNS", &c.DBSubscriptionMaxConns); err != nil {
+		return err
+	}
+	if err := parseInt32Env("DB_MAINTENANCE_MAX_CONNS", &c.DBMaintenanceMaxConns); err != nil {
+		return err
+	}
+	if raw, ok := os.LookupEnv("DB_POOL_ACQUIRE_TIMEOUT"); ok && strings.TrimSpace(raw) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(raw))
+		if err != nil {
+			return fmt.Errorf("parsing DB_POOL_ACQUIRE_TIMEOUT: %w", err)
+		}
+		c.DBPoolAcquireTimeout = d
+	}
+	if raw, ok := os.LookupEnv("DB_POOL_PRESSURE_THRESHOLD"); ok && strings.TrimSpace(raw) != "" {
+		f, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if err != nil {
+			return fmt.Errorf("parsing DB_POOL_PRESSURE_THRESHOLD: %w", err)
+		}
+		c.DBPoolPressureThreshold = f
+	}
+	return nil
+}
+
 // EffectiveEncryptionKeySpec returns the configured field-level encryption
 // key specification, preferring ENCRYPTION_KEYS when both ENCRYPTION_KEYS
 // and ENCRYPTION_KEY are set.
@@ -604,11 +750,38 @@ func (c Config) Validate() error {
 	if c.DBMinConns < 0 {
 		return fmt.Errorf("DB_MIN_CONNS must be non-negative, got %d", c.DBMinConns)
 	}
+	if c.DBMaxConns > 0 && c.DBMinConns > c.DBMaxConns {
+		return fmt.Errorf("DB_MIN_CONNS (%d) must be <= DB_MAX_CONNS (%d)", c.DBMinConns, c.DBMaxConns)
+	}
 	if c.DBMaxConnLifetime < 0 {
 		return fmt.Errorf("DB_MAX_CONN_LIFETIME must be non-negative, got %s", c.DBMaxConnLifetime)
 	}
 	if c.DBMaxConnIdleTime < 0 {
 		return fmt.Errorf("DB_MAX_CONN_IDLE_TIME must be non-negative, got %s", c.DBMaxConnIdleTime)
+	}
+	if c.DBIngesterReservedConns < 0 {
+		return fmt.Errorf("DB_INGESTER_RESERVED_CONNS must be non-negative, got %d", c.DBIngesterReservedConns)
+	}
+	if c.DBMaxConns > 0 && c.DBIngesterReservedConns >= c.DBMaxConns {
+		return fmt.Errorf("DB_INGESTER_RESERVED_CONNS (%d) must be < DB_MAX_CONNS (%d)", c.DBIngesterReservedConns, c.DBMaxConns)
+	}
+	if c.DBAPIReadMaxConns < 0 {
+		return fmt.Errorf("DB_API_READ_MAX_CONNS must be non-negative, got %d", c.DBAPIReadMaxConns)
+	}
+	if c.DBGraphQLMaxConns < 0 {
+		return fmt.Errorf("DB_GRAPHQL_MAX_CONNS must be non-negative, got %d", c.DBGraphQLMaxConns)
+	}
+	if c.DBSubscriptionMaxConns < 0 {
+		return fmt.Errorf("DB_SUBSCRIPTION_MAX_CONNS must be non-negative, got %d", c.DBSubscriptionMaxConns)
+	}
+	if c.DBMaintenanceMaxConns < 0 {
+		return fmt.Errorf("DB_MAINTENANCE_MAX_CONNS must be non-negative, got %d", c.DBMaintenanceMaxConns)
+	}
+	if c.DBPoolAcquireTimeout < 0 {
+		return fmt.Errorf("DB_POOL_ACQUIRE_TIMEOUT must be non-negative, got %s", c.DBPoolAcquireTimeout)
+	}
+	if c.DBPoolPressureThreshold < 0 || c.DBPoolPressureThreshold > 1 {
+		return fmt.Errorf("DB_POOL_PRESSURE_THRESHOLD must be in [0,1], got %v", c.DBPoolPressureThreshold)
 	}
 	// Empty means "unused": HORIZON_URL is only read by `sorotrail backfill`
 	// and Load supplies a default, so an unset value is not a misconfigured

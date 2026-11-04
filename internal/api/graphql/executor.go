@@ -3,6 +3,7 @@ package graphql
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/vektah/gqlparser/v2/ast"
 	"github.com/vektah/gqlparser/v2/parser"
+
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // resolverDefault is the active Resolver instance populated at
@@ -147,6 +150,9 @@ func executeOperation(ctx context.Context, req *GraphQLRequest) (*responseEnvelo
 		}
 		val, err := r.resolveQueryField(ctx, f, vars)
 		if err != nil {
+			if errors.Is(err, store.ErrPoolBudgetExhausted) {
+				return nil, err
+			}
 			data[f.Alias] = nil
 			return &responseEnvelope{
 				Data:   data,
