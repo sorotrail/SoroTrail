@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -18,7 +19,26 @@ import (
 // It uses WAL journal mode and a 5-second busy timeout to allow concurrent
 // readers during ingestion writes.
 type SQLite struct {
-	db *sql.DB
+	db                        *sql.DB
+	maxSparseFilterLedgerSpan atomic.Int64
+}
+
+// SetMaxSparseFilterLedgerSpan configures the maximum ledger span allowed
+// when querying sparse JSONB topic filters on SQLite.QueryEvents.
+func (s *SQLite) SetMaxSparseFilterLedgerSpan(maxSpan int64) {
+	if s == nil {
+		return
+	}
+	s.maxSparseFilterLedgerSpan.Store(maxSpan)
+}
+
+// MaxSparseFilterLedgerSpan returns the currently configured maximum ledger
+// span for sparse JSONB topic filters.
+func (s *SQLite) MaxSparseFilterLedgerSpan() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.maxSparseFilterLedgerSpan.Load()
 }
 
 var _ Store = (*SQLite)(nil)
@@ -272,6 +292,13 @@ func (s *SQLite) GetEventsByTxHash(ctx context.Context, txHash, excludeID string
 }
 
 func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
+	if err := ValidateSparseFilterRange(f, s.MaxSparseFilterLedgerSpan()); err != nil {
+		return nil, "", err
+	}
+	if !ValidOrderBy(f.OrderBy) {
+		return nil, "", fmt.Errorf("unsupported order_by %q", f.OrderBy)
+	}
+
 	limit := f.Limit
 	if limit <= 0 {
 		limit = DefaultQueryLimit
@@ -291,8 +318,30 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 	if f.Network != "" {
 		where = append(where, "network = "+arg(defaultNetwork(f.Network)))
 	}
-	if f.ContractID != "" {
+	if len(f.ContractIDs) > 0 {
+		ids := f.ContractIDs
+		if f.ContractID != "" {
+			has := false
+			for _, id := range ids {
+				if id == f.ContractID {
+					has = true
+					break
+				}
+			}
+			if !has {
+				ids = append(ids, f.ContractID)
+			}
+		}
+		ph := make([]string, 0, len(ids))
+		for _, id := range ids {
+			ph = append(ph, arg(id))
+		}
+		where = append(where, "contract_id IN ("+strings.Join(ph, ", ")+")")
+	} else if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
+	}
+	if f.ContractIDPrefix != "" {
+		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
 	}
 	if len(f.Types) > 0 {
 		// SQLite has no ANY(); expand to an IN list.
@@ -301,6 +350,12 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 			ph = append(ph, arg(t))
 		}
 		where = append(where, "type IN ("+strings.Join(ph, ", ")+")")
+	}
+	if f.TxHash != "" {
+		where = append(where, "tx_hash = "+arg(f.TxHash))
+	}
+	if f.InSuccessfulCall != nil {
+		where = append(where, "in_successful_call = "+arg(*f.InSuccessfulCall))
 	}
 	if len(f.Topic) > 0 {
 		where = append(where, topicContainsExpr(arg(f.Topic)))
@@ -338,19 +393,60 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 
 	orderDir := "ASC"
 	cursorOp := ">"
+	ledgerBoundOp := ">="
 	if f.Order == "desc" {
 		orderDir = "DESC"
 		cursorOp = "<"
+		ledgerBoundOp = "<="
 	}
+
+	orderCols := "id " + orderDir
+	if f.OrderBy != "" && f.OrderBy != OrderByID {
+		orderCols = f.OrderBy + " " + orderDir + ", id " + orderDir
+	}
+
 	if f.Cursor != "" {
-		where = append(where, "id "+cursorOp+" "+arg(f.Cursor))
+		switch f.OrderBy {
+		case "", OrderByID:
+			if cursorLedger, ok := CursorLedger(f.Cursor); ok {
+				if (f.FromLedger <= 0 || cursorLedger >= f.FromLedger) &&
+					(f.ToLedger <= 0 || cursorLedger <= f.ToLedger) {
+					where = append(where, "ledger "+ledgerBoundOp+" "+arg(cursorLedger))
+				}
+			}
+			where = append(where, "id "+cursorOp+" "+arg(f.Cursor))
+		default:
+			sortValue, id, err := decodeCompositeCursor(f.Cursor)
+			if err != nil {
+				return nil, "", err
+			}
+			switch f.OrderBy {
+			case OrderByLedger:
+				cursorLedger, perr := strconv.ParseInt(sortValue, 10, 64)
+				if perr != nil {
+					return nil, "", fmt.Errorf("%w: ledger cursor sort value is not an integer", ErrInvalidCursor)
+				}
+				where = append(where, "ledger "+ledgerBoundOp+" "+arg(cursorLedger))
+				where = append(where, fmt.Sprintf("(ledger, id) %s (%s, %s)",
+					cursorOp, arg(cursorLedger), arg(id)))
+			case OrderByCreatedAt:
+				t, perr := time.Parse(time.RFC3339Nano, sortValue)
+				if perr != nil {
+					return nil, "", fmt.Errorf("%w: created_at cursor sort value is not RFC3339Nano", ErrInvalidCursor)
+				}
+				formatted := formatTime(t)
+				where = append(where, "created_at "+ledgerBoundOp+" "+arg(formatted))
+				where = append(where, fmt.Sprintf("(created_at, id) %s (%s, %s)",
+					cursorOp, arg(formatted), arg(id)))
+			}
+		}
 	}
 
 	query := `SELECT ` + eventColumnsSQLite + ` FROM events`
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
-	query += " ORDER BY id " + orderDir + " LIMIT " + arg(limit+1)
+	query += " ORDER BY " + orderCols + " LIMIT " + arg(limit+1)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -373,7 +469,7 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 	next := ""
 	if len(events) > limit {
 		events = events[:limit]
-		next = events[limit-1].ID
+		next = EncodeCursor(f.OrderBy, events[limit-1])
 	}
 	return events, next, nil
 }

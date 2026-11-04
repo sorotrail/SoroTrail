@@ -86,3 +86,32 @@ an index no read uses. `BenchmarkUpsertEvents_Batch*` in
 `postgres_bench_test.go` provides the throughput baseline; re-run after any
 index change (`go test -tags=integration -bench=BenchmarkUpsert -benchmem
 ./internal/store/`).
+
+## Deep cursor pagination & partition pruning
+
+Because `events` is range-partitioned by `ledger` (`PARTITION BY RANGE (ledger)`),
+keyset pagination over wide ledger ranges benefits from pairing the total-order
+cursor predicate with an inclusive scalar `ledger` bound (`buildQueryEventsSQL`
+in `internal/store/postgres.go`):
+
+1. **`ORDER BY id` with canonical 64-bit Stellar TOID cursors**:
+   - A canonical Stellar SEP-0035 TOID (`<20-digit TOID>-<10-digit seq>`)
+     stores the ledger sequence in its upper 32 bits (`toid >> 32`).
+   - `store.CursorLedger` extracts that ledger sequence when `toid >= (1 << 32)`
+     and injects `ledger >= $N` (for `ASC`) or `ledger <= $N` (for `DESC`)
+     alongside `id > $M` / `id < $M`.
+   - PostgreSQL's partition pruner eliminates every child partition before (or
+     after) the cursor's ledger on every deep page, and `idx_events_contract_ledger_id`
+     `(contract_id, ledger, id)` or `idx_events_ledger` bounds the index scan.
+2. **`ORDER BY ledger, id` with composite cursors**:
+   - A row-value predicate `(ledger, id) > ($1::bigint, $2)` alone does not
+     trigger PostgreSQL range partition pruning on `PARTITION BY RANGE (ledger)`.
+   - `buildQueryEventsSQL` adds the scalar bound `ledger >= $1::bigint` (for
+     `ASC`) or `ledger <= $1::bigint` (for `DESC`) reusing the same `$1`
+     parameter, enabling partition pruning while `idx_events_contract_ledger_id`
+     delivers rows in index order with no `Sort` node.
+3. **Zero additional index write cost**:
+   - Both deep-pagination optimizations reuse the existing composite and
+     partition indexes (`idx_events_contract_ledger_id`, `idx_events_contract_id_id`,
+     `idx_events_ledger`, and `idx_events_topics`), adding **0 new indexes** and
+     **0% additional `INSERT`/`UPSERT` write amplification**.
