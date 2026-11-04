@@ -35,6 +35,8 @@ var completionCommands = []completionCommand{
 	{"version", "print the build version, commit, and build date"},
 	{"config", "print the effective configuration with secrets redacted"},
 	{"preflight", "run startup self-checks (config, database, migrations, RPC, archive, retention)"},
+	{"backup", "snapshot operator configuration, checkpoints, and optional events"},
+	{"restore", "restore and verify a backup archive into a migrated database"},
 	{"help", "show this help message"},
 }
 

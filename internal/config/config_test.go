@@ -1741,3 +1741,79 @@ func TestParseEndpointBodyLimitsAndOverrides(t *testing.T) {
 	_, err = ParseEndpointBodyLimits("POST /watched-contracts=-1")
 	assert.Error(t, err)
 }
+
+func TestConfig_FieldLevelEncryptionValidationAndRedaction(t *testing.T) {
+	hexKey1 := strings.Repeat("a1", 32)
+	hexKey2 := strings.Repeat("b2", 32)
+
+	t.Run("single ENCRYPTION_KEY and multi-version ENCRYPTION_KEYS load and validate", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("DATABASE_URL", "postgres://user:pass@localhost/sorotrail")
+		t.Setenv("RPC_URL", "https://soroban-testnet.stellar.org")
+		t.Setenv("ENCRYPTION_KEY", hexKey1)
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, hexKey1, cfg.EffectiveEncryptionKeySpec())
+
+		t.Setenv("ENCRYPTION_KEYS", "v2:"+hexKey2+",v1:"+hexKey1)
+		cfg, err = Load()
+		require.NoError(t, err)
+		assert.Equal(t, "v2:"+hexKey2+",v1:"+hexKey1, cfg.EffectiveEncryptionKeySpec())
+	})
+
+	t.Run("ENCRYPTION_KEY_FILE and ENCRYPTION_KEYS_FILE load via resolveFileEnv", func(t *testing.T) {
+		clearEnv(t)
+		dir := t.TempDir()
+		keyFile := dir + "/enc_key.txt"
+		keysFile := dir + "/enc_keys.txt"
+		require.NoError(t, os.WriteFile(keyFile, []byte(hexKey1+"\n"), 0o600))
+		require.NoError(t, os.WriteFile(keysFile, []byte("v2:"+hexKey2+",v1:"+hexKey1+"\n"), 0o600))
+
+		t.Setenv("DATABASE_URL", "postgres://user:pass@localhost/sorotrail")
+		t.Setenv("RPC_URL", "https://soroban-testnet.stellar.org")
+		t.Setenv("ENCRYPTION_KEY_FILE", keyFile)
+		t.Setenv("ENCRYPTION_KEYS_FILE", keysFile)
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, hexKey1, cfg.EncryptionKey)
+		assert.Equal(t, "v2:"+hexKey2+",v1:"+hexKey1, cfg.EncryptionKeys)
+		assert.Equal(t, "v2:"+hexKey2+",v1:"+hexKey1, cfg.EffectiveEncryptionKeySpec())
+	})
+
+	t.Run("invalid key length, invalid version identifier, or duplicate version fails startup without leaking raw key", func(t *testing.T) {
+		clearEnv(t)
+		shortSecret := "c2hvcnRfa2V5XzE2Ynl0ZQ==" // "short_key_16byte" (16 bytes)
+		t.Setenv("DATABASE_URL", "postgres://user:pass@localhost/sorotrail")
+		t.Setenv("RPC_URL", "https://soroban-testnet.stellar.org")
+		t.Setenv("ENCRYPTION_KEY", shortSecret)
+
+		_, err := Load()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ENCRYPTION_KEY")
+		assert.Contains(t, err.Error(), "want 32-byte AES-256 key")
+		assert.NotContains(t, err.Error(), shortSecret)
+
+		t.Setenv("ENCRYPTION_KEY", "")
+		t.Setenv("ENCRYPTION_KEYS", "v1:"+hexKey1+",v1:"+hexKey2)
+		_, err = Load()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duplicate key version \"v1\"")
+		assert.NotContains(t, err.Error(), hexKey1)
+		assert.NotContains(t, err.Error(), hexKey2)
+
+		for _, badVer := range []string{"v1.0", "-v1", "_v1"} {
+			t.Setenv("ENCRYPTION_KEYS", badVer+":"+hexKey1)
+			_, err = Load()
+			require.Error(t, err, "version %q must be rejected", badVer)
+			assert.Contains(t, err.Error(), "invalid key version identifier")
+			assert.NotContains(t, err.Error(), hexKey1)
+		}
+	})
+
+	t.Run("sensitiveEnvVars redacts ENCRYPTION_KEY and ENCRYPTION_KEYS", func(t *testing.T) {
+		assert.Equal(t, "***", redact("ENCRYPTION_KEY", hexKey1))
+		assert.Equal(t, "***", redact("ENCRYPTION_KEYS", "v2:"+hexKey2+",v1:"+hexKey1))
+	})
+}

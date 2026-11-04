@@ -816,55 +816,106 @@ If a certificate reload fails transiently (for example while Kubernetes updates 
 
 ## Backup and restore
 
-### What to back up
+### Irreplaceable vs. reconstructible state
 
-SoroTrail's only persistent state is the Postgres database. There are no
-files on disk that matter (the binary is stateless, cursors and progress
-are in the database).
+SoroTrail separates **irreplaceable operator configuration and checkpoints** (which do not exist on-chain and must be backed up) from **reconstructible chain events** (which can be re-indexed from Stellar RPC or ledger archives via `sorotrail backfill`, or optionally included in a full snapshot via `--include-events`):
 
-### Backup procedure
+| Table | Category | Backed up by default (`sorotrail backup`) | Recovery method |
+| --- | --- | --- | --- |
+| `watched_contracts` | **Irreplaceable** | Yes | Restored from backup; operator watch list does not exist on-chain. |
+| `contract_cursors` | **Irreplaceable** | Yes | Restored from backup; per-contract ingestion resume checkpoints. |
+| `ingestion_state` | **Irreplaceable** | Yes | Restored from backup; per-network global ingestion checkpoint (`last_ingested_ledger`, `last_cursor`, `last_successful_poll`). |
+| `audit_state` | **Irreplaceable** | Yes | Restored from backup; gap-audit watermark (`verified_through_ledger`). |
+| `audit_findings` | **Irreplaceable** | Yes | Restored from backup; historical gap-audit findings and repair status. |
+| `replay_state` | **Irreplaceable** | Yes | Restored from backup; in-progress decoder replay checkpoint. |
+| `backfill_state` | **Irreplaceable** | Yes | Restored from backup; parallel backfill range checkpoints (`ranges_json`). |
+| `subscriptions` | **Irreplaceable** | Yes | Restored from backup; webhook callback URLs, filters, and HMAC secrets. |
+| `api_keys` | **Irreplaceable** | Yes | Restored from backup; operator API key prefixes, bcrypt hashes, and revocation timestamps. |
+| `tenants`, `tenant_contract_grants`, `tenant_watched_contracts`, `tenant_api_keys` | **Irreplaceable** | Yes | Restored from backup; multi-tenant definitions, rate-limit quotas, ACL grants, and SHA-256 key hashes. |
+| `contract_specs` | **Irreplaceable** | Yes | Restored from backup; cached contract WASM specs. |
+| `contract_spec_overrides` | **Irreplaceable** | Yes | Restored from backup; operator-uploaded custom contract event specs. |
+| `contract_spec_override_history` | **Irreplaceable** | Yes | Restored from backup; immutable audit trail of spec override changes. |
+| `events` | **Reconstructible** | Optional (`--include-events`) | Re-indexed from Stellar RPC / ledger archives via `sorotrail backfill --from <min> --to <max>`, or included in full snapshots via `--include-events`. Even when omitted, `event_summary` (`total_count`, `min_ledger`, `max_ledger`, `per_contract_counts`) is always recorded in the backup manifest. |
+| `delivery_attempts` | **Reconstructible / Transient** | No | Transient webhook delivery telemetry; not required for resume correctness. |
+
+### Backup procedure (`sorotrail backup` & `pg_dump`)
+
+#### 1. Application-level portable backup (`sorotrail backup`)
+
+`sorotrail backup` produces a self-describing, SHA-256 integrity-verified JSON archive across both PostgreSQL and SQLite backends:
 
 ```sh
-# Full logical backup (recommended for small-to-medium databases).
-pg_dump "$DATABASE_URL" > sorotrail-backup-$(date +%Y%m%d-%H%M%S).sql
+# Fast configuration + checkpoint backup (recommended for frequent cron snapshots;
+# omits reconstructible chain events while recording event_summary bounds):
+sorotrail backup \
+  --output "sorotrail-config-$(date +%Y%m%d-%H%M%S).json" \
+  --secrets encrypt \
+  --passphrase "$SOROTRAIL_BACKUP_PASSPHRASE"
 
-# Or compressed:
-pg_dump "$DATABASE_URL" | gzip > sorotrail-backup-$(date +%Y%m%d-%H%M%S).sql.gz
+# Self-contained full backup (includes all stored chain events):
+sorotrail backup \
+  --output "sorotrail-full-$(date +%Y%m%d-%H%M%S).json" \
+  --include-events \
+  --secrets encrypt \
+  --passphrase "$SOROTRAIL_BACKUP_PASSPHRASE"
 ```
 
-For large databases, use `pg_basebackup` or your cloud provider's snapshot
-feature.
+#### 2. Native PostgreSQL physical/logical backup (`pg_dump`)
 
-### When to back up
-
-- Before upgrading the binary (migrations run automatically on startup).
-- Before changing `WATCHED_CONTRACTS` or `START_LEDGER`.
-- Periodically if you want point-in-time recovery.
-
-### Restore procedure
+For large multi-gigabyte PostgreSQL deployments where full event partitions are snapshotted alongside configuration:
 
 ```sh
-# Restore from a logical backup.
-# WARNING: this drops and recreates tables. Stop SoroTrail first.
-psql "$DATABASE_URL" < sorotrail-backup-YYYYMMDD-HHMMSS.sql
-
-# Then restart SoroTrail — it will re-run migrations if needed and resume
-# ingestion from the persisted cursor.
+# Custom-format compressed logical dump:
+pg_dump -Fc "$DATABASE_URL" > "sorotrail-backup-$(date +%Y%m%d-%H%M%S).dump"
 ```
 
-### What is NOT in the backup
+### Secret handling (`--secrets include|redact|encrypt`)
 
-- The running process state (cursor, backoff counter). On restart, the
-  ingester resumes from the persisted `ingestion_state` row.
-- Audit state and findings. These are in the database and will be restored.
-- Replay state. Also in the database.
+Webhook signing keys (`subscriptions.secret`) and API key hashes (`api_keys.key_hash`, `tenant_api_keys.key_hash`) are handled explicitly:
 
-### Recovery point objective
+- **`--secrets=encrypt` (recommended for off-host/S3 storage):** Encrypts every secret field with AES-256-GCM using a key derived from `--passphrase` (or `SOROTRAIL_BACKUP_PASSPHRASE`) and a per-archive random 128-bit salt (`encryption_salt`). Restoring requires the matching passphrase; a wrong passphrase fails deterministically before committing any database changes.
+- **`--secrets=redact` (safe for sharing archives in bug reports or staging drills):** Replaces secrets with `"REDACTED"`. On restore, any redacted webhook subscription is automatically inserted with `enabled = false` (`redacted_subscriptions_disabled` in the restore output) so the webhook worker will not sign deliveries with a placeholder secret until an operator rotates the secret and re-enables the subscription.
+- **`--secrets=include` (default for local administrative snapshots):** Writes secrets in plaintext JSON, enforces `0600` (owner read/write only) permissions on the output file, and prints a warning to `stderr`.
 
-SoroTrail's RPO is effectively zero under normal operation — every
-successful RPC page is immediately persisted. If the process crashes between
-pages, at most one page of events (up to 1000 events) needs to be
-re-fetched. Idempotent upserts mean re-fetching never creates duplicates.
+### Restore & post-restore verification procedure (`sorotrail restore`)
+
+`sorotrail restore` verifies the archive's `integrity_sha256` checksum and `schema_version` compatibility before executing a single atomic transaction:
+
+- **Safety guard against accidental overwrite:** `sorotrail restore` refuses to overwrite a database that already contains operator state or events (`restore target database is not empty`) unless `--force` is explicitly passed.
+- **Cross-version migration compatibility:** An archive created under an older migration version (`archive.schema_version <= target.schema_version`) restores cleanly into a newer schema, automatically populating defaults (such as `network = 'default'`) for columns added in later migrations. An archive from a newer schema than the target database is rejected (`ErrBackupNewerSchema`) until `sorotrail migrate up` is run.
+
+```sh
+# 1. Apply all migrations to the fresh target database:
+DATABASE_URL="$NEW_DATABASE_URL" sorotrail migrate up
+
+# 2. Restore the archive and run completeness + retention verification (--verify is enabled by default):
+DATABASE_URL="$NEW_DATABASE_URL" sorotrail restore \
+  --input sorotrail-full-YYYYMMDD-HHMMSS.json \
+  --passphrase "$SOROTRAIL_BACKUP_PASSPHRASE" \
+  --verify
+```
+
+When `--verify` is active (the default), `sorotrail restore` re-reads the live database after commit and verifies:
+1. Row counts and primary keys across all 16 irreplaceable tables (`watched_contracts`, `contract_cursors`, `ingestion_state`, `audit_state`, `audit_findings`, `replay_state`, `backfill_state`, `subscriptions`, `api_keys`, `tenants` + grants, `contract_specs`, `contract_spec_overrides`, `contract_spec_override_history`) and `events` (when `--include-events` was used).
+2. Secret round-trip integrity (or disabled status when `--secrets=redact` was used).
+3. Retention and partition consistency (`retention_report`).
+
+### Interaction with event retention and partitioning
+
+- **Restoring a config-only backup (`--include-events=false`):** `sorotrail restore --verify` compares the restored `ingestion_state.last_ingested_ledger` against the snapshot's `event_summary` (`[min_ledger..max_ledger]`), sets `retention_report.backfill_required = true`, and prints the exact `sorotrail backfill --from <min_ledger> --to <max_ledger>` command needed to reconstruct historical chain events (or notes that starting `sorotrail` will resume forward from `last_ingested_ledger`).
+- **Retention floor alignment (`--retention-min-ledger`):** Pass `--retention-min-ledger <N>` when restoring into an instance with active time/ledger pruning (`RETENTION_DAYS`) or detached PostgreSQL range partitions. If the archive's `event_summary.min_ledger` or `audit_state.verified_through_ledger` precedes the retention floor, `sorotrail restore` emits a structured warning so operators know which historical ledger range falls outside the active retention window.
+
+### Measured RPO and RTO (automated DR drill)
+
+The disaster recovery drill is exercised continuously in CI (`TestDisasterRecoveryDrill_FullAndConfigOnlyRestoreWithMeasuredRPORTO` in `internal/store/backup_restore_test.go` and `TestCLIBackupAndRestore_EndToEndDrill` in `cmd/sorotrail/backup_test.go`) against a populated database (3 watched contracts, per-contract cursors, ingestion & audit state, audit findings, replay checkpoint, webhook subscriptions with HMAC secrets, contract WASM specs, spec overrides + history, and 300 events across ledgers `500000..500299`):
+
+| Metric | Config + Checkpoint Backup (`--include-events=false`) | Full Snapshot (`--include-events=true`, 300 events) |
+| --- | --- | --- |
+| **Backup duration** | `~33 ms` | `~64 ms` |
+| **Atomic restore transaction** | `~45 ms` | `~196 ms` |
+| **End-to-end RTO (migrate + restore + verify)** | `~120 ms` | `~352 ms` |
+| **RPO (irreplaceable config & checkpoints)** | **`0` rows lost** | **`0` rows lost** |
+| **RPO (chain events)** | Reconstructible via `sorotrail backfill` from restored cursor | **`0` rows lost** (or at most 1 in-flight RPC page if the process crashed mid-poll) |
 
 ---
 
