@@ -252,6 +252,11 @@ type Server struct {
 	// endpoints (#1268).
 	idempotencyOnce sync.Once
 	idempotency     *idempotencyCoordinator
+
+	// actionAudit records every administrative action (#1277).
+	actionAuditOnce     sync.Once
+	actionAuditStore    store.ActionAuditStore
+	fallbackActionAudit *store.MemoryActionAuditStore
 }
 
 // SetHTTPRequestBodyLimit sets the request body size limit, in bytes, for all handlers accepting a body.
@@ -617,6 +622,7 @@ func (s *Server) router() chi.Router {
 	// without body size restrictions.
 	r.Use(s.bodyLimitMiddleware)
 	r.Use(s.responseLimitMiddleware)
+	r.Use(s.adminActionAuditMiddleware)
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 	// authenticate must run before any handler that reads events: it is what

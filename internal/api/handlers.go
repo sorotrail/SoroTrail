@@ -151,6 +151,22 @@ var cachePrivate atomic.Bool
 
 func SetCachePrivate(v bool) { cachePrivate.Store(v) }
 
+var maxSparseFilterLedgerSpan atomic.Int64
+
+// SetMaxSparseFilterLedgerSpan configures the maximum ledger span allowed
+// when querying sparse JSONB topic filters (topic, topic_contains, topic0..topic3)
+// on /events and /contracts/{id}/events. A value <= 0 disables the API-level cap.
+func SetMaxSparseFilterLedgerSpan(span int64) {
+	maxSparseFilterLedgerSpan.Store(span)
+	store.SetMaxSparseFilterLedgerSpan(span)
+}
+
+// MaxSparseFilterLedgerSpan returns the currently configured maximum ledger
+// span for sparse JSONB topic filters.
+func MaxSparseFilterLedgerSpan() int64 {
+	return maxSparseFilterLedgerSpan.Load()
+}
+
 // tenantScoped mirrors Server.multiTenant for the package-level cache
 // helpers, which are plain functions and have no server to ask.
 // WithMultiTenancy sets it at startup, before any request is served.
@@ -701,6 +717,11 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 
 	events, cursor, qerr := s.store.QueryEvents(ctx, filter)
 
+	if errors.Is(qerr, store.ErrSparseFilterRangeTooWide) || errors.Is(qerr, store.ErrInvalidCursor) {
+		writeFilterError(w, qerr)
+		return
+	}
+
 	if qerr != nil {
 
 		loggerFromContext(ctx).Error("streaming events (first batch)", "error", qerr)
@@ -935,6 +956,11 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 
 		return
 
+	}
+
+	if errors.Is(qerr, store.ErrSparseFilterRangeTooWide) {
+		writeFilterError(w, qerr)
+		return
 	}
 
 	if qerr != nil {
@@ -2808,6 +2834,12 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		}
 		f.Order = "desc"
 		f.Limit = n
+	}
+
+	if span := maxSparseFilterLedgerSpan.Load(); span > 0 {
+		if err := store.ValidateSparseFilterRange(f, span); err != nil {
+			return f, err
+		}
 	}
 
 	return f, nil

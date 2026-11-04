@@ -294,3 +294,34 @@ When the ingester falls behind the chain head by more than `LagWarnLedgers`, rep
    - While the ingester is lagging, background passes and batch loops yield early (`reason="ingest_lagging"`) and increment per-component yield counters (`LagYields`).
    - To prevent indefinite starvation of retention pruning, cold-storage archiving, or audit-log verification during prolonged chain catch-up, each job has a configurable maximum deferral window (`LagMaxDeferral`, default `15m`). Once a job has been continuously deferred for `>= MaxDeferral`, `ShouldYield(job)` returns `(false, "max_deferral_reached")`, allowing one bounded maintenance pass to run and resetting that job's deferral timer.
 
+---
+
+## 6. Deep Pagination Over Wide Ledger Ranges
+
+Walking hundreds of pages across wide ledger windows (`GET /events` and `GET /contracts/{id}/events`) stays flat in per-page latency (`O(limit)`) when two query-planner properties hold:
+
+1. **Cursor-Driven Partition Pruning (`store.CursorLedger` & `buildQueryEventsSQL`)**:
+   - The `events` table is range-partitioned by `ledger` (`PARTITION BY RANGE (ledger)` with `DefaultEventPartitionSpan = 120,960` ledgers per child partition).
+   - Under `order_by=id` (default), canonical 64-bit Stellar SEP-0035 TOIDs (`<20-digit TOID>-<10-digit seq>`) encode the ledger sequence in their upper 32 bits (`toid >> 32`). `CursorLedger` extracts that ledger and `buildQueryEventsSQL` appends an inclusive scalar bound (`ledger >= $N` for `asc`, `ledger <= $N` for `desc`) alongside `id > $M` / `id < $M`.
+   - Under `order_by=ledger`, PostgreSQL row-value comparisons `(ledger, id) > ($1::bigint, $2)` alone do not trigger range partition pruning. `buildQueryEventsSQL` therefore emits the scalar `ledger >= $1::bigint` (or `ledger <= $1::bigint` for `desc`) reusing the same bind parameter alongside `(ledger, id) > ($1::bigint, $2)`.
+   - In both orderings, PostgreSQL prunes every child partition prior to (for `asc`) or after (for `desc`) the cursor's ledger and bounds the `(contract_id, ledger, id)` or `(ledger, id)` index scan without touching earlier partitions.
+
+2. **Sparse Topic Filter Range Bounding (`store.ValidateSparseFilterRange`)**:
+   - When a query filters on sparse JSONB topic predicates (`topic`, `topic_contains`, `topic0..topic3`) that match few or zero rows across millions of events, an unbounded cursor walk would otherwise scan every partition or intersect large GIN posting lists across the entire retention window before filling a single page.
+   - When `MaxSparseFilterLedgerSpan` is enabled (`store.DefaultMaxSparseFilterLedgerSpan = 500,000` ledgers, ~4 partitions, via `store.Postgres.SetMaxSparseFilterLedgerSpan`, `api.SetMaxSparseFilterLedgerSpan`, or `EventFilter.MaxSparseFilterLedgerSpan`), sparse topic queries that omit `from_ledger`/`to_ledger` or span more than the configured ledger window fail fast with `store.ErrSparseFilterRangeTooWide` (`HTTP 400 Bad Request`, `code: "RANGE_TOO_WIDE"`, `field: "to_ledger"`).
+   - **Consumer Guidance**: For sparse topic searches, bound `[from_ledger, to_ledger]` to `<= 500,000` ledgers per window and advance the window sequentially, or use the streaming bulk export endpoints (`GET /events.csv` and `GET /contracts/{id}/export`) which stream bounded 200-row cursor pages in flat heap memory.
+
+### Deep Pagination Benchmark Results (`BenchmarkDeepPagination_WideRange`)
+
+Measured via `go test -bench=BenchmarkDeepPagination_WideRange -benchmem ./internal/store` across a 6,000-event wide-range dataset spanning 500,000 ledgers (`100,000..599,750`, 3 events/ledger, 8 contracts, `Limit=50`, `ANALYZE` run after seed, Apple M4 `arm64`):
+
+| Scenario | Page 1 (`ns/op`) | Page 20 (`ns/op`) | Page 50 (`ns/op`) | Page 100 (`ns/op`) | Page 20 → 100 Drift | Memory / Page (`B/op`) | Allocs / Page |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `OrderByID_Asc` | 79,954 ns (0.080 ms) | 88,944 ns (0.089 ms) | 88,755 ns (0.089 ms) | **90,183 ns (0.090 ms)** | **+1.4% (flat)** | 96,528 B | 1,381 allocs |
+| `OrderByID_Desc` | 89,503 ns (0.090 ms) | 99,019 ns (0.099 ms) | 97,921 ns (0.098 ms) | **98,444 ns (0.098 ms)** | **-0.6% (flat)** | 96,520 B | 1,381 allocs |
+| `OrderByLedger_Asc` | 81,296 ns (0.081 ms) | 93,606 ns (0.094 ms) | 93,889 ns (0.094 ms) | **93,613 ns (0.094 ms)** | **+0.0% (flat)** | 97,018 B | 1,392 allocs |
+| `OrderByLedger_Desc` | 91,240 ns (0.091 ms) | 103,066 ns (0.103 ms) | 102,843 ns (0.103 ms) | **102,642 ns (0.103 ms)** | **-0.4% (flat)** | 97,020 B | 1,392 allocs |
+| `ContractFiltered_OrderByID` | 93,653 ns (0.094 ms) | 105,583 ns (0.106 ms) | — | — | **flat** | 96,784 B | 1,385 allocs |
+| `SparseTopic_BoundedLedgerRange` | 1,158,714 ns (1.16 ms) | — (page 3: 1.15 ms) | — | — | **-0.5% (flat)** | 56,984 B | 1,001 allocs |
+
+

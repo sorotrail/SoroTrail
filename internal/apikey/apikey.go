@@ -73,6 +73,55 @@ func Parse(key string) (prefix, secret string, ok bool) {
 	return prefix, secret, true
 }
 
+// TenantSchemePrefix is the fixed prefix carried by every tenant-scoped API key
+// ("st_<prefix>_<secret>").
+const TenantSchemePrefix = "st_"
+
+// RedactIdentifier extracts a public, non-secret key identifier from a
+// presented bearer token or key prefix. For "sorotrail_<prefix>_<secret>" it
+// returns ("sorotrail_<prefix>", true); for "st_<prefix>_<secret>" it returns
+// ("st_<prefix>", true). Already-redacted identifiers ("sorotrail_<prefix>" or
+// "st_<prefix>" without a secret suffix) are returned unchanged. Arbitrary
+// bearer tokens return ("", false) so callers never persist raw secrets.
+func RedactIdentifier(presented string) (string, bool) {
+	presented = strings.TrimSpace(presented)
+	if presented == "" {
+		return "", false
+	}
+	if prefix, _, ok := Parse(presented); ok {
+		return SchemePrefix + prefix, true
+	}
+	if strings.HasPrefix(presented, TenantSchemePrefix) {
+		rest := strings.TrimPrefix(presented, TenantSchemePrefix)
+		idx := strings.IndexByte(rest, '_')
+		if idx > 0 {
+			prefix := rest[:idx]
+			secret := rest[idx+1:]
+			if secret != "" && !strings.ContainsRune(secret, '_') &&
+				!strings.ContainsAny(prefix, " \t\n\r") && !strings.ContainsAny(secret, " \t\n\r") {
+				return TenantSchemePrefix + prefix, true
+			}
+		} else if rest != "" && !strings.ContainsAny(rest, " \t\n\r") {
+			return TenantSchemePrefix + rest, true
+		}
+	}
+	if strings.HasPrefix(presented, SchemePrefix) {
+		rest := strings.TrimPrefix(presented, SchemePrefix)
+		idx := strings.IndexByte(rest, '_')
+		if idx > 0 {
+			prefix := rest[:idx]
+			secret := rest[idx+1:]
+			if secret != "" && !strings.ContainsRune(secret, '_') &&
+				!strings.ContainsAny(prefix, " \t\n\r") && !strings.ContainsAny(secret, " \t\n\r") {
+				return SchemePrefix + prefix, true
+			}
+		} else if rest != "" && !strings.ContainsAny(rest, " \t\n\r") {
+			return SchemePrefix + rest, true
+		}
+	}
+	return "", false
+}
+
 // isHex reports whether s is exactly n lowercase hexadecimal digits
 // (hex.EncodeToString output).
 func isHex(s string, n int) bool {

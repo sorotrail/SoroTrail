@@ -140,3 +140,15 @@ The read-only GraphQL schema in `internal/api/graphql/schema.graphqls` follows t
 3. **Wire behavior during and after the window:**
    - Throughout the deprecation window, resolvers continue to populate deprecated fields so existing GraphQL queries succeed without errors.
    - After the Sunset date and at least two minor releases have elapsed, the field or enum value is removed from `internal/api/graphql/schema.graphqls` and `gqlgen` code is regenerated. Queries still selecting the removed field after Sunset receive a standard GraphQL validation error (`Cannot query field "..." on type "..."`) before resolver execution.
+
+---
+
+## Pagination Cursor Stability Contract
+
+Pagination cursors returned in `cursor` response fields and `Link: <...>; rel="next"` headers are opaque tokens governed by the [Pagination Cursor Stability Contract](reference/cursors.md):
+
+- **Envelope format:** Composite and non-TOID cursors use a versioned, backend-tagged envelope with a keyed HMAC-SHA256 integrity checksum (`<version>.<backend>.<payload_b64url>.<mac_b64url>`, currently `v2`). Default `order_by=id` event cursors emit the canonical event TOID verbatim.
+- **Compatibility across upgrades:** Cursors minted under `v1` (and legacy unversioned base64url cursors) remain accepted across minor and patch upgrades. Any breaking change to the cursor envelope bumps the version prefix and retains decoding support for the prior version for at least one minor release window.
+- **Deterministic rejection (`400 Bad Request` / `INVALID_CURSOR`):** A cursor replayed against a different storage backend (`pg` vs `sq` vs `ch`), a different `order_by` / `sort_key` ordering, an unsupported cursor version (`v0`, `v3`, ...), or with a tampered payload/MAC is rejected with HTTP `400 Bad Request` (`code: "INVALID_CURSOR"`, `field: "cursor"`) and never `500 Internal Server Error` or silent wrong results.
+- **Client recovery:** SDK consumers can detect stale or invalidated cursors via `client.IsStaleCursor(err)` / `errors.Is(err, client.ErrStaleCursor)` and fall back to their last durably processed `from_ledger` anchor.
+
