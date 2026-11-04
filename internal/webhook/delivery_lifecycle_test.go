@@ -67,8 +67,15 @@ func TestWebhookDeliveryLifecycle_Table(t *testing.T) {
 				if tt.expectSignature {
 					assert.NotEmpty(t, r.Header.Get(SignatureHeader))
 					body, _ := io.ReadAll(r.Body)
-					expectedSig := Sign("secret123", body)
+					expectedSig := SignDelivery(
+						"secret123",
+						r.Header.Get(IdempotencyKeyHeader),
+						r.Header.Get(DeliveryAttemptHeader),
+						r.Header.Get(DeliveryTimestampHeader),
+						body,
+					)
 					assert.Equal(t, expectedSig, r.Header.Get(SignatureHeader))
+					assert.True(t, VerifyDelivery("secret123", r.Header, body))
 				}
 
 				tt.serverHandler(w, r)

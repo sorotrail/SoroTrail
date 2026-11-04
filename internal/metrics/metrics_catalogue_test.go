@@ -183,6 +183,25 @@ var metricCatalogue = []metricSpec{
 		Meaning: "One 0/1 series per (provider, state). Only present in multi-provider mode (RPC_URLS). Shows which provider traffic is on and which have failed, without reading logs.",
 		touch:   func() { RPCProviderState.WithLabelValues("localhost", "active") },
 	},
+	{
+		Name: "sorotrail_rpc_provider_demotions_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "provider", Values: "the hostname of one RPC_URLS entry — scheme, credentials, path and query are stripped, so nothing client-identifying is exported"},
+			{Name: "reason", Values: "consecutive_errors | behind_cursor | retention_gap | network_mismatch | divergence"},
+		},
+		Help:    "Total number of RPC provider demotions, labelled by provider and reason.",
+		Meaning: "Every time a provider is demoted from active to degraded or down, labelled by the exact reason: consecutive network/5xx errors, lagging behind the ingestion cursor, retention window not covering the requested ledger range, network passphrase mismatch, or divergent event answers for an overlapping ledger.",
+		touch:   func() { RPCProviderDemotionsTotal.WithLabelValues("localhost", "consecutive_errors") },
+	},
+	{
+		Name: "sorotrail_rpc_provider_promotions_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "provider", Values: "the hostname of one RPC_URLS entry — scheme, credentials, path and query are stripped, so nothing client-identifying is exported"},
+		},
+		Help:    "Total number of RPC provider promotions back to active, labelled by provider.",
+		Meaning: "Every time a degraded or down provider completes probation and returns to active rotation.",
+		touch:   func() { RPCProviderPromotionsTotal.WithLabelValues("localhost") },
+	},
 
 	// --- Storage ---
 	{

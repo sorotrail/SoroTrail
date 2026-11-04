@@ -115,3 +115,50 @@ The canonical label set is documented above and mirrored for automation in
 `.github/labeler.yml` (PR path → `area/*` rules). When you add a new
 `area/*` or `type/*` label, update both this guide and the labeler config so
 the two don't drift.
+
+## Diagnosing a Failover-Induced Gap
+
+When triaging an `area/rpc` or `area/ingester` report where events appear
+missing or delayed around an RPC provider switch, check the failover metrics
+and structured logs in the following order:
+
+1. **Confirm whether a provider switch or cursor re-anchor occurred:**
+   - Query `rate(sorotrail_rpc_failovers_total[5m])` by `reason`:
+     - `reason="switch"` indicates the active provider changed between calls.
+     - `reason="reanchor"` indicates a switch occurred mid-pagination while a
+       cursor was active; the ingester discards the foreign cursor and
+       re-anchors from the last ingested ledger.
+   - Check `sorotrail_rpc_provider_state{provider, state}` to see which
+     providers are currently `active`, `degraded`, or `down`.
+
+2. **Inspect per-provider demotion reasons and promotions:**
+   - Query `increase(sorotrail_rpc_provider_demotions_total[1h])` by `provider`
+     and `reason`:
+     - `reason="consecutive_errors"`: transport errors or HTTP 5xx responses
+       exceeded `maxConsecutiveErrors`.
+     - `reason="behind_cursor"`: candidate provider reported a `LatestLedger`
+       behind the current ingestion cursor (or lagged the highest observed
+       chain head beyond `headSkewTolerance`) and was skipped before advancing
+       the cursor.
+     - `reason="retention_gap"`: candidate provider's `OldestLedger` started
+       after the requested `StartLedger` (or returned `IsLedgerOutOfRange`). If
+       every configured provider has aged past the cursor, the ingester logs
+       `resume ledger fell outside RPC retention window; skipping ahead` and
+       increments `sorotrail_ledger_gaps_detected_total`.
+     - `reason="network_mismatch"`: candidate provider's `getNetwork`
+       passphrase did not match the configured Stellar network; the provider is
+       permanently pinned to `down` and never promoted.
+     - `reason="divergence"`: candidate provider returned event IDs or payloads
+       for an overlapping ledger range that disagreed with events already
+       observed from the previous provider.
+   - Query `increase(sorotrail_rpc_provider_promotions_total[1h])` to spot
+     flapping providers that repeatedly recover via `getHealth` probes and get
+     re-demoted on live traffic.
+
+3. **Correlate with structured log lines:**
+   - `provider behind cursor on selection path — skipping` / `provider response latestLedger is behind cursor — skipping`
+   - `provider retention gap detected in getEvents response — skipping` / `provider returned ledger out of range — failing over`
+   - `provider network passphrase mismatch — rejecting provider`
+   - `provider returned divergent event data — demoting to down`
+   - `provider switch with active cursor — re-anchor required`
+

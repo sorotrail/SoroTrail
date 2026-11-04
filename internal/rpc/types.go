@@ -97,6 +97,13 @@ type Health struct {
 	LedgerRetentionWindow uint32 `json:"ledgerRetentionWindow"`
 }
 
+// NetworkInfo is the result of getNetwork.
+type NetworkInfo struct {
+	FriendbotURL    string `json:"friendbotUrl,omitempty"`
+	Passphrase      string `json:"passphrase"`
+	ProtocolVersion uint32 `json:"protocolVersion,omitempty"`
+}
+
 // GetLedgerEntriesRequest is the params for getLedgerEntries.
 type GetLedgerEntriesRequest struct {
 	Keys []string `json:"keys"` // base64-encoded LedgerKey XDR
