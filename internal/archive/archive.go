@@ -10,11 +10,13 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"sync/atomic"
 	"time"
 
@@ -148,6 +150,10 @@ type Options struct {
 	SecretAccessKey string
 	// UseSSL controls whether the S3 endpoint uses TLS.
 	UseSSL bool
+	// TLSConfig configures outbound TLS/mTLS (client certificate + custom CA
+	// bundle) for the S3-compatible archive endpoint. When non-nil, TLS is
+	// enabled automatically.
+	TLSConfig *tls.Config
 	// MaxRetries is the per-chunk retry budget. Default 3.
 	MaxRetries int
 	// Logger is the structured logger. When nil a discard logger is used.
@@ -191,7 +197,12 @@ func New(st store.Store, opts Options) (*Archiver, error) {
 	}
 
 	minioOpts := &minio.Options{
-		Secure: opts.UseSSL,
+		Secure: opts.UseSSL || opts.TLSConfig != nil,
+	}
+	if opts.TLSConfig != nil {
+		minioOpts.Transport = &http.Transport{
+			TLSClientConfig: opts.TLSConfig.Clone(),
+		}
 	}
 	if opts.Region != "" {
 		minioOpts.Region = opts.Region

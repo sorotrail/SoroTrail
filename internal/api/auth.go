@@ -380,6 +380,12 @@ var publicPaths = map[string]bool{
 // rely on scopeFrom returning a real answer instead of silently denying.
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if handled, ok := s.authenticateMTLS(w, &r); handled {
+			if ok {
+				next.ServeHTTP(w, r)
+			}
+			return
+		}
 		if !s.multiTenant {
 			ctx := WithPrincipal(r.Context(), Principal{
 				Scope:      store.WildcardScope(),
@@ -431,6 +437,10 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			// holds a genuine credential and needs to know the account is
 			// suspended rather than the key wrong.
 			writeError(w, http.StatusForbidden, errors.New("tenant is disabled"))
+			return
+		}
+		if expectedTenantID, ok := r.Context().Value(expectedMTLSTenantCtxKey{}).(int64); ok && expectedTenantID != tenant.ID {
+			writeMTLSRejection(w, http.StatusForbidden, CodeForbidden, "API key tenant does not match client certificate identity")
 			return
 		}
 

@@ -193,6 +193,8 @@ func classifyError(status int, err error) (ErrorCode, string, string) {
 			return CodeQuotaExceeded, "", msg
 		case errors.Is(err, store.ErrDuplicate) && status == http.StatusConflict:
 			return CodeConflict, "name", msg
+		case errors.Is(err, store.ErrIdempotencyKeyMismatch) && status == http.StatusConflict:
+			return CodeConflict, IdempotencyKeyHeader, msg
 		case errors.Is(err, store.ErrUnsupported) && status == http.StatusNotImplemented:
 			return CodeUnsupportedOperation, "", msg
 		case errors.Is(err, store.ErrNotFound) && status == http.StatusNotFound:
@@ -363,6 +365,8 @@ func extractParamField(msg string) string {
 	case strings.HasPrefix(msg, "days "),
 		strings.HasPrefix(msg, "invalid days"):
 		return "days"
+	case strings.HasPrefix(msg, "Idempotency-Key"):
+		return IdempotencyKeyHeader
 	default:
 		return ""
 	}

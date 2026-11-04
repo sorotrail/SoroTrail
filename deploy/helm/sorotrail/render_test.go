@@ -195,6 +195,23 @@ func TestRender_ManifestInvariants(t *testing.T) {
 		assert.Contains(t, sm, "interval: 15s", "ServiceMonitor must carry the configured interval")
 	})
 
+	t.Run("mtls mounts secrets and wires env vars when enabled", func(t *testing.T) {
+		withMTLS := renderChart(t, helm,
+			"--set", "mtls.enabled=true",
+			"--set", "mtls.secretName=sorotrail-server-tls",
+			"--set", "mtls.dbSecretName=sorotrail-db-tls",
+			"--set", "mtls.allowedIdentities=spiffe://cluster.local/ns/prod/sa/api",
+		)
+		dep := manifest(t, withMTLS, "Deployment")
+		cm := manifest(t, withMTLS, "ConfigMap")
+		assert.Contains(t, dep, "secretName: sorotrail-server-tls")
+		assert.Contains(t, dep, "secretName: sorotrail-db-tls")
+		assert.Contains(t, dep, "scheme: HTTPS")
+		assert.Contains(t, cm, `MTLS_ENABLED: "true"`)
+		assert.Contains(t, cm, `TLS_CERT_FILE: "/etc/sorotrail/tls/tls.crt"`)
+		assert.Contains(t, cm, `DB_TLS_CERT_FILE: "/etc/sorotrail/db-tls/tls.crt"`)
+	})
+
 }
 
 // TestRender_ConfigValuesReachThePod is the config-variable guard, and the

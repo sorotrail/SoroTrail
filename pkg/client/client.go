@@ -29,6 +29,35 @@ import (
 // WithHTTPClient.
 const defaultTimeout = 30 * time.Second
 
+const (
+	// IdempotencyKeyHeader is the HTTP request header sent by callers to
+	// deduplicate write retries within the server's retention window.
+	IdempotencyKeyHeader = "Idempotency-Key"
+	// IdempotencyReplayedHeader is the HTTP response header set to "true"
+	// when a response was served from the idempotency store.
+	IdempotencyReplayedHeader = "Idempotency-Replayed"
+)
+
+type idempotencyKeyCtxKey struct{}
+
+// WithIdempotencyKey attaches an Idempotency-Key header value to ctx so the
+// next write call made with ctx sends `Idempotency-Key: <key>`.
+func WithIdempotencyKey(ctx context.Context, key string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, idempotencyKeyCtxKey{}, key)
+}
+
+// IdempotencyKeyFromContext returns the idempotency key attached to ctx, or "".
+func IdempotencyKeyFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(idempotencyKeyCtxKey{}).(string)
+	return v
+}
+
 // Option configures a Client.
 type Option func(*Client)
 
@@ -53,9 +82,18 @@ func WithHTTPClient(hc *http.Client) Option {
 // Client talks to one SoroTrail API instance. Construct with New; all
 // generated methods are on this type.
 type Client struct {
-	baseURL string
-	http    *http.Client
-	apiKey  string
+	baseURL        string
+	http           *http.Client
+	apiKey         string
+	idempotencyKey string
+}
+
+// WithIdempotencyKey returns a shallow copy of c that sends `Idempotency-Key: <key>`
+// on requests unless overridden by a context-scoped WithIdempotencyKey(ctx, ...).
+func (c *Client) WithIdempotencyKey(key string) *Client {
+	cp := *c
+	cp.idempotencyKey = key
+	return &cp
 }
 
 // New returns a Client for the given base URL (e.g.
@@ -197,6 +235,11 @@ func (c *Client) send(ctx context.Context, method, path string, query url.Values
 	}
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	if key := IdempotencyKeyFromContext(ctx); key != "" {
+		req.Header.Set(IdempotencyKeyHeader, key)
+	} else if c.idempotencyKey != "" {
+		req.Header.Set(IdempotencyKeyHeader, c.idempotencyKey)
 	}
 
 	resp, err := c.http.Do(req)

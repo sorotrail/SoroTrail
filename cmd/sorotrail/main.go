@@ -335,7 +335,11 @@ func runService(dryRun bool) error {
 		return fmt.Errorf(
 			"clickhouse: the backend is not production-ready; use a postgres:// DATABASE_URL")
 	} else {
-		pool, err = store.NewPool(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns, cfg.DBMaxConnLifetime, cfg.DBMaxConnIdleTime)
+		dbTLS, _, tlsErr := cfg.OutboundDBTLSConfig(log)
+		if tlsErr != nil {
+			return fmt.Errorf("configuring postgres TLS: %w", tlsErr)
+		}
+		pool, err = store.NewPoolWithTLS(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns, cfg.DBMaxConnLifetime, cfg.DBMaxConnIdleTime, dbTLS)
 		if err != nil {
 			return fmt.Errorf("connecting to postgres: %w", err)
 		}
@@ -609,6 +613,10 @@ func runService(dryRun bool) error {
 	// to the pre-archive build.
 	var arch *archive.Archiver
 	if cfg.ArchiveEnabled() {
+		archTLS, _, tlsErr := cfg.OutboundArchiveTLSConfig(log)
+		if tlsErr != nil {
+			return fmt.Errorf("configuring archive TLS: %w", tlsErr)
+		}
 		var err error
 		aArchiverOpts := archive.Options{
 			Bucket:          cfg.ArchiveBucket,
@@ -618,6 +626,7 @@ func runService(dryRun bool) error {
 			AccessKeyID:     cfg.ArchiveAccessKeyID,
 			SecretAccessKey: cfg.ArchiveSecretAccessKey,
 			UseSSL:          cfg.ArchiveUseSSL,
+			TLSConfig:       archTLS,
 			MaxRetries:      cfg.ArchiveMaxRetries,
 			Logger:          log,
 		}
@@ -735,9 +744,26 @@ func runService(dryRun bool) error {
 			"stream_scope_sync", cfg.MultiTenantStreamScopeSync)
 	}
 
+	srvTLS, _, tlsErr := cfg.ServerTLSConfig(log)
+	if tlsErr != nil {
+		return fmt.Errorf("configuring HTTP server TLS: %w", tlsErr)
+	}
+	if cfg.MTLSEnabled || len(cfg.TLSClientAllowedIdentities) > 0 || cfg.TLSClientTenantMap != "" {
+		tenantMap, mapErr := config.ParseTenantCertMap(cfg.TLSClientTenantMap)
+		if mapErr != nil {
+			return mapErr
+		}
+		apiServer.SetMTLSConfig(api.MTLSConfig{
+			Enabled:           cfg.MTLSEnabled,
+			AllowedIdentities: cfg.TLSClientAllowedIdentities,
+			TenantMap:         tenantMap,
+		})
+	}
+
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiServer.Router(),
+		TLSConfig:         srvTLS,
 		ReadTimeout:       cfg.HTTPReadTimeout,
 		WriteTimeout:      cfg.HTTPWriteTimeout,
 		IdleTimeout:       cfg.HTTPIdleTimeout,
@@ -775,9 +801,15 @@ func runService(dryRun bool) error {
 		}()
 	}
 	go func() {
-		log.Info("http api listening", "addr", cfg.HTTPAddr)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("http server: %w", err)
+		log.Info("http api listening", "addr", cfg.HTTPAddr, "mtls_enabled", cfg.MTLSEnabled)
+		var serveErr error
+		if server.TLSConfig != nil {
+			serveErr = server.ListenAndServeTLS("", "")
+		} else {
+			serveErr = server.ListenAndServe()
+		}
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("http server: %w", serveErr)
 		} else {
 			errCh <- nil
 		}
