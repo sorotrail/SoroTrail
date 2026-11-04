@@ -168,7 +168,10 @@ func TestServerTLSConfig_HandshakeAndRejections(t *testing.T) {
 			},
 		},
 	}
-	_, err = clientExpired.Get(srv.URL)
+	respExpired, err := clientExpired.Get(srv.URL)
+	if respExpired != nil {
+		_ = respExpired.Body.Close()
+	}
 	require.Error(t, err, "expired client certificate must be rejected during TLS handshake")
 
 	// 3. Untrusted CA client certificate fails TLS handshake.
@@ -182,7 +185,10 @@ func TestServerTLSConfig_HandshakeAndRejections(t *testing.T) {
 			},
 		},
 	}
-	_, err = clientUntrusted.Get(srv.URL)
+	respUntrusted, err := clientUntrusted.Get(srv.URL)
+	if respUntrusted != nil {
+		_ = respUntrusted.Body.Close()
+	}
 	require.Error(t, err, "client certificate from untrusted CA must be rejected during TLS handshake")
 }
 

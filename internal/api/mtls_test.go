@@ -183,11 +183,17 @@ func TestMTLS_HandshakeAndAllowlistAndProbes(t *testing.T) {
 	assert.Contains(t, string(rawForbidden), "client certificate identity is not authorized")
 
 	// 4c. Expired client cert fails TLS handshake.
-	_, err = makeClient(expiredClientCert).Get(ts.URL + "/events")
+	respExpired, err := makeClient(expiredClientCert).Get(ts.URL + "/events")
+	if respExpired != nil {
+		_ = respExpired.Body.Close()
+	}
 	require.Error(t, err)
 
 	// 4d. Client cert signed by untrusted CA fails TLS handshake.
-	_, err = makeClient(untrustedClientCert).Get(ts.URL + "/events")
+	respUntrusted, err := makeClient(untrustedClientCert).Get(ts.URL + "/events")
+	if respUntrusted != nil {
+		_ = respUntrusted.Body.Close()
+	}
 	require.Error(t, err)
 }
 

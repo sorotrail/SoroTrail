@@ -163,7 +163,7 @@ func (r *CertReloader) reload(force bool) error {
 		r.keyModTime = kMod
 		r.certSize = cSize
 		r.keySize = kSize
-		days := newNotAfter.Sub(time.Now()).Hours() / 24.0
+		days := time.Until(newNotAfter).Hours() / 24.0
 		metrics.TLSCertificateExpiryDays.Set(days)
 	}
 	if caChanged {
