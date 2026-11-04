@@ -474,6 +474,23 @@ multi-replica caveat.
 | `METRICS_ENABLED` | bool | `false` | Enable metrics collection. | restart |
 | `ENABLE_METRICS` | bool | `false` | Expose the Prometheus `/metrics` endpoint. See also `METRICS_ENABLED`. | restart |
 
+### Mutual TLS (mTLS)
+
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `MTLS_ENABLED` | bool | `false` | Require and verify client certificates on inbound HTTP API connections (`TLS_CERT_FILE`, `TLS_KEY_FILE`, and `TLS_CLIENT_CA_FILE` are required when `true`). `/health`, `/livez`, and `/readyz` remain reachable for Kubernetes probes. | restart |
+| `TLS_CERT_FILE` | string | empty | Path to the server PEM certificate file for the HTTP listener. Reloaded live from disk when the file changes. | restart |
+| `TLS_KEY_FILE` | string | empty | Path to the server PEM private key file for the HTTP listener. Reloaded live from disk when the file changes. | restart |
+| `TLS_CLIENT_CA_FILE` | string | empty | Path to the PEM CA bundle used to verify inbound client certificates when `MTLS_ENABLED=true`. Reloaded live from disk when the file changes. | restart |
+| `TLS_CLIENT_ALLOWED_IDENTITIES` | CSV | empty | Optional allowlist of client certificate identities (Subject CN, SAN URI such as `spiffe://...`, or SAN DNS name) permitted to call the API. Empty allows any certificate signed by `TLS_CLIENT_CA_FILE`. | restart |
+| `TLS_CLIENT_TENANT_MAP` | string | empty | Optional comma-separated `<cert_identity>=<tenant_name>` mappings for `MULTI_TENANT=true` deployments. Unmapped certificate identities are rejected with `403 Forbidden` (fail-closed). | restart |
+| `DB_TLS_CERT_FILE` | string | empty | Path to the client PEM certificate presented to PostgreSQL for outbound mTLS. Takes precedence over `sslcert` in `DATABASE_URL`. | restart |
+| `DB_TLS_KEY_FILE` | string | empty | Path to the client PEM private key presented to PostgreSQL for outbound mTLS. Takes precedence over `sslkey` in `DATABASE_URL`. | restart |
+| `DB_TLS_CA_FILE` | string | empty | Path to the PEM CA bundle used to verify the PostgreSQL server certificate. Takes precedence over `sslrootcert` in `DATABASE_URL`. | restart |
+| `ARCHIVE_TLS_CERT_FILE` | string | empty | Path to the client PEM certificate presented to the S3-compatible archive endpoint for outbound mTLS. | restart |
+| `ARCHIVE_TLS_KEY_FILE` | string | empty | Path to the client PEM private key presented to the S3-compatible archive endpoint for outbound mTLS. | restart |
+| `ARCHIVE_TLS_CA_FILE` | string | empty | Path to the PEM CA bundle used to verify the S3-compatible archive server certificate. | restart |
+
 With `ENABLE_METRICS=true`, the Prometheus `/metrics` endpoint exposes the
 pipeline metrics (`sorotrail_*`) in addition to the per-server HTTP
 histogram. The full catalogue — every metric the build exports, with its

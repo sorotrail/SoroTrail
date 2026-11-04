@@ -32,3 +32,4 @@ sorotrail_db_operations_total
 sorotrail_rpc_retries_total
 sorotrail_rpc_failovers_total
 sorotrail_http_deprecated_requests_total
+sorotrail_tls_certificate_expiry_days

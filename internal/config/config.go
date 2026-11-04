@@ -367,6 +367,22 @@ type Config struct {
 	// request logger (#29), so it is the default; an operator can extend
 	// the list or empty it to suppress the header entirely.
 	CORSExposedHeaders []string `env:"CORS_EXPOSED_HEADERS" envDefault:"X-Request-ID,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset"`
+
+	// Mutual TLS (mTLS) between components (#1267). All mTLS fields default
+	// to disabled/empty so existing HTTP and local-dev deployments run
+	// unchanged without certificates.
+	MTLSEnabled                bool     `env:"MTLS_ENABLED" envDefault:"false"`
+	TLSCertFile                string   `env:"TLS_CERT_FILE"`
+	TLSKeyFile                 string   `env:"TLS_KEY_FILE"`
+	TLSClientCAFile            string   `env:"TLS_CLIENT_CA_FILE"`
+	TLSClientAllowedIdentities []string `env:"TLS_CLIENT_ALLOWED_IDENTITIES"`
+	TLSClientTenantMap         string   `env:"TLS_CLIENT_TENANT_MAP"`
+	DBTLSCertFile              string   `env:"DB_TLS_CERT_FILE"`
+	DBTLSKeyFile               string   `env:"DB_TLS_KEY_FILE"`
+	DBTLSCAFile                string   `env:"DB_TLS_CA_FILE"`
+	ArchiveTLSCertFile         string   `env:"ARCHIVE_TLS_CERT_FILE"`
+	ArchiveTLSKeyFile          string   `env:"ARCHIVE_TLS_KEY_FILE"`
+	ArchiveTLSCAFile           string   `env:"ARCHIVE_TLS_CA_FILE"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -712,6 +728,9 @@ func (c Config) Validate() error {
 	}
 	if c.ArchiveMaxRetries < 0 {
 		return fmt.Errorf("ARCHIVE_MAX_RETRIES must be non-negative")
+	}
+	if mtlsErrs := c.validateMTLS(); len(mtlsErrs) > 0 {
+		return fmt.Errorf("%s", mtlsErrs[0])
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -45,6 +46,14 @@ const (
 // (zero means "leave pgx's default"). Use this instead of pgxpool.New so the
 // DB connection pool size is configurable from the environment.
 func NewPool(ctx context.Context, databaseURL string, maxConns, minConns int32, maxConnLifetime, maxConnIdleTime time.Duration) (*pgxpool.Pool, error) {
+	return NewPoolWithTLS(ctx, databaseURL, maxConns, minConns, maxConnLifetime, maxConnIdleTime, nil)
+}
+
+// NewPoolWithTLS creates a pgx pool for databaseURL, applying optional sizing
+// knobs and an explicit outbound *tls.Config when non-nil. When tlsConfig is
+// provided (via DB_TLS_CERT_FILE / DB_TLS_KEY_FILE / DB_TLS_CA_FILE), it takes
+// precedence over any sslcert/sslkey/sslrootcert parameters in databaseURL.
+func NewPoolWithTLS(ctx context.Context, databaseURL string, maxConns, minConns int32, maxConnLifetime, maxConnIdleTime time.Duration, tlsConfig *tls.Config) (*pgxpool.Pool, error) {
 	poolConfig, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, err
@@ -60,6 +69,13 @@ func NewPool(ctx context.Context, databaseURL string, maxConns, minConns int32, 
 	}
 	if maxConnIdleTime > 0 {
 		poolConfig.MaxConnIdleTime = maxConnIdleTime
+	}
+	if tlsConfig != nil {
+		cloned := tlsConfig.Clone()
+		if cloned.ServerName == "" && poolConfig.ConnConfig.Host != "" {
+			cloned.ServerName = poolConfig.ConnConfig.Host
+		}
+		poolConfig.ConnConfig.TLSConfig = cloned
 	}
 	return pgxpool.NewWithConfig(ctx, poolConfig)
 }
