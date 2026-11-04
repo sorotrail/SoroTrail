@@ -5,8 +5,11 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -185,7 +188,11 @@ type Server struct {
 	// Off by default: the API behaves exactly as before.
 	apiKeyAuth bool
 
-	httpRequestBodyLimit int64 // max accepted request body size, in bytes
+	httpRequestBodyLimit      int64            // max accepted request body size, in bytes
+	httpResponseBodyLimit     int64            // max serialized response body size, in bytes (0 = unbounded)
+	maxDecompressedBodySize   int64            // max decompressed request body size, in bytes
+	endpointBodyLimitsMu      sync.RWMutex     // guards endpointRequestBodyLimits
+	endpointRequestBodyLimits map[string]int64 // per-endpoint request body size overrides
 
 	// specInvalidationPublisher tells the other replicas that a contract's
 	// cached spec must be evicted after a write. Optional: a single-process
@@ -250,6 +257,144 @@ type Server struct {
 // SetHTTPRequestBodyLimit sets the request body size limit, in bytes, for all handlers accepting a body.
 func (s *Server) SetHTTPRequestBodyLimit(n int64) {
 	s.httpRequestBodyLimit = n
+}
+
+// SetHTTPResponseBodyLimit sets the maximum serialized response body size, in
+// bytes, for non-streaming HTTP endpoints (#1283). Values <= 0 disable the cap.
+func (s *Server) SetHTTPResponseBodyLimit(n int64) {
+	s.httpResponseBodyLimit = n
+}
+
+// SetMaxDecompressedBodySize sets the maximum decompressed request body size,
+// in bytes, when Content-Encoding (gzip/deflate) is used (#1283).
+func (s *Server) SetMaxDecompressedBodySize(n int64) {
+	s.maxDecompressedBodySize = n
+}
+
+// SetEndpointRequestBodyLimit configures a per-endpoint request body limit
+// override (e.g. "POST /watched-contracts" or "PUT /contracts/{id}/spec").
+func (s *Server) SetEndpointRequestBodyLimit(endpoint string, limit int64) {
+	s.endpointBodyLimitsMu.Lock()
+	defer s.endpointBodyLimitsMu.Unlock()
+	if s.endpointRequestBodyLimits == nil {
+		s.endpointRequestBodyLimits = make(map[string]int64)
+	}
+	s.endpointRequestBodyLimits[strings.TrimSpace(endpoint)] = limit
+}
+
+// SetEndpointRequestBodyLimits replaces the per-endpoint request body limit
+// override map (#1283).
+func (s *Server) SetEndpointRequestBodyLimits(limits map[string]int64) {
+	s.endpointBodyLimitsMu.Lock()
+	defer s.endpointBodyLimitsMu.Unlock()
+	if len(limits) == 0 {
+		s.endpointRequestBodyLimits = nil
+		return
+	}
+	cp := make(map[string]int64, len(limits))
+	for k, v := range limits {
+		cp[strings.TrimSpace(k)] = v
+	}
+	s.endpointRequestBodyLimits = cp
+}
+
+// EffectiveRequestBodyLimit returns the request body byte limit for r,
+// consulting per-endpoint overrides before falling back to httpRequestBodyLimit.
+func (s *Server) EffectiveRequestBodyLimit(r *http.Request) int64 {
+	if r != nil {
+		s.endpointBodyLimitsMu.RLock()
+		overrides := s.endpointRequestBodyLimits
+		if len(overrides) > 0 {
+			method := strings.ToUpper(r.Method)
+			path := r.URL.Path
+			routePat := s.routePattern(r)
+			candidates := []string{
+				method + " " + routePat,
+				method + " " + path,
+				routePat,
+				path,
+			}
+			for _, key := range candidates {
+				if lim, ok := overrides[key]; ok {
+					s.endpointBodyLimitsMu.RUnlock()
+					return lim
+				}
+			}
+			for pattern, lim := range overrides {
+				if matchEndpointPattern(pattern, method, path) {
+					s.endpointBodyLimitsMu.RUnlock()
+					return lim
+				}
+			}
+		}
+		s.endpointBodyLimitsMu.RUnlock()
+	}
+	return s.httpRequestBodyLimit
+}
+
+// EffectiveDecompressedBodyLimit returns the maximum decompressed request
+// stream size in bytes for r (#1283).
+func (s *Server) EffectiveDecompressedBodyLimit(r *http.Request) int64 {
+	if s.maxDecompressedBodySize > 0 {
+		return s.maxDecompressedBodySize
+	}
+	if reqLim := s.EffectiveRequestBodyLimit(r); reqLim > 0 {
+		return reqLim
+	}
+	return DefaultMaxDecompressedBodyBytes
+}
+
+func matchEndpointPattern(pattern, method, path string) bool {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return false
+	}
+	patMethod := ""
+	patPath := pattern
+	if parts := strings.Fields(pattern); len(parts) == 2 {
+		patMethod = strings.ToUpper(parts[0])
+		patPath = parts[1]
+	}
+	if patMethod != "" && patMethod != method {
+		return false
+	}
+	patSegs := strings.Split(strings.Trim(patPath, "/"), "/")
+	pathSegs := strings.Split(strings.Trim(path, "/"), "/")
+	if len(patSegs) != len(pathSegs) {
+		return false
+	}
+	for i := range patSegs {
+		ps := patSegs[i]
+		if strings.HasPrefix(ps, "{") && strings.HasSuffix(ps, "}") {
+			if pathSegs[i] == "" {
+				return false
+			}
+			continue
+		}
+		if ps != pathSegs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) metricRouteLabel(r *http.Request) string {
+	if r == nil {
+		return "unmatched"
+	}
+	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+		if pat := rctx.RoutePattern(); pat != "" {
+			return pat
+		}
+		if len(rctx.RoutePatterns) > 0 && rctx.RoutePatterns[0] != "" {
+			return rctx.RoutePatterns[0]
+		}
+	}
+	return "unmatched"
+}
+
+func (s *Server) recordPayloadRejection(r *http.Request, reason string) {
+	metrics.HTTPPayloadSizeRejectionsTotal.WithLabelValues(s.metricRouteLabel(r), reason).Inc()
 }
 
 // SpecInvalidationPublisher tells the other replicas that a contract's
@@ -466,12 +611,12 @@ func (s *Server) router() chi.Router {
 	// unconditionally so an operator can flip the config on without
 	// restarts; CORS() is a no-op when the allowlist is empty.
 	r.Use(CORS(s.cors))
-	// Limit request body size to prevent resource exhaustion.
+	// Limit request and decompressed body sizes, and bound non-streaming
+	// response sizes to prevent resource exhaustion (#1283).
 	// Applied after CORS so preflight requests (OPTIONS) pass through
 	// without body size restrictions.
-	if s.httpRequestBodyLimit > 0 {
-		r.Use(s.bodyLimitMiddleware)
-	}
+	r.Use(s.bodyLimitMiddleware)
+	r.Use(s.responseLimitMiddleware)
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 	// authenticate must run before any handler that reads events: it is what
@@ -749,15 +894,79 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 }
 
 // bodyLimitMiddleware wraps the request body with http.MaxBytesReader to
-// enforce a maximum request body size. This prevents resource exhaustion
-// from clients sending excessively large request bodies. A limit <= 0 means
-// no limit is enforced.
+// enforce the effective request body size limit (including per-endpoint
+// overrides) and bounds decompressed Content-Encoding streams (#1283).
 func (s *Server) bodyLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.httpRequestBodyLimit > 0 {
-			r.Body = http.MaxBytesReader(w, r.Body, s.httpRequestBodyLimit)
+		limit := s.EffectiveRequestBodyLimit(r)
+		if limit > 0 && r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+		}
+		if r.Body != nil {
+			enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding")))
+			if enc != "" && enc != "identity" {
+				if enc != "gzip" && enc != "deflate" {
+					status := http.StatusBadRequest
+					writeError(w, status, fmt.Errorf("unsupported Content-Encoding %q", enc))
+					return
+				}
+				decompLimit := s.EffectiveDecompressedBodyLimit(r)
+				r.Body = newBoundedDecompressedReader(r.Body, enc, decompLimit, func() {
+					s.recordPayloadRejection(r, "decompressed_body")
+				})
+				r.Header.Del("Content-Encoding")
+				r.Header.Del("Content-Length")
+				r.ContentLength = -1
+			}
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// responseLimitMiddleware caps non-streaming responses at s.httpResponseBodyLimit
+// bytes and returns a structured 413 error with pagination guidance when a
+// serialized response exceeds the ceiling (#1283). Streaming endpoints
+// (SSE, CSV/NDJSON exports, WebSocket upgrades) bypass buffering completely.
+func (s *Server) responseLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		limit := s.httpResponseBodyLimit
+		if limit <= 0 || isStreamingResponse(r, w.Header()) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		bw := &boundedResponseWriter{
+			ResponseWriter: w,
+			req:            r,
+			maxBytes:       limit,
+		}
+		next.ServeHTTP(bw, r)
+		if bw.hijacked || bw.streaming {
+			return
+		}
+		if bw.exceeded {
+			s.recordPayloadRejection(r, "response_body")
+			w.Header().Del("Content-Encoding")
+			w.Header().Del("Content-Length")
+			w.Header().Del("ETag")
+			w.Header().Set("X-Response-Truncated", "true")
+			w.Header().Set("X-Response-Limit-Bytes", strconv.FormatInt(limit, 10))
+			status := http.StatusRequestEntityTooLarge
+			writeError(w, status, fmt.Errorf(
+				"response body exceeds the configured limit of %d bytes: %w (reduce limit or paginate with cursor)",
+				limit, errBodyTooLarge,
+			))
+			return
+		}
+		status := bw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		if bw.wroteHeader || status != http.StatusOK || bw.buf.Len() > 0 {
+			w.WriteHeader(status)
+		}
+		if bw.buf.Len() > 0 {
+			_, _ = w.Write(bw.buf.Bytes())
+		}
 	})
 }
 

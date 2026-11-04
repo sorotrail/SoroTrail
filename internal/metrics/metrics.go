@@ -203,6 +203,17 @@ var (
 		Name: "sorotrail_tls_certificate_expiry_days",
 		Help: "Minimum remaining validity in days across active mTLS certificates.",
 	})
+
+	// HTTPPayloadSizeRejectionsTotal counts HTTP requests or responses rejected
+	// because their size exceeded the configured request, decompressed-stream,
+	// or response byte limit (#1283).
+	HTTPPayloadSizeRejectionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sorotrail_http_payload_size_rejections_total",
+			Help: "Total HTTP requests or responses rejected for exceeding configured size limits, labelled by route and reason (request_body | decompressed_body | response_body).",
+		},
+		[]string{"route", "reason"},
+	)
 )
 
 func init() {
@@ -226,6 +237,7 @@ func init() {
 		SpecInvalidationsReceived,
 		DeprecatedHTTPRequestsTotal,
 		TLSCertificateExpiryDays,
+		HTTPPayloadSizeRejectionsTotal,
 	)
 }
 

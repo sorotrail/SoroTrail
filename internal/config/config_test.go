@@ -1728,3 +1728,16 @@ func TestNewLogHandlerRespectsHandlerOptions(t *testing.T) {
 	assert.Equal(t, "kept", got["msg"])
 	assert.Equal(t, "req-2", got["request_id"])
 }
+
+func TestParseEndpointBodyLimitsAndOverrides(t *testing.T) {
+	limits, err := ParseEndpointBodyLimits("POST /watched-contracts=4194304, PUT /contracts/{id}/spec=2097152")
+	require.NoError(t, err)
+	assert.Equal(t, int64(4194304), limits["POST /watched-contracts"])
+	assert.Equal(t, int64(2097152), limits["PUT /contracts/{id}/spec"])
+
+	_, err = ParseEndpointBodyLimits("invalid-entry")
+	assert.Error(t, err)
+
+	_, err = ParseEndpointBodyLimits("POST /watched-contracts=-1")
+	assert.Error(t, err)
+}

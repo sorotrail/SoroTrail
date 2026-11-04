@@ -249,6 +249,16 @@ var metricCatalogue = []metricSpec{
 		Meaning: "Remaining days until the earliest-expiring active mTLS certificate (HTTP listener, Postgres client, or Archive client) expires, updated whenever certificates are loaded or reloaded from disk. Alert when this drops below your rotation window (for example, < 7 days).",
 	},
 	{
+		Name: "sorotrail_http_payload_size_rejections_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "route", Values: "the matched chi route pattern (e.g. /events/{id}), or \"unmatched\" for a path no route registered — never the raw path, so probes cannot grow cardinality"},
+			{Name: "reason", Values: "request_body | decompressed_body | response_body"},
+		},
+		Help:    "Total HTTP requests or responses rejected for exceeding configured size limits, labelled by route and reason (request_body | decompressed_body | response_body).",
+		Meaning: "Requests or responses rejected with HTTP 413 for exceeding HTTP_REQUEST_BODY_LIMIT (or an endpoint override), the decompressed Content-Encoding ceiling, or the response body size cap. Spikes indicate oversized client writes, compression-bomb attempts, or list queries that need smaller page limits.",
+		touch:   func() { HTTPPayloadSizeRejectionsTotal.WithLabelValues("/watched-contracts", "request_body") },
+	},
+	{
 		Name: "http_request_duration_seconds", Scope: scopeServer, Kind: "histogram",
 		Labels: []metricLabel{
 			{Name: "route", Values: "the matched chi route pattern (e.g. /events/{id}), or \"unmatched\" for a path no route registered — never the raw path, so probes cannot grow cardinality"},

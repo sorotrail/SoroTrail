@@ -168,9 +168,12 @@ func (s *Server) idempotencyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		bodyBytes, err := readIdempotencyBody(r, s.httpRequestBodyLimit)
+		bodyBytes, err := readIdempotencyBody(r, s.EffectiveRequestBodyLimit(r))
 		if err != nil {
 			if errors.Is(err, errBodyTooLarge) {
+				if !isDecompressedLimitError(err) {
+					s.recordPayloadRejection(r, "request_body")
+				}
 				writeError(w, http.StatusRequestEntityTooLarge, err)
 				return
 			}
@@ -407,6 +410,9 @@ func readIdempotencyBody(r *http.Request, limit int64) ([]byte, error) {
 		body, err = io.ReadAll(r.Body)
 	}
 	if err != nil {
+		if isDecompressedLimitError(err) {
+			return nil, err
+		}
 		tooLarge := errors.Is(err, errBodyTooLarge) || strings.Contains(err.Error(), "request body too large")
 		if tooLarge {
 			return nil, fmt.Errorf("request body exceeds %d bytes: %w", limit, errBodyTooLarge)
