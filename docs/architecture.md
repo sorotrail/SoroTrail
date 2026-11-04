@@ -975,3 +975,92 @@ offer: `verified_through_ledger` in `/stats` names the highest ledger
 whose stored events have been verified against the RPC, not merely
 ingested. See the [Data integrity section](../README.md#data-integrity)
 for the auditor's contract and edge-case handling.
+
+### Chain reorganisation model, confirmation window, and derived-state reconciliation
+
+While finalized Stellar ledgers do not reorganise under normal consensus, an
+upstream Soroban RPC pool (load-balanced nodes, failover replicas, or local
+sandbox restarts) can roll back its tip or rewrite events within a recent
+unconfirmed window. SoroTrail treats recent ledgers within a bounded
+**confirmation window** (`Options.ReorgConfirmationWindow`, default `64`
+ledgers via `ingester.DefaultReorgConfirmationWindow`) as subject to
+reorganisation and guarantees deterministic reconciliation across the primary
+event table and all derived state.
+
+#### 1. Detection (`ingester.ReorgTracker`)
+
+`ingester.ReorgTracker` maintains a bounded sliding window of deterministic per-ledger
+event fingerprints (`ingester.ComputeLedgerFingerprint`, SHA-256 over sorted
+canonical `(id, contract_id, tx_hash, tx_index, op_index, type, in_successful_call, topics, value)` tuples)
+for the most recent `ReorgConfirmationWindow` ledgers and detects two classes of
+upstream reorganisation during live polling:
+
+- **Tip regression** (`ReorgTracker.CheckTipRegression` / `Ingester.maybeHandleTipRegression`):
+  the RPC's reported `latestLedger` drops below the highest previously observed
+  or persisted ledger (`from = latestLedger + 1`, `to = highestObserved`).
+- **Content divergence** (`ReorgTracker.RecordLedgerHash` / `Ingester.recordIngestedLedgerFingerprints`):
+  a re-observed ledger within the confirmation window produces a fingerprint
+  different from the previously recorded fingerprint for that ledger sequence.
+
+Concurrent or overlapping reorg signals for the same `Ingester` are coalesced
+by an internal coordinator (`reorgCoordinator`) so overlapping ledger ranges
+are merged into `[min(from), max(to)]` and reconciled sequentially without
+deadlocking or racing.
+
+#### 2. Derived-state retraction and re-ingestion (`store.ReconcileReorgRange`)
+
+When `Ingester.HandleReorgRange(ctx, client, fromLedger, toLedger, newHeadLedger)`
+runs on a valid reorg range `[from, to]`, it re-fetches all filter batches across
+`[from, to]` before mutating the store, then invokes `store.ReconcileReorgRange`
+(backed on `*Postgres` and `*SQLite` by `TransactionalReorgMaintainer.ReconcileReorgTx`
+inside a single database transaction) to reconcile both primary rows and every
+derived state table atomically:
+
+| State / Surface | Action on Reorg over `[from, to]` |
+|---|---|
+| `events` | Orphaned events in `[from, to]` missing from the replacement set or carrying modified payloads are recorded in `RetractedEventIDs`; previous rows in `[from, to]` are deleted (`ReorgMaintainer.DeleteEventsInRange`) and canonical replacement events are upserted (`InsertedEventIDs`), even when the replacement set is empty. |
+| `event_addresses` | Derived address references for all previous event IDs in `[from, to]` are explicitly deleted via `ReorgMaintainer.DeleteAddressRefsByEventIDs` (`RetractedAddressRefs`) and re-indexed for canonical replacement events (`InsertedAddressRefs`). |
+| `dead_letters` | Unresolved dead-letter entries in `[from, to]` are purged via `ReorgMaintainer.DeleteDeadLettersInRange` (`RetractedDeadLetters`) so stale poison pills from retracted ledgers never linger. |
+| `contract_cursors` | Per-contract cursors at or above `from` are clamped to `newHeadLedger` (or `from - 1` when `RewindCursorsToFromLedger` is set) with an empty pagination cursor (`RewoundContractCursors`). |
+| `ingestion_state` | When `last_ingested_ledger >= from`, stale pagination cursors are cleared and `last_ingested_ledger` is clamped to `newHeadLedger` (or `from - 1` when `RewindCursorsToFromLedger` is set) (`RewoundIngestionLedger`). |
+| `audit_state` | If `verified_through_ledger >= from`, the auditor high-water mark is clamped back to `from - 1` (`RewoundAuditLedger`) so the auditor re-verifies the reorganised range. |
+
+#### 3. Subscription & webhook retraction notices (`ingester.ReorgNotifier`)
+
+Downstream consumers that may have already received events from `[from, to]`
+over live streams or webhooks can implement `ingester.ReorgNotifier`
+(`NotifyReorgRetraction(ctx, ReorgRetractionNotice)`). After `store.ReconcileReorgRange`
+commits, `HandleReorgRange` emits a `ReorgRetractionNotice` containing:
+
+- `Network`, `FromLedger`, `ToLedger`, `NewHeadLedger`, `DetectedAt`
+- `RetractedEventIDs` (sorted TOIDs removed or rewritten in `[from, to]`)
+- `ReplacementEventIDs` and `ReplacementEvents` (canonical replacement events in `[from, to]`)
+
+#### 4. Confirmation window limit & cold-archive immutability boundary
+
+Two hard boundaries fail closed with structured alerts and Prometheus counters:
+
+1. **Confirmation window depth limit (`ingester.ErrReorgDepthExceeded`)**:
+   If a reorg's depth (`to - from + 1` or distance from the ingested tip)
+   exceeds `ReorgConfirmationWindow`, `HandleReorgRange` refuses automatic
+   retraction, increments `sorotrail_reorg_window_exceeded_total`, and logs a
+   structured `ERROR` alert so an operator can inspect the upstream RPC before
+   mutating deep history.
+2. **Cold-archive immutability boundary (`ingester.ErrReorgTouchesArchivedRange`)**:
+   Cold-archived ledger ranges (configured via `Ingester.SetArchivedThroughLedger`
+   or `Ingester.SetArchiveBoundary`) are immutable. If `fromLedger <= archivedThroughLedger`,
+   `HandleReorgRange` refuses to mutate stored or archived state, increments
+   `sorotrail_reorg_archived_boundary_violations_total`, and returns
+   `ErrReorgTouchesArchivedRange`.
+
+#### 5. Reorg observability metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `sorotrail_reorgs_detected_total` | Counter | Total chain reorganisations detected by the ingester |
+| `sorotrail_reorg_depth_ledgers` | Histogram | Depth (in ledgers) of detected chain reorganisations |
+| `sorotrail_reorg_window_limit_ledgers` | Gauge | Configured maximum reorg confirmation window depth in ledgers |
+| `sorotrail_reorg_window_utilization_ratio` | Gauge | Ratio of the most recent reorg depth to the configured confirmation window limit |
+| `sorotrail_reorg_window_exceeded_total` | Counter | Total reorgs rejected because their depth exceeded the confirmation window |
+| `sorotrail_reorg_archived_boundary_violations_total` | Counter | Total reorgs rejected because they touched a cold-archived ledger range |
+| `sorotrail_reorg_retracted_rows_total` | CounterVec (`table`) | Total rows retracted or rewound during reorg reconciliation (`events`, `event_addresses`, `dead_letters`, `contract_cursors`) |
