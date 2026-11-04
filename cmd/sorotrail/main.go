@@ -382,6 +382,16 @@ func runService(dryRun bool) error {
 		log.Info("postgres connection established")
 		pg = store.NewPostgresWithHealthCheck(ctx, pool, cfg.DatabaseURL, int64(cfg.PartitionLedgerSpan))
 		defer pg.StopHealthCheck()
+		if keySpec := cfg.EffectiveEncryptionKeySpec(); keySpec != "" {
+			enc, encErr := store.ParseFieldEncryptor(keySpec)
+			if encErr != nil {
+				return fmt.Errorf("configuring field-level encryption: %w", encErr)
+			}
+			pg.SetFieldEncryptor(enc)
+		}
+		if err := pg.VerifyEncryptionReadiness(ctx); err != nil {
+			return fmt.Errorf("verifying field-level encryption readiness: %w", err)
+		}
 		st = pg
 	}
 

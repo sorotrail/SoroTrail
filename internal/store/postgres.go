@@ -89,6 +89,7 @@ type Postgres struct {
 	pool                      *pgxpool.Pool
 	partitionSpan             int64
 	maxSparseFilterLedgerSpan atomic.Int64
+	fieldEncryptor            atomic.Pointer[FieldEncryptor]
 
 	// Health monitoring
 	healthMu      sync.RWMutex
@@ -96,6 +97,24 @@ type Postgres struct {
 	lastHealthErr error
 	databaseURL   string
 	stopHealthCk  context.CancelFunc
+}
+
+// SetFieldEncryptor configures the FieldEncryptor used to encrypt and decrypt
+// sensitive columns at rest (such as subscriptions.secret).
+func (p *Postgres) SetFieldEncryptor(enc *FieldEncryptor) {
+	if p == nil {
+		return
+	}
+	p.fieldEncryptor.Store(enc)
+}
+
+// FieldEncryptor returns the configured FieldEncryptor, or nil if field-level
+// encryption is not enabled.
+func (p *Postgres) FieldEncryptor() *FieldEncryptor {
+	if p == nil {
+		return nil
+	}
+	return p.fieldEncryptor.Load()
 }
 
 // SetMaxSparseFilterLedgerSpan configures the maximum ledger span allowed
