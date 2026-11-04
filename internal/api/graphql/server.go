@@ -3,6 +3,7 @@ package graphql
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	"github.com/vektah/gqlparser/v2/parser"
 
 	"github.com/sorotrail/sorotrail/internal/api"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // Handler is the runtime for the GraphQL transport: one Resolver,
@@ -276,6 +278,7 @@ func registerRoutes(r *Resolver) {
 // /graphql/persisted (or /graphql/persisted/{id}) are routed to the
 // persisted-operations management handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(store.WithSubsystem(r.Context(), store.SubsystemGraphQL))
 	if r.URL != nil && isPersistedManagementPath(r.URL.Path) {
 		h.handlePersisted(w, r)
 		return
@@ -370,8 +373,20 @@ func (h *Handler) runQuery(w http.ResponseWriter, ctx context.Context, req *Grap
 	start := time.Now()
 	resp, err := executeOperation(ctx, req)
 	if err != nil {
+		status := http.StatusOK
+		if errors.Is(err, store.ErrPoolBudgetExhausted) {
+			status = http.StatusServiceUnavailable
+			retrySecs := 1
+			var budgetErr *store.PoolBudgetExhaustedError
+			if errors.As(err, &budgetErr) && budgetErr.RetryAfter > 0 {
+				if s := int(budgetErr.RetryAfter.Seconds()); s > 0 {
+					retrySecs = s
+				}
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+		}
 		// Operation-level error: no `data`, single entry in `errors`.
-		writeErrorEnvelope(w, http.StatusOK, err.Error(), nil)
+		writeErrorEnvelope(w, status, err.Error(), nil)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

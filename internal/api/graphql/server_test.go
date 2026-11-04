@@ -2,17 +2,20 @@ package graphql
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/sorotrail/sorotrail/internal/api"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // Every failure on the /graphql and /graphiql surface answers through
@@ -164,4 +167,34 @@ func assertGraphQLErrorEnvelope(t *testing.T, rec *httptest.ResponseRecorder) {
 	assert.NotNil(t, env.Data, "the GraphQL envelope always carries data")
 	require.Len(t, env.Errors, 1, "an operation-level failure carries one error")
 	assert.NotEmpty(t, env.Errors[0].Message)
+}
+
+func TestHandleQuery_PoolBudgetExhaustedReturns503WithRetryAfter(t *testing.T) {
+	budget := store.NewPoolBudget(store.PoolBudgetConfig{
+		TotalConns:       4,
+		IngesterReserved: 1,
+		GraphQLMax:       1,
+		AcquireTimeout:   10 * time.Millisecond,
+		RetryAfter:       3 * time.Second,
+	})
+	budgeted := store.NewBudgetedStore(&stubStore{}, budget, store.SubsystemGraphQL)
+
+	_, releaseHeld, err := budget.Acquire(context.Background(), store.SubsystemGraphQL)
+	require.NoError(t, err)
+	defer releaseHeld()
+
+	h, err := New(api.ServerDeps{Store: budgeted}, slog.New(slog.NewTextHandler(io.Discard, nil)), false)
+	require.NoError(t, err)
+
+	body, err := json.Marshal(GraphQLRequest{Query: "{contracts{edges{node{id}}}}"})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/graphql", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "3", rec.Header().Get("Retry-After"))
+	assertGraphQLErrorEnvelope(t, rec)
 }

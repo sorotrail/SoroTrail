@@ -1742,6 +1742,90 @@ func TestParseEndpointBodyLimitsAndOverrides(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestResolvePoolSizingAndEnvOverrides(t *testing.T) {
+	t.Run("default formula from DefaultDBMaxConns=20", func(t *testing.T) {
+		var cfg Config
+		sizing := cfg.ResolvePoolSizing()
+		assert.Equal(t, int32(20), sizing.TotalConns)
+		assert.Equal(t, int32(5), sizing.MinConns)
+		assert.Equal(t, int32(5), sizing.IngesterReserved)
+		assert.Equal(t, int32(15), sizing.SharedMax)
+		assert.Equal(t, int32(10), sizing.APIReadMax)
+		assert.Equal(t, int32(6), sizing.GraphQLMax)
+		assert.Equal(t, int32(4), sizing.SubscriptionMax)
+		assert.Equal(t, int32(3), sizing.MaintenanceMax)
+		assert.Equal(t, 50*time.Millisecond, sizing.AcquireTimeout)
+		assert.InDelta(t, 0.75, sizing.PressureThreshold, 1e-6)
+	})
+
+	t.Run("environment overrides and validation", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("DATABASE_URL", "postgres://localhost:5432/sorotrail")
+		t.Setenv("DB_MAX_CONNS", "32")
+		t.Setenv("DB_MIN_CONNS", "8")
+		t.Setenv("DB_INGESTER_RESERVED_CONNS", "8")
+		t.Setenv("DB_API_READ_MAX_CONNS", "16")
+		t.Setenv("DB_GRAPHQL_MAX_CONNS", "10")
+		t.Setenv("DB_SUBSCRIPTION_MAX_CONNS", "6")
+		t.Setenv("DB_MAINTENANCE_MAX_CONNS", "4")
+		t.Setenv("DB_POOL_ACQUIRE_TIMEOUT", "75ms")
+		t.Setenv("DB_POOL_PRESSURE_THRESHOLD", "0.80")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+
+		sizing := cfg.ResolvePoolSizing()
+		assert.Equal(t, int32(32), sizing.TotalConns)
+		assert.Equal(t, int32(8), sizing.MinConns)
+		assert.Equal(t, int32(8), sizing.IngesterReserved)
+		assert.Equal(t, int32(24), sizing.SharedMax)
+		assert.Equal(t, int32(16), sizing.APIReadMax)
+		assert.Equal(t, int32(10), sizing.GraphQLMax)
+		assert.Equal(t, int32(6), sizing.SubscriptionMax)
+		assert.Equal(t, int32(4), sizing.MaintenanceMax)
+		assert.Equal(t, 75*time.Millisecond, sizing.AcquireTimeout)
+		assert.InDelta(t, 0.80, sizing.PressureThreshold, 1e-6)
+	})
+
+	t.Run("rejects invalid pool budget relationships", func(t *testing.T) {
+		cfg := Config{
+			DatabaseURL:                "postgres://localhost:5432/sorotrail",
+			RPCURL:                     "https://soroban-testnet.stellar.org",
+			PollInterval:               5 * time.Second,
+			APIQueryTimeout:            25 * time.Second,
+			APISlowQueryThreshold:      2 * time.Second,
+			RetentionLedgers:           17280,
+			PartitionLedgerSpan:        120960,
+			LogLevel:                   "info",
+			LogFormat:                  "text",
+			AuditPollInterval:          30 * time.Second,
+			AuditBatchLedgers:          100,
+			AuditLagThreshold:          200,
+			AuditMaxRPS:                10,
+			AuditMaxRepair:             3,
+			AuditFindingMaxLgrs:        100,
+			RPCRateLimitRPS:            10,
+			RPCRateLimit:               10,
+			RetentionBatchSize:         5000,
+			IngestPageSize:             1000,
+			IngestBatchSize:            1000,
+			RetentionInterval:          time.Hour,
+			BackfillRateRPS:            10,
+			RPCMaxAttempts:             3,
+			RPCBaseBackoff:             500 * time.Millisecond,
+			RPCMaxBackoff:              30 * time.Second,
+			APIMaxLimit:                500,
+			SweepConcurrency:           1,
+			ExportMaxRange:             17280,
+			MultiTenantUsageFlush:      10 * time.Second,
+			MultiTenantStreamScopeSync: 30 * time.Second,
+			DBMaxConns:                 10,
+			DBIngesterReservedConns:    10,
+		}
+		require.ErrorContains(t, cfg.Validate(), "DB_INGESTER_RESERVED_CONNS")
+	})
+}
+
 func TestConfig_FieldLevelEncryptionValidationAndRedaction(t *testing.T) {
 	hexKey1 := strings.Repeat("a1", 32)
 	hexKey2 := strings.Repeat("b2", 32)

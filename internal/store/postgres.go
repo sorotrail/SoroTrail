@@ -36,15 +36,65 @@ var ErrInvalidCursor = errors.New("invalid cursor")
 const (
 	DefaultEventPartitionSpan = 120960
 
+	// Default Postgres connection pool sizing knobs (#1231).
+	DefaultPoolMaxConns        int32         = 20
+	DefaultPoolMinConns        int32         = 5
+	DefaultPoolMaxConnLifetime time.Duration = 30 * time.Minute
+	DefaultPoolMaxConnIdleTime time.Duration = 5 * time.Minute
+
 	poolHealthCheckInterval  = 5 * time.Second
 	poolHealthCheckTimeout   = 2 * time.Second
 	poolReconnectBaseBackoff = 100 * time.Millisecond
 	poolReconnectMaxBackoff  = 30 * time.Second
 )
 
+// ParsePoolConfigWithTLS parses databaseURL into a *pgxpool.Config and applies
+// explicit sizing knobs or SoroTrail's sensible production defaults (#1231):
+//   - MaxConns defaults to DefaultPoolMaxConns (20)
+//   - MinConns defaults to max(2, MaxConns/4) (5 when MaxConns=20), clamped to MaxConns
+//   - MaxConnLifetime defaults to DefaultPoolMaxConnLifetime (30m)
+//   - MaxConnIdleTime defaults to DefaultPoolMaxConnIdleTime (5m)
+func ParsePoolConfigWithTLS(databaseURL string, maxConns, minConns int32, maxConnLifetime, maxConnIdleTime time.Duration, tlsConfig *tls.Config) (*pgxpool.Config, error) {
+	poolConfig, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if maxConns > 0 {
+		poolConfig.MaxConns = maxConns
+	} else {
+		poolConfig.MaxConns = DefaultPoolMaxConns
+	}
+	if minConns > 0 {
+		poolConfig.MinConns = minConns
+	} else {
+		poolConfig.MinConns = max(int32(2), poolConfig.MaxConns/4)
+	}
+	if poolConfig.MinConns > poolConfig.MaxConns {
+		poolConfig.MinConns = poolConfig.MaxConns
+	}
+	if maxConnLifetime > 0 {
+		poolConfig.MaxConnLifetime = maxConnLifetime
+	} else {
+		poolConfig.MaxConnLifetime = DefaultPoolMaxConnLifetime
+	}
+	if maxConnIdleTime > 0 {
+		poolConfig.MaxConnIdleTime = maxConnIdleTime
+	} else {
+		poolConfig.MaxConnIdleTime = DefaultPoolMaxConnIdleTime
+	}
+	if tlsConfig != nil {
+		cloned := tlsConfig.Clone()
+		if cloned.ServerName == "" && poolConfig.ConnConfig.Host != "" {
+			cloned.ServerName = poolConfig.ConnConfig.Host
+		}
+		poolConfig.ConnConfig.TLSConfig = cloned
+	}
+	return poolConfig, nil
+}
+
 // NewPool creates a pgx pool for databaseURL, applying optional sizing knobs
-// (zero means "leave pgx's default"). Use this instead of pgxpool.New so the
-// DB connection pool size is configurable from the environment.
+// (zero applies SoroTrail's sensible defaults). Use this instead of pgxpool.New
+// so the DB connection pool size is configurable from the environment.
 func NewPool(ctx context.Context, databaseURL string, maxConns, minConns int32, maxConnLifetime, maxConnIdleTime time.Duration) (*pgxpool.Pool, error) {
 	return NewPoolWithTLS(ctx, databaseURL, maxConns, minConns, maxConnLifetime, maxConnIdleTime, nil)
 }
@@ -54,28 +104,9 @@ func NewPool(ctx context.Context, databaseURL string, maxConns, minConns int32, 
 // provided (via DB_TLS_CERT_FILE / DB_TLS_KEY_FILE / DB_TLS_CA_FILE), it takes
 // precedence over any sslcert/sslkey/sslrootcert parameters in databaseURL.
 func NewPoolWithTLS(ctx context.Context, databaseURL string, maxConns, minConns int32, maxConnLifetime, maxConnIdleTime time.Duration, tlsConfig *tls.Config) (*pgxpool.Pool, error) {
-	poolConfig, err := pgxpool.ParseConfig(databaseURL)
+	poolConfig, err := ParsePoolConfigWithTLS(databaseURL, maxConns, minConns, maxConnLifetime, maxConnIdleTime, tlsConfig)
 	if err != nil {
 		return nil, err
-	}
-	if maxConns > 0 {
-		poolConfig.MaxConns = maxConns
-	}
-	if minConns > 0 {
-		poolConfig.MinConns = minConns
-	}
-	if maxConnLifetime > 0 {
-		poolConfig.MaxConnLifetime = maxConnLifetime
-	}
-	if maxConnIdleTime > 0 {
-		poolConfig.MaxConnIdleTime = maxConnIdleTime
-	}
-	if tlsConfig != nil {
-		cloned := tlsConfig.Clone()
-		if cloned.ServerName == "" && poolConfig.ConnConfig.Host != "" {
-			cloned.ServerName = poolConfig.ConnConfig.Host
-		}
-		poolConfig.ConnConfig.TLSConfig = cloned
 	}
 	return pgxpool.NewWithConfig(ctx, poolConfig)
 }
