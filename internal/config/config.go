@@ -201,6 +201,16 @@ type Config struct {
 	// HTTPRequestBodyLimit caps the max size accepted for any request body (all endpoints).
 	// Default 1048576 (1 MiB) protects against memory/resource exhaustion. Set higher if needed when trusting clients.
 	HTTPRequestBodyLimit int64 `env:"HTTP_REQUEST_BODY_LIMIT" envDefault:"1048576"`
+	// HTTPResponseBodyLimit caps the maximum serialized response size (in bytes)
+	// for non-streaming HTTP endpoints (#1283). Zero disables the response size cap.
+	HTTPResponseBodyLimit int64 `env:"-"`
+	// HTTPDecompressedBodyLimit caps the maximum decompressed request body size
+	// (in bytes) when Content-Encoding: gzip/deflate is accepted (#1283).
+	// Zero defaults to HTTPRequestBodyLimit.
+	HTTPDecompressedBodyLimit int64 `env:"-"`
+	// HTTPEndpointBodyLimits holds optional per-endpoint request body size
+	// overrides keyed by "METHOD /pattern" or "/pattern" (#1283).
+	HTTPEndpointBodyLimits map[string]int64 `env:"-"`
 
 	// APIKey, when set, gates the watched-contracts management endpoints
 	// via a constant-time comparison against the X-API-Key request header.
@@ -406,6 +416,9 @@ func Load() (Config, error) {
 	if _, explicitlySet := os.LookupEnv("RPC_URL"); !explicitlySet && len(cfg.RPCURLS) == 0 {
 		cfg.RPCURL = networks[cfg.Network].RPCURL
 	}
+	if err := cfg.loadBodySizeEnvOverrides(); err != nil {
+		return Config{}, err
+	}
 	if err := cfg.ValidateAll(); err != nil {
 		return Config{}, err
 	}
@@ -449,6 +462,59 @@ func resolveFileEnv() error {
 
 func IsSQLite(databaseURL string) bool {
 	return strings.HasPrefix(databaseURL, "sqlite:")
+}
+
+// ParseEndpointBodyLimits parses a comma-separated list of "ROUTE=BYTES"
+// overrides (e.g. "POST /watched-contracts=4194304,/contracts/{id}/spec=2097152").
+func ParseEndpointBodyLimits(raw string) (map[string]int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	out := make(map[string]int64)
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		route, valStr, ok := strings.Cut(entry, "=")
+		route = strings.TrimSpace(route)
+		valStr = strings.TrimSpace(valStr)
+		if !ok || route == "" || valStr == "" {
+			return nil, fmt.Errorf("HTTP_ENDPOINT_BODY_LIMITS: invalid entry %q (want ROUTE=BYTES)", entry)
+		}
+		n, err := strconv.ParseInt(valStr, 10, 64)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("HTTP_ENDPOINT_BODY_LIMITS: invalid byte limit for %q: %q", route, valStr)
+		}
+		out[route] = n
+	}
+	return out, nil
+}
+
+func (c *Config) loadBodySizeEnvOverrides() error {
+	if raw, ok := os.LookupEnv("HTTP_RESPONSE_BODY_LIMIT"); ok && strings.TrimSpace(raw) != "" {
+		n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		if err != nil {
+			return fmt.Errorf("parsing HTTP_RESPONSE_BODY_LIMIT: %w", err)
+		}
+		c.HTTPResponseBodyLimit = n
+	}
+	if raw, ok := os.LookupEnv("HTTP_DECOMPRESSED_BODY_LIMIT"); ok && strings.TrimSpace(raw) != "" {
+		n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		if err != nil {
+			return fmt.Errorf("parsing HTTP_DECOMPRESSED_BODY_LIMIT: %w", err)
+		}
+		c.HTTPDecompressedBodyLimit = n
+	}
+	if raw, ok := os.LookupEnv("HTTP_ENDPOINT_BODY_LIMITS"); ok && strings.TrimSpace(raw) != "" {
+		limits, err := ParseEndpointBodyLimits(raw)
+		if err != nil {
+			return err
+		}
+		c.HTTPEndpointBodyLimits = limits
+	}
+	return nil
 }
 
 // ParseLogLevel maps a LOG_LEVEL string to a slog.Level. Unknown or empty
@@ -665,6 +731,17 @@ func (c Config) Validate() error {
 	}
 	if c.HTTPRequestBodyLimit < 0 {
 		return fmt.Errorf("HTTP_REQUEST_BODY_LIMIT must be non-negative, got %d", c.HTTPRequestBodyLimit)
+	}
+	if c.HTTPResponseBodyLimit < 0 {
+		return fmt.Errorf("HTTP_RESPONSE_BODY_LIMIT must be non-negative, got %d", c.HTTPResponseBodyLimit)
+	}
+	if c.HTTPDecompressedBodyLimit < 0 {
+		return fmt.Errorf("HTTP_DECOMPRESSED_BODY_LIMIT must be non-negative, got %d", c.HTTPDecompressedBodyLimit)
+	}
+	for k, v := range c.HTTPEndpointBodyLimits {
+		if strings.TrimSpace(k) == "" || v <= 0 {
+			return fmt.Errorf("HTTP_ENDPOINT_BODY_LIMITS entry %q must have a positive byte limit, got %d", k, v)
+		}
 	}
 	if c.APIMaxLimit < 1 {
 		return fmt.Errorf("API_MAX_LIMIT must be positive, got %d", c.APIMaxLimit)

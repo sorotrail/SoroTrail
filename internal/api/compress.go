@@ -2,14 +2,274 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 )
+
+// DefaultMaxDecompressedBodyBytes is the fallback upper bound (4 MiB) on a
+// decompressed request body when Content-Encoding (gzip/deflate) is accepted
+// and no explicit decompressed or request body limit is configured (#1283).
+const DefaultMaxDecompressedBodyBytes int64 = 4 << 20
+
+// decompressedLimitError is returned when a gzip/deflate request stream
+// expands past the configured decompressed byte cap. It unwraps to both
+// errBodyTooLarge and *http.MaxBytesError so callers checking either sentinel
+// classify the rejection as 413 Request Entity Too Large.
+type decompressedLimitError struct {
+	limit int64
+}
+
+func (e *decompressedLimitError) Error() string {
+	return fmt.Sprintf("decompressed request body exceeds %d bytes: %s", e.limit, errBodyTooLarge.Error())
+}
+
+func (e *decompressedLimitError) Unwrap() []error {
+	return []error{errBodyTooLarge, &http.MaxBytesError{Limit: e.limit}}
+}
+
+// isDecompressedLimitError reports whether err came from a decompressed stream
+// exceeding its configured cap.
+func isDecompressedLimitError(err error) bool {
+	var target *decompressedLimitError
+	return errors.As(err, &target)
+}
+
+// boundedDecompressedReader wraps a compressed request body (gzip or deflate)
+// and enforces a strict ceiling on the number of decompressed bytes produced,
+// aborting immediately if a compression bomb expands past maxBytes (#1283).
+type boundedDecompressedReader struct {
+	raw        io.ReadCloser
+	encoding   string
+	maxBytes   int64
+	reader     io.ReadCloser
+	readSoFar  int64
+	initErr    error
+	inited     bool
+	onRejected func()
+	rejected   bool
+}
+
+func newBoundedDecompressedReader(raw io.ReadCloser, encoding string, maxBytes int64, onRejected func()) io.ReadCloser {
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxDecompressedBodyBytes
+	}
+	return &boundedDecompressedReader{
+		raw:        raw,
+		encoding:   encoding,
+		maxBytes:   maxBytes,
+		onRejected: onRejected,
+	}
+}
+
+func (b *boundedDecompressedReader) init() error {
+	if b.inited {
+		return b.initErr
+	}
+	b.inited = true
+	switch b.encoding {
+	case "gzip":
+		gr, err := gzip.NewReader(b.raw)
+		if err != nil {
+			b.initErr = fmt.Errorf("invalid gzip request body: %w", err)
+			return b.initErr
+		}
+		b.reader = gr
+	case "deflate":
+		b.reader = flate.NewReader(b.raw)
+	default:
+		b.initErr = fmt.Errorf("unsupported Content-Encoding %q", b.encoding)
+	}
+	return b.initErr
+}
+
+func (b *boundedDecompressedReader) Read(p []byte) (int, error) {
+	if err := b.init(); err != nil {
+		return 0, err
+	}
+	remaining := (b.maxBytes + 1) - b.readSoFar
+	if remaining <= 0 {
+		b.fireRejected()
+		return 0, &decompressedLimitError{limit: b.maxBytes}
+	}
+	if int64(len(p)) > remaining {
+		p = p[:remaining]
+	}
+	n, err := b.reader.Read(p)
+	b.readSoFar += int64(n)
+	if b.readSoFar > b.maxBytes {
+		b.fireRejected()
+		return n, &decompressedLimitError{limit: b.maxBytes}
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return n, err
+		}
+		return n, fmt.Errorf("reading %s request body: %w", b.encoding, err)
+	}
+	return n, err
+}
+
+func (b *boundedDecompressedReader) fireRejected() {
+	if !b.rejected {
+		b.rejected = true
+		if b.onRejected != nil {
+			b.onRejected()
+		}
+	}
+}
+
+func (b *boundedDecompressedReader) Close() error {
+	var firstErr error
+	if b.reader != nil {
+		firstErr = b.reader.Close()
+	}
+	if err := b.raw.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
+// isStreamingResponse reports whether a request or response header indicates a
+// streaming transport (SSE, NDJSON/CSV export, or WebSocket) that must not be
+// buffered by the response size limiter (#1283).
+func isStreamingResponse(r *http.Request, h http.Header) bool {
+	if isWebSocketUpgrade(r) {
+		return true
+	}
+	if r != nil {
+		path := r.URL.Path
+		if path == "/events.csv" || path == "/events/ws" || strings.HasSuffix(path, "/export") {
+			return true
+		}
+		if strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/event-stream") {
+			return true
+		}
+	}
+	mediaType, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(h.Get("Content-Type"))), ";")
+	switch mediaType {
+	case "text/event-stream", "application/x-ndjson", "text/csv":
+		return true
+	default:
+		return false
+	}
+}
+
+// boundedResponseWriter buffers non-streaming responses up to maxBytes and
+// rejects responses that exceed the cap with a structured 413 error and
+// pagination hint instead of growing without bound (#1283). Streaming
+// responses (SSE, exports, WebSocket upgrades) bypass buffering completely.
+type boundedResponseWriter struct {
+	http.ResponseWriter
+	req         *http.Request
+	maxBytes    int64
+	status      int
+	wroteHeader bool
+	streaming   bool
+	hijacked    bool
+	exceeded    bool
+	buf         bytes.Buffer
+}
+
+func (w *boundedResponseWriter) WriteHeader(status int) {
+	if w.hijacked || w.exceeded {
+		return
+	}
+	w.status = status
+	if isStreamingResponse(w.req, w.Header()) {
+		w.streaming = true
+		w.wroteHeader = true
+		w.ResponseWriter.WriteHeader(status)
+	}
+}
+
+func (w *boundedResponseWriter) Write(p []byte) (int, error) {
+	if w.hijacked {
+		return 0, http.ErrHijacked
+	}
+	if !w.streaming && isStreamingResponse(w.req, w.Header()) {
+		w.streaming = true
+		if !w.wroteHeader {
+			w.wroteHeader = true
+			status := w.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			w.ResponseWriter.WriteHeader(status)
+		}
+		if w.buf.Len() > 0 {
+			if _, err := w.ResponseWriter.Write(w.buf.Bytes()); err != nil {
+				return 0, err
+			}
+			w.buf.Reset()
+		}
+	}
+	if w.streaming {
+		return w.ResponseWriter.Write(p)
+	}
+	if w.exceeded {
+		return len(p), nil
+	}
+	if int64(w.buf.Len()+len(p)) > w.maxBytes {
+		w.exceeded = true
+		w.buf.Reset()
+		return len(p), nil
+	}
+	return w.buf.Write(p)
+}
+
+func (w *boundedResponseWriter) Flush() {
+	if w.hijacked || w.exceeded {
+		return
+	}
+	// Any handler that explicitly flushes is streaming; commit buffered bytes
+	// and switch to pass-through mode so SSE and chunked streams work.
+	if !w.streaming {
+		w.streaming = true
+		if !w.wroteHeader {
+			w.wroteHeader = true
+			status := w.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			w.ResponseWriter.WriteHeader(status)
+		}
+		if w.buf.Len() > 0 {
+			_, _ = w.ResponseWriter.Write(w.buf.Bytes())
+			w.buf.Reset()
+		}
+	}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *boundedResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	conn, rw, err := hj.Hijack()
+	if err == nil {
+		w.hijacked = true
+	}
+	return conn, rw, err
+}
+
+func (w *boundedResponseWriter) Pretty() bool {
+	if pw, ok := w.ResponseWriter.(prettyWriter); ok {
+		return pw.Pretty()
+	}
+	return false
+}
 
 // Response compression.
 //

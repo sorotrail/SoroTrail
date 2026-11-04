@@ -58,9 +58,12 @@ var errBodyTooLarge = errors.New("request body exceeds the configured limit")
 // malformed request gets the same status and message no matter which route
 // serves it.
 func (s *Server) decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	body, err := readJSONBody(r, s.httpRequestBodyLimit)
+	body, err := readJSONBody(r, s.EffectiveRequestBodyLimit(r))
 	if err != nil {
 		if errors.Is(err, errBodyTooLarge) {
+			if !isDecompressedLimitError(err) {
+				s.recordPayloadRejection(r, "request_body")
+			}
 			writeError(w, http.StatusRequestEntityTooLarge, err)
 		} else {
 			writeError(w, http.StatusBadRequest, err)
@@ -98,6 +101,9 @@ func readJSONBody(r *http.Request, limit int64) ([]byte, error) {
 		body, err = io.ReadAll(r.Body)
 	}
 	if err != nil {
+		if isDecompressedLimitError(err) {
+			return nil, err
+		}
 		tooLarge := errors.Is(err, errBodyTooLarge) || strings.Contains(err.Error(), "request body too large")
 		if tooLarge {
 			return nil, fmt.Errorf("request body exceeds %d bytes: %w", limit, errBodyTooLarge)
