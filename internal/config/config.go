@@ -403,6 +403,16 @@ type Config struct {
 	ArchiveTLSCertFile         string   `env:"ARCHIVE_TLS_CERT_FILE"`
 	ArchiveTLSKeyFile          string   `env:"ARCHIVE_TLS_KEY_FILE"`
 	ArchiveTLSCAFile           string   `env:"ARCHIVE_TLS_CA_FILE"`
+
+	// Field-level encryption at rest for sensitive database columns (#1225).
+	// ENCRYPTION_KEYS accepts a comma-separated keyring of "<version>:<key>"
+	// entries (first entry is the active write key; remaining entries are
+	// retained for decrypting older rows during zero-downtime key rotation).
+	// ENCRYPTION_KEY accepts a single 32-byte AES-256 key (64-char hex or
+	// base64) and defaults to version "v1". Both support *_FILE indirection
+	// via resolveFileEnv().
+	EncryptionKey  string `env:"-"`
+	EncryptionKeys string `env:"-"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -526,6 +536,12 @@ func (c *Config) loadBodySizeEnvOverrides() error {
 			return err
 		}
 		c.HTTPEndpointBodyLimits = limits
+	}
+	if raw, ok := os.LookupEnv("ENCRYPTION_KEY"); ok && strings.TrimSpace(raw) != "" {
+		c.EncryptionKey = strings.TrimSpace(raw)
+	}
+	if raw, ok := os.LookupEnv("ENCRYPTION_KEYS"); ok && strings.TrimSpace(raw) != "" {
+		c.EncryptionKeys = strings.TrimSpace(raw)
 	}
 	return nil
 }
@@ -661,6 +677,16 @@ func (c *Config) loadPoolBudgetEnvOverrides() error {
 		c.DBPoolPressureThreshold = f
 	}
 	return nil
+}
+
+// EffectiveEncryptionKeySpec returns the configured field-level encryption
+// key specification, preferring ENCRYPTION_KEYS when both ENCRYPTION_KEYS
+// and ENCRYPTION_KEY are set.
+func (c Config) EffectiveEncryptionKeySpec() string {
+	if s := strings.TrimSpace(c.EncryptionKeys); s != "" {
+		return s
+	}
+	return strings.TrimSpace(c.EncryptionKey)
 }
 
 // ParseLogLevel maps a LOG_LEVEL string to a slog.Level. Unknown or empty
@@ -981,6 +1007,9 @@ func (c Config) Validate() error {
 	}
 	if mtlsErrs := c.validateMTLS(); len(mtlsErrs) > 0 {
 		return fmt.Errorf("%s", mtlsErrs[0])
+	}
+	if encErrs := c.validateEncryption(); len(encErrs) > 0 {
+		return fmt.Errorf("%s", encErrs[0])
 	}
 	return nil
 }

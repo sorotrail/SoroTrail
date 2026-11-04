@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -121,6 +120,7 @@ type Postgres struct {
 	pool                      *pgxpool.Pool
 	partitionSpan             int64
 	maxSparseFilterLedgerSpan atomic.Int64
+	fieldEncryptor            atomic.Pointer[FieldEncryptor]
 
 	// Health monitoring
 	healthMu      sync.RWMutex
@@ -128,6 +128,24 @@ type Postgres struct {
 	lastHealthErr error
 	databaseURL   string
 	stopHealthCk  context.CancelFunc
+}
+
+// SetFieldEncryptor configures the FieldEncryptor used to encrypt and decrypt
+// sensitive columns at rest (such as subscriptions.secret).
+func (p *Postgres) SetFieldEncryptor(enc *FieldEncryptor) {
+	if p == nil {
+		return
+	}
+	p.fieldEncryptor.Store(enc)
+}
+
+// FieldEncryptor returns the configured FieldEncryptor, or nil if field-level
+// encryption is not enabled.
+func (p *Postgres) FieldEncryptor() *FieldEncryptor {
+	if p == nil {
+		return nil
+	}
+	return p.fieldEncryptor.Load()
 }
 
 // SetMaxSparseFilterLedgerSpan configures the maximum ledger span allowed
@@ -553,8 +571,11 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 	var sortValue, cursorContractID string
 	if f.Cursor != "" {
 		var err error
-		sortValue, cursorContractID, err = DecodeContractsCursor(f.Cursor)
+		sortValue, cursorContractID, err = DecodeContractsCursorForBackend(CursorBackendPostgres, f.Cursor)
 		if err != nil {
+			return nil, "", err
+		}
+		if _, err := contractsCursorValue(sortCol, sortType, sortValue); err != nil {
 			return nil, "", err
 		}
 	}
@@ -621,7 +642,7 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 	if len(out) > limit {
 		last := out[limit-1]
 		out = out[:limit]
-		next = EncodeContractsCursor(f.SortKey, contractSortValue(last, f.SortKey), last.ContractID)
+		next = EncodeContractsCursorForBackend(CursorBackendPostgres, f.SortKey, contractSortValue(last, f.SortKey), last.ContractID)
 	}
 	return out, next, nil
 }
@@ -1047,15 +1068,19 @@ func buildQueryEventsSQL(f EventFilter, maxSparseSpan int64) (string, []any, int
 	if f.Cursor != "" {
 		switch f.OrderBy {
 		case "", OrderByID:
-			if cursorLedger, ok := CursorLedger(f.Cursor); ok {
+			cursorID, err := DecodeEventIDCursorForBackend(CursorBackendPostgres, f.Cursor)
+			if err != nil {
+				return "", nil, 0, err
+			}
+			if cursorLedger, ok := CursorLedger(cursorID); ok {
 				if (f.FromLedger <= 0 || cursorLedger >= f.FromLedger) &&
 					(f.ToLedger <= 0 || cursorLedger <= f.ToLedger) {
 					where = append(where, "ledger "+ledgerBoundOp+" "+arg(cursorLedger))
 				}
 			}
-			where = append(where, "id "+cursorOp+" "+arg(f.Cursor))
+			where = append(where, "id "+cursorOp+" "+arg(cursorID))
 		default:
-			sortValue, id, err := decodeCompositeCursor(f.Cursor)
+			sortValue, id, err := decodeCompositeCursorForBackend(CursorBackendPostgres, f.Cursor)
 			if err != nil {
 				return "", nil, 0, err
 			}
@@ -1065,7 +1090,7 @@ func buildQueryEventsSQL(f EventFilter, maxSparseSpan int64) (string, []any, int
 			switch f.OrderBy {
 			case OrderByLedger:
 				if _, perr := strconv.ParseInt(sortValue, 10, 64); perr != nil {
-					return "", nil, 0, fmt.Errorf("%w: ledger cursor sort value is not an integer", ErrInvalidCursor)
+					return "", nil, 0, fmt.Errorf("%w: %w: ledger cursor sort value is not an integer", ErrInvalidCursor, ErrStaleCursor)
 				}
 				sortParam := arg(sortValue) + "::bigint"
 				// Emit an explicit scalar ledger bound alongside the row-value
@@ -1076,7 +1101,7 @@ func buildQueryEventsSQL(f EventFilter, maxSparseSpan int64) (string, []any, int
 					cursorOp, sortParam, arg(id)))
 			case OrderByCreatedAt:
 				if _, perr := time.Parse(time.RFC3339Nano, sortValue); perr != nil {
-					return "", nil, 0, fmt.Errorf("%w: created_at cursor sort value is not RFC3339Nano", ErrInvalidCursor)
+					return "", nil, 0, fmt.Errorf("%w: %w: created_at cursor sort value is not RFC3339Nano", ErrInvalidCursor, ErrStaleCursor)
 				}
 				typed := arg(sortValue) + "::timestamptz"
 				where = append(where, fmt.Sprintf("(created_at, id) %s (%s, %s)",
@@ -1131,7 +1156,7 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 
 		if len(events) > limit {
 			events = events[:limit]
-			next = EncodeCursor(f.OrderBy, events[limit-1])
+			next = EncodeCursorForBackend(CursorBackendPostgres, f.OrderBy, events[limit-1])
 		}
 		return nil
 	})
@@ -1869,7 +1894,7 @@ func (p *Postgres) ListContractSpecOverrideHistory(ctx context.Context, contract
 	// everything older than it.
 	var afterID int64 = 0
 	if cursor != "" {
-		id, err := DecodeSpecOverrideHistoryCursor(cursor)
+		id, err := DecodeSpecOverrideHistoryCursorForBackend(CursorBackendPostgres, cursor)
 		if err != nil {
 			return nil, "", err
 		}
@@ -1909,7 +1934,7 @@ func (p *Postgres) ListContractSpecOverrideHistory(ctx context.Context, contract
 
 	next := ""
 	if len(out) == limit {
-		next = EncodeSpecOverrideHistoryCursor(out[len(out)-1].ID)
+		next = EncodeSpecOverrideHistoryCursorForBackend(CursorBackendPostgres, out[len(out)-1].ID)
 	}
 	return out, next, nil
 }
@@ -2071,12 +2096,12 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, contractID string, limit
 		where = append(where, "contract_id = "+arg(contractID))
 	}
 	if cursor != "" {
-		sv, err := base64.RawURLEncoding.DecodeString(cursor)
+		afterID, err := DecodeDeadLetterCursorForBackend(CursorBackendPostgres, cursor)
 		if err != nil {
-			return nil, "", fmt.Errorf("%w: dead letter cursor", ErrInvalidContractsCursor)
+			return nil, "", err
 		}
 		idIdx := len(args) + 1
-		args = append(args, string(sv))
+		args = append(args, strconv.FormatInt(afterID, 10))
 		where = append(where, fmt.Sprintf("dead_letters.id < $%d", idIdx))
 	}
 	query := `SELECT id, event_id, contract_id, ledger, type, tx_hash,
@@ -2119,7 +2144,7 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, contractID string, limit
 	if len(rows) > limit {
 		last := rows[limit-1]
 		rows = rows[:limit]
-		next = base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprint(last.ID)))
+		next = EncodeDeadLetterCursorForBackend(CursorBackendPostgres, last.ID)
 	}
 	return rows, next, nil
 }
@@ -2342,7 +2367,11 @@ func (p *Postgres) QueryAddressEvents(ctx context.Context, address string, f Eve
 	orderCols := "e.id " + orderDir
 
 	if f.Cursor != "" {
-		where = append(where, "e.id "+cursorOp+" "+arg(f.Cursor))
+		cursorID, err := DecodeEventIDCursorForBackend(CursorBackendPostgres, f.Cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		where = append(where, "e.id "+cursorOp+" "+arg(cursorID))
 	}
 
 	query := `SELECT ` + eventColumns + `

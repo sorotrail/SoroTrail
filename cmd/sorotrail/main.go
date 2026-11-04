@@ -171,6 +171,10 @@ func dispatch(args []string) error {
 		return runConfig(args[1:])
 	case "preflight", "self-check":
 		return runPreflight(args[1:])
+	case "backup":
+		return runBackup(args[1:])
+	case "restore":
+		return runRestore(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -225,6 +229,10 @@ subcommands:
                    (sorotrail config --help)
   preflight        run startup self-checks (config, database, migrations, RPC, archive, retention)
                    (sorotrail preflight --help)
+  backup           snapshot operator configuration, checkpoints, and optional events
+                   (sorotrail backup --help)
+  restore          restore and verify a backup archive into a migrated database
+                   (sorotrail restore --help)
 `)
 }
 
@@ -383,6 +391,16 @@ func runService(dryRun bool) error {
 		log.Info("postgres connection established")
 		pg = store.NewPostgresWithHealthCheck(ctx, pool, cfg.DatabaseURL, int64(cfg.PartitionLedgerSpan))
 		defer pg.StopHealthCheck()
+		if keySpec := cfg.EffectiveEncryptionKeySpec(); keySpec != "" {
+			enc, encErr := store.ParseFieldEncryptor(keySpec)
+			if encErr != nil {
+				return fmt.Errorf("configuring field-level encryption: %w", encErr)
+			}
+			pg.SetFieldEncryptor(enc)
+		}
+		if err := pg.VerifyEncryptionReadiness(ctx); err != nil {
+			return fmt.Errorf("verifying field-level encryption readiness: %w", err)
+		}
 		st = pg
 	}
 
