@@ -93,6 +93,22 @@ var (
 		Help: "Per-provider failover health state as a 0/1 gauge per state (active | degraded | down).",
 	}, []string{"provider", "state"})
 
+	// RPCProviderDemotionsTotal counts every time a failover provider is
+	// demoted, labelled by provider hostname and the reason for demotion
+	// (consecutive_errors | behind_cursor | retention_gap | network_mismatch | divergence).
+	RPCProviderDemotionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_rpc_provider_demotions_total",
+		Help: "Total number of RPC provider demotions, labelled by provider and reason.",
+	}, []string{"provider", "reason"})
+
+	// RPCProviderPromotionsTotal counts every time a demoted failover
+	// provider passes probation and is promoted back to active, labelled by
+	// provider hostname.
+	RPCProviderPromotionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_rpc_provider_promotions_total",
+		Help: "Total number of RPC provider promotions back to active, labelled by provider.",
+	}, []string{"provider"})
+
 	// DBWriteLatency records the wall-clock duration of a database write
 	// operation (batch upsert, replace-in-range, etc.).
 	DBWriteLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -223,6 +239,8 @@ func init() {
 		RPCFailoversTotal,
 		RPCCircuitBreakerState,
 		RPCProviderState,
+		RPCProviderDemotionsTotal,
+		RPCProviderPromotionsTotal,
 		SpecInvalidationsReceived,
 		DeprecatedHTTPRequestsTotal,
 		TLSCertificateExpiryDays,
