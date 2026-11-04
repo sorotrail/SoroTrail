@@ -75,7 +75,12 @@ func (s *idempotencyTestStore) DeleteSubscription(_ context.Context, id int64, _
 	return nil
 }
 
-func doIdemRequest(t *testing.T, srv *Server, method, path, apiKey, idemKey, body string) (*http.Response, []byte) {
+type idemTestResponse struct {
+	StatusCode int
+	Header     http.Header
+}
+
+func doIdemRequest(t *testing.T, srv *Server, method, path, apiKey, idemKey, body string) (idemTestResponse, []byte) {
 	t.Helper()
 	var reader io.Reader
 	if body != "" {
@@ -94,10 +99,13 @@ func doIdemRequest(t *testing.T, srv *Server, method, path, apiKey, idemKey, bod
 	rec := httptest.NewRecorder()
 	srv.Router().ServeHTTP(rec, req)
 	resp := rec.Result()
+	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	_ = resp.Body.Close()
-	return resp, raw
+	return idemTestResponse{
+		StatusCode: resp.StatusCode,
+		Header:     resp.Header,
+	}, raw
 }
 
 func TestIdempotency_RepeatReturnsStoredResponseWithoutReexecuting(t *testing.T) {

@@ -396,9 +396,9 @@ func (s *SQLite) DeleteExpiredIdempotencyKeys(ctx context.Context, now time.Time
 
 func scanSQLiteIdempotencyRow(row *sql.Row) (IdempotencyRecord, error) {
 	var (
-		rec              IdempotencyRecord
-		createdAtRaw     string
-		expiresAtRaw     string
+		rec          IdempotencyRecord
+		createdAtRaw string
+		expiresAtRaw string
 	)
 	err := row.Scan(
 		&rec.TenantID,
