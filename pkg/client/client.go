@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -133,6 +134,14 @@ const (
 	CodeServiceUnavailable   ErrorCode = "SERVICE_UNAVAILABLE"
 )
 
+// ErrStaleCursor is matched via errors.Is(err, client.ErrStaleCursor) or
+// client.IsStaleCursor(err) when the server rejects a pagination cursor with
+// HTTP 400 / code INVALID_CURSOR (for example after a major-version upgrade,
+// a storage-backend migration, or a sort-order change). Callers that observe
+// ErrStaleCursor should restart pagination from an explicit anchor such as
+// FromLedger (or from an empty Cursor).
+var ErrStaleCursor = errors.New("sorotrail: stale or invalid pagination cursor")
+
 // APIError is returned for every non-2xx response. Message, Code, and Field
 // are populated from the server's standard error envelope when the body
 // carried one.
@@ -148,6 +157,42 @@ func (e *APIError) Error() string {
 		return fmt.Sprintf("sorotrail: %s (HTTP %d)", e.Message, e.StatusCode)
 	}
 	return fmt.Sprintf("sorotrail: HTTP %d", e.StatusCode)
+}
+
+// IsStaleCursor reports whether e represents a rejected pagination cursor
+// (HTTP 400 with code INVALID_CURSOR, field "cursor", or a cursor-rejection
+// error message), indicating that the caller should restart pagination from a
+// fresh anchor (such as FromLedger) instead of retrying the same cursor.
+func (e *APIError) IsStaleCursor() bool {
+	if e == nil {
+		return false
+	}
+	if e.Code == CodeInvalidCursor {
+		return true
+	}
+	if e.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	if strings.EqualFold(e.Field, "cursor") {
+		return true
+	}
+	msg := strings.ToLower(e.Message)
+	return strings.Contains(msg, "invalid cursor") || strings.Contains(msg, "stale cursor")
+}
+
+// Is allows errors.Is(err, client.ErrStaleCursor) to match cursor-rejection
+// APIErrors directly.
+func (e *APIError) Is(target error) bool {
+	if target == ErrStaleCursor {
+		return e.IsStaleCursor()
+	}
+	return false
+}
+
+// IsStaleCursor reports whether err (or any wrapped *APIError) indicates a
+// stale or invalid pagination cursor.
+func IsStaleCursor(err error) bool {
+	return errors.Is(err, ErrStaleCursor)
 }
 
 // do is the typed helper the generated object-returning methods call.

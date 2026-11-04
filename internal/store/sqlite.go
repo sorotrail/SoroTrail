@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -307,6 +306,10 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 		limit = MaxQueryLimit
 	}
 
+	if !ValidOrderBy(f.OrderBy) {
+		return nil, "", fmt.Errorf("%w: unsupported order_by %q", ErrInvalidCursor, f.OrderBy)
+	}
+
 	var (
 		where []string
 		args  []any
@@ -314,6 +317,14 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 	arg := func(v any) string {
 		args = append(args, v)
 		return "?"
+	}
+	if len(f.Scope.Contracts()) > 0 {
+		contracts := f.Scope.Contracts()
+		ph := make([]string, 0, len(contracts))
+		for _, cid := range contracts {
+			ph = append(ph, arg(cid))
+		}
+		where = append(where, "contract_id IN ("+strings.Join(ph, ", ")+")")
 	}
 	if f.Network != "" {
 		where = append(where, "network = "+arg(defaultNetwork(f.Network)))
@@ -399,7 +410,6 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 		cursorOp = "<"
 		ledgerBoundOp = "<="
 	}
-
 	orderCols := "id " + orderDir
 	if f.OrderBy != "" && f.OrderBy != OrderByID {
 		orderCols = f.OrderBy + " " + orderDir + ", id " + orderDir
@@ -408,15 +418,19 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 	if f.Cursor != "" {
 		switch f.OrderBy {
 		case "", OrderByID:
-			if cursorLedger, ok := CursorLedger(f.Cursor); ok {
+			cursorID, err := DecodeEventIDCursorForBackend(CursorBackendSQLite, f.Cursor)
+			if err != nil {
+				return nil, "", err
+			}
+			if cursorLedger, ok := CursorLedger(cursorID); ok {
 				if (f.FromLedger <= 0 || cursorLedger >= f.FromLedger) &&
 					(f.ToLedger <= 0 || cursorLedger <= f.ToLedger) {
 					where = append(where, "ledger "+ledgerBoundOp+" "+arg(cursorLedger))
 				}
 			}
-			where = append(where, "id "+cursorOp+" "+arg(f.Cursor))
+			where = append(where, "id "+cursorOp+" "+arg(cursorID))
 		default:
-			sortValue, id, err := decodeCompositeCursor(f.Cursor)
+			sortValue, id, err := decodeCompositeCursorForBackend(CursorBackendSQLite, f.Cursor)
 			if err != nil {
 				return nil, "", err
 			}
@@ -424,7 +438,7 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 			case OrderByLedger:
 				cursorLedger, perr := strconv.ParseInt(sortValue, 10, 64)
 				if perr != nil {
-					return nil, "", fmt.Errorf("%w: ledger cursor sort value is not an integer", ErrInvalidCursor)
+					return nil, "", fmt.Errorf("%w: %w: ledger cursor sort value is not an integer", ErrInvalidCursor, ErrStaleCursor)
 				}
 				where = append(where, "ledger "+ledgerBoundOp+" "+arg(cursorLedger))
 				where = append(where, fmt.Sprintf("(ledger, id) %s (%s, %s)",
@@ -432,7 +446,7 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 			case OrderByCreatedAt:
 				t, perr := time.Parse(time.RFC3339Nano, sortValue)
 				if perr != nil {
-					return nil, "", fmt.Errorf("%w: created_at cursor sort value is not RFC3339Nano", ErrInvalidCursor)
+					return nil, "", fmt.Errorf("%w: %w: created_at cursor sort value is not RFC3339Nano", ErrInvalidCursor, ErrStaleCursor)
 				}
 				formatted := formatTime(t)
 				where = append(where, "created_at "+ledgerBoundOp+" "+arg(formatted))
@@ -469,7 +483,7 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 	next := ""
 	if len(events) > limit {
 		events = events[:limit]
-		next = EncodeCursor(f.OrderBy, events[limit-1])
+		next = EncodeCursorForBackend(CursorBackendSQLite, f.OrderBy, events[limit-1])
 	}
 	return events, next, nil
 }
@@ -691,7 +705,11 @@ func (s *SQLite) QueryAddressEvents(ctx context.Context, address string, f Event
 	orderCols := "e.id " + orderDir
 
 	if f.Cursor != "" {
-		where = append(where, "e.id "+cursorOp+" "+arg(f.Cursor))
+		cursorID, err := DecodeEventIDCursorForBackend(CursorBackendSQLite, f.Cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		where = append(where, "e.id "+cursorOp+" "+arg(cursorID))
 	}
 
 	query := `SELECT ` + eventColumnsSQLite + `
@@ -815,11 +833,11 @@ func (s *SQLite) ListDeadLetters(ctx context.Context, contractID string, limit i
 		where = append(where, "contract_id = "+arg(contractID))
 	}
 	if cursor != "" {
-		sv, err := base64.RawURLEncoding.DecodeString(cursor)
+		afterID, err := DecodeDeadLetterCursorForBackend(CursorBackendSQLite, cursor)
 		if err != nil {
-			return nil, "", fmt.Errorf("%w: dead letter cursor", ErrInvalidContractsCursor)
+			return nil, "", err
 		}
-		where = append(where, "dead_letters.id < "+arg(string(sv)))
+		where = append(where, "dead_letters.id < "+arg(strconv.FormatInt(afterID, 10)))
 	}
 	query := "SELECT id, event_id, contract_id, ledger, type, tx_hash, topic_xdr, value_xdr, error, attempts, last_attempt, created_at FROM dead_letters"
 	if len(where) > 0 {
@@ -855,7 +873,7 @@ func (s *SQLite) ListDeadLetters(ctx context.Context, contractID string, limit i
 	next := ""
 	if len(letters) > limit {
 		letters = letters[:limit]
-		next = base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d", letters[limit-1].ID)))
+		next = EncodeDeadLetterCursorForBackend(CursorBackendSQLite, letters[limit-1].ID)
 	}
 	return letters, next, nil
 }
@@ -1599,7 +1617,7 @@ func (s *SQLite) ListContractSpecOverrideHistory(ctx context.Context, contractID
 
 	var afterID int64
 	if cursor != "" {
-		id, err := DecodeSpecOverrideHistoryCursor(cursor)
+		id, err := DecodeSpecOverrideHistoryCursorForBackend(CursorBackendSQLite, cursor)
 		if err != nil {
 			return nil, "", err
 		}
@@ -1642,7 +1660,7 @@ func (s *SQLite) ListContractSpecOverrideHistory(ctx context.Context, contractID
 
 	next := ""
 	if len(out) == limit {
-		next = EncodeSpecOverrideHistoryCursor(out[len(out)-1].ID)
+		next = EncodeSpecOverrideHistoryCursorForBackend(CursorBackendSQLite, out[len(out)-1].ID)
 	}
 	return out, next, nil
 }
@@ -1864,7 +1882,7 @@ func (s *SQLite) ListContracts(ctx context.Context, f ContractsFilter) ([]Contra
 		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
 	}
 	if f.Cursor != "" {
-		sortValue, contractID, err := DecodeContractsCursor(f.Cursor)
+		sortValue, contractID, err := DecodeContractsCursorForBackend(CursorBackendSQLite, f.Cursor)
 		if err != nil {
 			return nil, "", err
 		}
@@ -1926,7 +1944,7 @@ func (s *SQLite) ListContracts(ctx context.Context, f ContractsFilter) ([]Contra
 	if len(out) > limit {
 		last := out[limit-1]
 		out = out[:limit]
-		next = EncodeContractsCursor(f.SortKey, contractSortValue(last, f.SortKey), last.ContractID)
+		next = EncodeContractsCursorForBackend(CursorBackendSQLite, f.SortKey, contractSortValue(last, f.SortKey), last.ContractID)
 	}
 	return out, next, nil
 }
