@@ -117,11 +117,11 @@ func TestPostgres_ReconcileReorgRange_DerivedStateAndMultiNetworkIsolation(t *te
 	}))
 
 	_, err = st.DeadLetterEvent(ctx, DeadLetterInput{
-		EventID: "dl-main-201", ContractID: "CCONTRACT_MAIN", Ledger: 201, Type: "contract", Err: errors.New("main err"),
+		EventID: "dl-main-201", ContractID: "CCONTRACT_MAIN", Ledger: 201, Type: "contract", TxHash: "tx-dl-main", Err: errors.New("main err"),
 	})
 	require.NoError(t, err)
 	_, err = st.DeadLetterEvent(ctx, DeadLetterInput{
-		EventID: "dl-test-201", ContractID: "CCONTRACT_TEST", Ledger: 201, Type: "contract", Err: errors.New("test err"),
+		EventID: "dl-test-201", ContractID: "CCONTRACT_TEST", Ledger: 201, Type: "contract", TxHash: "tx-dl-test", Err: errors.New("test err"),
 	})
 	require.NoError(t, err)
 
