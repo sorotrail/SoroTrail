@@ -698,6 +698,9 @@ func runService(dryRun bool) error {
 	apiServer.SetMetricsEnabled(cfg.MetricsEnabled)
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 	apiServer.SetHTTPRequestBodyLimit(cfg.HTTPRequestBodyLimit)
+	apiServer.SetHTTPResponseBodyLimit(cfg.HTTPResponseBodyLimit)
+	apiServer.SetMaxDecompressedBodySize(cfg.HTTPDecompressedBodyLimit)
+	apiServer.SetEndpointRequestBodyLimits(cfg.HTTPEndpointBodyLimits)
 	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
 	apiServer.SetDefaultNetwork(cfg.Network)
 	apiServer.SetCORSConfig(api.CORSConfig{
