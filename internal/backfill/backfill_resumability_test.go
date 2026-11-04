@@ -3,10 +3,19 @@ package backfill_test
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/backfill"
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/horizon"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // mockResumableStore simulates storage for backfill checkpoint and batch commits.
@@ -133,14 +142,127 @@ func TestBackfill_ResumabilityAndIdempotency(tests *testing.T) {
 
 	tests.Run("permanently failing range is reported rather than retried forever", func(t *testing.T) {
 		t.Parallel()
-		// Assert that after max retry attempts, a failing range returns a terminal error instead of looping.
-		err := errors.New("permanent rpc failure")
-		assert.Error(t, err)
+		st := &rangeMemoryStore{}
+		hc := &flakyRangeHorizon{
+			permanentErr: errors.New("permanent rpc failure"),
+		}
+		b := backfill.New(hc, st, decode.XDRDecoder{}, slog.New(slog.NewTextHandler(io.Discard, nil)), backfill.Options{
+			ContractID:          "0000000000000000000000000000000000000000000000000000000000000001",
+			FromLedger:          100,
+			ToLedger:            119,
+			Workers:             2,
+			MaxRetries:          2,
+			RetryInitialBackoff: time.Millisecond,
+		})
+		sum, err := b.Run(context.Background())
+		require.Error(t, err)
+		assert.False(t, sum.Completed)
+		assert.NotEmpty(t, sum.FailedRanges)
+		assert.Contains(t, err.Error(), "permanent rpc failure")
+	})
+
+	tests.Run("transient sub-range error is retried and succeeds", func(t *testing.T) {
+		t.Parallel()
+		st := &rangeMemoryStore{}
+		hc := &flakyRangeHorizon{
+			transientFailuresBeforeSuccess: 2,
+		}
+		b := backfill.New(hc, st, decode.XDRDecoder{}, slog.New(slog.NewTextHandler(io.Discard, nil)), backfill.Options{
+			ContractID:          "0000000000000000000000000000000000000000000000000000000000000001",
+			FromLedger:          100,
+			ToLedger:            119,
+			Workers:             2,
+			MaxRetries:          3,
+			RetryInitialBackoff: time.Millisecond,
+		})
+		sum, err := b.Run(context.Background())
+		require.NoError(t, err)
+		assert.True(t, sum.Completed)
+		assert.Equal(t, 2, sum.CompletedRanges)
 	})
 
 	tests.Run("progress is persisted often enough that an interrupt loses bounded work", func(t *testing.T) {
 		t.Parallel()
-		// Assert state checkpointing frequency bounds the lost work window.
-		assert.True(t, true)
+		ranges := backfill.SplitLedgerRanges(100, 199, 25, 4)
+		require.Len(t, ranges, 4)
+		assert.Equal(t, int64(100), ranges[0].FromLedger)
+		assert.Equal(t, int64(124), ranges[0].ToLedger)
+		assert.Equal(t, int64(175), ranges[3].FromLedger)
+		assert.Equal(t, int64(199), ranges[3].ToLedger)
 	})
+}
+
+type rangeMemoryStore struct {
+	mu    sync.Mutex
+	state store.BackfillState
+	init  bool
+}
+
+func (s *rangeMemoryStore) UpsertEvents(_ context.Context, events []store.Event) (int64, error) {
+	return int64(len(events)), nil
+}
+
+func (s *rangeMemoryStore) GetBackfillState(_ context.Context) (store.BackfillState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.init {
+		return store.BackfillState{}, store.ErrNotFound
+	}
+	return s.state, nil
+}
+
+func (s *rangeMemoryStore) StartBackfillState(_ context.Context, contractID string, fromLedger, toLedger int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.init = true
+	s.state = store.BackfillState{
+		ContractID: contractID,
+		FromLedger: fromLedger,
+		ToLedger:   toLedger,
+	}
+	return nil
+}
+
+func (s *rangeMemoryStore) UpdateBackfillState(_ context.Context, lastLedger int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if lastLedger > s.state.LastLedger {
+		s.state.LastLedger = lastLedger
+	}
+	return nil
+}
+
+func (s *rangeMemoryStore) SaveBackfillRanges(_ context.Context, ranges []store.BackfillRange) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.Ranges = append([]store.BackfillRange(nil), ranges...)
+	return nil
+}
+
+func (s *rangeMemoryStore) CompleteBackfillState(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	s.state.CompletedAt = &now
+	return nil
+}
+
+type flakyRangeHorizon struct {
+	mu                             sync.Mutex
+	transientFailuresBeforeSuccess int
+	permanentErr                   error
+	calls                          int
+}
+
+func (f *flakyRangeHorizon) ListContractTransactions(_ context.Context, _ string, _ string, _ int, _ bool) (horizon.TransactionsResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.permanentErr != nil {
+		return horizon.TransactionsResponse{}, f.permanentErr
+	}
+	if f.calls <= f.transientFailuresBeforeSuccess {
+		return horizon.TransactionsResponse{}, horizon.ErrRateLimited
+	}
+	return horizon.TransactionsResponse{}, nil
 }

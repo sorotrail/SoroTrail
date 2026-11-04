@@ -17,6 +17,9 @@ func TestRunBackfill_Flags(t *testing.T) {
 		{"missing ledger", []string{"--contract", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"}, true},
 		{"inverted range", []string{"--contract", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4", "--from-ledger", "100", "--to-ledger", "50"}, true},
 		{"invalid batch size", []string{"--contract", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4", "--from-ledger", "1", "--batch-size", "999"}, true},
+		{"invalid workers zero", []string{"--contract", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4", "--from-ledger", "1", "--to-ledger", "100", "--workers", "0"}, true},
+		{"negative range size", []string{"--contract", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4", "--from-ledger", "1", "--to-ledger", "100", "--range-size", "-10"}, true},
+		{"parallel workers require to-ledger", []string{"--contract", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4", "--from-ledger", "1", "--workers", "4"}, true},
 	}
 
 	for _, tt := range tests {
@@ -29,6 +32,19 @@ func TestRunBackfill_Flags(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseBackfillFlags_ParallelOptions(t *testing.T) {
+	f, err := parseBackfillFlags([]string{
+		"--contract", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+		"--from-ledger", "100",
+		"--to-ledger", "500",
+		"--workers", "4",
+		"--range-size", "100",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, 4, f.workers)
+	assert.Equal(t, int64(100), f.rangeSize)
 }
 
 func TestRunBackfill_SubcommandsAndUsage(t *testing.T) {

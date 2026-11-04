@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,6 +122,7 @@ func dummyLog() *slog.Logger {
 // no-op, which is exactly the property TestRun_RunningTwiceDoesNotDuplicateRows
 // and TestRun_ResumeDiscardsOverlapWithoutDuplicating need to observe.
 type fakeStore struct {
+	mu              sync.Mutex
 	state           store.BackfillState
 	startCalled     bool
 	updateCallCount int
@@ -136,6 +139,8 @@ func rowKey(e store.Event) string {
 }
 
 func (f *fakeStore) UpsertEvents(_ context.Context, events []store.Event) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.upsertCallCount++
 	f.upsertBatches = append(f.upsertBatches, events)
 	if f.rows == nil {
@@ -153,12 +158,18 @@ func (f *fakeStore) UpsertEvents(_ context.Context, events []store.Event) (int64
 	return inserted, nil
 }
 func (f *fakeStore) GetBackfillState(_ context.Context) (store.BackfillState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if !f.startCalled && !f.completeCalled && f.state.ContractID == "" {
 		return store.BackfillState{}, store.ErrNotFound
 	}
-	return f.state, nil
+	s := f.state
+	s.Ranges = cloneRanges(f.state.Ranges)
+	return s, nil
 }
 func (f *fakeStore) StartBackfillState(_ context.Context, contractID string, fromLedger, toLedger int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.startCalled = true
 	f.state = store.BackfillState{
 		ContractID: contractID, FromLedger: fromLedger, ToLedger: toLedger,
@@ -167,6 +178,8 @@ func (f *fakeStore) StartBackfillState(_ context.Context, contractID string, fro
 	return nil
 }
 func (f *fakeStore) UpdateBackfillState(_ context.Context, lastLedger int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.updateCallCount++
 	f.updateLedgers = append(f.updateLedgers, lastLedger)
 	if lastLedger > f.state.LastLedger {
@@ -174,7 +187,22 @@ func (f *fakeStore) UpdateBackfillState(_ context.Context, lastLedger int64) err
 	}
 	return nil
 }
+func (f *fakeStore) SaveBackfillRanges(_ context.Context, ranges []store.BackfillRange) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.state.Ranges = cloneRanges(ranges)
+	f.state.UpdatedAt = time.Now()
+	if len(ranges) > 0 {
+		wm := store.ContiguousWatermark(ranges[0].FromLedger, ranges)
+		if wm > f.state.LastLedger {
+			f.state.LastLedger = wm
+		}
+	}
+	return nil
+}
 func (f *fakeStore) CompleteBackfillState(_ context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.completeCalled = true
 	ts := time.Now()
 	f.state.CompletedAt = &ts
@@ -514,6 +542,308 @@ func TestRun_ResumeDiscardsOverlapWithoutDuplicating(t *testing.T) {
 	assert.EqualValues(t, 1, sum2.Extracted)
 	assert.EqualValues(t, 1, sum2.Inserted, "only the new ledger-101 row is a genuinely new insert")
 	assert.Len(t, fs.rows, 3, "store ends with exactly the three distinct events across both runs, no duplicates")
+}
+
+// cursorHorizon is a stateless, cursor-indexed Horizon fake safe for concurrent
+// use across N workers. Each call with cursor="" returns page 0, and a call
+// with the last transaction's ID/PagingToken returns the next page.
+type cursorHorizon struct {
+	mu          sync.Mutex
+	pages       [][]horizon.Transaction
+	rangeErrors map[int64]error // keyed by range fromLedger
+	rangeCalls  map[string]int  // keyed by "from..to"
+}
+
+func (c *cursorHorizon) pageForCursor(cursor string, rows []horizon.Transaction, limit int) []horizon.Transaction {
+	startIdx := 0
+	if cursor != "" {
+		found := false
+		for i, tx := range rows {
+			tok := tx.PagingToken
+			if tok == "" {
+				tok = tx.ID
+			}
+			if tok == cursor {
+				startIdx = i + 1
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil
+		}
+	}
+	if startIdx >= len(rows) {
+		return nil
+	}
+	endIdx := startIdx + limit
+	if endIdx > len(rows) {
+		endIdx = len(rows)
+	}
+	out := make([]horizon.Transaction, endIdx-startIdx)
+	copy(out, rows[startIdx:endIdx])
+	return out
+}
+
+func (c *cursorHorizon) flattenRows() []horizon.Transaction {
+	var all []horizon.Transaction
+	for _, p := range c.pages {
+		all = append(all, p...)
+	}
+	return all
+}
+
+func (c *cursorHorizon) ListContractTransactions(_ context.Context, _ string, cursor string, limit int, _ bool) (horizon.TransactionsResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	records := c.pageForCursor(cursor, c.flattenRows(), limit)
+	var resp horizon.TransactionsResponse
+	resp.Embedded.Records = records
+	return resp, nil
+}
+
+func (c *cursorHorizon) ListContractTransactionsInRange(_ context.Context, _ string, fromLedger, toLedger int64, cursor string, limit int, _ bool) (horizon.TransactionsResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rangeCalls == nil {
+		c.rangeCalls = make(map[string]int)
+	}
+	key := fmt.Sprintf("%d..%d", fromLedger, toLedger)
+	c.rangeCalls[key]++
+	if err, ok := c.rangeErrors[fromLedger]; ok && err != nil {
+		return horizon.TransactionsResponse{}, err
+	}
+	var inRange []horizon.Transaction
+	for _, tx := range c.flattenRows() {
+		if tx.Ledger >= fromLedger && (toLedger <= 0 || tx.Ledger <= toLedger) {
+			inRange = append(inRange, tx)
+		}
+	}
+	var resp horizon.TransactionsResponse
+	resp.Embedded.Records = c.pageForCursor(cursor, inRange, limit)
+	return resp, nil
+}
+
+type countingRateLimiter struct {
+	waits atomic.Int64
+}
+
+func (l *countingRateLimiter) Wait(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	l.waits.Add(1)
+	return nil
+}
+
+// TestParallelRun_MatchesSerialEventSet verifies that running backfill across
+// N parallel workers produces the exact same event set, IDs, and summary counts
+// as a serial single-worker run over the same input (#1237).
+func TestParallelRun_MatchesSerialEventSet(t *testing.T) {
+	targetContract := contractIDFromSeed("parallel-parity")
+	var allTxs []horizon.Transaction
+	for ledger := int64(100); ledger <= 119; ledger++ {
+		for txIdx := 0; txIdx < 2; txIdx++ {
+			id := fmt.Sprintf("tx-%d-%d", ledger, txIdx)
+			meta := buildSimpleMeta(t, "parallel-parity", scVec(scSymbol("mint"), scU64(uint64(ledger*10+int64(txIdx)))))
+			allTxs = append(allTxs, horizon.Transaction{
+				ID:            id,
+				PagingToken:   id,
+				Hash:          fmt.Sprintf("hash-%d-%d", ledger, txIdx),
+				Ledger:        ledger,
+				CreatedAt:     "2026-07-24T00:00:00Z",
+				ResultCode:    "txSuccess",
+				ResultMetaXDR: meta,
+			})
+		}
+	}
+
+	serialStore := &fakeStore{}
+	serialHorizon := &cursorHorizon{pages: [][]horizon.Transaction{allTxs}}
+	serialBackfiller := New(serialHorizon, serialStore, decode.XDRDecoder{}, dummyLog(), Options{
+		ContractID: targetContract,
+		FromLedger: 100,
+		ToLedger:   119,
+		BatchSize:  5,
+		Workers:    1,
+	})
+	serialSum, err := serialBackfiller.Run(context.Background())
+	require.NoError(t, err)
+	require.True(t, serialSum.Completed)
+
+	parallelStore := &fakeStore{}
+	parallelHorizon := &cursorHorizon{pages: [][]horizon.Transaction{allTxs}}
+	parallelBackfiller := New(parallelHorizon, parallelStore, decode.XDRDecoder{}, dummyLog(), Options{
+		ContractID: targetContract,
+		FromLedger: 100,
+		ToLedger:   119,
+		BatchSize:  5,
+		Workers:    4,
+	})
+	parallelSum, err := parallelBackfiller.Run(context.Background())
+	require.NoError(t, err)
+	require.True(t, parallelSum.Completed)
+
+	assert.Equal(t, 4, parallelSum.TotalRanges)
+	assert.Equal(t, 4, parallelSum.CompletedRanges)
+	assert.Empty(t, parallelSum.FailedRanges)
+	assert.Equal(t, serialSum.Transactions, parallelSum.Transactions)
+	assert.Equal(t, serialSum.Extracted, parallelSum.Extracted)
+	assert.Equal(t, serialSum.Inserted, parallelSum.Inserted)
+	assert.Equal(t, serialSum.Skipped, parallelSum.Skipped)
+	assert.Equal(t, serialSum.Failed, parallelSum.Failed)
+	assert.Equal(t, serialStore.rows, parallelStore.rows, "parallel worker pool must produce the exact same event set as serial execution")
+}
+
+// TestParallelRun_WorkerFailureAndResumeOnlyIncompleteRanges verifies that:
+//  1. A worker failure in one sub-range does not hang or abort sibling workers.
+//  2. The failed sub-range is surfaced clearly in the error and Summary.FailedRanges.
+//  3. Re-running resumes only the failed/incomplete sub-range without re-fetching
+//     already completed sub-ranges (#1237).
+func TestParallelRun_WorkerFailureAndResumeOnlyIncompleteRanges(t *testing.T) {
+	targetContract := contractIDFromSeed("parallel-resume")
+	var allTxs []horizon.Transaction
+	for ledger := int64(100); ledger <= 129; ledger++ {
+		id := fmt.Sprintf("tx-%d", ledger)
+		meta := buildSimpleMeta(t, "parallel-resume", scVec(scSymbol("swap"), scU64(uint64(ledger))))
+		allTxs = append(allTxs, horizon.Transaction{
+			ID:            id,
+			PagingToken:   id,
+			Hash:          fmt.Sprintf("hash-%d", ledger),
+			Ledger:        ledger,
+			CreatedAt:     "2026-07-24T00:00:00Z",
+			ResultCode:    "txSuccess",
+			ResultMetaXDR: meta,
+		})
+	}
+
+	fs := &fakeStore{}
+	// 3 ranges of 10 ledgers each: [100..109], [110..119], [120..129].
+	// Force range [110..119] to fail with a permanent error on run 1.
+	h1 := &cursorHorizon{
+		pages: [][]horizon.Transaction{allTxs},
+		rangeErrors: map[int64]error{
+			110: errors.New("simulated range 110..119 failure"),
+		},
+	}
+
+	b1 := New(h1, fs, decode.XDRDecoder{}, dummyLog(), Options{
+		ContractID: targetContract,
+		FromLedger: 100,
+		ToLedger:   129,
+		BatchSize:  5,
+		Workers:    3,
+		RangeSize:  10,
+	})
+	sum1, err1 := b1.Run(context.Background())
+	require.Error(t, err1)
+	assert.Contains(t, err1.Error(), "[110..119]")
+	assert.False(t, sum1.Completed)
+	assert.Equal(t, 3, sum1.TotalRanges)
+	assert.Equal(t, 2, sum1.CompletedRanges, "sibling ranges [100..109] and [120..129] must complete despite range [110..119] failing")
+	require.Len(t, sum1.FailedRanges, 1)
+	assert.Equal(t, int64(110), sum1.FailedRanges[0].FromLedger)
+	assert.Equal(t, int64(119), sum1.FailedRanges[0].ToLedger)
+	assert.Len(t, fs.rows, 20, "20 events from the two healthy ranges must be committed")
+
+	// Run 2: clear the failure and resume. Completed ranges [100..109] and [120..129]
+	// must NOT be re-fetched; only [110..119] should be queried.
+	h2 := &cursorHorizon{
+		pages: [][]horizon.Transaction{allTxs},
+	}
+	b2 := New(h2, fs, decode.XDRDecoder{}, dummyLog(), Options{
+		ContractID: targetContract,
+		FromLedger: 100,
+		ToLedger:   129,
+		BatchSize:  5,
+		Workers:    3,
+		RangeSize:  10,
+	})
+	sum2, err2 := b2.Run(context.Background())
+	require.NoError(t, err2)
+	assert.True(t, sum2.Resumed)
+	assert.True(t, sum2.Completed)
+	assert.Equal(t, 3, sum2.CompletedRanges)
+	assert.Empty(t, sum2.FailedRanges)
+	assert.Equal(t, 0, h2.rangeCalls["100..109"], "completed range [100..109] must not be re-fetched on resume")
+	assert.Equal(t, 0, h2.rangeCalls["120..129"], "completed range [120..129] must not be re-fetched on resume")
+	assert.Greater(t, h2.rangeCalls["110..119"], 0, "incomplete range [110..119] must be fetched on resume")
+	assert.Len(t, fs.rows, 30, "all 30 events across all three ranges are now stored without duplicates")
+}
+
+// TestParallelRun_AggregateRateLimitingAcrossWorkers verifies that all workers
+// share the configured aggregate RateLimiter so concurrent workers never bypass
+// rate limiting (#1237).
+func TestParallelRun_AggregateRateLimitingAcrossWorkers(t *testing.T) {
+	targetContract := contractIDFromSeed("rate-limit")
+	var allTxs []horizon.Transaction
+	for ledger := int64(100); ledger <= 115; ledger++ {
+		id := fmt.Sprintf("tx-%d", ledger)
+		meta := buildSimpleMeta(t, "rate-limit", scVec(scSymbol("tick"), scU64(uint64(ledger))))
+		allTxs = append(allTxs, horizon.Transaction{
+			ID:            id,
+			PagingToken:   id,
+			Hash:          fmt.Sprintf("hash-%d", ledger),
+			Ledger:        ledger,
+			CreatedAt:     "2026-07-24T00:00:00Z",
+			ResultCode:    "txSuccess",
+			ResultMetaXDR: meta,
+		})
+	}
+
+	limiter := &countingRateLimiter{}
+	var snapshots []ProgressSnapshot
+	var snapMu sync.Mutex
+
+	h := &cursorHorizon{pages: [][]horizon.Transaction{allTxs}}
+	fs := &fakeStore{}
+	b := New(h, fs, decode.XDRDecoder{}, dummyLog(), Options{
+		ContractID: targetContract,
+		FromLedger: 100,
+		ToLedger:   115,
+		BatchSize:  2,
+		Workers:    4,
+		Limiter:    limiter,
+		RangeProgress: func(snap ProgressSnapshot) {
+			snapMu.Lock()
+			snapshots = append(snapshots, snap)
+			snapMu.Unlock()
+		},
+	})
+	sum, err := b.Run(context.Background())
+	require.NoError(t, err)
+	assert.True(t, sum.Completed)
+	assert.GreaterOrEqual(t, limiter.waits.Load(), sum.PagesFetched,
+		"every page fetch across all concurrent workers must pass through the shared RateLimiter")
+
+	snapMu.Lock()
+	require.NotEmpty(t, snapshots)
+	finalSnap := snapshots[len(snapshots)-1]
+	snapMu.Unlock()
+	assert.Equal(t, 4, finalSnap.TotalRanges)
+	assert.Equal(t, 4, finalSnap.CompletedRanges)
+	assert.Equal(t, int64(16), finalSnap.CompletedLedgers)
+	assert.Equal(t, int64(0), finalSnap.EstimatedRemainingLedgers)
+}
+
+func TestIntervalRateLimiter_EnforcesAggregateSpacing(t *testing.T) {
+	rl := NewIntervalRateLimiter(5 * time.Millisecond)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			require.NoError(t, rl.Wait(ctx))
+		}()
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	assert.Equal(t, int64(4), rl.WaitCount())
+	// 4 calls spaced by 5ms require at least 3 intervals (~15ms).
+	assert.GreaterOrEqual(t, elapsed, 12*time.Millisecond)
 }
 
 // avoid `errors` import flagging by referencing it once.
