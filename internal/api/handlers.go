@@ -564,6 +564,9 @@ func (s *Server) handleCountEvents(w http.ResponseWriter, r *http.Request) {
 
 	total, err := s.store.CountEvents(r.Context(), filter)
 	if err != nil {
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 		loggerFromContext(r.Context()).Error("counting events", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("counting events failed"))
 		return
@@ -621,6 +624,9 @@ func (s *Server) handleAggregateEvents(w http.ResponseWriter, r *http.Request) {
 
 	buckets, err := s.store.AggregateEvents(r.Context(), filter, bucket)
 	if err != nil {
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 		loggerFromContext(r.Context()).Error("aggregating events", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("aggregating events failed"))
 		return
@@ -723,6 +729,9 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if qerr != nil {
+		if writePoolBudgetExhausted(w, qerr) {
+			return
+		}
 
 		loggerFromContext(ctx).Error("streaming events (first batch)", "error", qerr)
 
@@ -964,6 +973,9 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 	}
 
 	if qerr != nil {
+		if writePoolBudgetExhausted(w, qerr) {
+			return
+		}
 
 		loggerFromContext(r.Context()).Error("querying events", "error", qerr)
 
@@ -1344,6 +1356,9 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 
 		loggerFromContext(r.Context()).Error("loading event", "id", id, "error", err)
 
@@ -1540,6 +1555,9 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		loggerFromContext(r.Context()).Error("listing contracts", "error", err)
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
 		return
 	}
@@ -1674,6 +1692,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	stats, err := s.assembleStats(r.Context())
 	if err != nil {
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 		loggerFromContext(r.Context()).Error("loading stats", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
@@ -3133,7 +3154,32 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = enc.Encode(v)
 }
 
+// writePoolBudgetExhausted writes a retriable 503 Service Unavailable with a
+// Retry-After header when err wraps store.ErrPoolBudgetExhausted (#1231).
+func writePoolBudgetExhausted(w http.ResponseWriter, err error) bool {
+	if !errors.Is(err, store.ErrPoolBudgetExhausted) {
+		return false
+	}
+	retrySecs := 1
+	var budgetErr *store.PoolBudgetExhaustedError
+	if errors.As(err, &budgetErr) && budgetErr.RetryAfter > 0 {
+		if s := int(budgetErr.RetryAfter.Seconds()); s > 0 {
+			retrySecs = s
+		}
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusServiceUnavailable, errorResponse{
+		Error: "database connection pool budget exhausted; retry after backpressure clears",
+		Code:  CodeServiceUnavailable,
+	})
+	return true
+}
+
 func writeError(w http.ResponseWriter, status int, err error) {
+	if writePoolBudgetExhausted(w, err) {
+		return
+	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	code, field, msg := classifyError(status, err)
 	writeJSON(w, status, errorResponse{

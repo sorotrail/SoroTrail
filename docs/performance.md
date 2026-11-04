@@ -324,4 +324,69 @@ Measured via `go test -bench=BenchmarkDeepPagination_WideRange -benchmem ./inter
 | `ContractFiltered_OrderByID` | 93,653 ns (0.094 ms) | 105,583 ns (0.106 ms) | — | — | **flat** | 96,784 B | 1,385 allocs |
 | `SparseTopic_BoundedLedgerRange` | 1,158,714 ns (1.16 ms) | — (page 3: 1.15 ms) | — | — | **-0.5% (flat)** | 56,984 B | 1,001 allocs |
 
+---
+
+## 7. Database Connection Pool Budget, Subsystem Isolation & Backpressure
+
+To prevent a burst of slow read, GraphQL, or export queries from starving the ingester or exhausting the PostgreSQL connection pool, SoroTrail partitions pool capacity across logical subsystems via `store.PoolBudget` and `store.BudgetedStore` (`internal/store/pool_budget.go`) and applies fast-fail backpressure (#1231).
+
+### A. Pool Sizing Formula & Defaults
+
+For a PostgreSQL host with $C$ vCPUs and $R$ SoroTrail replicas sharing the database, choose per-replica `DB_MAX_CONNS` ($N$) using:
+
+$$N = \left\lfloor \frac{\min(\text{postgres\_max\_connections} - \text{reserved\_admin\_conns},\; 4 \times C)}{R} \right\rfloor$$
+
+When `DB_MAX_CONNS` is unset (`0`), `store.ParsePoolConfigWithTLS` and `config.Config.ResolvePoolSizing()` apply sensible production defaults for $N = 20$:
+
+| Parameter | Environment Variable | Default ($N = 20$) | Sizing Formula |
+|---|---|---|---|
+| Total pool ceiling | `DB_MAX_CONNS` | `20` | $N$ |
+| Warm minimum idle conns | `DB_MIN_CONNS` | `5` | $\max(2, \lfloor 0.25 \times N \rfloor)$, clamped to $\le N$ |
+| Max connection lifetime | `DB_MAX_CONN_LIFETIME` | `30m` | `30m` |
+| Max connection idle time | `DB_MAX_CONN_IDLE_TIME` | `5m` | `5m` |
+| Ingester reserved floor | `DB_INGESTER_RESERVED_CONNS` | `5` | $F_{\text{ingest}} = \max(2, \lfloor 0.25 \times N \rfloor)$ (`< N`) |
+| Shared non-ingester cap | *(derived)* | `15` | $S_{\text{shared}} = N - F_{\text{ingest}}$ |
+| HTTP read API cap | `DB_API_READ_MAX_CONNS` | `10` | $\min(S_{\text{shared}}, \max(1, \lfloor 0.50 \times N \rfloor))$ |
+| GraphQL cap | `DB_GRAPHQL_MAX_CONNS` | `6` | $\min(S_{\text{shared}}, \max(1, \lfloor 0.30 \times N \rfloor))$ |
+| Subscription / webhook cap | `DB_SUBSCRIPTION_MAX_CONNS` | `4` | $\min(S_{\text{shared}}, \max(1, \lfloor 0.20 \times N \rfloor))$ |
+| Background maintenance cap | `DB_MAINTENANCE_MAX_CONNS` | `3` | $\min(S_{\text{shared}}, \max(1, \lfloor 0.15 \times N \rfloor))$ |
+| Non-ingester acquire timeout | `DB_POOL_ACQUIRE_TIMEOUT` | `50ms` | Bounded fast-fail wait before returning `503` |
+| Maintenance pressure threshold | `DB_POOL_PRESSURE_THRESHOLD` | `0.75` | Shared or total pool utilization ratio (`0.0–1.0`) |
+
+### B. Reserved Ingester Floor & Two-Level Semaphore Isolation
+
+`store.PoolBudget` enforces a strict two-level semaphore invariant:
+
+1. Every non-ingester subsystem (`api_read`, `graphql`, `subscription`, `maintenance`) must acquire both:
+   - a permit from its per-subsystem semaphore (`subsystemSem[sub]`), and
+   - a permit from the shared non-ingester semaphore (`sharedSem`, capacity $S_{\text{shared}} = N - F_{\text{ingest}}$), before acquiring a slot in `totalSem` ($N$).
+2. `SubsystemIngester` acquires directly from `totalSem` ($N$). Because non-ingester subsystems combined can hold at most $N - F_{\text{ingest}}$ permits in `totalSem`, at least $F_{\text{ingest}}$ connections are **mathematically guaranteed** to remain immediately available to the ingester even when all read, GraphQL, subscription, and maintenance queues are 100% saturated.
+3. Context-level permit tracking makes `PoolBudget.Acquire` re-entrant on the same request context so nested store calls never deadlock or double-count permits.
+
+### C. Fast-Fail Backpressure (`503 Service Unavailable` + `Retry-After`)
+
+When a non-ingester subsystem exhausts either its own cap (`reason="subsystem_cap"`) or the shared non-ingester ceiling (`reason="shared_cap"`) and cannot acquire a permit within `DB_POOL_ACQUIRE_TIMEOUT` (`50ms` default):
+
+- `PoolBudget.Acquire` fails fast with `*store.PoolBudgetExhaustedError` (`errors.Is(err, store.ErrPoolBudgetExhausted)`).
+- The HTTP API (`writePoolBudgetExhausted` in `internal/api/handlers.go`) and GraphQL handler (`runQuery` in `internal/api/graphql/server.go`) translate `store.ErrPoolBudgetExhausted` into a retriable `503 Service Unavailable` response with `Retry-After: 1` instead of queueing callers until `API_QUERY_TIMEOUT` (`25s`).
+
+### D. Background Maintenance Yielding Under Pool Pressure
+
+`PoolBudget.ShouldYield(job)` implements the maintenance yield controller interface consumed by `pruner.Pruner`, `archive.Archiver`, and `audit.Auditor`:
+
+- Returns `(true, "pool_pressure")` whenever the ingester has waiting acquisitions (`ingester_waiters > 0`), shared non-ingester utilization reaches `DB_POOL_PRESSURE_THRESHOLD` (`0.75`), total pool utilization reaches `0.75`, or live `pgxpool.Stat` utilization reaches `0.75`.
+- Enforces `MaxMaintenanceDeferral` (`15m` default) so a continuously deferred job is granted one bounded pass (`(false, "max_deferral_reached")`) and cannot starve indefinitely.
+
+### E. Pool Budget Observability Metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `sorotrail_db_pool_budget_in_use` | GaugeVec | `subsystem` | Permits currently held by each subsystem (`ingester`, `api_read`, `graphql`, `subscription`, `maintenance`) |
+| `sorotrail_db_pool_budget_limit` | GaugeVec | `subsystem` | Configured maximum permits per subsystem |
+| `sorotrail_db_pool_budget_utilization_ratio` | GaugeVec | `subsystem` | Current utilization ratio (`in_use / limit`) per subsystem |
+| `sorotrail_db_pool_budget_wait_duration_seconds` | HistogramVec | `subsystem`, `outcome` | Time spent waiting for a pool budget permit (`acquired`, `rejected`, `canceled`) |
+| `sorotrail_db_pool_budget_rejections_total` | CounterVec | `subsystem`, `reason` | Total fast-fail rejections due to budget exhaustion (`subsystem_cap`, `shared_cap`) |
+| `sorotrail_db_pool_maintenance_yields_total` | CounterVec | `job`, `reason` | Total times background maintenance yielded due to pool pressure |
+| `sorotrail_db_pool_connections` | GaugeVec | `state` | Live connection counts (`acquired`, `idle`, `total`, `max`, `ingester_reserved`, `shared_cap`) |
+
 
