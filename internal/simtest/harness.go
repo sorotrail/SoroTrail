@@ -10,8 +10,19 @@ import (
 
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
+
+// ReorgAction describes a simulated chain reorganisation injected at a specific
+// step in the simulation harness.
+type ReorgAction struct {
+	AfterStep         int
+	FromLedger        uint32
+	ToLedger          uint32
+	NewHeadLedger     uint32
+	ReplacementEvents []rpc.Event
+}
 
 // Scenario describes one simulation test case: the chain setup, fault
 // schedule, and expected outcome.
@@ -42,6 +53,11 @@ type Scenario struct {
 	WatchedContracts []string
 	// ExpectNoLoss means every event should be in the store (no legitimate gaps).
 	ExpectNoLoss bool
+	// ReorgConfirmationWindow configures the ingester's reorg confirmation
+	// depth limit (0 = unlimited/disabled).
+	ReorgConfirmationWindow uint32
+	// Reorgs schedules deterministic chain reorganisations after specific steps.
+	Reorgs []ReorgAction
 }
 
 // EventPlacement places one event at a specific ledger in the chain.
@@ -167,6 +183,16 @@ func (h *Harness) Run(ctx context.Context) error {
 			}
 		}
 
+		// Check if any scheduled chain reorganisations fire before this step.
+		for _, ra := range h.Scenario.Reorgs {
+			if ra.AfterStep == step-1 {
+				h.Chain.ReorgRange(ra.FromLedger, ra.ToLedger, ra.ReplacementEvents, ra.NewHeadLedger)
+				if _, rerr := h.ing.HandleReorgRange(ctx, h.Chain, ra.FromLedger, ra.ToLedger, ra.NewHeadLedger); rerr != nil {
+					return rerr
+				}
+			}
+		}
+
 		caughtUp, err := h.ing.RunOnceForTest(ctx)
 		_ = err // transient errors (timeouts, etc.) are expected and retried
 		_ = caughtUp
@@ -194,6 +220,11 @@ func (h *Harness) Run(ctx context.Context) error {
 	return h.Oracle.Verify(ctx, h.Store)
 }
 
+// Ingester returns the harness's active ingester instance.
+func (h *Harness) Ingester() *ingester.Ingester {
+	return h.ing
+}
+
 // newIngester creates a fresh ingester instance connected to the chain and
 // store. This is called on initial setup and after simulated crashes.
 func (h *Harness) newIngester() {
@@ -205,13 +236,14 @@ func (h *Harness) newIngester() {
 		decode.XDRDecoder{},
 		log,
 		ingester.Options{
-			PollInterval:     time.Second, // irrelevant — clock is virtual
-			StartLedger:      h.Scenario.StartLedger,
-			RetentionLedgers: h.Scenario.RetentionLedgers,
-			PageLimit:        h.Scenario.PageLimit,
-			SweepWindow:      h.Scenario.SweepWindow,
-			Clock:            h.clock,
-			Jitter:           DeterministicJitter(h.rng),
+			PollInterval:            time.Second, // irrelevant — clock is virtual
+			StartLedger:             h.Scenario.StartLedger,
+			RetentionLedgers:        h.Scenario.RetentionLedgers,
+			PageLimit:               h.Scenario.PageLimit,
+			SweepWindow:             h.Scenario.SweepWindow,
+			ReorgConfirmationWindow: h.Scenario.ReorgConfirmationWindow,
+			Clock:                   h.clock,
+			Jitter:                  DeterministicJitter(h.rng),
 		},
 	)
 }

@@ -439,6 +439,18 @@ type Ingester struct {
 	// accessed by the Run goroutine (or the single goroutine driving
 	// RunOnceForTest), so it needs no synchronization.
 	dryRunPosition *dryRunPosition
+	// reorgTracker tracks ledger fingerprints across ReorgConfirmationWindow
+	// and enforces the configured reorg depth limit.
+	reorgTracker *ReorgTracker
+	// reorgCoord serializes and coalesces overlapping reorg reconciliations.
+	reorgCoord reorgCoordinator
+	// reorgNotifier receives explicit ReorgRetractionNotice callbacks when
+	// previously persisted events are retracted by a chain reorganisation.
+	reorgNotifier ReorgNotifier
+	// archivedThroughLedger and archiveBoundaryFn guard immutable cold storage
+	// against reorg retractions.
+	archivedThroughLedger atomic.Uint32
+	archiveBoundaryFn     ArchiveBoundaryFunc
 }
 
 // cycleCounters holds the per-poll-cycle totals behind the structured
@@ -507,6 +519,7 @@ func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger
 		opts:          opts,
 		skipContracts: skipMap,
 		tracer:        noop.NewTracerProvider().Tracer("github.com/sorotrail/sorotrail/internal/ingester"),
+		reorgTracker:  NewReorgTracker(opts.ReorgConfirmationWindow),
 	}
 	if opts.LagCoordinator != nil {
 		ing.lagCoordinator = opts.LagCoordinator
@@ -902,8 +915,16 @@ func (ing *Ingester) singlePageWatched(ctx context.Context, filters []rpc.EventF
 		return false, fmt.Errorf("getEvents from ledger %d: %w", startLedger, err)
 	}
 
+	if regressed, rerr := ing.maybeHandleTipRegression(ctx, resp.LatestLedger); rerr != nil {
+		return false, rerr
+	} else if regressed {
+		ing.setIngestionLag(int64(resp.LatestLedger), int64(resp.LatestLedger))
+		return true, nil
+	}
+
 	ing.cycle.addFetched(len(resp.Events))
-	if err := ing.persistEvents(ctx, resp.Events, resp.LatestLedger); err != nil {
+	caughtUp := uint(len(resp.Events)) < limit
+	if err := ing.persistEventsWithReorgCheck(ctx, resp.Events, resp.LatestLedger, caughtUp && cursor == ""); err != nil {
 		return false, err
 	}
 
@@ -911,7 +932,6 @@ func (ing *Ingester) singlePageWatched(ctx context.Context, filters []rpc.EventF
 		return false, err
 	}
 
-	caughtUp := uint(len(resp.Events)) < limit
 	return caughtUp, nil
 }
 
@@ -936,12 +956,18 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 		return false, fmt.Errorf("getEvents from ledger %d: %w", startLedger, err)
 	}
 
-	ing.cycle.addFetched(len(resp.Events))
-	if err := ing.persistEvents(ctx, resp.Events, resp.LatestLedger); err != nil {
-		return false, err
+	if regressed, rerr := ing.maybeHandleTipRegression(ctx, resp.LatestLedger); rerr != nil {
+		return false, rerr
+	} else if regressed {
+		ing.setIngestionLag(int64(resp.LatestLedger), int64(resp.LatestLedger))
+		return true, nil
 	}
 
+	ing.cycle.addFetched(len(resp.Events))
 	state, caughtUp := nextState(resp, limit)
+	if err := ing.persistEventsWithReorgCheck(ctx, resp.Events, resp.LatestLedger, caughtUp && cursor == ""); err != nil {
+		return false, err
+	}
 	if state.LastCursor == "" && state.LastIngestedLedger <= 0 {
 		state.LastIngestedLedger = int64(startLedger) - 1
 	}
@@ -959,7 +985,13 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 	return caughtUp, nil
 }
 
-// ReingestRange re-fetches events for the closed range [fromLedger, toLedger].
+// ReingestRange re-fetches events for the closed range [fromLedger, toLedger]
+// across all watched filter batches and replaces stored events and derived
+// address references in place while enforcing cold-archive immutability.
+// Unlike HandleReorgRange, ReingestRange is a non-destructive gap-repair and
+// rescan helper: it does not delete dead_letters, clamp audit_state, rewind
+// cursors, or fire reorg retraction notices, and it aborts without mutating
+// the store if any batch hits rpc.IsLedgerOutOfRange.
 func (ing *Ingester) ReingestRange(ctx context.Context, client rpc.Client, fromLedger, toLedger uint32) (int, error) {
 	if fromLedger > toLedger {
 		return 0, fmt.Errorf("ReingestRange: from %d > %d", fromLedger, toLedger)
@@ -967,91 +999,62 @@ func (ing *Ingester) ReingestRange(ctx context.Context, client rpc.Client, fromL
 	if client == nil {
 		client = ing.client
 	}
+
+	archivedThrough, err := ing.resolveArchivedBoundary(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if archivedThrough > 0 && fromLedger <= archivedThrough {
+		ReorgArchivedBoundaryViolationsTotal.Inc()
+		ing.log.Error("reingest touches archived immutable ledger range",
+			"from_ledger", fromLedger,
+			"to_ledger", toLedger,
+			"archived_through_ledger", archivedThrough,
+		)
+		return 0, fmt.Errorf(
+			"%w: reingest range [%d,%d] intersects archived ledgers (archived through %d)",
+			ErrReorgTouchesArchivedRange, fromLedger, toLedger, archivedThrough,
+		)
+	}
+
 	filters, err := ing.BuildFilterBatches(ctx)
 	if err != nil {
 		return 0, err
 	}
-	repaired := 0
-	for _, batch := range filters {
-		inserted, err := ing.reingestBatch(ctx, client, fromLedger, toLedger, batch)
-		if err != nil {
-			return repaired, err
-		}
-		repaired += inserted
-	}
-	return repaired, nil
-}
 
-func (ing *Ingester) reingestBatch(ctx context.Context, client rpc.Client, fromLedger, toLedger uint32, batch []rpc.EventFilter) (int, error) {
-	endLedgerExcl := toLedger + 1
-	var collected []rpc.Event
-	cursor := ""
-	for {
-		resp, err := client.GetEvents(ctx, rpc.GetEventsRequest{
-			StartLedger: fromLedger,
-			EndLedger:   endLedgerExcl,
-			Filters:     batch,
-			Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
-		})
-		if rpc.IsLedgerOutOfRange(err) {
+	var allStoreEvents []store.Event
+	for _, batch := range filters {
+		collected, outOfRange, berr := ing.collectBatchEventsInRange(ctx, client, fromLedger, toLedger, batch, true)
+		if berr != nil {
+			return 0, berr
+		}
+		if outOfRange {
 			return 0, nil
 		}
-		if err != nil {
-			return 0, fmt.Errorf("ReingestRange getEvents [%d,%d]: %w", fromLedger, toLedger, err)
-		}
-		for _, e := range resp.Events {
-			if e.Ledger <= toLedger {
-				collected = append(collected, e)
-			}
-		}
-		if len(resp.Events) == 0 {
-			break
-		}
-		last := resp.Events[len(resp.Events)-1]
-		// A short page is only terminal when the RPC supplies no
-		// continuation cursor: some endpoints return fewer results than
-		// requested while more data remains, and stopping here would make
-		// ReplaceEventsInRange delete rows that were never re-fetched.
-		if uint(len(resp.Events)) < ing.opts.PageLimit && resp.Cursor == "" {
-			break
-		}
-		if last.Ledger > toLedger {
-			break
-		}
-		next := resp.Cursor
-		if next == "" {
-			next = last.CursorValue()
-		}
-		if next == cursor {
-			break // non-advancing cursor: stop rather than spin forever
-		}
-		cursor = next
+		allStoreEvents = append(allStoreEvents, collected...)
 	}
-	storeEvents := make([]store.Event, 0, len(collected))
-	for _, re := range collected {
-		ev, err := ing.toStoreEvent(re)
-		if err != nil {
-			return 0, err
-		}
-		ev.Network = ing.opts.Network
-		storeEvents = append(storeEvents, ev)
-	}
+	allStoreEvents = removeDuplicateEvents(allStoreEvents)
+
 	if ing.opts.DryRun {
-		ids := make([]string, len(storeEvents))
-		for i, event := range storeEvents {
+		ids := make([]string, len(allStoreEvents))
+		for i, event := range allStoreEvents {
 			ids[i] = event.ID
 		}
 		ing.log.Info("dry-run: would replace events",
 			"from_ledger", fromLedger,
 			"to_ledger", toLedger,
-			"count", len(storeEvents),
+			"count", len(allStoreEvents),
 			"event_ids", ids)
-		return len(storeEvents), nil
+		return len(allStoreEvents), nil
 	}
-	if err := ing.store.ReplaceEventsInRange(ctx, storeEvents, int64(fromLedger), int64(toLedger)); err != nil {
+
+	if err := ing.store.ReplaceEventsInRange(ctx, allStoreEvents, int64(fromLedger), int64(toLedger)); err != nil {
 		return 0, fmt.Errorf("ReplaceEventsInRange [%d,%d]: %w", fromLedger, toLedger, err)
 	}
-	return len(storeEvents), nil
+	if err := ing.indexEventAddresses(ctx, allStoreEvents); err != nil {
+		ing.log.Error("indexing event addresses", "error", err)
+	}
+	return len(allStoreEvents), nil
 }
 
 // BuildFilterBatches converts the watched-contract list into getEvents
@@ -1176,6 +1179,12 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 	if err != nil {
 		return false, fmt.Errorf("getHealth for sweep window: %w", err)
 	}
+	if regressed, rerr := ing.maybeHandleTipRegression(ctx, health.LatestLedger); rerr != nil {
+		return false, rerr
+	} else if regressed {
+		ing.setIngestionLag(int64(health.LatestLedger), int64(health.LatestLedger))
+		return true, nil
+	}
 	if start > health.LatestLedger {
 		return true, nil
 	}
@@ -1259,6 +1268,12 @@ func (ing *Ingester) windowSweepWatched(ctx context.Context, batches [][]rpc.Eve
 	health, err := ing.client.GetHealth(ctx)
 	if err != nil {
 		return false, fmt.Errorf("getHealth for sweep window: %w", err)
+	}
+	if regressed, rerr := ing.maybeHandleTipRegression(ctx, health.LatestLedger); rerr != nil {
+		return false, rerr
+	} else if regressed {
+		ing.setIngestionLag(int64(health.LatestLedger), int64(health.LatestLedger))
+		return true, nil
 	}
 	start, err := ing.earliestStartLedger(ctx, health)
 	if err != nil {
@@ -1462,6 +1477,10 @@ func removeDuplicateEvents(events []store.Event) []store.Event {
 }
 
 func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, latestLedger uint32) error {
+	return ing.persistEventsWithReorgCheck(ctx, rpcEvents, latestLedger, false)
+}
+
+func (ing *Ingester) persistEventsWithReorgCheck(ctx context.Context, rpcEvents []rpc.Event, latestLedger uint32, checkDivergence bool) error {
 	if len(rpcEvents) == 0 {
 		return nil
 	}
@@ -1517,6 +1536,11 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	for start := 0; start < len(events); start += int(ing.opts.WriteBatchSize) {
 		end := min(start+int(ing.opts.WriteBatchSize), len(events))
 		if err := ing.persistEventBatch(ctx, events[start:end], rpcEvents[len(rpcEvents)-1].Ledger, latestLedger); err != nil {
+			return err
+		}
+	}
+	if !ing.opts.DryRun {
+		if err := ing.recordIngestedLedgerFingerprints(ctx, events, latestLedger, checkDivergence); err != nil {
 			return err
 		}
 	}
