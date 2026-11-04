@@ -123,7 +123,7 @@ func TestCompletionMatchesDispatch(t *testing.T) {
 	dispatched := []string{
 		"replay", "apikey", "contracts", "backfill", "index-addresses",
 		"migrate", "healthcheck", "schema-inspect", "migrate-status",
-		"completion", "version", "config", "preflight", "help",
+		"completion", "version", "config", "preflight", "backup", "restore", "help",
 	}
 	completion := completionNames()
 	assert.ElementsMatch(t, dispatched, completion,
