@@ -1,8 +1,10 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -322,8 +324,21 @@ func sameCanonicalEventContent(a, b Event) bool {
 		a.TxIndex == b.TxIndex &&
 		a.OpIndex == b.OpIndex &&
 		a.InSuccessfulCall == b.InSuccessfulCall &&
-		string(a.Topics) == string(b.Topics) &&
-		string(a.Value) == string(b.Value)
+		canonicalJSONEqual(a.Topics, b.Topics) &&
+		canonicalJSONEqual(a.Value, b.Value)
+}
+
+func canonicalJSONEqual(a, b json.RawMessage) bool {
+	if bytes.Equal(a, b) {
+		return true
+	}
+	var ca, cb bytes.Buffer
+	errA := json.Compact(&ca, a)
+	errB := json.Compact(&cb, b)
+	if errA == nil && errB == nil {
+		return bytes.Equal(ca.Bytes(), cb.Bytes())
+	}
+	return bytes.Equal(bytes.TrimSpace(a), bytes.TrimSpace(b))
 }
 
 func deduplicateAddressRefs(refs []AddressRef, allowedEvents map[string]Event) []AddressRef {
