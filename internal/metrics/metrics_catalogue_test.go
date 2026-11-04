@@ -263,6 +263,11 @@ var metricCatalogue = []metricSpec{
 		touch:   func() { DeprecatedHTTPRequestsTotal.WithLabelValues("/events", "GET") },
 	},
 	{
+		Name: "sorotrail_tls_certificate_expiry_days", Scope: scopeGlobal, Kind: "gauge",
+		Help:    "Minimum remaining validity in days across active mTLS certificates.",
+		Meaning: "Remaining days until the earliest-expiring active mTLS certificate (HTTP listener, Postgres client, or Archive client) expires, updated whenever certificates are loaded or reloaded from disk. Alert when this drops below your rotation window (for example, < 7 days).",
+	},
+	{
 		Name: "http_request_duration_seconds", Scope: scopeServer, Kind: "histogram",
 		Labels: []metricLabel{
 			{Name: "route", Values: "the matched chi route pattern (e.g. /events/{id}), or \"unmatched\" for a path no route registered — never the raw path, so probes cannot grow cardinality"},

@@ -211,6 +211,14 @@ var (
 		},
 		[]string{"route", "method"},
 	)
+
+	// TLSCertificateExpiryDays reports the minimum remaining validity in days
+	// across active mTLS certificates loaded by the process, so operators can
+	// alert before a certificate expires.
+	TLSCertificateExpiryDays = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "sorotrail_tls_certificate_expiry_days",
+		Help: "Minimum remaining validity in days across active mTLS certificates.",
+	})
 )
 
 func init() {
@@ -235,6 +243,7 @@ func init() {
 		RPCProviderPromotionsTotal,
 		SpecInvalidationsReceived,
 		DeprecatedHTTPRequestsTotal,
+		TLSCertificateExpiryDays,
 	)
 }
 

@@ -240,6 +240,11 @@ type Server struct {
 	deprecationMu     sync.RWMutex
 	deprecationPolicy *DeprecationPolicy
 	deprecatedCounts  map[string]uint64
+
+	// idempotency coordinates optional Idempotency-Key headers across write
+	// endpoints (#1268).
+	idempotencyOnce sync.Once
+	idempotency     *idempotencyCoordinator
 }
 
 // SetHTTPRequestBodyLimit sets the request body size limit, in bytes, for all handlers accepting a body.
@@ -513,7 +518,7 @@ func (s *Server) router() chi.Router {
 
 	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.
 	adminMW := apiKeyAuth(s.apiKey)
-	r.With(adminMW).Delete("/events", s.handleDeleteEvents)
+	r.With(adminMW, s.idempotencyMiddleware).Delete("/events", s.handleDeleteEvents)
 	// GraphQL transport — read-only, mounts at /graphql and dev-mode
 	// /graphiql. Built by the graphql package; the API server only
 	// owns the route registration so a misconfigured GraphQL handler
@@ -541,23 +546,23 @@ func (s *Server) router() chi.Router {
 	// watched_contracts table that forms one side of the ingestion union.
 	// Tenants manage their own claims through /tenant/watch below.
 	watchedMW := apiKeyAuth(s.apiKey)
-	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
-	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
+	r.With(watchedMW, s.idempotencyMiddleware).Post("/watched-contracts", s.handleAddWatchedChain)
+	r.With(watchedMW, s.idempotencyMiddleware).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
 
 	// Contract spec overrides: user-supplied spec JSON per contract_id.
 	// A spec override silently changes how that contract's events decode,
 	// so — like every other management surface — writes are never open.
-	r.With(watchedMW).Put("/contracts/{id}/spec", s.handlePutContractSpecOverride)
+	r.With(watchedMW, s.idempotencyMiddleware).Put("/contracts/{id}/spec", s.handlePutContractSpecOverride)
 	r.With(watchedMW).Get("/contracts/{id}/spec", s.handleGetContractSpecOverride)
-	r.With(watchedMW).Delete("/contracts/{id}/spec", s.handleDeleteContractSpecOverride)
+	r.With(watchedMW, s.idempotencyMiddleware).Delete("/contracts/{id}/spec", s.handleDeleteContractSpecOverride)
 	// The override history answers "did someone change the override?", and
 	// a revert puts a previous version back. Both are management surfaces,
 	// so they sit behind the same key gate as the override itself.
 	r.With(watchedMW).Get("/contracts/{id}/spec/history", s.handleListContractSpecOverrideHistory)
-	r.With(watchedMW).Post("/contracts/{id}/spec/revert", s.handleRevertContractSpecOverride)
+	r.With(watchedMW, s.idempotencyMiddleware).Post("/contracts/{id}/spec/revert", s.handleRevertContractSpecOverride)
 
 	r.With(watchedMW).Get("/dead-letters", s.handleListDeadLetters)
-	r.With(watchedMW).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)
+	r.With(watchedMW, s.idempotencyMiddleware).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)
 
 	// API key management is ALWAYS authenticated: an unauthenticated
 	// create endpoint would let anyone mint keys and walk around auth
@@ -565,9 +570,9 @@ func (s *Server) router() chi.Router {
 	// the first key.
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireAPIKey)
-		r.Post("/apikeys", s.handleCreateAPIKey)
+		r.With(s.idempotencyMiddleware).Post("/apikeys", s.handleCreateAPIKey)
 		r.Get("/apikeys", s.handleListAPIKeys)
-		r.Delete("/apikeys/{id}", s.handleRevokeAPIKey)
+		r.With(s.idempotencyMiddleware).Delete("/apikeys/{id}", s.handleRevokeAPIKey)
 	})
 
 	// The streaming and subscription routes are the surface that auth
@@ -582,9 +587,9 @@ func (s *Server) router() chi.Router {
 	r.Group(func(r chi.Router) {
 		r.Use(protect)
 		r.Get("/events/ws", s.handleEventStreamWS)
-		r.Post("/subscriptions", s.handleCreateSubscription)
-		r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
-		r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
+		r.With(s.idempotencyMiddleware).Post("/subscriptions", s.handleCreateSubscription)
+		r.With(s.idempotencyMiddleware).Put("/subscriptions/{id}", s.handleUpdateSubscription)
+		r.With(s.idempotencyMiddleware).Delete("/subscriptions/{id}", s.handleDeleteSubscription)
 	})
 
 	// Read endpoints. Compression is a deliberate two-way split:
@@ -650,27 +655,27 @@ func (s *Server) router() chi.Router {
 		r.Get("/tenant", s.handleWhoAmI)
 		r.Get("/tenant/usage", s.handleOwnUsage)
 		r.Get("/tenant/watch", s.handleListOwnWatched)
-		r.Post("/tenant/watch", s.handleAddOwnWatched)
-		r.Delete("/tenant/watch/{contract_id}", s.handleRemoveOwnWatched)
+		r.With(s.idempotencyMiddleware).Post("/tenant/watch", s.handleAddOwnWatched)
+		r.With(s.idempotencyMiddleware).Delete("/tenant/watch/{contract_id}", s.handleRemoveOwnWatched)
 	})
 
 	// Tenant administration.
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireAdmin)
-		r.Post("/admin/tenants", s.handleCreateTenant)
+		r.With(s.idempotencyMiddleware).Post("/admin/tenants", s.handleCreateTenant)
 		r.Get("/admin/tenants", s.handleListTenants)
 		r.Get("/admin/tenants/{id}", s.handleGetTenant)
-		r.Patch("/admin/tenants/{id}", s.handleUpdateTenant)
-		r.Delete("/admin/tenants/{id}", s.handleDeleteTenant)
+		r.With(s.idempotencyMiddleware).Patch("/admin/tenants/{id}", s.handleUpdateTenant)
+		r.With(s.idempotencyMiddleware).Delete("/admin/tenants/{id}", s.handleDeleteTenant)
 		r.Get("/admin/tenants/{id}/usage", s.handleTenantUsage)
 
 		r.Get("/admin/tenants/{id}/grants", s.handleListTenantGrants)
-		r.Post("/admin/tenants/{id}/grants", s.handleGrantContract)
-		r.Delete("/admin/tenants/{id}/grants/{contract_id}", s.handleRevokeContract)
+		r.With(s.idempotencyMiddleware).Post("/admin/tenants/{id}/grants", s.handleGrantContract)
+		r.With(s.idempotencyMiddleware).Delete("/admin/tenants/{id}/grants/{contract_id}", s.handleRevokeContract)
 
 		r.Get("/admin/tenants/{id}/keys", s.handleListTenantKeys)
-		r.Post("/admin/tenants/{id}/keys", s.handleCreateTenantKey)
-		r.Delete("/admin/keys/{key_id}", s.handleRevokeTenantKey)
+		r.With(s.idempotencyMiddleware).Post("/admin/tenants/{id}/keys", s.handleCreateTenantKey)
+		r.With(s.idempotencyMiddleware).Delete("/admin/keys/{key_id}", s.handleRevokeTenantKey)
 	})
 
 	// Return the underlying *chi.Mux, not the registration guard: callers

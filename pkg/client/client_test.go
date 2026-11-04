@@ -265,3 +265,24 @@ func TestGetEventEscapesPathParameter(t *testing.T) {
 	assert.Equal(t, "event/1", event.ID)
 	assert.Equal(t, "/events/event%2F1", escapedPath)
 }
+
+func TestClientSendsIdempotencyKeyFromContextAndClientClone(t *testing.T) {
+	var gotKeys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKeys = append(gotKeys, r.Header.Get(client.IdempotencyKeyHeader))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	base := client.New(server.URL)
+	ctx := client.WithIdempotencyKey(context.Background(), "ctx-key-123")
+	require.Equal(t, "ctx-key-123", client.IdempotencyKeyFromContext(ctx))
+	require.NoError(t, base.DeleteSubscription(ctx, 42))
+
+	scoped := base.WithIdempotencyKey("client-key-456")
+	require.NoError(t, scoped.DeleteSubscription(context.Background(), 42))
+	// Context key overrides client-scoped key.
+	require.NoError(t, scoped.DeleteSubscription(client.WithIdempotencyKey(context.Background(), "override-key-789"), 42))
+
+	assert.Equal(t, []string{"ctx-key-123", "client-key-456", "override-key-789"}, gotKeys)
+}

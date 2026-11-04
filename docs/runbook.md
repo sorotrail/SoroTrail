@@ -23,6 +23,7 @@ database, API and replay errors by their text.
 - [RPC rate limiting / 429 errors](#rpc-rate-limiting--429-errors)
 - [Gap in ingested data (retention window missed)](#gap-in-ingested-data-retention-window-missed)
 - [Bulk event deletion (`DELETE /events`)](#bulk-event-deletion-delete-events)
+- [Mutual TLS (mTLS) and certificate rotation](#mutual-tls-mtls-and-certificate-rotation)
 - [Backup and restore](#backup-and-restore)
 - [Useful queries](#useful-queries)
 - [Configuration reference](#configuration-reference)
@@ -697,6 +698,55 @@ exists in the RPC, the archive, or your own export.
 7. **Keep the export.** The NDJSON file and its checksum are the only
    recovery path once the RPC has aged out the range; keep them for at
    least as long as the deleted data matters.
+
+---
+
+## Mutual TLS (mTLS) and certificate rotation
+
+SoroTrail supports mutual TLS (mTLS) on the inbound HTTP API as well as on
+outbound connections to PostgreSQL and S3-compatible object storage. All
+certificate pairs are loaded through `config.CertReloader` (`GetCertificate` /
+`GetClientCertificate`), so certs mounted by SPIFFE/SPIRE or `cert-manager`
+rotate live on disk without restarting the process.
+
+### Inbound HTTP API mTLS
+
+Enable inbound mTLS by setting:
+
+- `MTLS_ENABLED=true`
+- `TLS_CERT_FILE=/path/to/tls.crt`
+- `TLS_KEY_FILE=/path/to/tls.key`
+- `TLS_CLIENT_CA_FILE=/path/to/ca.crt`
+- `TLS_CLIENT_ALLOWED_IDENTITIES=spiffe://cluster.local/ns/default/sa/gateway,api-client` _(optional comma-separated allowlist of client certificate `Subject.CommonName`, DNS SANs, or URI SANs)_
+- `TLS_CLIENT_TENANT_MAP=spiffe://cluster.local/ns/default/sa/gateway=tenant-a,api-client=tenant-b` _(optional identity-to-tenant mapping)_
+
+**Defence-in-depth with API keys:**
+
+- When `MTLS_ENABLED=true` and `API_KEY` (or a managed `Bearer` API key) is configured, **both** checks must succeed: the TLS listener requires and verifies the client certificate against `TLS_CLIENT_CA_FILE`, the HTTP middleware enforces `TLS_CLIENT_ALLOWED_IDENTITIES`, and the request must still present a valid API key unless `TLS_CLIENT_TENANT_MAP` maps the verified client certificate identity directly to a `TenantContext` (and `API_KEY` is unset).
+- If `TLS_CLIENT_TENANT_MAP` is configured alongside `API_KEY` or a `Bearer` token, the client certificate must match the tenant mapping **and** the API key must authenticate.
+
+### Outbound PostgreSQL and Archive mTLS
+
+- **PostgreSQL (`DB_TLS_CERT_FILE`, `DB_TLS_KEY_FILE`, `DB_TLS_CA_FILE`)**: Configures `pgxpool` with a live-reloading `tls.Config` (`GetClientCertificate`). Explicit `DB_TLS_*` variables take precedence over `sslcert`, `sslkey`, and `sslrootcert` query parameters in `DATABASE_URL`.
+- **Archive S3 (`ARCHIVE_TLS_CERT_FILE`, `ARCHIVE_TLS_KEY_FILE`, `ARCHIVE_TLS_CA_FILE`)**: Configures the S3 archive HTTP transport with a live-reloading `tls.Config` (`GetClientCertificate`) and optional custom root CA bundle.
+
+### Certificate expiry monitoring (`sorotrail_tls_certificate_expiry_days`)
+
+SoroTrail exports the `sorotrail_tls_certificate_expiry_days` gauge labelled by `component` (`http_server`, `database_client`, `archive_client`). It is updated automatically whenever a certificate is loaded or rotated on disk.
+
+Recommended Prometheus alert rule:
+
+```yaml
+- alert: SoroTrailTLSCertificateExpiringSoon
+  expr: sorotrail_tls_certificate_expiry_days < 7
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    summary: "SoroTrail TLS certificate for {{ $labels.component }} expires in less than 7 days"
+```
+
+If a certificate reload fails transiently (for example while Kubernetes updates a Secret symlink), `CertReloader` logs a warning and continues serving the last valid in-memory keypair until both files are readable and match.
 
 ---
 
