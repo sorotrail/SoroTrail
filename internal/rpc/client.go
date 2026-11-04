@@ -51,6 +51,14 @@ type Client interface {
 	SimulateTransaction(ctx context.Context, req SimulateTransactionRequest) (SimulateTransactionResponse, error)
 }
 
+// NetworkInspector is an optional capability implemented by RPC clients that
+// support the getNetwork JSON-RPC method. FailoverClient uses it to verify
+// that every candidate provider is serving the expected Stellar network
+// passphrase before routing traffic to it.
+type NetworkInspector interface {
+	GetNetwork(ctx context.Context) (NetworkInfo, error)
+}
+
 // RequestObserver is called after each RPC call completes so callers can
 // instrument request counts by method and outcome without the rpc package
 // importing a metrics library.
@@ -150,7 +158,10 @@ type HTTPClient struct {
 	requestObserver RequestObserver
 }
 
-var _ Client = (*HTTPClient)(nil)
+var (
+	_ Client           = (*HTTPClient)(nil)
+	_ NetworkInspector = (*HTTPClient)(nil)
+)
 
 // Option customizes an HTTPClient.
 type Option func(*HTTPClient)
@@ -246,6 +257,18 @@ func (c *HTTPClient) GetHealth(ctx context.Context) (Health, error) {
 	var resp Health
 	err := c.call(ctx, "getHealth", nil, &resp)
 	return resp, err
+}
+
+func (c *HTTPClient) GetNetwork(ctx context.Context) (NetworkInfo, error) {
+	var resp NetworkInfo
+	err := c.call(ctx, "getNetwork", nil, &resp)
+	return resp, err
+}
+
+// SupportsXDRJSON reports whether the client still sends xdrFormat: "json"
+// on GetEvents calls (true until the server rejects the parameter).
+func (c *HTTPClient) SupportsXDRJSON() bool {
+	return !c.xdrJSONUnsupported.Load()
 }
 
 func (c *HTTPClient) GetLedgerEntries(ctx context.Context, req GetLedgerEntriesRequest) (GetLedgerEntriesResponse, error) {

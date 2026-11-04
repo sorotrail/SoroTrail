@@ -319,4 +319,37 @@ var CuratedScenarios = []Scenario{
 		},
 		ExpectNoLoss: true,
 	},
+
+	//
+	// Scenario 14: Multi-provider failover mid-batch with behind, short-retention,
+	// and divergent candidate providers
+	//
+	// Covers failover mid-batch (including multiple events per ledger across page
+	// boundaries), a secondary provider whose LatestLedger is behind the cursor,
+	// a secondary provider with a shorter retention window, and a secondary
+	// provider returning subtly different event payloads for the same range.
+	// Stored events must equal what a single healthy provider would produce.
+	{
+		Name:             "multi_provider_failover_mid_batch",
+		Description:      "Multi-provider failover mid-batch across behind, short-retention, and divergent providers produces identical stored events to a single healthy provider.",
+		RetentionLedgers: 200,
+		ChainLedgers:     40,
+		PageLimit:        3,
+		Events: []EventPlacement{
+			{Ledger: 5, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 5, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 10, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 10, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 10, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 15, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 20, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 25, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+			{Ledger: 30, ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+		},
+		Faults: []FaultDescriptor{
+			{Kind: FaultTimeout, CallIndex: 2},
+			{Kind: FaultRPCMovingBack, AfterStep: 1, Ledger: 10},
+		},
+		ExpectNoLoss: true,
+	},
 }
