@@ -119,6 +119,8 @@ they matter rather than on every path.
 | `INVALID_PARAMETER` | GET /subscriptions/{id} is given a path id that is not a positive integer | GET /subscriptions/{id} | `subscription id must be a positive integer, got %q` |
 | `INVALID_PARAMETER` | GET /subscriptions/{id}/deliveries is given a path id that is not a positive integer | GET /subscriptions/{id}/deliveries | `subscription id must be a positive integer, got %q` |
 | `LIMIT_EXCEEDED` | the delivery-history page size is outside [1, limit] | GET /subscriptions/{id}/deliveries | `limit must be an integer in [1,%d]` |
+| `INVALID_PARAMETER`, `INVALID_BODY` | the Idempotency-Key header contains non-ASCII characters or the request body cannot be read for hashing | any authenticated or rate-limited operation (middleware-wide) | `Idempotency-Key must contain only printable ASCII characters; reading request body: <io error>` |
+| `INVALID_PARAMETER` | the Idempotency-Key header exceeds MaxIdempotencyKeyLength (255 characters) | any authenticated or rate-limited operation (middleware-wide) | `Idempotency-Key must be at most %d characters` |
 | `INVALID_PARAMETER` | PUT /subscriptions/{id} is given a path id that is not a positive integer | PUT /subscriptions/{id} | `subscription id must be a positive integer, got %q` |
 | `INVALID_PARAMETER` | the update would empty the subscription's webhook URL | PUT /subscriptions/{id} | `url must not be empty` |
 | `INVALID_PARAMETER` | the body's contract_id is not a strkey | POST /tenant/watch | `invalid contract_id %q` |
@@ -176,6 +178,9 @@ they matter rather than on every path.
 
 | Code | Condition | Operations | Message |
 | --- | --- | --- | --- |
+| `CONFLICT` | a concurrent request with the same Idempotency-Key is still in flight when the waiter's context expires | DELETE /events, POST /watched-contracts, DELETE /watched-contracts/{id}, PUT /contracts/{id}/spec, DELETE /contracts/{id}/spec, POST /contracts/{id}/spec/revert, DELETE /dead-letters/{id}, POST /apikeys, DELETE /apikeys/{id}, POST /subscriptions, PUT /subscriptions/{id}, DELETE /subscriptions/{id}, POST /tenant/watch, DELETE /tenant/watch/{contract_id}, POST /admin/tenants, PATCH /admin/tenants/{id}, DELETE /admin/tenants/{id}, POST /admin/tenants/{id}/grants, DELETE /admin/tenants/{id}/grants/{contract_id}, POST /admin/tenants/{id}/keys, DELETE /admin/keys/{key_id} | `concurrent request with same Idempotency-Key is still in progress` |
+| `CONFLICT` | an Idempotency-Key is reused within its retention window with a different HTTP method, path, or request body | DELETE /events, POST /watched-contracts, DELETE /watched-contracts/{id}, PUT /contracts/{id}/spec, DELETE /contracts/{id}/spec, POST /contracts/{id}/spec/revert, DELETE /dead-letters/{id}, POST /apikeys, DELETE /apikeys/{id}, POST /subscriptions, PUT /subscriptions/{id}, DELETE /subscriptions/{id}, POST /tenant/watch, DELETE /tenant/watch/{contract_id}, POST /admin/tenants, PATCH /admin/tenants/{id}, DELETE /admin/tenants/{id}, POST /admin/tenants/{id}/grants, DELETE /admin/tenants/{id}/grants/{contract_id}, POST /admin/tenants/{id}/keys, DELETE /admin/keys/{key_id} | `idempotency key already used with a different request` |
+| `CONFLICT` | an Idempotency-Key is reused on an in-flight request with a different HTTP method, path, or request body | DELETE /events, POST /watched-contracts, DELETE /watched-contracts/{id}, PUT /contracts/{id}/spec, DELETE /contracts/{id}/spec, POST /contracts/{id}/spec/revert, DELETE /dead-letters/{id}, POST /apikeys, DELETE /apikeys/{id}, POST /subscriptions, PUT /subscriptions/{id}, DELETE /subscriptions/{id}, POST /tenant/watch, DELETE /tenant/watch/{contract_id}, POST /admin/tenants, PATCH /admin/tenants/{id}, DELETE /admin/tenants/{id}, POST /admin/tenants/{id}/grants, DELETE /admin/tenants/{id}/grants/{contract_id}, POST /admin/tenants/{id}/keys, DELETE /admin/keys/{key_id} | `idempotency key already used with a different request` |
 | `CONFLICT` | a tenant with the same name exists (store.ErrDuplicate) | POST /admin/tenants | `already exists` |
 | `CONFLICT` | a tenant is authenticated as tries to delete its own account | DELETE /admin/tenants/{id} | `a tenant cannot delete itself` |
 | `CONFLICT` | the update would rename the tenant onto an existing name (store.ErrDuplicate) | PATCH /admin/tenants/{id} | `already exists` |
@@ -185,6 +190,7 @@ they matter rather than on every path.
 | Code | Condition | Operations | Message |
 | --- | --- | --- | --- |
 | `PAYLOAD_TOO_LARGE` | the shared request-body decoder rejects an oversized body | any authenticated or rate-limited operation (middleware-wide) | `request body exceeds <limit> bytes` |
+| `PAYLOAD_TOO_LARGE` | the idempotency middleware rejects a request body exceeding HTTP_REQUEST_BODY_LIMIT while hashing | any authenticated or rate-limited operation (middleware-wide) | `request body too large` |
 
 ### 429 Too Many Requests
 
@@ -236,6 +242,7 @@ they matter rather than on every path.
 | `INTERNAL_ERROR` | the store fails while creating the subscription | POST /subscriptions | `creating subscription failed` |
 | `INTERNAL_ERROR` | the store fails while deleting the subscription | DELETE /subscriptions/{id} | `deleting subscription failed` |
 | `INTERNAL_ERROR` | the store fails while loading the subscription | GET /subscriptions/{id} | `getting subscription failed` |
+| `INTERNAL_ERROR` | the store fails while claiming or reading an Idempotency-Key record | any authenticated or rate-limited operation (middleware-wide) | `idempotency check failed` |
 | `INTERNAL_ERROR` | the store fails while listing delivery attempts | GET /subscriptions/{id}/deliveries | `listing delivery attempts failed` |
 | `INTERNAL_ERROR` | the store fails while listing subscriptions | GET /subscriptions | `listing subscriptions failed` |
 | `INTERNAL_ERROR` | the store fails while loading the subscription before the merge | PUT /subscriptions/{id} | `getting subscription failed` |
