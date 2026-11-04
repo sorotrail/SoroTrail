@@ -22,6 +22,7 @@ when it is switched on.
 - [Configuration](#configuration)
 - [Upgrading an existing deployment](#upgrading-an-existing-deployment)
 - [Adding an endpoint](#adding-an-endpoint)
+- [Field-level encryption at rest](#field-level-encryption-at-rest)
 
 ## The model
 
@@ -395,3 +396,92 @@ If your endpoint returns event data:
 
 If you forget all of this, the endpoint returns nothing rather than
 everything. That is the intended failure mode, but it is still a bug.
+
+## Field-level encryption at rest
+
+Even when full-disk encryption is enabled on the underlying storage volume, a
+raw database snapshot, backup export, or read-only SQL session exposes every
+plaintext column in the database. SoroTrail supports application-layer
+authenticated encryption (`AES-256-GCM`) with versioned keys for columns that
+must be recovered in plaintext at runtime (such as webhook HMAC signing
+secrets), while keeping authentication tokens one-way hashed.
+
+### Sensitive column protection inventory
+
+The authoritative inventory lives in `store.SensitiveColumnInventory()`
+(`internal/store/encryption.go`):
+
+| Table.Column | Protection | Rationale & Indexing Implications |
+| --- | --- | --- |
+| `subscriptions.secret` | `encrypted-aead-aes-256-gcm` (`AES-256-GCM`) | Webhook HMAC-SHA256 signing secret. Must be decrypted in memory by the webhook delivery worker to compute `X-SoroTrail-Signature` headers, so one-way hashing is not possible. Encrypted with a fresh 96-bit random nonce per write (`enc:<version>:<base64url(nonce\|\|ciphertext\|\|tag)>`). Because ciphertexts are non-deterministic, equality and prefix indexes cannot be used on `subscriptions.secret`. |
+| `api_keys.key_hash` | `hashed-one-way` (`bcrypt`) | Operator API key verifier (`sorotrail_<prefix>_<secret>`). Stored strictly as a one-way bcrypt hash (`bcrypt.DefaultCost`) and verified at authentication time; the raw key is returned only once at creation time. |
+| `tenant_api_keys.key_hash` | `hashed-one-way` (`SHA-256`) | Multi-tenant API key verifier (`st_<prefix>_<secret>`). Stored strictly as an irreversible SHA-256 hex digest (`UNIQUE`); verified via constant-time digest comparison after indexed lookup. |
+| `idempotency_keys.request_hash` | `hashed-one-way` (`SHA-256`) | Idempotent request payload digest stored as a one-way SHA-256 hash rather than persisting raw request bodies. |
+| `api_keys.prefix`, `tenant_api_keys.prefix` | `plaintext` | Short non-secret key identifier prefix (`sorotrail_<16 hex chars>` / `st_<16 chars>`) used for indexed lookup and operator audit trails without exposing secret entropy. |
+
+### Provisioning encryption keys
+
+Keys are supplied via `ENCRYPTION_KEYS` (recommended for key rotation) or
+`ENCRYPTION_KEY` (single-key shorthand, defaults to version `v1`). Both
+variables also support `*_FILE` indirection (`ENCRYPTION_KEYS_FILE` /
+`ENCRYPTION_KEY_FILE`) for Kubernetes Secrets, Docker Swarm secrets, or vault
+agent mounts.
+
+Each key must decode to **32 bytes (256 bits)** from either 64 hexadecimal
+characters or base64 (standard, URL-safe, padded, or unpadded):
+
+```bash
+# Generate a 32-byte key (64 hex chars)
+openssl rand -hex 32
+
+# Single-key configuration (implicitly version "v1")
+export ENCRYPTION_KEY="$(openssl rand -hex 32)"
+
+# Multi-version keyring configuration (first entry is the active write key)
+export ENCRYPTION_KEYS="v1:$(openssl rand -hex 32)"
+```
+
+At startup:
+
+1. `config.Load()` validates that every configured key version has a valid
+   identifier (`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$`, 1..32 chars starting with an
+   alphanumeric character), no duplicate version names, and exactly 32 decoded
+   bytes. Invalid keys fail startup immediately without echoing raw key material
+   in error messages or logs.
+2. `store.VerifyEncryptionReadiness(ctx)` scans stored `subscriptions.secret`
+   rows and verifies that every `enc:<version>:...` envelope can be decrypted
+   and authenticated by the configured keyring before the service begins
+   accepting traffic or dispatching webhooks.
+
+### Zero-downtime key rotation
+
+Ciphertexts are prefixed with `enc:<version>:` and bind `sorotrail:field:<version>`
+as AEAD Additional Authenticated Data (AAD), preventing version-header
+downgrade or substitution attacks. Rotating to a new key requires no downtime:
+
+1. **Generate a new key version (`v2`) and prepend it to `ENCRYPTION_KEYS`**
+   while keeping `v1` in the keyring:
+   ```bash
+   export ENCRYPTION_KEYS="v2:<new-32-byte-key>,v1:<old-32-byte-key>"
+   ```
+   All new and updated subscriptions are immediately encrypted under `v2`,
+   while existing `enc:v1:...` rows (and any legacy unencrypted rows) continue
+   to decrypt transparently on read.
+2. **Re-encrypt existing rows in bounded batches** using
+   `pg.RotateSubscriptionsEncryption(ctx, batchSize)` (or
+   `sq.RotateSubscriptionsEncryption(ctx, batchSize)` on SQLite). Each batch
+   reads rows ordered by `id > lastID`, decrypts any legacy plaintext or older
+   `enc:v1:...` values in memory, and writes fresh `enc:v2:...` ciphertexts
+   using an optimistic concurrency guard (`WHERE id = $2 AND secret = $3`) so
+   concurrent tenant secret updates are never clobbered. Structured `slog.Info`
+   progress logs and the returned `store.EncryptionRotationStats` report
+   `Scanned`, `EncryptedNew`, `ReEncrypted`, `AlreadyActive`, and
+   `SkippedConcurrentUpdates` counts without ever logging plaintext secrets.
+3. **Retire the old key (`v1`)** once `RotateSubscriptionsEncryption` reports
+   `EncryptedNew == 0 && ReEncrypted == 0`:
+   ```bash
+   export ENCRYPTION_KEYS="v2:<new-32-byte-key>"
+   ```
+   On the next startup, `VerifyEncryptionReadiness` confirms that no remaining
+   rows reference `v1`.
+

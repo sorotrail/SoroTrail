@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -31,11 +33,15 @@ func (p *Postgres) CreateSubscription(ctx context.Context, s Subscription) (Subs
 	if err != nil {
 		return Subscription{}, fmt.Errorf("marshaling subscription filters: %w", err)
 	}
+	storedSecret, err := encryptSubscriptionSecret(p.FieldEncryptor(), s.Secret)
+	if err != nil {
+		return Subscription{}, fmt.Errorf("encrypting subscription secret: %w", err)
+	}
 	err = p.pool.QueryRow(ctx, `
 		INSERT INTO subscriptions (url, filters, secret, enabled, tenant_id)
 		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, failure_count, created_at`,
-		s.URL, filtersJSON, s.Secret, s.Enabled, s.TenantID,
+		s.URL, filtersJSON, storedSecret, s.Enabled, s.TenantID,
 	).Scan(&s.ID, &s.FailureCount, &s.CreatedAt)
 	if err != nil {
 		return Subscription{}, fmt.Errorf("creating subscription: %w", err)
@@ -45,21 +51,27 @@ func (p *Postgres) CreateSubscription(ctx context.Context, s Subscription) (Subs
 
 func (p *Postgres) GetSubscription(ctx context.Context, id int64, owner SubscriptionOwner) (Subscription, error) {
 	var (
-		s       Subscription
-		filters []byte
-		network *string
+		s            Subscription
+		filters      []byte
+		storedSecret string
+		network      *string
 	)
 	pred, args := ownerPredicate(owner, 2)
 	err := p.pool.QueryRow(ctx,
 		`SELECT `+subscriptionColumns+` FROM subscriptions WHERE id = $1`+pred,
 		append([]any{id}, args...)...,
-	).Scan(&s.ID, &s.URL, &filters, &s.Secret, &s.Enabled, &s.FailureCount, &s.CreatedAt, &s.TenantID)
+	).Scan(&s.ID, &s.URL, &filters, &storedSecret, &s.Enabled, &s.FailureCount, &s.CreatedAt, &s.TenantID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Subscription{}, ErrNotFound
 	}
 	if err != nil {
 		return Subscription{}, fmt.Errorf("getting subscription %d: %w", id, err)
 	}
+	secret, err := decryptSubscriptionSecret(p.FieldEncryptor(), storedSecret)
+	if err != nil {
+		return Subscription{}, fmt.Errorf("decrypting subscription %d secret: %w", id, err)
+	}
+	s.Secret = secret
 	if err := json.Unmarshal(filters, &s.Filters); err != nil {
 		return Subscription{}, fmt.Errorf("unmarshaling subscription filters: %w", err)
 	}
@@ -80,13 +92,17 @@ func (p *Postgres) ListSubscriptions(ctx context.Context, owner SubscriptionOwne
 		return nil, fmt.Errorf("listing subscriptions: %w", err)
 	}
 	defer rows.Close()
-	return scanSubscriptions(rows)
+	return scanSubscriptions(rows, p.FieldEncryptor())
 }
 
 func (p *Postgres) UpdateSubscription(ctx context.Context, s Subscription, owner SubscriptionOwner) (Subscription, error) {
 	filtersJSON, err := json.Marshal(s.Filters)
 	if err != nil {
 		return Subscription{}, fmt.Errorf("marshaling subscription filters: %w", err)
+	}
+	storedSecret, err := encryptSubscriptionSecret(p.FieldEncryptor(), s.Secret)
+	if err != nil {
+		return Subscription{}, fmt.Errorf("encrypting subscription %d secret: %w", s.ID, err)
 	}
 	var updatedFilters []byte
 	pred, ownerArgs := ownerPredicate(owner, 6)
@@ -98,7 +114,7 @@ func (p *Postgres) UpdateSubscription(ctx context.Context, s Subscription, owner
 			enabled = $5
 		WHERE id = $1`+pred+`
 		RETURNING filters`,
-		append([]any{s.ID, s.URL, filtersJSON, s.Secret, s.Enabled}, ownerArgs...)...,
+		append([]any{s.ID, s.URL, filtersJSON, storedSecret, s.Enabled}, ownerArgs...)...,
 	).Scan(&updatedFilters)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Subscription{}, ErrNotFound
@@ -141,7 +157,7 @@ func (p *Postgres) ListEnabledSubscriptions(ctx context.Context) ([]Subscription
 		return nil, fmt.Errorf("listing enabled subscriptions: %w", err)
 	}
 	defer rows.Close()
-	return scanSubscriptions(rows)
+	return scanSubscriptions(rows, p.FieldEncryptor())
 }
 
 func (p *Postgres) IncrementSubscriptionFailures(ctx context.Context, id int64, maxFailures int) (int, bool, error) {
@@ -249,18 +265,24 @@ func (p *Postgres) CountDeliveryAttempts(ctx context.Context, subscriptionID int
 	return total, nil
 }
 
-func scanSubscriptions(rows pgx.Rows) ([]Subscription, error) {
+func scanSubscriptions(rows pgx.Rows, enc *FieldEncryptor) ([]Subscription, error) {
 	var subs []Subscription
 	for rows.Next() {
 		var (
-			s       Subscription
-			filters []byte
-			network *string
+			s            Subscription
+			filters      []byte
+			storedSecret string
+			network      *string
 		)
-		if err := rows.Scan(&s.ID, &s.URL, &filters, &s.Secret, &s.Enabled,
+		if err := rows.Scan(&s.ID, &s.URL, &filters, &storedSecret, &s.Enabled,
 			&s.FailureCount, &s.CreatedAt, &s.TenantID); err != nil {
 			return nil, fmt.Errorf("scanning subscription: %w", err)
 		}
+		secret, err := decryptSubscriptionSecret(enc, storedSecret)
+		if err != nil {
+			return nil, fmt.Errorf("decrypting subscription %d secret: %w", s.ID, err)
+		}
+		s.Secret = secret
 		if err := json.Unmarshal(filters, &s.Filters); err != nil {
 			return nil, fmt.Errorf("unmarshaling subscription filters: %w", err)
 		}
@@ -270,6 +292,176 @@ func scanSubscriptions(rows pgx.Rows) ([]Subscription, error) {
 		subs = append(subs, s)
 	}
 	return subs, rows.Err()
+}
+
+// VerifyEncryptionReadiness checks stored subscriptions.secret rows at startup
+// to verify that if any encrypted rows exist, the configured FieldEncryptor
+// contains every required key version and can authenticate a sample row for each.
+func (p *Postgres) VerifyEncryptionReadiness(ctx context.Context) error {
+	rows, err := p.pool.Query(ctx, `SELECT id, secret FROM subscriptions WHERE secret LIKE 'enc:%'`)
+	if err != nil {
+		return fmt.Errorf("checking encrypted subscriptions readiness: %w", err)
+	}
+	defer rows.Close()
+
+	enc := p.FieldEncryptor()
+	verifiedVersions := make(map[string]bool)
+	var missingVersions []string
+
+	for rows.Next() {
+		var (
+			id     int64
+			secret string
+		)
+		if err := rows.Scan(&id, &secret); err != nil {
+			return fmt.Errorf("scanning encrypted subscription readiness row: %w", err)
+		}
+		ver, ok := EncryptedValueVersion(secret)
+		if !ok {
+			return fmt.Errorf("subscription %d: %w: malformed encrypted envelope", id, ErrEncryptionAuthFailed)
+		}
+		if enc == nil {
+			return fmt.Errorf("subscription %d: %w (version %q)", id, ErrEncryptionKeyRequired, ver)
+		}
+		if _, exists := enc.aeads[ver]; !exists {
+			missingVersions = append(missingVersions, ver)
+			continue
+		}
+		if !verifiedVersions[ver] {
+			if _, err := enc.DecryptString(secret); err != nil {
+				return fmt.Errorf("subscription %d: %w", id, err)
+			}
+			verifiedVersions[ver] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("reading encrypted subscriptions readiness: %w", err)
+	}
+	if len(missingVersions) > 0 {
+		sort.Strings(missingVersions)
+		return fmt.Errorf("%w: database contains rows encrypted with key version(s) %v not present in keyring", ErrUnknownEncryptionKeyVersion, compactUniqueStrings(missingVersions))
+	}
+	return nil
+}
+
+// RotateSubscriptionsEncryption scans subscriptions.secret in bounded batches,
+// encrypting legacy plaintext rows and re-encrypting rows on older key versions
+// to the active key version with fresh random nonces. Each row update is guarded
+// by `WHERE id = $2 AND secret = $3` so concurrent tenant secret updates are
+// never clobbered.
+func (p *Postgres) RotateSubscriptionsEncryption(ctx context.Context, batchSize int) (EncryptionRotationStats, error) {
+	enc := p.FieldEncryptor()
+	if enc == nil {
+		return EncryptionRotationStats{}, ErrEncryptionKeyRequired
+	}
+	if batchSize <= 0 {
+		batchSize = 250
+	}
+
+	var (
+		stats  EncryptionRotationStats
+		lastID int64
+	)
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+
+		rows, err := p.pool.Query(ctx, `
+			SELECT id, secret
+			FROM subscriptions
+			WHERE id > $1
+			ORDER BY id ASC
+			LIMIT $2`,
+			lastID, batchSize,
+		)
+		if err != nil {
+			return stats, fmt.Errorf("scanning subscriptions for encryption rotation: %w", err)
+		}
+
+		type rowItem struct {
+			id     int64
+			secret string
+		}
+		var batch []rowItem
+		for rows.Next() {
+			var it rowItem
+			if err := rows.Scan(&it.id, &it.secret); err != nil {
+				rows.Close()
+				return stats, fmt.Errorf("reading subscription row for rotation: %w", err)
+			}
+			batch = append(batch, it)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return stats, fmt.Errorf("iterating subscriptions for rotation: %w", err)
+		}
+		rows.Close()
+
+		if len(batch) == 0 {
+			break
+		}
+
+		tx, err := p.pool.Begin(ctx)
+		if err != nil {
+			return stats, fmt.Errorf("beginning encryption rotation batch transaction: %w", err)
+		}
+
+		for _, it := range batch {
+			stats.Scanned++
+			lastID = it.id
+			if it.secret == "" || !enc.NeedsRotation(it.secret) {
+				stats.AlreadyActive++
+				continue
+			}
+
+			wasEncrypted := IsEncryptedValue(it.secret)
+			plaintext, err := enc.DecryptString(it.secret)
+			if err != nil {
+				_ = tx.Rollback(ctx)
+				return stats, fmt.Errorf("decrypting subscription %d during rotation: %w", it.id, err)
+			}
+			reencrypted, err := enc.EncryptString(plaintext)
+			if err != nil {
+				_ = tx.Rollback(ctx)
+				return stats, fmt.Errorf("encrypting subscription %d during rotation: %w", it.id, err)
+			}
+			tag, err := tx.Exec(ctx, `UPDATE subscriptions SET secret = $1 WHERE id = $2 AND secret = $3`, reencrypted, it.id, it.secret)
+			if err != nil {
+				_ = tx.Rollback(ctx)
+				return stats, fmt.Errorf("updating subscription %d during rotation: %w", it.id, err)
+			}
+			if tag.RowsAffected() == 0 {
+				stats.SkippedConcurrentUpdates++
+				continue
+			}
+			if wasEncrypted {
+				stats.ReEncrypted++
+			} else {
+				stats.EncryptedNew++
+			}
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return stats, fmt.Errorf("committing encryption rotation batch: %w", err)
+		}
+
+		slog.Default().Info("rotated subscription secrets encryption batch",
+			"active_version", enc.ActiveVersion(),
+			"scanned", stats.Scanned,
+			"encrypted_new", stats.EncryptedNew,
+			"re_encrypted", stats.ReEncrypted,
+			"already_active", stats.AlreadyActive,
+			"skipped_concurrent_updates", stats.SkippedConcurrentUpdates,
+		)
+
+		if len(batch) < batchSize {
+			break
+		}
+	}
+
+	return stats, nil
 }
 
 const (
