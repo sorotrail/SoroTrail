@@ -85,6 +85,7 @@ it is documented. Regenerate it with:
 | --- | --- | --- | --- | --- |
 | `sorotrail_spec_invalidations_received_total` | counter | — | Total number of spec cache invalidations received from other replicas. | Spec-cache invalidations this process applied because another replica said the contract's decoded shape changed. A non-zero value proves the cross-replica fan-out is working; a replica that never invalidates anything while its peers change specs is serving stale decodes. Stays at zero on a single-replica deployment, where there is nobody to hear from. |
 | `sorotrail_http_deprecated_requests_total` | counter | `route` (the matched chi route pattern (e.g. /events/{id}), or "unmatched" for a path no route registered — never the raw path, so probes cannot grow cardinality); `method` (the HTTP method (GET \| POST \| PUT \| PATCH \| DELETE)) | Total HTTP requests to deprecated API endpoints, labelled by route and method. | Calls to HTTP endpoints marked deprecated: true in the OpenAPI specification. Operators watch this counter approach zero during a deprecation window before removing the endpoint after its Sunset date. |
+| `sorotrail_tls_certificate_expiry_days` | gauge | — | Minimum remaining validity in days across active mTLS certificates. | Remaining days until the earliest-expiring active mTLS certificate (HTTP listener, Postgres client, or Archive client) expires, updated whenever certificates are loaded or reloaded from disk. Alert when this drops below your rotation window (for example, < 7 days). |
 
 ## HTTP metrics (per-server registry)
 

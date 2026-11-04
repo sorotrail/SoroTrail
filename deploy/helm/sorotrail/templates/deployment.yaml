@@ -54,12 +54,18 @@ spec:
             httpGet:
               path: /health
               port: http
+              {{- if .Values.mtls.enabled }}
+              scheme: HTTPS
+              {{- end }}
             periodSeconds: 5
             failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /health
               port: http
+              {{- if .Values.mtls.enabled }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: 10
             periodSeconds: 15
             failureThreshold: 3
@@ -67,11 +73,60 @@ spec:
             httpGet:
               path: /readyz
               port: http
+              {{- if .Values.mtls.enabled }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 3
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          {{- if or .Values.mtls.enabled .Values.mtls.dbSecretName .Values.mtls.archiveSecretName }}
+          volumeMounts:
+            {{- if .Values.mtls.enabled }}
+            - name: tls-certs
+              mountPath: {{ .Values.mtls.mountPath | default "/etc/sorotrail/tls" }}
+              readOnly: true
+            {{- if .Values.mtls.clientCASecretName }}
+            - name: tls-client-ca
+              mountPath: "{{ .Values.mtls.mountPath | default "/etc/sorotrail/tls" }}-client-ca"
+              readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- if .Values.mtls.dbSecretName }}
+            - name: db-tls-certs
+              mountPath: /etc/sorotrail/db-tls
+              readOnly: true
+            {{- end }}
+            {{- if .Values.mtls.archiveSecretName }}
+            - name: archive-tls-certs
+              mountPath: /etc/sorotrail/archive-tls
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if or .Values.mtls.enabled .Values.mtls.dbSecretName .Values.mtls.archiveSecretName }}
+      volumes:
+        {{- if .Values.mtls.enabled }}
+        - name: tls-certs
+          secret:
+            secretName: {{ .Values.mtls.secretName }}
+        {{- if .Values.mtls.clientCASecretName }}
+        - name: tls-client-ca
+          secret:
+            secretName: {{ .Values.mtls.clientCASecretName }}
+        {{- end }}
+        {{- end }}
+        {{- if .Values.mtls.dbSecretName }}
+        - name: db-tls-certs
+          secret:
+            secretName: {{ .Values.mtls.dbSecretName }}
+        {{- end }}
+        {{- if .Values.mtls.archiveSecretName }}
+        - name: archive-tls-certs
+          secret:
+            secretName: {{ .Values.mtls.archiveSecretName }}
+        {{- end }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

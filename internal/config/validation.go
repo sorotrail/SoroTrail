@@ -222,6 +222,7 @@ func (c Config) ValidateAll() error {
 	if (c.RateLimitRPS > 0) != (c.RateLimitBurst > 0) {
 		errs = append(errs, "RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
 	}
+	errs = append(errs, c.validateMTLS()...)
 
 	if len(errs) == 0 {
 		return nil
