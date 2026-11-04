@@ -100,6 +100,10 @@ func (s *Server) requireAPIKey(next http.Handler) http.Handler {
 			s.writeUnauthorized(w)
 			return
 		}
+		if h := auditHolderFrom(r.Context()); h != nil {
+			cp := stored
+			h.apiKey = &cp
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -302,9 +306,10 @@ func credentialFromRequest(r *http.Request) string {
 // makes the boundary a property of the request rather than a decision each
 // handler gets to make (or forget).
 type Principal struct {
-	Tenant store.Tenant
-	Scope  store.Scope
-	KeyID  int64
+	Tenant    store.Tenant
+	Scope     store.Scope
+	KeyID     int64
+	KeyPrefix string
 	// Untenanted marks the implicit principal of a MULTI_TENANT=false
 	// deployment: full access, no key required, no usage accounting. It
 	// exists so downstream code can tell "single-tenant mode" apart from
@@ -317,6 +322,10 @@ type principalCtxKey struct{}
 // WithPrincipal returns a context carrying p. Exported for tests, which
 // exercise handlers without going through the authentication middleware.
 func WithPrincipal(ctx context.Context, p Principal) context.Context {
+	if h := auditHolderFrom(ctx); h != nil {
+		h.hasPrincipal = true
+		h.principal = p
+	}
 	return context.WithValue(ctx, principalCtxKey{}, p)
 }
 
@@ -464,9 +473,10 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		}
 
 		ctx := WithPrincipal(r.Context(), Principal{
-			Tenant: tenant,
-			Scope:  scope,
-			KeyID:  key.ID,
+			Tenant:    tenant,
+			Scope:     scope,
+			KeyID:     key.ID,
+			KeyPrefix: prefix,
 		})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
