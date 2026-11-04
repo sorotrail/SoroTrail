@@ -645,6 +645,10 @@ func (b *Backfiller) runRanged(ctx context.Context, started time.Time) (Summary,
 	snap := b.progressSnapshotLocked()
 	b.mu.Unlock()
 
+	if !b.opts.DryRun {
+		_ = b.persistRanges(ctx, finalRanges)
+	}
+
 	sum.TotalRanges = snap.TotalRanges
 	sum.CompletedRanges = snap.CompletedRanges
 	sum.InFlightRanges = snap.InFlightRanges
