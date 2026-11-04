@@ -167,6 +167,14 @@ Clients cannot resume from a position inside the WebSocket connection itself;
 the position is maintained via your application's persistent state and the
 REST query cursor.
 
+### Cursor persistence across upgrades and restarts
+
+If your consumer persists a REST pagination `cursor` across restarts, note the guarantees defined in the [Pagination Cursor Stability Contract](reference/cursors.md):
+
+- Cursors survive SoroTrail process restarts, rolling upgrades across patch/minor versions (`v1` and `v2` envelopes), concurrent ingestion, and retention pruning against the same storage backend.
+- Cursors are invalidated (returning HTTP `400 Bad Request` with `code: "INVALID_CURSOR"`) if the server's storage backend changes (`pg`, `sq`, `ch`), if the query's `order_by` parameter changes, or if the cursor is truncated/tampered with.
+- Always persist the last processed `ledger` sequence (`lastProcessedLedger`) alongside any saved `cursor`. If a catch-up request fails with `400 Bad Request` (`INVALID_CURSOR`, detectable in the Go client via `client.IsStaleCursor(err)`), discard the saved cursor and restart the catch-up query from `from_ledger=<lastProcessedLedger>`.
+
 ## Backpressure and slow consumers
 
 To prevent a slow consumer from blocking the ingestion pipeline or exhausting

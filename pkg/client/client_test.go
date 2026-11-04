@@ -286,3 +286,58 @@ func TestClientSendsIdempotencyKeyFromContextAndClientClone(t *testing.T) {
 
 	assert.Equal(t, []string{"ctx-key-123", "client-key-456", "override-key-789"}, gotKeys)
 }
+
+func TestClientDetectsStaleCursorErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		wantStale  bool
+	}{
+		{
+			name:       "INVALID_CURSOR code",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error":"invalid cursor \"v99.pg.abc.1234\"","code":"INVALID_CURSOR","field":"cursor"}`,
+			wantStale:  true,
+		},
+		{
+			name:       "legacy cursor message without code",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error":"invalid cursor \"v1.sq.abc\""}`,
+			wantStale:  true,
+		},
+		{
+			name:       "non-cursor bad request",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error":"limit must be an integer in [1,1000]","code":"LIMIT_EXCEEDED","field":"limit"}`,
+			wantStale:  false,
+		},
+		{
+			name:       "server error",
+			statusCode: http.StatusInternalServerError,
+			body:       `{"error":"database unavailable","code":"INTERNAL_ERROR"}`,
+			wantStale:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			_, err := client.New(server.URL).ListEvents(context.Background(), client.ListEventsParams{
+				Cursor: "v99.pg.abc.1234",
+			})
+			require.Error(t, err)
+			assert.Equal(t, tt.wantStale, client.IsStaleCursor(err))
+			assert.Equal(t, tt.wantStale, errors.Is(err, client.ErrStaleCursor))
+
+			var apiErr *client.APIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, tt.wantStale, apiErr.IsStaleCursor())
+		})
+	}
+}
