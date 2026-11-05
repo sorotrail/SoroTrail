@@ -4,6 +4,8 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -669,5 +671,125 @@ func TestWatchedContracts_CountsAgreeWithTheEnforcedCaps(t *testing.T) {
 
 		// The count says full, and the enforcement agrees.
 		assert.ErrorIs(t, p.AddTenantWatchedContract(ctx, one, "", contractC, 2), ErrQuotaExceeded)
+	})
+}
+
+func syntheticContractID(i int) string {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+	b := make([]byte, 56)
+	b[0] = 'C'
+	n := i + 1
+	for pos := 55; pos >= 1; pos-- {
+		b[pos] = alphabet[n%32]
+		n /= 32
+	}
+	return string(b)
+}
+
+// TestAddTenantWatchedContract_ConcurrentCapEnforcement fires parallel adds at
+// a tenant one below its cap and at two tenants competing for the final
+// instance-wide slot (#1140).
+func TestAddTenantWatchedContract_ConcurrentCapEnforcement(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("parallel adds for one tenant one below its cap admit exactly one", func(t *testing.T) {
+		p := testTenantStore(t)
+		capLimit := 2
+		tenant, err := p.CreateTenant(ctx, Tenant{
+			Name:                "race-tenant",
+			Enabled:             true,
+			MaxWatchedContracts: &capLimit,
+		})
+		require.NoError(t, err)
+
+		// Pre-fill to cap - 1.
+		require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", contractA, 0))
+
+		const workers = 16
+		start := make(chan struct{})
+		errs := make(chan error, workers)
+		var wg sync.WaitGroup
+		for i := range workers {
+			cid := syntheticContractID(i)
+			wg.Add(1)
+			go func(contract string) {
+				defer wg.Done()
+				<-start
+				errs <- p.AddTenantWatchedContract(ctx, tenant, "", contract, 0)
+			}(cid)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+
+		var successes, quotaExceededs int
+		for err := range errs {
+			switch {
+			case err == nil:
+				successes++
+			case assert.ErrorIs(t, err, ErrQuotaExceeded, "unexpected error: %v", err):
+				quotaExceededs++
+			}
+		}
+		assert.Equal(t, 1, successes, "exactly one concurrent add may take the last tenant slot")
+		assert.Equal(t, workers-1, quotaExceededs)
+
+		held, err := p.CountTenantWatchedContracts(ctx, tenant.ID)
+		require.NoError(t, err)
+		assert.Equal(t, capLimit, held)
+
+		// Idempotent re-add of an already held contract still succeeds at cap.
+		require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", contractA, 0))
+	})
+
+	t.Run("parallel adds across two tenants one below instance cap admit", func(t *testing.T) {
+		p := testTenantStore(t)
+		t1 := mustTenant(t, p, "race-inst-1")
+		t2 := mustTenant(t, p, "race-inst-2")
+
+		const instanceCap = 2
+		// Pre-fill 1 contract in the union (instanceCap - 1).
+		require.NoError(t, p.AddTenantWatchedContract(ctx, t1, "", contractA, instanceCap))
+
+		const perTenantWorkers = 8
+		totalWorkers := perTenantWorkers * 2
+		start := make(chan struct{})
+		errs := make(chan error, totalWorkers)
+		var wg sync.WaitGroup
+
+		for i := range perTenantWorkers {
+			c1 := syntheticContractID(100 + i)
+			c2 := syntheticContractID(200 + i)
+			wg.Add(2)
+			go func(contract string) {
+				defer wg.Done()
+				<-start
+				errs <- p.AddTenantWatchedContract(ctx, t1, "", contract, instanceCap)
+			}(c1)
+			go func(contract string) {
+				defer wg.Done()
+				<-start
+				errs <- p.AddTenantWatchedContract(ctx, t2, "", contract, instanceCap)
+			}(c2)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+
+		var successes, quotaExceededs int
+		for err := range errs {
+			switch {
+			case err == nil:
+				successes++
+			case assert.ErrorIs(t, err, ErrQuotaExceeded, fmt.Sprintf("unexpected error: %v", err)):
+				quotaExceededs++
+			}
+		}
+		assert.Equal(t, 1, successes, "exactly one concurrent add across tenants may take the last instance slot")
+		assert.Equal(t, totalWorkers-1, quotaExceededs)
+
+		unionHeld, err := p.CountInstanceWatchedContracts(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, instanceCap, unionHeld)
 	})
 }
