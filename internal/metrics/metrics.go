@@ -137,6 +137,21 @@ var (
 		Help: "Total store operations, labelled by operation and outcome (success | error).",
 	}, []string{"operation", "outcome"})
 
+	// DBAttributedCostSeconds records cumulative database wall-clock time
+	// attributed to the originating HTTP route pattern or background job and
+	// opaque tenant bucket (#1278).
+	DBAttributedCostSeconds = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_db_attributed_cost_seconds_total",
+		Help: "Cumulative database query time in seconds attributed by originator, operation, and tenant.",
+	}, []string{"originator", "operation", "tenant"})
+
+	// DBAttributedQueriesTotal counts database operations attributed to their
+	// originating route or background job and opaque tenant bucket (#1278).
+	DBAttributedQueriesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_db_attributed_queries_total",
+		Help: "Total database queries attributed by originator, operation, tenant, and outcome.",
+	}, []string{"originator", "operation", "tenant", "outcome"})
+
 	// IngestionLag is the number of ledgers the indexer is behind the
 	// Stellar RPC chain head. Updated after every ingestion pass that
 	// has access to the chain head.
@@ -240,6 +255,8 @@ func init() {
 		DBWriteLatency,
 		DBQueryDuration,
 		DBOperationsTotal,
+		DBAttributedCostSeconds,
+		DBAttributedQueriesTotal,
 		IngestionLag,
 		EventBatchWrites,
 		EventBatchSize,

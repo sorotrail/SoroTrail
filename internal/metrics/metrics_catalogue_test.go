@@ -228,6 +228,31 @@ var metricCatalogue = []metricSpec{
 		Meaning: "Count of guarded Store calls. Errors are counted separately from successes so a failing backend is a direct query rather than something inferred by subtracting histograms.",
 		touch:   func() { DBOperationsTotal.WithLabelValues("store.QueryEvents", "success") },
 	},
+	{
+		Name: "sorotrail_db_attributed_cost_seconds_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "originator", Values: "matched HTTP route pattern (e.g. GET /events/{id}) or background worker id (ingester | pruner | auditor | archiver | reconciler | webhook | unknown)"},
+			{Name: "operation", Values: "store.<Store method> — the same fixed table as sorotrail_db_query_duration_seconds"},
+			{Name: "tenant", Values: "default, or an opaque hashed tenant bucket (t_<8hex>) capped at 64 series with overflow folded into other"},
+		},
+		Help:    "Cumulative database query time in seconds attributed by originator, operation, and tenant.",
+		Meaning: "Joins database execution time back to the HTTP endpoint or background worker and tenant that caused it, so capacity and quota decisions can be driven from observed database cost.",
+		touch:   func() { DBAttributedCostSeconds.WithLabelValues("ingester", "store.UpsertEvents", "default") },
+	},
+	{
+		Name: "sorotrail_db_attributed_queries_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "originator", Values: "matched HTTP route pattern (e.g. GET /events/{id}) or background worker id (ingester | pruner | auditor | archiver | reconciler | webhook | unknown)"},
+			{Name: "operation", Values: "store.<Store method> — the same fixed table as sorotrail_db_query_duration_seconds"},
+			{Name: "tenant", Values: "default, or an opaque hashed tenant bucket (t_<8hex>) capped at 64 series with overflow folded into other"},
+			{Name: "outcome", Values: "success | error"},
+		},
+		Help:    "Total database queries attributed by originator, operation, tenant, and outcome.",
+		Meaning: "Counts database queries per originating route/background job and opaque tenant bucket, separating cheap high-frequency endpoints from rare expensive ones.",
+		touch: func() {
+			DBAttributedQueriesTotal.WithLabelValues("ingester", "store.UpsertEvents", "default", "success")
+		},
+	},
 
 	// --- Batching ---
 	{
@@ -308,14 +333,16 @@ var idBearingLabelRe = regexp.MustCompile(`(?i)(^|_)(id|ids|uuid|hash|digest|tx|
 // label name must be added here deliberately, with its cardinality
 // bounded by construction at the call site.
 var allowedLabelNames = map[string]bool{
-	"method":    true, // fixed enum: RPC methods, or HTTP verbs
-	"outcome":   true, // success | error
-	"reason":    true, // fixed enum per metric
-	"state":     true, // fixed enum per metric
-	"provider":  true, // one value per configured RPC URL, hostname only
-	"operation": true, // one value per guarded Store method
-	"route":     true, // matched chi route pattern, or "unmatched"
-	"status":    true, // decimal status code of a real response
+	"method":     true, // fixed enum: RPC methods, or HTTP verbs
+	"outcome":    true, // success | error
+	"reason":     true, // fixed enum per metric
+	"state":      true, // fixed enum per metric
+	"provider":   true, // one value per configured RPC URL, hostname only
+	"operation":  true, // one value per guarded Store method
+	"originator": true, // matched chi route pattern or background job name
+	"tenant":     true, // opaque tenant bucket (default | t_<8hex> | other)
+	"route":      true, // matched chi route pattern, or "unmatched"
+	"status":     true, // decimal status code of a real response
 }
 
 // catalogueByName indexes the catalogue for the reverse checks.

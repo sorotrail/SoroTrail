@@ -2231,6 +2231,14 @@ func (p *Postgres) withStatementTimeoutTx(ctx context.Context, fn func(pgx.Tx) e
 			return fmt.Errorf("setting statement_timeout: %w", err)
 		}
 	}
+	opName, _ := ctx.Value(queryNameContextKey{}).(string)
+	if opName == "" {
+		opName = "store.tx"
+	}
+	if _, err := tx.Exec(ctx, FormatSQLComment(ctx, opName)+"SELECT set_config('application_name', $1, true)",
+		AttributionFromContext(ctx).Originator+":"+AttributionFromContext(ctx).Tenant); err != nil {
+		return fmt.Errorf("setting query attribution: %w", err)
+	}
 	if err := fn(tx); err != nil {
 		return err
 	}
