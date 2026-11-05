@@ -3155,8 +3155,25 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // writePoolBudgetExhausted writes a retriable 503 Service Unavailable with a
-// Retry-After header when err wraps store.ErrPoolBudgetExhausted (#1231).
+// Retry-After header when err wraps store.ErrPoolBudgetExhausted (#1231) or
+// store.ErrStoreUnavailable (#1282).
 func writePoolBudgetExhausted(w http.ResponseWriter, err error) bool {
+	if errors.Is(err, store.ErrStoreUnavailable) {
+		retrySecs := 2
+		var unavailErr *store.StoreUnavailableError
+		if errors.As(err, &unavailErr) && unavailErr.RetryAfter > 0 {
+			if s := int(unavailErr.RetryAfter.Seconds()); s > 0 {
+				retrySecs = s
+			}
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+		writeCacheHeaders(w, cacheNoStore, 0, "")
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{
+			Error: "database is temporarily unavailable; retry after recovery backoff",
+			Code:  CodeServiceUnavailable,
+		})
+		return true
+	}
 	if !errors.Is(err, store.ErrPoolBudgetExhausted) {
 		return false
 	}

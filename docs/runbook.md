@@ -31,6 +31,31 @@ database, API and replay errors by their text.
 
 ---
 
+## Degraded mode when the database is unavailable (`#1282`)
+
+When PostgreSQL is unreachable or failing consecutively, SoroTrail enters a defined degraded mode governed by `store.StoreBreaker`:
+
+### 1. Endpoint posture during a database outage
+
+| Endpoint | Status in degraded mode | Touches database? | Notes |
+|---|---|---|---|
+| `GET /livez` | `200 OK` | **Never** | Liveness stays green so Kubernetes does not restart healthy processes during an external database outage. |
+| `GET /version` | `200 OK` | **Never** | Returns compiled-in build version and commit metadata. |
+| `GET /openapi.json`, `GET /docs` | `200 OK` | **Never** | Serves embedded OpenAPI specification and Swagger UI. |
+| `GET /metrics` | `200 OK` | **Never** | Exports Prometheus metrics, including `sorotrail_db_circuit_breaker_state` and `sorotrail_db_degraded_rejections_total`. |
+| `GET /readyz`, `GET /health` | `503 Service Unavailable` | Probe only | Removes the replica from load-balancer rotation while reporting per-dependency status. |
+| Store-backed reads & writes (`/events`, `/contracts`, `/stats`, etc.) | `503 Service Unavailable` + `Retry-After` | **Fails fast while circuit is open** | Rejects immediately without queueing or waiting for the 25s query timeout. |
+
+### 2. Recovery & anti-stampede backoff
+
+- After `FailureThreshold` (default `3`) consecutive database failures, the breaker opens for `BaseCooldown` (`2s`, doubling up to `30s` with random jitter).
+- While open, requests fail immediately with a jittered `Retry-After` header so retrying clients spread out instead of synchronising.
+- Once the cooldown expires, a single half-open probe request is allowed through; if it succeeds, the circuit closes and normal traffic resumes.
+- The ingester never advances its cursor on a failed store write and backs off with jittered exponential delay.
+- State transitions (`closed -> open`, `open -> half-open`, `half-open -> closed`) are logged once per transition via `OnStateChange` to prevent per-request log floods.
+
+---
+
 ## Pre-deployment preflight self-check
 
 Run `sorotrail preflight` before rolling out a new version or as a Kubernetes

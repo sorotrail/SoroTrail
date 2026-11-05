@@ -15,11 +15,13 @@ type GuardedStoreOptions struct {
 	Timeout            time.Duration
 	SlowQueryThreshold time.Duration
 	Logger             *slog.Logger
+	Breaker            *StoreBreaker
 }
 
 type guardedStore struct {
 	Store
 	options     GuardedStoreOptions
+	breaker     *StoreBreaker
 	queryErrors atomic.Uint64
 }
 
@@ -38,7 +40,21 @@ func NewGuardedStore(base Store, opts GuardedStoreOptions) Store {
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &guardedStore{Store: base, options: opts}
+	return &guardedStore{Store: base, options: opts, breaker: opts.Breaker}
+}
+
+func (s *guardedStore) checkBreaker() (bool, error) {
+	if s.breaker == nil {
+		return false, nil
+	}
+	return s.breaker.Allow()
+}
+
+func (s *guardedStore) finishCall(ctx context.Context, name string, start time.Time, probe bool, err error) {
+	if s.breaker != nil {
+		s.breaker.Record(probe, err)
+	}
+	s.logSlowQuery(ctx, name, start, err)
 }
 
 func (s *guardedStore) wrapContext(ctx context.Context, name string) (context.Context, context.CancelFunc) {
@@ -80,65 +96,93 @@ func (s *guardedStore) logSlowQuery(ctx context.Context, name string, start time
 }
 
 func (s *guardedStore) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
+	probe, err := s.checkBreaker()
+	if err != nil {
+		return 0, err
+	}
 	ctx, cancel := s.wrapContext(ctx, "store.UpsertEvents")
 	defer cancel()
 	start := time.Now()
 	n, err := s.Store.UpsertEvents(ctx, events)
-	s.logSlowQuery(ctx, "store.UpsertEvents", start, err)
+	s.finishCall(ctx, "store.UpsertEvents", start, probe, err)
 	return n, err
 }
 
 func (s *guardedStore) ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error {
+	probe, err := s.checkBreaker()
+	if err != nil {
+		return err
+	}
 	ctx, cancel := s.wrapContext(ctx, "store.ReplaceEventsInRange")
 	defer cancel()
 	start := time.Now()
-	err := s.Store.ReplaceEventsInRange(ctx, events, fromLedger, toLedger)
-	s.logSlowQuery(ctx, "store.ReplaceEventsInRange", start, err)
+	err = s.Store.ReplaceEventsInRange(ctx, events, fromLedger, toLedger)
+	s.finishCall(ctx, "store.ReplaceEventsInRange", start, probe, err)
 	return err
 }
 
 func (s *guardedStore) GetEvent(ctx context.Context, id string, sc Scope) (Event, error) {
+	probe, err := s.checkBreaker()
+	if err != nil {
+		return Event{}, err
+	}
 	ctx, cancel := s.wrapContext(ctx, "store.GetEvent")
 	defer cancel()
 	start := time.Now()
 	e, err := s.Store.GetEvent(ctx, id, sc)
-	s.logSlowQuery(ctx, "store.GetEvent", start, err)
+	s.finishCall(ctx, "store.GetEvent", start, probe, err)
 	return e, err
 }
 
 func (s *guardedStore) GetEventsByTxHash(ctx context.Context, txHash, excludeID string) ([]Event, error) {
+	probe, err := s.checkBreaker()
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := s.wrapContext(ctx, "store.GetEventsByTxHash")
 	defer cancel()
 	start := time.Now()
 	events, err := s.Store.GetEventsByTxHash(ctx, txHash, excludeID)
-	s.logSlowQuery(ctx, "store.GetEventsByTxHash", start, err)
+	s.finishCall(ctx, "store.GetEventsByTxHash", start, probe, err)
 	return events, err
 }
 
 func (s *guardedStore) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
+	probe, err := s.checkBreaker()
+	if err != nil {
+		return false, err
+	}
 	ctx, cancel := s.wrapContext(ctx, "store.EventExists")
 	defer cancel()
 	start := time.Now()
 	exists, err := s.Store.EventExists(ctx, id, sc)
-	s.logSlowQuery(ctx, "store.EventExists", start, err)
+	s.finishCall(ctx, "store.EventExists", start, probe, err)
 	return exists, err
 }
 
 func (s *guardedStore) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
+	probe, err := s.checkBreaker()
+	if err != nil {
+		return nil, "", err
+	}
 	ctx, cancel := s.wrapContext(ctx, "store.QueryEvents")
 	defer cancel()
 	start := time.Now()
 	events, cursor, err := s.Store.QueryEvents(ctx, f)
-	s.logSlowQuery(ctx, "store.QueryEvents", start, err)
+	s.finishCall(ctx, "store.QueryEvents", start, probe, err)
 	return events, cursor, err
 }
 
 func (s *guardedStore) CountEvents(ctx context.Context, f EventFilter) (int64, error) {
+	probe, err := s.checkBreaker()
+	if err != nil {
+		return 0, err
+	}
 	ctx, cancel := s.wrapContext(ctx, "store.CountEvents")
 	defer cancel()
 	start := time.Now()
 	total, err := s.Store.CountEvents(ctx, f)
-	s.logSlowQuery(ctx, "store.CountEvents", start, err)
+	s.finishCall(ctx, "store.CountEvents", start, probe, err)
 	return total, err
 }
 
@@ -243,20 +287,28 @@ func (s *guardedStore) ContractEventTypeCounts(ctx context.Context, contractID s
 }
 
 func (s *guardedStore) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {
+	probe, err := s.checkBreaker()
+	if err != nil {
+		return nil, "", err
+	}
 	ctx, cancel := s.wrapContext(ctx, "store.ListContracts")
 	defer cancel()
 	start := time.Now()
 	summaries, cursor, err := s.Store.ListContracts(ctx, f)
-	s.logSlowQuery(ctx, "store.ListContracts", start, err)
+	s.finishCall(ctx, "store.ListContracts", start, probe, err)
 	return summaries, cursor, err
 }
 
 func (s *guardedStore) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
+	probe, err := s.checkBreaker()
+	if err != nil {
+		return 0, err
+	}
 	ctx, cancel := s.wrapContext(ctx, "store.CountContracts")
 	defer cancel()
 	start := time.Now()
 	total, err := s.Store.CountContracts(ctx, f)
-	s.logSlowQuery(ctx, "store.CountContracts", start, err)
+	s.finishCall(ctx, "store.CountContracts", start, probe, err)
 	return total, err
 }
 
@@ -490,21 +542,29 @@ func (s *guardedStore) MigrationVersion(ctx context.Context) (int, bool, error) 
 }
 
 func (s *guardedStore) Stats(ctx context.Context, sc Scope) (Stats, error) {
+	probe, err := s.checkBreaker()
+	if err != nil {
+		return Stats{}, err
+	}
 	ctx, cancel := s.wrapContext(ctx, "store.Stats")
 	defer cancel()
 	start := time.Now()
 	stats, err := s.Store.Stats(ctx, sc)
-	s.logSlowQuery(ctx, "store.Stats", start, err)
+	s.finishCall(ctx, "store.Stats", start, probe, err)
 	stats.QueryErrors = s.queryErrors.Load()
 	return stats, err
 }
 
 func (s *guardedStore) Ping(ctx context.Context) error {
+	probe, err := s.checkBreaker()
+	if err != nil {
+		return err
+	}
 	ctx, cancel := s.wrapContext(ctx, "store.Ping")
 	defer cancel()
 	start := time.Now()
-	err := s.Store.Ping(ctx)
-	s.logSlowQuery(ctx, "store.Ping", start, err)
+	err = s.Store.Ping(ctx)
+	s.finishCall(ctx, "store.Ping", start, probe, err)
 	return err
 }
 
