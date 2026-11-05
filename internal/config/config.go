@@ -445,15 +445,6 @@ func Load() (Config, error) {
 	if err := cfg.ValidateAll(); err != nil {
 		return Config{}, err
 	}
-	// Validate() holds the per-field rules that predate ValidateAll
-	// (API_QUERY_TIMEOUT, LOG_FORMAT, the HTTP_* timeouts, audit and
-	// retention bounds). It is called here rather than from ValidateAll
-	// because it assumes envDefaults have been applied, which is only true
-	// on this path; ValidateAll also runs against hand-built Configs in
-	// tests. Without this call those rules were silently unenforced.
-	if err := cfg.Validate(); err != nil {
-		return Config{}, err
-	}
 	return cfg, nil
 }
 
@@ -718,300 +709,196 @@ func NewLogHandler(w io.Writer, format string, opts *slog.HandlerOptions) slog.H
 }
 
 // Validate checks the configuration for values that would fail at runtime.
+// It is a thin wrapper around ValidateAll so callers using either entry point
+// enforce the exact same set of rules in one pass (#1143).
 func (c Config) Validate() error {
-	if c.DatabaseURL == "" {
-		return fmt.Errorf("DATABASE_URL is required")
-	}
-	// RPC_URLS takes priority when set; RPC_URL is the single-provider
-	// fallback that works unchanged for existing deployments.
-	if len(c.RPCURLS) > 0 {
-		for i, raw := range c.RPCURLS {
-			u, err := url.Parse(raw)
-			if err != nil || u.Scheme == "" || u.Host == "" {
-				return fmt.Errorf("RPC_URLS[%d] %q is not a valid URL", i, raw)
-			}
-		}
-	} else if !IsSQLite(c.DatabaseURL) {
-		u, err := url.Parse(c.RPCURL)
-		if err != nil || u.Scheme == "" || u.Host == "" {
-			return fmt.Errorf("RPC_URL %q is not a valid URL", c.RPCURL)
-		}
-	}
+	return c.ValidateAll()
+}
+
+// collectLegacyValidateErrors collects every validation failure that formerly
+// lived only in Validate() so ValidateAll() reports all configuration errors
+// in a single pass rather than two rounds (#1143).
+func (c Config) collectLegacyValidateErrors() []string {
+	var errs []string
 	if IsSQLite(c.DatabaseURL) {
 		path := c.DatabaseURL[7:]
 		if path == "" || path == ":memory:" {
 		} else if path[0] != '/' && path[0] != '.' && path[0] != ':' {
-			return fmt.Errorf("sqlite DATABASE_URL %q must be an absolute or relative path (or :memory:)", c.DatabaseURL)
+			errs = append(errs, fmt.Sprintf("DATABASE_URL: sqlite DATABASE_URL %q must be an absolute or relative path (or :memory:)", c.DatabaseURL))
 		}
 	}
 	if c.DBMaxConns < 0 {
-		return fmt.Errorf("DB_MAX_CONNS must be non-negative, got %d", c.DBMaxConns)
+		errs = append(errs, fmt.Sprintf("DB_MAX_CONNS must be non-negative, got %d", c.DBMaxConns))
 	}
 	if c.DBMinConns < 0 {
-		return fmt.Errorf("DB_MIN_CONNS must be non-negative, got %d", c.DBMinConns)
+		errs = append(errs, fmt.Sprintf("DB_MIN_CONNS must be non-negative, got %d", c.DBMinConns))
 	}
 	if c.DBMaxConns > 0 && c.DBMinConns > c.DBMaxConns {
-		return fmt.Errorf("DB_MIN_CONNS (%d) must be <= DB_MAX_CONNS (%d)", c.DBMinConns, c.DBMaxConns)
+		errs = append(errs, fmt.Sprintf("DB_MIN_CONNS (%d) must be <= DB_MAX_CONNS (%d)", c.DBMinConns, c.DBMaxConns))
 	}
 	if c.DBMaxConnLifetime < 0 {
-		return fmt.Errorf("DB_MAX_CONN_LIFETIME must be non-negative, got %s", c.DBMaxConnLifetime)
+		errs = append(errs, fmt.Sprintf("DB_MAX_CONN_LIFETIME must be non-negative, got %s", c.DBMaxConnLifetime))
 	}
 	if c.DBMaxConnIdleTime < 0 {
-		return fmt.Errorf("DB_MAX_CONN_IDLE_TIME must be non-negative, got %s", c.DBMaxConnIdleTime)
+		errs = append(errs, fmt.Sprintf("DB_MAX_CONN_IDLE_TIME must be non-negative, got %s", c.DBMaxConnIdleTime))
 	}
 	if c.DBIngesterReservedConns < 0 {
-		return fmt.Errorf("DB_INGESTER_RESERVED_CONNS must be non-negative, got %d", c.DBIngesterReservedConns)
+		errs = append(errs, fmt.Sprintf("DB_INGESTER_RESERVED_CONNS must be non-negative, got %d", c.DBIngesterReservedConns))
 	}
 	if c.DBMaxConns > 0 && c.DBIngesterReservedConns >= c.DBMaxConns {
-		return fmt.Errorf("DB_INGESTER_RESERVED_CONNS (%d) must be < DB_MAX_CONNS (%d)", c.DBIngesterReservedConns, c.DBMaxConns)
+		errs = append(errs, fmt.Sprintf("DB_INGESTER_RESERVED_CONNS (%d) must be < DB_MAX_CONNS (%d)", c.DBIngesterReservedConns, c.DBMaxConns))
 	}
 	if c.DBAPIReadMaxConns < 0 {
-		return fmt.Errorf("DB_API_READ_MAX_CONNS must be non-negative, got %d", c.DBAPIReadMaxConns)
+		errs = append(errs, fmt.Sprintf("DB_API_READ_MAX_CONNS must be non-negative, got %d", c.DBAPIReadMaxConns))
 	}
 	if c.DBGraphQLMaxConns < 0 {
-		return fmt.Errorf("DB_GRAPHQL_MAX_CONNS must be non-negative, got %d", c.DBGraphQLMaxConns)
+		errs = append(errs, fmt.Sprintf("DB_GRAPHQL_MAX_CONNS must be non-negative, got %d", c.DBGraphQLMaxConns))
 	}
 	if c.DBSubscriptionMaxConns < 0 {
-		return fmt.Errorf("DB_SUBSCRIPTION_MAX_CONNS must be non-negative, got %d", c.DBSubscriptionMaxConns)
+		errs = append(errs, fmt.Sprintf("DB_SUBSCRIPTION_MAX_CONNS must be non-negative, got %d", c.DBSubscriptionMaxConns))
 	}
 	if c.DBMaintenanceMaxConns < 0 {
-		return fmt.Errorf("DB_MAINTENANCE_MAX_CONNS must be non-negative, got %d", c.DBMaintenanceMaxConns)
+		errs = append(errs, fmt.Sprintf("DB_MAINTENANCE_MAX_CONNS must be non-negative, got %d", c.DBMaintenanceMaxConns))
 	}
 	if c.DBPoolAcquireTimeout < 0 {
-		return fmt.Errorf("DB_POOL_ACQUIRE_TIMEOUT must be non-negative, got %s", c.DBPoolAcquireTimeout)
+		errs = append(errs, fmt.Sprintf("DB_POOL_ACQUIRE_TIMEOUT must be non-negative, got %s", c.DBPoolAcquireTimeout))
 	}
 	if c.DBPoolPressureThreshold < 0 || c.DBPoolPressureThreshold > 1 {
-		return fmt.Errorf("DB_POOL_PRESSURE_THRESHOLD must be in [0,1], got %v", c.DBPoolPressureThreshold)
+		errs = append(errs, fmt.Sprintf("DB_POOL_PRESSURE_THRESHOLD must be in [0,1], got %v", c.DBPoolPressureThreshold))
 	}
-	// Empty means "unused": HORIZON_URL is only read by `sorotrail backfill`
-	// and Load supplies a default, so an unset value is not a misconfigured
-	// indexer. Validate the shape only when someone actually set one.
 	if u, err := url.Parse(c.HorizonURL); c.HorizonURL != "" && (err != nil || u.Scheme == "" || u.Host == "") {
-		return fmt.Errorf("HORIZON_URL %q is not a valid URL", c.HorizonURL)
+		errs = append(errs, fmt.Sprintf("HORIZON_URL %q is not a valid URL", c.HorizonURL))
 	}
-
 	if c.HTTPAddr != "" {
 		if _, _, err := net.SplitHostPort(c.HTTPAddr); err != nil {
-			return fmt.Errorf("HTTP_ADDR %q is not a valid host:port (e.g. :8080)", c.HTTPAddr)
+			errs = append(errs, fmt.Sprintf("HTTP_ADDR %q is not a valid host:port (e.g. :8080)", c.HTTPAddr))
 		}
-	}
-
-	if c.PollInterval <= 0 {
-		return fmt.Errorf("POLL_INTERVAL must be positive, got %s", c.PollInterval)
-	}
-	if c.PollIntervalMin < 0 {
-		return fmt.Errorf("POLL_INTERVAL_MIN must be non-negative, got %s", c.PollIntervalMin)
-	}
-	if c.PollIntervalMax < 0 {
-		return fmt.Errorf("POLL_INTERVAL_MAX must be non-negative, got %s", c.PollIntervalMax)
-	}
-	if c.PollIntervalMin > 0 && c.PollIntervalMax > 0 && c.PollIntervalMin > c.PollIntervalMax {
-		return fmt.Errorf("POLL_INTERVAL_MIN (%s) must be <= POLL_INTERVAL_MAX (%s)",
-			c.PollIntervalMin, c.PollIntervalMax)
 	}
 	if c.APIQueryTimeout <= 0 {
-		return fmt.Errorf("API_QUERY_TIMEOUT must be positive, got %s", c.APIQueryTimeout)
+		errs = append(errs, fmt.Sprintf("API_QUERY_TIMEOUT must be positive, got %s", c.APIQueryTimeout))
 	}
 	if c.APISlowQueryThreshold <= 0 {
-		return fmt.Errorf("API_SLOW_QUERY_THRESHOLD must be positive, got %s", c.APISlowQueryThreshold)
-	}
-	if c.RetentionLedgers == 0 {
-		return fmt.Errorf("RETENTION_LEDGERS must be positive")
+		errs = append(errs, fmt.Sprintf("API_SLOW_QUERY_THRESHOLD must be positive, got %s", c.APISlowQueryThreshold))
 	}
 	if c.RetentionAge < 0 {
-		return fmt.Errorf("RETENTION_AGE must be non-negative")
+		errs = append(errs, "RETENTION_AGE must be non-negative")
 	}
-	// RetentionPoll mirrors RetentionAge: it only matters once age-based
-	// pruning is enabled, and zero (the hand-built, non-default value) is a
-	// valid "disabled" state rather than a misconfiguration.
 	if c.RetentionPoll < 0 {
-		return fmt.Errorf("RETENTION_POLL_INTERVAL must be non-negative")
-	}
-	if c.PartitionLedgerSpan == 0 {
-		return fmt.Errorf("PARTITION_LEDGER_SPAN must be positive")
-	}
-	switch strings.ToLower(c.LogLevel) {
-	case "debug", "info", "warn", "error":
-	default:
-		return fmt.Errorf("LOG_LEVEL %q is not one of debug|info|warn|error", c.LogLevel)
-	}
-	switch strings.ToLower(c.LogFormat) {
-	case "text", "json":
-	default:
-		return fmt.Errorf("LOG_FORMAT %q is not one of text|json", c.LogFormat)
-	}
-	for _, id := range c.WatchedContracts {
-		if !ValidContractID(id) {
-			return fmt.Errorf("WATCHED_CONTRACTS entry %q is not a valid contract ID (want C... strkey, 56 chars)", id)
-		}
+		errs = append(errs, "RETENTION_POLL_INTERVAL must be non-negative")
 	}
 	for _, id := range c.SkipContracts {
 		if !ValidContractID(id) {
-			return fmt.Errorf("SKIP_CONTRACTS entry %q is not a valid contract ID (want C... strkey, 56 chars)", id)
+			errs = append(errs, fmt.Sprintf("SKIP_CONTRACTS entry %q is not a valid contract ID (want C... strkey, 56 chars)", id))
 		}
 	}
-	if c.AuditPollInterval <= 0 {
-		return fmt.Errorf("AUDIT_POLL_INTERVAL must be positive")
-	}
-	if c.AuditBatchLedgers == 0 {
-		return fmt.Errorf("AUDIT_BATCH_LEDGERS must be positive")
-	}
-	if c.AuditLagThreshold == 0 {
-		return fmt.Errorf("AUDIT_LAG_THRESHOLD must be positive")
-	}
-	if c.AuditBudgetShare < 0 || c.AuditBudgetShare > 1 {
-		return fmt.Errorf("AUDIT_BUDGET_SHARE must be in [0,1]")
-	}
-	if c.AuditMaxRPS <= 0 {
-		return fmt.Errorf("AUDIT_MAX_RPS must be positive")
-	}
-	if c.AuditMaxRepair <= 0 {
-		return fmt.Errorf("AUDIT_MAX_REPAIR_ATTEMPTS must be positive")
-	}
-	if c.AuditFindingMaxLgrs == 0 {
-		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
-	}
 	if c.RPCRateLimitRPS <= 0 {
-		return fmt.Errorf("RPC_RATE_LIMIT_RPS must be positive")
+		errs = append(errs, "RPC_RATE_LIMIT_RPS must be positive")
 	}
 	if c.RPCRateLimit <= 0 {
-		return fmt.Errorf("RPC_RATE_LIMIT must be positive, got %v", c.RPCRateLimit)
+		errs = append(errs, fmt.Sprintf("RPC_RATE_LIMIT must be positive, got %v", c.RPCRateLimit))
 	}
 	if c.RetentionBatchSize <= 0 {
-		return fmt.Errorf("RETENTION_BATCH_SIZE must be positive")
+		errs = append(errs, "RETENTION_BATCH_SIZE must be positive")
 	}
 	if c.IngestPageSize == 0 {
-		return fmt.Errorf("INGEST_PAGE_SIZE must be positive")
+		errs = append(errs, "INGEST_PAGE_SIZE must be positive")
 	}
 	if c.IngestBatchSize == 0 {
-		return fmt.Errorf("INGEST_BATCH_SIZE must be positive")
+		errs = append(errs, "INGEST_BATCH_SIZE must be positive")
 	}
 	if c.RetentionPause < 0 {
-		return fmt.Errorf("RETENTION_PAUSE must be non-negative")
+		errs = append(errs, "RETENTION_PAUSE must be non-negative")
 	}
 	if c.RetentionInterval <= 0 {
-		return fmt.Errorf("RETENTION_INTERVAL must be positive")
+		errs = append(errs, "RETENTION_INTERVAL must be positive")
 	}
 	if c.RetentionMaxAge < 0 {
-		return fmt.Errorf("RETENTION_MAX_AGE must be non-negative")
+		errs = append(errs, "RETENTION_MAX_AGE must be non-negative")
 	}
 	if c.BackfillRateRPS <= 0 {
-		return fmt.Errorf("BACKFILL_RATE_RPS must be positive, got %v", c.BackfillRateRPS)
+		errs = append(errs, fmt.Sprintf("BACKFILL_RATE_RPS must be positive, got %v", c.BackfillRateRPS))
 	}
 	if c.RPCMaxAttempts <= 0 {
-		return fmt.Errorf("RPC_MAX_ATTEMPTS must be positive, got %d", c.RPCMaxAttempts)
+		errs = append(errs, fmt.Sprintf("RPC_MAX_ATTEMPTS must be positive, got %d", c.RPCMaxAttempts))
 	}
 	if c.RPCBaseBackoff <= 0 {
-		return fmt.Errorf("RPC_BASE_BACKOFF must be positive, got %s", c.RPCBaseBackoff)
+		errs = append(errs, fmt.Sprintf("RPC_BASE_BACKOFF must be positive, got %s", c.RPCBaseBackoff))
 	}
 	if c.RPCMaxBackoff <= 0 {
-		return fmt.Errorf("RPC_MAX_BACKOFF must be positive, got %s", c.RPCMaxBackoff)
+		errs = append(errs, fmt.Sprintf("RPC_MAX_BACKOFF must be positive, got %s", c.RPCMaxBackoff))
 	}
 	if c.RPCHTTPTimeout < 0 {
-		return fmt.Errorf("RPC_HTTP_TIMEOUT must be non-negative, got %s", c.RPCHTTPTimeout)
-	}
-	if c.RateLimitRPS < 0 {
-		return fmt.Errorf("RATE_LIMIT_RPS must be non-negative")
-	}
-	if c.RateLimitBurst < 0 {
-		return fmt.Errorf("RATE_LIMIT_BURST must be non-negative")
+		errs = append(errs, fmt.Sprintf("RPC_HTTP_TIMEOUT must be non-negative, got %s", c.RPCHTTPTimeout))
 	}
 	if c.HTTPReadTimeout < 0 {
-		return fmt.Errorf("HTTP_READ_TIMEOUT must be non-negative, got %s", c.HTTPReadTimeout)
+		errs = append(errs, fmt.Sprintf("HTTP_READ_TIMEOUT must be non-negative, got %s", c.HTTPReadTimeout))
 	}
 	if c.HTTPWriteTimeout < 0 {
-		return fmt.Errorf("HTTP_WRITE_TIMEOUT must be non-negative, got %s", c.HTTPWriteTimeout)
+		errs = append(errs, fmt.Sprintf("HTTP_WRITE_TIMEOUT must be non-negative, got %s", c.HTTPWriteTimeout))
 	}
 	if c.HTTPIdleTimeout < 0 {
-		return fmt.Errorf("HTTP_IDLE_TIMEOUT must be non-negative, got %s", c.HTTPIdleTimeout)
+		errs = append(errs, fmt.Sprintf("HTTP_IDLE_TIMEOUT must be non-negative, got %s", c.HTTPIdleTimeout))
 	}
 	if c.HTTPReadHeaderTimeout < 0 {
-		return fmt.Errorf("HTTP_READ_HEADER_TIMEOUT must be non-negative, got %s", c.HTTPReadHeaderTimeout)
+		errs = append(errs, fmt.Sprintf("HTTP_READ_HEADER_TIMEOUT must be non-negative, got %s", c.HTTPReadHeaderTimeout))
 	}
 	if c.HTTPRequestBodyLimit < 0 {
-		return fmt.Errorf("HTTP_REQUEST_BODY_LIMIT must be non-negative, got %d", c.HTTPRequestBodyLimit)
+		errs = append(errs, fmt.Sprintf("HTTP_REQUEST_BODY_LIMIT must be non-negative, got %d", c.HTTPRequestBodyLimit))
 	}
 	if c.HTTPResponseBodyLimit < 0 {
-		return fmt.Errorf("HTTP_RESPONSE_BODY_LIMIT must be non-negative, got %d", c.HTTPResponseBodyLimit)
+		errs = append(errs, fmt.Sprintf("HTTP_RESPONSE_BODY_LIMIT must be non-negative, got %d", c.HTTPResponseBodyLimit))
 	}
 	if c.HTTPDecompressedBodyLimit < 0 {
-		return fmt.Errorf("HTTP_DECOMPRESSED_BODY_LIMIT must be non-negative, got %d", c.HTTPDecompressedBodyLimit)
+		errs = append(errs, fmt.Sprintf("HTTP_DECOMPRESSED_BODY_LIMIT must be non-negative, got %d", c.HTTPDecompressedBodyLimit))
 	}
 	for k, v := range c.HTTPEndpointBodyLimits {
 		if strings.TrimSpace(k) == "" || v <= 0 {
-			return fmt.Errorf("HTTP_ENDPOINT_BODY_LIMITS entry %q must have a positive byte limit, got %d", k, v)
+			errs = append(errs, fmt.Sprintf("HTTP_ENDPOINT_BODY_LIMITS entry %q must have a positive byte limit, got %d", k, v))
 		}
 	}
 	if c.APIMaxLimit < 1 {
-		return fmt.Errorf("API_MAX_LIMIT must be positive, got %d", c.APIMaxLimit)
+		errs = append(errs, fmt.Sprintf("API_MAX_LIMIT must be positive, got %d", c.APIMaxLimit))
 	}
 	if c.ShutdownTimeout < 0 {
-		return fmt.Errorf("SHUTDOWN_TIMEOUT must be non-negative, got %s", c.ShutdownTimeout)
+		errs = append(errs, fmt.Sprintf("SHUTDOWN_TIMEOUT must be non-negative, got %s", c.ShutdownTimeout))
 	}
 	if c.SweepConcurrency < 1 {
-		return fmt.Errorf("SWEEP_CONCURRENCY must be positive, got %d", c.SweepConcurrency)
+		errs = append(errs, fmt.Sprintf("SWEEP_CONCURRENCY must be positive, got %d", c.SweepConcurrency))
 	}
-	// MAX_EVENTS_PER_CYCLE needs no explicit rule: the env parser rejects
-	// negatives (uint), and zero is the documented "disabled" value.
-	// BATCH_TARGET_LATENCY and BATCH_MAX_BACKOFF tune the batching
-	// behavior that only exists when BATCH_SIZE is set, but tolerating
-	// them when batching is off (a config that sets a budget but forgets
-	// the size) is safer than rejecting it — the operator sees a warning
-	// at startup rather than a crash loop only during a deploy review.
 	if c.BatchSize > 0 && c.BatchTargetLatency < 0 {
-		return fmt.Errorf("BATCH_TARGET_LATENCY must be non-negative, got %s", c.BatchTargetLatency)
+		errs = append(errs, fmt.Sprintf("BATCH_TARGET_LATENCY must be non-negative, got %s", c.BatchTargetLatency))
 	}
 	if c.BatchMaxBackoff < 0 {
-		return fmt.Errorf("BATCH_MAX_BACKOFF must be non-negative, got %s", c.BatchMaxBackoff)
+		errs = append(errs, fmt.Sprintf("BATCH_MAX_BACKOFF must be non-negative, got %s", c.BatchMaxBackoff))
 	}
 	if c.ReorgConfirmationWindow > 0 && c.ReorgRescanInterval <= 0 {
-		return fmt.Errorf("REORG_RESCAN_INTERVAL must be positive when REORG_CONFIRMATION_WINDOW is set")
+		errs = append(errs, "REORG_RESCAN_INTERVAL must be positive when REORG_CONFIRMATION_WINDOW is set")
 	}
 	if c.ExportMaxRange <= 0 {
-		return fmt.Errorf("EXPORT_MAX_RANGE must be positive, got %d", c.ExportMaxRange)
+		errs = append(errs, fmt.Sprintf("EXPORT_MAX_RANGE must be positive, got %d", c.ExportMaxRange))
 	}
 	if err := validateCORSOrigins(c.CORSAllowedOrigins); err != nil {
-		return err
-	}
-	// Both must be set together: half-configured limits would silently
-	// behave like the disabled case (Enabled returns false when either is
-	// non-positive), which would confuse operators who set one and
-	// expected throttling to kick in.
-	if (c.RateLimitRPS > 0) != (c.RateLimitBurst > 0) {
-		return fmt.Errorf("RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
+		errs = append(errs, err.Error())
 	}
 	if c.MultiTenantMaxWatched < 0 {
-		return fmt.Errorf("MULTI_TENANT_MAX_WATCHED must be non-negative")
+		errs = append(errs, "MULTI_TENANT_MAX_WATCHED must be non-negative")
 	}
 	if c.MultiTenantUsageFlush <= 0 {
-		return fmt.Errorf("MULTI_TENANT_USAGE_FLUSH must be positive")
+		errs = append(errs, "MULTI_TENANT_USAGE_FLUSH must be positive")
 	}
 	if c.MultiTenantStreamScopeSync <= 0 {
-		return fmt.Errorf("MULTI_TENANT_STREAM_SCOPE_SYNC must be positive")
+		errs = append(errs, "MULTI_TENANT_STREAM_SCOPE_SYNC must be positive")
 	}
-	// Rejected rather than ignored: an operator who sets a bootstrap key
-	// without enabling multi-tenancy has configured a credential that
-	// authenticates nothing, and would reasonably assume the instance is
-	// protected when it is wide open.
 	if c.MultiTenantBootstrapKey != "" && !c.MultiTenant {
-		return fmt.Errorf("MULTI_TENANT_BOOTSTRAP_KEY is set but MULTI_TENANT is false")
+		errs = append(errs, "MULTI_TENANT_BOOTSTRAP_KEY is set but MULTI_TENANT is false")
 	}
-	// Archive configuration: ARCHIVE_BUCKET is the master switch. When
-	// set, the endpoint must also be provided (S3-compatible stores
-	// need an explicit endpoint).
 	if c.ArchiveBucket != "" && c.ArchiveEndpoint == "" {
-		return fmt.Errorf("ARCHIVE_ENDPOINT is required when ARCHIVE_BUCKET is set")
+		errs = append(errs, "ARCHIVE_ENDPOINT is required when ARCHIVE_BUCKET is set")
 	}
 	if c.ArchiveMaxRetries < 0 {
-		return fmt.Errorf("ARCHIVE_MAX_RETRIES must be non-negative")
+		errs = append(errs, "ARCHIVE_MAX_RETRIES must be non-negative")
 	}
-	if mtlsErrs := c.validateMTLS(); len(mtlsErrs) > 0 {
-		return fmt.Errorf("%s", mtlsErrs[0])
-	}
-	if encErrs := c.validateEncryption(); len(encErrs) > 0 {
-		return fmt.Errorf("%s", encErrs[0])
-	}
-	return nil
+	return errs
 }
 
 // RetentionEnabled reports whether at least one retention policy is
