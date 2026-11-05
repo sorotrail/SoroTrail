@@ -35,6 +35,13 @@ var (
 		Help: "Total number of ingestion passes that failed with an error.",
 	})
 
+	// DeadLettersTotal counts poison events quarantined to the dead-letter
+	// sink during ingestion, labelled by reason (decode | store) (#1240).
+	DeadLettersTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_dead_letters_total",
+		Help: "Total number of poison events recorded in the dead-letter table, labelled by reason (decode | store).",
+	}, []string{"reason"})
+
 	// RPCCallLatency records the wall-clock duration of a single
 	// JSON-RPC call (HTTP round trip + body read + unmarshal), labelled
 	// by method (a fixed enum: getEvents, getLatestLedger, getHealth,
@@ -251,6 +258,7 @@ func init() {
 	prometheus.MustRegister(
 		EventsIngested,
 		IngestErrors,
+		DeadLettersTotal,
 		RPCCallLatency,
 		DBWriteLatency,
 		DBQueryDuration,

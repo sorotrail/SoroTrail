@@ -1509,8 +1509,7 @@ func (ing *Ingester) persistEventsWithReorgCheck(ctx context.Context, rpcEvents 
 			if ing.deadLetterStore == nil {
 				return err
 			}
-			dlCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			if _, derr := ing.deadLetterStore.DeadLetterEvent(dlCtx, store.DeadLetterInput{
+			if derr := ing.recordDeadLetter(ctx, store.DeadLetterInput{
 				EventID:    re.ID,
 				ContractID: re.ContractID,
 				Ledger:     int64(re.Ledger),
@@ -1519,10 +1518,9 @@ func (ing *Ingester) persistEventsWithReorgCheck(ctx context.Context, rpcEvents 
 				TopicXDR:   re.Topic,
 				ValueXDR:   re.Value,
 				Err:        err,
-			}); derr != nil {
-				ing.log.Warn("dead-lettering failed", "event_id", re.ID, "error", derr)
+			}, "decode"); derr != nil {
+				return fmt.Errorf("dead-lettering decode failure for event %s: %w (original error: %v)", re.ID, derr, err)
 			}
-			cancel()
 			ing.cycle.addSkipped(1)
 			continue
 		}
@@ -1605,11 +1603,11 @@ func (ing *Ingester) writeEventsPersist(ctx context.Context, events []store.Even
 		return 0, nil
 	}
 
-	// Batching disabled: single write of the whole page, exactly as the
-	// ingester has always done.
+	// Batching disabled: single write of the whole page, with per-event
+	// fallback isolation when a permanent event-level failure occurs (#1240).
 	if ing.opts.BatchSize == 0 {
 		timer := prometheus.NewTimer(metrics.DBWriteLatency)
-		inserted, err := ing.store.UpsertEvents(ctx, events)
+		inserted, err := ing.upsertChunkWithIsolation(ctx, events)
 		timer.ObserveDuration()
 		if err != nil {
 			return 0, err
@@ -1636,7 +1634,7 @@ func (ing *Ingester) writeEventsPersist(ctx context.Context, events []store.Even
 
 		begin := ing.opts.Clock.Now()
 		timer := prometheus.NewTimer(metrics.DBWriteLatency)
-		got, err := ing.store.UpsertEvents(ctx, chunk)
+		got, err := ing.upsertChunkWithIsolation(ctx, chunk)
 		timer.ObserveDuration()
 		latency := ing.opts.Clock.Now().Sub(begin)
 		if err != nil {
@@ -1663,6 +1661,72 @@ func (ing *Ingester) writeEventsPersist(ctx context.Context, events []store.Even
 		}
 	}
 	return inserted, nil
+}
+
+// recordDeadLetter persists a poison event to the dead-letter sink and updates
+// the DeadLettersTotal metric. If the dead-letter write itself fails, the error
+// is returned so the caller refuses to advance the ingestion cursor (#1240: no
+// event may be silently dropped without either landing in events or in
+// dead_letters).
+func (ing *Ingester) recordDeadLetter(ctx context.Context, in store.DeadLetterInput, reason string) error {
+	dlCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if _, err := ing.deadLetterStore.DeadLetterEvent(dlCtx, in); err != nil {
+		ing.log.Error("dead-lettering failed; aborting batch to preserve cursor invariant",
+			"event_id", in.EventID, "ledger", in.Ledger, "reason", reason, "error", err)
+		return err
+	}
+	metrics.DeadLettersTotal.WithLabelValues(reason).Inc()
+	ing.log.Warn("poison event recorded in dead_letters",
+		"event_id", in.EventID,
+		"contract_id", in.ContractID,
+		"ledger", in.Ledger,
+		"reason", reason,
+		"error", in.Err,
+	)
+	return nil
+}
+
+// upsertChunkWithIsolation attempts a batch UpsertEvents call. If the batch
+// fails with a permanent per-event error (store.IsPermanentEventError) and a
+// dead-letter sink is configured, it isolates each event in the chunk: valid
+// events are persisted and poison events are dead-lettered. Transient failures
+// (connection drops, timeouts) return immediately so the cursor never advances
+// past uncommitted data.
+func (ing *Ingester) upsertChunkWithIsolation(ctx context.Context, chunk []store.Event) (int64, error) {
+	inserted, err := ing.store.UpsertEvents(ctx, chunk)
+	if err == nil {
+		return inserted, nil
+	}
+	if ing.deadLetterStore == nil || !store.IsPermanentEventError(err) {
+		return 0, err
+	}
+
+	var totalInserted int64
+	for _, ev := range chunk {
+		n, singleErr := ing.store.UpsertEvents(ctx, []store.Event{ev})
+		if singleErr == nil {
+			totalInserted += n
+			continue
+		}
+		if !store.IsPermanentEventError(singleErr) {
+			return totalInserted, singleErr
+		}
+		if derr := ing.recordDeadLetter(ctx, store.DeadLetterInput{
+			EventID:    ev.ID,
+			ContractID: ev.ContractID,
+			Ledger:     ev.Ledger,
+			Type:       ev.Type,
+			TxHash:     ev.TxHash,
+			TopicXDR:   ev.RawTopicXDR,
+			ValueXDR:   ev.RawValueXDR,
+			Err:        singleErr,
+		}, "store"); derr != nil {
+			return totalInserted, derr
+		}
+		ing.cycle.addSkipped(1)
+	}
+	return totalInserted, nil
 }
 
 // newBatchController builds a fresh batch controller from Options. It is
