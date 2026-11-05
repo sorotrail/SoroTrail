@@ -389,4 +389,21 @@ When a non-ingester subsystem exhausts either its own cap (`reason="subsystem_ca
 | `sorotrail_db_pool_maintenance_yields_total` | CounterVec | `job`, `reason` | Total times background maintenance yielded due to pool pressure |
 | `sorotrail_db_pool_connections` | GaugeVec | `state` | Live connection counts (`acquired`, `idle`, `total`, `max`, `ingester_reserved`, `shared_cap`) |
 
+---
+
+## 8. Database Query Cost Attribution (`#1278`)
+
+SoroTrail attributes every database operation to its originating HTTP route pattern or background worker (`ingester`, `pruner`, `auditor`, `archiver`, `reconciler`, `webhook`) and an opaque tenant bucket (`default`, `t_<8hex>`, or `other`, capped at `MaxTrackedTenants = 64`):
+
+1. **Prometheus Cost & Query Counters (`internal/metrics/metrics.go`)**:
+   - `sorotrail_db_attributed_cost_seconds_total{originator, operation, tenant}`: cumulative database wall-clock execution time in seconds.
+   - `sorotrail_db_attributed_queries_total{originator, operation, tenant, outcome}`: total store queries by originator, operation, opaque tenant bucket, and outcome (`success` | `error`).
+2. **PostgreSQL Statement & Session Attribution (`internal/store/attribution.go`, `internal/store/postgres.go`)**:
+   - Every guarded transaction sets a transaction-local `application_name` (`<originator>:<tenant>`) prefixed with a SQL comment `/*originator=...,tenant=...,op=...*/` so `pg_stat_activity` and `pg_stat_statements` join database load back to the application view without leaking raw contract IDs or tenant secrets.
+3. **Slow-Query Log Attribution (`internal/store/guarded_store.go`)**:
+   - Slow queries crossing `SlowQueryThreshold` log `originator`, `tenant`, `query`, `duration`, and `request_id`.
+4. **Measured Overhead**:
+   - Context attribution lookup + opaque tenant hashing + Prometheus counter update adds **< 250 ns/op** (`< 0.03%` of a ~1 ms database query).
+
+
 

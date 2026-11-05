@@ -57,8 +57,11 @@ func (s *guardedStore) logSlowQuery(ctx context.Context, name string, start time
 		s.queryErrors.Add(1)
 	}
 	duration := time.Since(start)
+	attr := AttributionFromContext(ctx)
 	metrics.DBOperationsTotal.WithLabelValues(name, outcome).Inc()
 	metrics.DBQueryDuration.WithLabelValues(name).Observe(duration.Seconds())
+	metrics.DBAttributedCostSeconds.WithLabelValues(attr.Originator, name, attr.Tenant).Add(duration.Seconds())
+	metrics.DBAttributedQueriesTotal.WithLabelValues(attr.Originator, name, attr.Tenant, outcome).Inc()
 	if duration < s.options.SlowQueryThreshold {
 		return
 	}
@@ -68,6 +71,8 @@ func (s *guardedStore) logSlowQuery(ctx context.Context, name string, start time
 	attrs := requestid.Attrs(ctx)
 	attrs = append(attrs,
 		"query", name,
+		"originator", attr.Originator,
+		"tenant", attr.Tenant,
 		"duration", duration,
 		"error", err,
 	)

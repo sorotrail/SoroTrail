@@ -638,6 +638,7 @@ func (s *Server) router() chi.Router {
 	// usageMiddleware must run after authenticate: it reads the Principal
 	// that authenticate installs, and counts one request per tenant.
 	r.Use(s.usageMiddleware)
+	r.Use(s.queryAttributionMiddleware)
 
 	// prettyMiddleware must be the innermost wrapper (closest to the handler)
 	// so the type assertion in writeJSON sees the prettyWriter interface.
@@ -862,6 +863,9 @@ func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 // cardinality.
 func (s *Server) routePattern(r *http.Request) string {
 	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+		if pat := rctx.RoutePattern(); pat != "" {
+			return pat
+		}
 		if len(rctx.RoutePatterns) > 0 {
 			return rctx.RoutePatterns[0]
 		}
@@ -870,6 +874,23 @@ func (s *Server) routePattern(r *http.Request) string {
 		}
 	}
 	return r.URL.Path
+}
+
+// queryAttributionMiddleware attaches the matched route pattern (never the raw
+// URL path) and the authenticated tenant's opaque identifier onto the request
+// context so every downstream Store operation attributes its database cost to
+// the endpoint and tenant that caused it (#1278).
+func (s *Server) queryAttributionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		route := s.metricRouteLabel(r)
+		originator := r.Method + " " + route
+		tenantID := "default"
+		if p, ok := PrincipalFrom(r.Context()); ok && !p.Untenanted && p.Tenant.ID > 0 {
+			tenantID = strconv.FormatInt(p.Tenant.ID, 10)
+		}
+		ctx := store.WithQueryAttribution(r.Context(), originator, tenantID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 func (s *Server) requestLogger(next http.Handler) http.Handler {
