@@ -502,7 +502,7 @@ func TestValidate_DatabaseURLEmpty(t *testing.T) {
 	cfg.DatabaseURL = ""
 	err := cfg.Validate()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "DATABASE_URL is required")
+	assert.Contains(t, err.Error(), "DATABASE_URL: required but empty")
 }
 
 func TestValidate_RPCURLInvalid(t *testing.T) {
@@ -511,7 +511,7 @@ func TestValidate_RPCURLInvalid(t *testing.T) {
 	err := cfg.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "RPC_URL")
-	assert.Contains(t, err.Error(), "not a valid URL")
+	assert.Contains(t, err.Error(), "not a valid absolute URL")
 }
 
 func TestValidate_PollIntervalZero(t *testing.T) {
@@ -520,7 +520,7 @@ func TestValidate_PollIntervalZero(t *testing.T) {
 	err := cfg.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "POLL_INTERVAL")
-	assert.Contains(t, err.Error(), "must be positive")
+	assert.Contains(t, err.Error(), "must be a positive duration")
 }
 
 func TestValidate_APIQueryTimeoutZero(t *testing.T) {

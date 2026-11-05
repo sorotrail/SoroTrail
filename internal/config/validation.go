@@ -4,9 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"net/url"
-	"os"
 	"strings"
 )
 
@@ -226,6 +224,7 @@ func (c Config) ValidateAll() error {
 	if (c.RateLimitRPS > 0) != (c.RateLimitBurst > 0) {
 		errs = append(errs, "RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
 	}
+	errs = append(errs, c.collectLegacyValidateErrors()...)
 	errs = append(errs, c.validateMTLS()...)
 	errs = append(errs, c.validateEncryption()...)
 
@@ -331,14 +330,4 @@ func decodedAES256KeyLength(raw string) (int, error) {
 		}
 	}
 	return 0, fmt.Errorf("key material is neither valid 64-character hex nor valid base64")
-}
-
-// MustValidate validates the configuration and exits the process with a fatal
-// log message when any check fails. It is intended for the top-level main
-// function so that boot-time errors are surfaced immediately.
-func (c Config) MustValidate() {
-	if err := c.ValidateAll(); err != nil {
-		log.Printf("FATAL: %s", err)
-		os.Exit(1)
-	}
 }

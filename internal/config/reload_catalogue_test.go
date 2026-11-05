@@ -250,7 +250,7 @@ func TestReloadableGuardsHold(t *testing.T) {
 		err = cfg.Validate()
 		require.Error(t, err, "a zero POLL_INTERVAL must not survive validation — "+
 			"applyReload's SetPollInterval guard depends on it")
-		assert.Contains(t, err.Error(), "POLL_INTERVAL must be positive",
+		assert.Contains(t, err.Error(), "POLL_INTERVAL",
 			"the rejection must name the variable an operator set")
 	})
 
