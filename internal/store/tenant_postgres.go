@@ -184,6 +184,11 @@ func (p *Postgres) ScopeForTenant(ctx context.Context, t Tenant) (Scope, error) 
 const (
 	countTenantWatchedSQL   = `SELECT count(*) FROM tenant_watched_contracts WHERE tenant_id = $1`
 	countInstanceWatchedSQL = `SELECT count(*) FROM (` + watchedContractsUnion + `) u`
+
+	// instanceWatchCapAdvisoryLockKey is the transaction-scoped Postgres
+	// advisory lock key used by AddTenantWatchedContract whenever an
+	// instance-wide watch cap (MULTI_TENANT_MAX_WATCHED) is enforced (#1140).
+	instanceWatchCapAdvisoryLockKey int64 = 0x53545F5741544348 // "ST_WATCH"
 )
 
 // CountTenantWatchedContracts returns how many contracts the tenant watches.
@@ -208,8 +213,19 @@ func (p *Postgres) CountInstanceWatchedContracts(ctx context.Context) (int, erro
 // AddTenantWatchedContract adds a contract to the tenant's watch list,
 // enforcing the tenant's own cap and the instance-wide cap.
 //
-// Both checks and the insert run in one transaction, so two concurrent
-// requests cannot each observe headroom for the last slot and both take it.
+// Under Postgres' default READ COMMITTED isolation, running SELECT count(*)
+// and INSERT inside a transaction without locking allows concurrent requests
+// to observe the same pre-commit count and overrun both caps (#1140). To
+// serialise cap checks without penalising the idempotent re-add path:
+//   - The idempotent re-add check runs first with no lock.
+//   - Before counting a tenant's watched contracts, the tenant's row in
+//     tenants is locked with SELECT ... FOR UPDATE, serialising concurrent
+//     adds for the same tenant.
+//   - When an instance-wide cap is configured, pg_advisory_xact_lock is
+//     acquired before counting the union across tenants, serialising
+//     concurrent adds across different tenants competing for the last
+//     instance slot. Both locks release automatically when tx commits or
+//     rolls back.
 func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, network, contractID string, instanceCap int) error {
 	network = defaultNetwork(network)
 	tx, err := p.pool.Begin(ctx)
@@ -218,8 +234,9 @@ func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, netwo
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Already held: nothing to check, nothing to do. Checked first so a
-	// tenant at its cap can still re-issue an add idempotently.
+	// Already held: nothing to check, nothing to do. Checked first before
+	// acquiring any row or advisory lock so a tenant at its cap can re-issue
+	// an add idempotently without contending on locks.
 	var exists int
 	err = tx.QueryRow(ctx, `
 		SELECT 1 FROM tenant_watched_contracts
@@ -229,6 +246,26 @@ func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, netwo
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("checking watch list: %w", err)
+	}
+
+	// Lock the tenant row so concurrent adds for the same tenant serialise
+	// before counting held contracts. Re-check after locking in case a
+	// concurrent request just inserted the same contract.
+	var lockedTenantID int64
+	if err := tx.QueryRow(ctx, `SELECT id FROM tenants WHERE id = $1 FOR UPDATE`, t.ID).Scan(&lockedTenantID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("locking tenant row for watch-list cap check: %w", err)
+	}
+	err = tx.QueryRow(ctx, `
+		SELECT 1 FROM tenant_watched_contracts
+		WHERE tenant_id = $1 AND network = $2 AND contract_id = $3`, t.ID, network, contractID).Scan(&exists)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("re-checking watch list under lock: %w", err)
 	}
 
 	if t.MaxWatchedContracts != nil {
@@ -243,6 +280,12 @@ func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, netwo
 	}
 
 	if instanceCap > 0 {
+		// Serialise instance-wide union cap checks across all tenants using a
+		// transaction-scoped advisory lock.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, instanceWatchCapAdvisoryLockKey); err != nil {
+			return fmt.Errorf("acquiring instance watch-list advisory lock: %w", err)
+		}
+
 		// The instance cap bounds the union, not any single list: what
 		// costs the operator RPC budget is the number of distinct
 		// (network, contract_id) pairs ingestion must poll. A contract
