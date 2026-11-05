@@ -152,6 +152,20 @@ var (
 		Help: "Total database queries attributed by originator, operation, tenant, and outcome.",
 	}, []string{"originator", "operation", "tenant", "outcome"})
 
+	// DBCircuitBreakerState exposes the database circuit breaker's current
+	// state as a 0/1 gauge per state (closed | open | half-open) (#1282).
+	DBCircuitBreakerState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sorotrail_db_circuit_breaker_state",
+		Help: "Database circuit breaker state as a 0/1 gauge per state (closed | open | half-open).",
+	}, []string{"state"})
+
+	// DBDegradedRejectionsTotal counts requests that failed fast because the
+	// database circuit breaker was open (#1282).
+	DBDegradedRejectionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "sorotrail_db_degraded_rejections_total",
+		Help: "Total store calls rejected fast because the database circuit breaker is open.",
+	})
+
 	// IngestionLag is the number of ledgers the indexer is behind the
 	// Stellar RPC chain head. Updated after every ingestion pass that
 	// has access to the chain head.
@@ -257,6 +271,8 @@ func init() {
 		DBOperationsTotal,
 		DBAttributedCostSeconds,
 		DBAttributedQueriesTotal,
+		DBCircuitBreakerState,
+		DBDegradedRejectionsTotal,
 		IngestionLag,
 		EventBatchWrites,
 		EventBatchSize,

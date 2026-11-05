@@ -253,6 +253,20 @@ var metricCatalogue = []metricSpec{
 			DBAttributedQueriesTotal.WithLabelValues("ingester", "store.UpsertEvents", "default", "success")
 		},
 	},
+	{
+		Name: "sorotrail_db_circuit_breaker_state", Scope: scopeGlobal, Kind: "gauge",
+		Labels: []metricLabel{
+			{Name: "state", Values: "closed | open | half-open"},
+		},
+		Help:    "Database circuit breaker state as a 0/1 gauge per state (closed | open | half-open).",
+		Meaning: "Exposes whether the store circuit breaker is closed (normal), open (failing fast with 503 and Retry-After during a database outage), or half-open (probing recovery).",
+		touch:   func() { DBCircuitBreakerState.WithLabelValues("closed") },
+	},
+	{
+		Name: "sorotrail_db_degraded_rejections_total", Scope: scopeGlobal, Kind: "counter",
+		Help:    "Total store calls rejected fast because the database circuit breaker is open.",
+		Meaning: "Counts requests rejected immediately in degraded mode while the database circuit breaker is open, separating dependency-unavailable rejections from application errors.",
+	},
 
 	// --- Batching ---
 	{
