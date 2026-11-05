@@ -113,6 +113,15 @@ var metricCatalogue = []metricSpec{
 		Meaning: "Ingestion passes that ended in an error — an RPC failure, a decode failure or a database write failure. Retries are not counted, only passes that ended badly. Registered but not yet incremented by any call site, so it reads 0; it is pinned here so the wiring lands against a documented contract.",
 	},
 	{
+		Name: "sorotrail_dead_letters_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "reason", Values: "decode | store"},
+		},
+		Help:    "Total number of poison events recorded in the dead-letter table, labelled by reason (decode | store).",
+		Meaning: "Poison events that could not be decoded or permanently failed per-event storage validation and were quarantined in dead_letters so ingestion could advance past them without stalling or silently dropping history.",
+		touch:   func() { DeadLettersTotal.WithLabelValues("decode") },
+	},
+	{
 		Name: "sorotrail_ingestion_lag_ledgers", Scope: scopeGlobal, Kind: "gauge",
 		Help:    "Number of ledgers the indexer is behind the chain head.",
 		Meaning: "Chain head minus last ingested ledger, updated after every ingestion pass that knows the chain head. The direct alert for a stalled pipeline: anything above zero for a sustained window means ingestion is falling behind.",
