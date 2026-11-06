@@ -402,6 +402,42 @@ func runService(dryRun bool) error {
 			return fmt.Errorf("verifying field-level encryption readiness: %w", err)
 		}
 		st = pg
+		if cfg.ReplicaDatabaseURL != "" {
+			replicaPool, repErr := store.NewPoolWithTLS(ctx, cfg.ReplicaDatabaseURL, sizing.TotalConns, cfg.DBMinConns, cfg.DBMaxConnLifetime, cfg.DBMaxConnIdleTime, dbTLS)
+			if repErr != nil {
+				return fmt.Errorf("creating postgres replica pool: %w", repErr)
+			}
+			defer replicaPool.Close()
+			if err := replicaPool.Ping(ctx); err != nil {
+				return fmt.Errorf("pinging postgres replica: %w", err)
+			}
+			replicaPG := store.NewPostgresWithHealthCheck(ctx, replicaPool, cfg.ReplicaDatabaseURL, int64(cfg.PartitionLedgerSpan))
+			defer replicaPG.StopHealthCheck()
+			if keySpec := cfg.EffectiveEncryptionKeySpec(); keySpec != "" {
+				if enc := pg.FieldEncryptor(); enc != nil {
+					replicaPG.SetFieldEncryptor(enc)
+				}
+			}
+			router := store.NewReplicaRouter(pg, replicaPG, store.ReplicaRouterOptions{
+				MaxReplicaLag: cfg.ReplicaMaxLag,
+				ReplicaPool:   replicaPool,
+			})
+			_, _ = router.SampleReplicaLag(ctx)
+			go func() {
+				ticker := time.NewTicker(5 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						_, _ = router.SampleReplicaLag(ctx)
+					}
+				}
+			}()
+			st = router
+			log.Info("postgres read replica routing enabled")
+		}
 	}
 
 	// Single-provider client: the interval limiter caps the request rate

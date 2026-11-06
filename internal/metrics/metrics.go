@@ -173,6 +173,22 @@ var (
 		Help: "Total store calls rejected fast because the database circuit breaker is open.",
 	})
 
+	// DBReplicaLagSeconds exposes the observed replication lag in seconds on
+	// the Postgres read replica (sampled via pg_last_xact_replay_timestamp) (#1222).
+	DBReplicaLagSeconds = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "sorotrail_db_replica_lag_seconds",
+		Help: "Observed replication lag in seconds on the Postgres read replica (0 when no replica is configured).",
+	})
+
+	// DBReplicaFallbacksTotal counts read queries that were routed to the
+	// replica but had to fall back to the primary because the replica was
+	// unreachable, exceeded the lag ceiling, or had not yet replayed a
+	// primary-minted pagination cursor (#1222).
+	DBReplicaFallbacksTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "sorotrail_db_replica_fallbacks_total",
+		Help: "Total read-only store queries that fell back from the read replica to the primary.",
+	})
+
 	// IngestionLag is the number of ledgers the indexer is behind the
 	// Stellar RPC chain head. Updated after every ingestion pass that
 	// has access to the chain head.
@@ -281,6 +297,8 @@ func init() {
 		DBAttributedQueriesTotal,
 		DBCircuitBreakerState,
 		DBDegradedRejectionsTotal,
+		DBReplicaLagSeconds,
+		DBReplicaFallbacksTotal,
 		IngestionLag,
 		EventBatchWrites,
 		EventBatchSize,
