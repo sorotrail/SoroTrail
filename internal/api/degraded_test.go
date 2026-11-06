@@ -114,3 +114,46 @@ func TestDegradedModeWhenDatabaseUnavailable(t *testing.T) {
 	assert.Equal(t, []string{"closed->open", "open->half-open", "half-open->closed"}, transitions,
 		"transitions are logged once per state change, never per request")
 }
+
+func TestDegradedModeHalfOpenFailedProbeReopensWithExponentialBackoff(t *testing.T) {
+	now := time.Date(2026, 11, 6, 1, 0, 0, 0, time.UTC)
+	breaker := store.NewStoreBreaker(store.BreakerOptions{
+		FailureThreshold: 1,
+		BaseCooldown:     2 * time.Second,
+		MaxCooldown:      16 * time.Second,
+		Now:              func() time.Time { return now },
+		Jitter:           func(d time.Duration) time.Duration { return d },
+	})
+
+	rawStore := &tripwireStore{failWith: errors.New("connection reset by peer")}
+	guarded := store.NewGuardedStore(rawStore, store.GuardedStoreOptions{
+		Timeout:            time.Second,
+		SlowQueryThreshold: time.Hour,
+		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Breaker:            breaker,
+	})
+
+	srv := New(guarded, &stubRPC{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)), "test-api-key")
+	handler := srv.Router()
+
+	// First failure opens the breaker with 2s cooldown.
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, httptest.NewRequest(http.MethodGet, "/events", nil))
+	assert.Equal(t, http.StatusInternalServerError, w1.Code)
+	assert.Equal(t, store.BreakerOpen, breaker.State())
+
+	// Advance past first 2s cooldown; probe fails again and re-opens with 4s cooldown.
+	now = now.Add(3 * time.Second)
+	wProbe := httptest.NewRecorder()
+	handler.ServeHTTP(wProbe, httptest.NewRequest(http.MethodGet, "/events", nil))
+	assert.Equal(t, http.StatusInternalServerError, wProbe.Code)
+	assert.Equal(t, store.BreakerOpen, breaker.State())
+
+	// At +2s into the new 4s cooldown, requests still fail fast with 503.
+	now = now.Add(2 * time.Second)
+	wFastFail := httptest.NewRecorder()
+	handler.ServeHTTP(wFastFail, httptest.NewRequest(http.MethodGet, "/events", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, wFastFail.Code)
+	assert.NotEmpty(t, wFastFail.Header().Get("Retry-After"))
+}
