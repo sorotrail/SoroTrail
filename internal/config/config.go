@@ -98,6 +98,10 @@ type Config struct {
 	DBMaintenanceMaxConns   int32         `env:"-"`
 	DBPoolAcquireTimeout    time.Duration `env:"-"`
 	DBPoolPressureThreshold float64       `env:"-"`
+	// Read replica configuration (#1222). Empty ReplicaDatabaseURL keeps all
+	// reads on the primary pool.
+	ReplicaDatabaseURL string        `env:"-"`
+	ReplicaMaxLag      time.Duration `env:"-"`
 	// HTTPAddr is the address the HTTP server listens on (host:port), e.g.
 	// ":8080" or "0.0.0.0:9090". See HTTP_ADDR in .env.example. It must be a
 	// valid host:port pair.
@@ -667,6 +671,16 @@ func (c *Config) loadPoolBudgetEnvOverrides() error {
 		}
 		c.DBPoolPressureThreshold = f
 	}
+	if raw, ok := os.LookupEnv("REPLICA_DATABASE_URL"); ok && strings.TrimSpace(raw) != "" {
+		c.ReplicaDatabaseURL = strings.TrimSpace(raw)
+	}
+	if raw, ok := os.LookupEnv("REPLICA_MAX_LAG"); ok && strings.TrimSpace(raw) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(raw))
+		if err != nil {
+			return fmt.Errorf("parsing REPLICA_MAX_LAG: %w", err)
+		}
+		c.ReplicaMaxLag = d
+	}
 	return nil
 }
 
@@ -765,6 +779,16 @@ func (c Config) collectLegacyValidateErrors() []string {
 	}
 	if c.DBPoolPressureThreshold < 0 || c.DBPoolPressureThreshold > 1 {
 		errs = append(errs, fmt.Sprintf("DB_POOL_PRESSURE_THRESHOLD must be in [0,1], got %v", c.DBPoolPressureThreshold))
+	}
+	if c.ReplicaDatabaseURL != "" {
+		if IsSQLite(c.DatabaseURL) || strings.HasPrefix(strings.ToLower(c.DatabaseURL), "clickhouse:") {
+			errs = append(errs, "REPLICA_DATABASE_URL: read replica routing is only supported with a Postgres DATABASE_URL")
+		} else if u, err := url.Parse(c.ReplicaDatabaseURL); err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") || u.Host == "" {
+			errs = append(errs, fmt.Sprintf("REPLICA_DATABASE_URL: %q is not a valid postgres URL", redact("DATABASE_URL", c.ReplicaDatabaseURL)))
+		}
+	}
+	if c.ReplicaMaxLag < 0 {
+		errs = append(errs, fmt.Sprintf("REPLICA_MAX_LAG: must be non-negative, got %s", c.ReplicaMaxLag))
 	}
 	if u, err := url.Parse(c.HorizonURL); c.HorizonURL != "" && (err != nil || u.Scheme == "" || u.Host == "") {
 		errs = append(errs, fmt.Sprintf("HORIZON_URL %q is not a valid URL", c.HorizonURL))

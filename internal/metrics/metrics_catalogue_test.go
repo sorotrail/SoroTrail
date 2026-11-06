@@ -276,6 +276,16 @@ var metricCatalogue = []metricSpec{
 		Help:    "Total store calls rejected fast because the database circuit breaker is open.",
 		Meaning: "Counts requests rejected immediately in degraded mode while the database circuit breaker is open, separating dependency-unavailable rejections from application errors.",
 	},
+	{
+		Name: "sorotrail_db_replica_lag_seconds", Scope: scopeGlobal, Kind: "gauge",
+		Help:    "Observed replication lag in seconds on the Postgres read replica (0 when no replica is configured).",
+		Meaning: "Replication lag sampled from pg_last_xact_replay_timestamp() on the read replica; routed reads fall back to the primary when this exceeds the configured lag ceiling.",
+	},
+	{
+		Name: "sorotrail_db_replica_fallbacks_total", Scope: scopeGlobal, Kind: "counter",
+		Help:    "Total read-only store queries that fell back from the read replica to the primary.",
+		Meaning: "Counts routed read queries replayed on the primary because the replica was unreachable, exceeded the replication lag ceiling, or lacked a primary-minted pagination cursor.",
+	},
 
 	// --- Batching ---
 	{
