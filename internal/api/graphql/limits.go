@@ -4,6 +4,9 @@ import (
 	"fmt"
 
 	"github.com/vektah/gqlparser/v2/ast"
+	"github.com/vektah/gqlparser/v2/parser"
+
+	"github.com/sorotrail/sorotrail/internal/api/queries"
 )
 
 // DepthLimit caps the maximum nesting depth of a GraphQL operation.
@@ -129,12 +132,40 @@ func connectionFieldCost(f *ast.Field, vars map[string]any) int {
 	if len(vars) == 0 || f == nil || len(f.Arguments) == 0 {
 		return connectionCost
 	}
-	first := extractRequestedFirst(f, vars)
-	if first <= defaultComplexityPageSize {
-		return connectionCost
+	// The page-size weighting lives in queries.PageCost so the REST cost
+	// budget and this check agree on what a page of rows costs.
+	return queries.PageCost(extractRequestedFirst(f, vars))
+}
+
+// EstimateQueryCost returns the cost-budget estimate for a GraphQL document:
+// the same complexity score CheckComplexity enforces, plus the depth and
+// list fan-out charge from queries.DepthCost. A document that does not parse
+// or has no single operation costs queries.BaseRequestCost; the executor
+// rejects it with a proper error afterwards.
+func EstimateQueryCost(query string, vars map[string]any) int {
+	doc, err := parser.ParseQuery(&ast.Source{Input: query})
+	if err != nil || len(doc.Operations) != 1 {
+		return queries.BaseRequestCost
 	}
-	multiplier := (first + defaultComplexityPageSize - 1) / defaultComplexityPageSize
-	return connectionCost * multiplier
+	op := doc.Operations[0]
+	return complexityWithVars(op.SelectionSet, vars) + operationCost +
+		queries.DepthCost(depth(op.SelectionSet, 1), connectionFields(op.SelectionSet))
+}
+
+func connectionFields(sel []ast.Selection) int {
+	n := 0
+	for _, s := range sel {
+		switch t := s.(type) {
+		case *ast.Field:
+			if isConnectionField(t.Name) {
+				n++
+			}
+			n += connectionFields(t.SelectionSet)
+		case *ast.InlineFragment:
+			n += connectionFields(t.SelectionSet)
+		}
+	}
+	return n
 }
 
 func extractRequestedFirst(f *ast.Field, vars map[string]any) int {

@@ -407,3 +407,45 @@ SoroTrail attributes every database operation to its originating HTTP route patt
 
 
 
+
+## Per-tenant query cost budget
+
+`COST_BUDGET_CAPACITY` (cost units, default `0` = off) and
+`COST_BUDGET_REFILL_PER_SEC` (units/second, required when capacity is set)
+enable a token bucket per tenant that is charged by what a query costs, not
+by how many requests were made. Single-tenant (untenanted) traffic is never
+charged.
+
+**One cost function.** `internal/api/queries/cost.go` decides cost for both the
+GraphQL complexity check and this budget. Drivers: page size (25 units per 50
+rows), ledger-range width (1 unit per 10,000 ledgers, capped at 20; an
+unbounded range costs the cap), no index-backed filter (`contract_id`,
+`contract_ids`, `tx_hash`) (+25), aggregate breadth (1 unit per 100 buckets,
+capped at 50), and GraphQL depth beyond 3 (+2 per level) and list fan-out
+(+10 per extra list field). Any other request costs 1.
+
+**Flow.** The cost is estimated before execution and taken from the bucket;
+an empty bucket returns `429` with `Retry-After` and a JSON body whose
+`budget` is `tenant_query_cost`. After the handler runs, the cost is
+recomputed from the rows actually served and the difference is refunded or
+charged. `sorotrail_cost_actual_to_estimate_ratio` records the ratio and
+`sorotrail_cost_budget_consumed_total{tenant}` the units consumed. Endpoints
+that do not report rows settle at their estimate. A single query costing more
+than the capacity is clamped to the capacity.
+
+**Exemptions.** `/health`, `/livez`, `/readyz` and `/metrics` (the rate
+limiter's `exemptPaths`) are never charged. Streaming exports (`/events.csv`,
+`/contracts/{id}/export`) are exempt too: their length is unknown up front and
+they are bounded by `EXPORT_MAX_RANGE` and the request-rate limiter.
+
+**Defaults and reasoning.** None are enabled by default. A starting point is
+capacity 500 with refill 50/s: that allows a burst of about ten indexed
+50-row pages, and a sustained rate of about one such page per half second.
+Tune from the two metrics above.
+
+**Known gap: per instance only.** Buckets are in process memory. With N
+replicas a tenant can consume up to N times its budget, and a restart refills
+every bucket. Coordinating across replicas needs shared state (for example a
+Postgres table) and is not included. GraphQL requests are priced from page
+size, depth and fan-out only; ledger-range arguments are not inspected, and
+time-range (`from_time`/`to_time`) filters are not priced on REST.
