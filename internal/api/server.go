@@ -169,6 +169,7 @@ type Server struct {
 	log              *slog.Logger
 	apiKey           string
 	limiter          *RateLimiter
+	costBudget       *CostBudget
 	bcast            *broadcast.Broadcaster
 	enricher         Enricher
 	enableMetrics    bool
@@ -522,6 +523,12 @@ func (s *Server) SetRateLimiter(l *RateLimiter) {
 	s.limiter = l
 }
 
+// SetCostBudget wires the per-tenant query cost budget. Nil (the default)
+// leaves it off.
+func (s *Server) SetCostBudget(b *CostBudget) {
+	s.costBudget = b
+}
+
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
 // can deliver events as they arrive.
 func (s *Server) WithBroadcaster(b *broadcast.Broadcaster) *Server {
@@ -633,6 +640,9 @@ func (s *Server) router() chi.Router {
 	r.Use(s.authenticate)
 	if s.limiter != nil {
 		r.Use(s.limiter.Middleware)
+	}
+	if s.costBudget != nil {
+		r.Use(s.costBudget.Middleware)
 	}
 
 	// usageMiddleware must run after authenticate: it reads the Principal

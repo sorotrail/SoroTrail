@@ -733,6 +733,8 @@ func runService(dryRun bool) error {
 	}
 	apiServer.SetStatsTTL(cfg.StatsCacheTTL)
 	apiServer.SetRateLimiter(limiter)
+	apiServer.SetCostBudget(api.NewCostBudget(cfg.CostBudgetCapacity, cfg.CostBudgetRefillPerSec,
+		api.WithGraphQLEstimator(graphql.EstimateQueryCost)))
 	if cfg.APIKeyAuthEnabled {
 		log.Info("api key authentication enabled", "gated", "write/streaming/subscriptions routes")
 	}

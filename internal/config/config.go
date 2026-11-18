@@ -232,6 +232,10 @@ type Config struct {
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
+	// Per-tenant query cost budget (#1242). Per-instance only: each replica
+	// keeps its own buckets. Off when CostBudgetCapacity is 0.
+	CostBudgetCapacity     float64 `env:"COST_BUDGET_CAPACITY"`
+	CostBudgetRefillPerSec float64 `env:"COST_BUDGET_REFILL_PER_SEC"`
 	// APIKeyAuthEnabled turns on optional API key authentication: when
 	// true, write, streaming, and key-management endpoints reject
 	// requests that do not present a valid API key (see README "API key

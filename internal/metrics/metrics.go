@@ -159,6 +159,21 @@ var (
 		Help: "Total database queries attributed by originator, operation, tenant, and outcome.",
 	}, []string{"originator", "operation", "tenant", "outcome"})
 
+	// CostBudgetConsumedTotal counts cost units charged against per-tenant
+	// cost budgets (#1242), by opaque tenant bucket.
+	CostBudgetConsumedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_cost_budget_consumed_total",
+		Help: "Total query cost units charged against per-tenant cost budgets, by tenant.",
+	}, []string{"tenant"})
+
+	// CostEstimatedTotal counts the cost units estimated before execution for
+	// requests charged against a cost budget. Against
+	// CostBudgetConsumedTotal (actual units) it shows estimator drift (#1242).
+	CostEstimatedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "sorotrail_cost_estimated_total",
+		Help: "Total query cost units estimated before execution for requests charged against a cost budget.",
+	})
+
 	// DBCircuitBreakerState exposes the database circuit breaker's current
 	// state as a 0/1 gauge per state (closed | open | half-open) (#1282).
 	DBCircuitBreakerState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -279,6 +294,8 @@ func init() {
 		DBOperationsTotal,
 		DBAttributedCostSeconds,
 		DBAttributedQueriesTotal,
+		CostBudgetConsumedTotal,
+		CostEstimatedTotal,
 		DBCircuitBreakerState,
 		DBDegradedRejectionsTotal,
 		IngestionLag,

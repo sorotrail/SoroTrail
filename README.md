@@ -393,6 +393,8 @@ once. A single process still ingests one network — the one named by
 | `RATE_LIMIT_TRUSTED_PROXY` | bool | `false` | Honor `X-Forwarded-For` for client IP detection. Only enable behind a trusted proxy that strips/rewrites the header. | restart |
 | `HOURLY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a fixed 1-hour window that starts at the client's first request. `0` disables the quota. See [Rate limits and quotas](docs/rate-limits.md). | restart |
 | `DAILY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a fixed 24-hour window that starts at the client's first request. `0` disables the quota. See [Rate limits and quotas](docs/rate-limits.md). | restart |
+| `COST_BUDGET_CAPACITY` | float64 | `0` (disabled) | Per-tenant query cost budget: the number of cost units a tenant's bucket holds. Requests are charged by estimated cost (page size, ledger range, index use, aggregate breadth, GraphQL depth) and rejected with `429` + `Retry-After` when the bucket is empty. Per instance only. See [Performance](docs/performance.md). | restart |
+| `COST_BUDGET_REFILL_PER_SEC` | float64 | `0` | Cost units added back to each tenant's bucket per second. Required (positive) when `COST_BUDGET_CAPACITY` is set. | restart |
 
 See [Rate limits and quotas](docs/rate-limits.md) for the evaluation order,
 client-key derivation, response headers, per-tenant overrides, and the
