@@ -126,8 +126,6 @@ func complexityWithVars(sel []ast.Selection, vars map[string]any) int {
 	return total
 }
 
-const defaultComplexityPageSize = 50
-
 func connectionFieldCost(f *ast.Field, vars map[string]any) int {
 	if len(vars) == 0 || f == nil || len(f.Arguments) == 0 {
 		return connectionCost
