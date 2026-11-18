@@ -166,12 +166,12 @@ var (
 		Help: "Total query cost units charged against per-tenant cost budgets, by tenant.",
 	}, []string{"tenant"})
 
-	// CostActualToEstimateRatio records actual-cost / estimated-cost for each
-	// charged request, so estimator drift is visible (#1242).
-	CostActualToEstimateRatio = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "sorotrail_cost_actual_to_estimate_ratio",
-		Help:    "Ratio of actual to estimated query cost for requests charged against a cost budget.",
-		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 5},
+	// CostEstimatedTotal counts the cost units estimated before execution for
+	// requests charged against a cost budget. Against
+	// CostBudgetConsumedTotal (actual units) it shows estimator drift (#1242).
+	CostEstimatedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "sorotrail_cost_estimated_total",
+		Help: "Total query cost units estimated before execution for requests charged against a cost budget.",
 	})
 
 	// DBCircuitBreakerState exposes the database circuit breaker's current
@@ -295,7 +295,7 @@ func init() {
 		DBAttributedCostSeconds,
 		DBAttributedQueriesTotal,
 		CostBudgetConsumedTotal,
-		CostActualToEstimateRatio,
+		CostEstimatedTotal,
 		DBCircuitBreakerState,
 		DBDegradedRejectionsTotal,
 		IngestionLag,

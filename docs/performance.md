@@ -428,8 +428,9 @@ capped at 50), and GraphQL depth beyond 3 (+2 per level) and list fan-out
 an empty bucket returns `429` with `Retry-After` and a JSON body whose
 `budget` is `tenant_query_cost`. After the handler runs, the cost is
 recomputed from the rows actually served and the difference is refunded or
-charged. `sorotrail_cost_actual_to_estimate_ratio` records the ratio and
-`sorotrail_cost_budget_consumed_total{tenant}` the units consumed. Endpoints
+charged. `sorotrail_cost_estimated_total` and
+`sorotrail_cost_budget_consumed_total{tenant}` (actual units) are both counted;
+their rate ratio is the actual-vs-estimate reconciliation. Endpoints
 that do not report rows settle at their estimate. A single query costing more
 than the capacity is clamped to the capacity.
 

@@ -13,7 +13,7 @@
 //     the exhausted budget;
 //  3. charge   — after the handler returns, the cost is recomputed from the
 //     rows it actually served and the difference is refunded or charged;
-//  4. record   — actual/estimate is observed in a histogram so estimator
+//  4. record   — estimated and actual units are both counted so estimator
 //     drift is visible.
 //
 // Scope: per instance. Buckets live in process memory, so N replicas grant a
@@ -318,8 +318,6 @@ func (b *CostBudget) Middleware(next http.Handler) http.Handler {
 		tr.mu.Unlock()
 		b.settle(key, estimate, actual)
 		metrics.CostBudgetConsumedTotal.WithLabelValues(store.OpaqueTenantLabel(strconv.FormatInt(p.Tenant.ID, 10))).Add(actual)
-		if estimate > 0 {
-			metrics.CostActualToEstimateRatio.Observe(actual / estimate)
-		}
+		metrics.CostEstimatedTotal.Add(estimate)
 	})
 }

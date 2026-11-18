@@ -258,9 +258,10 @@ var metricCatalogue = []metricSpec{
 		touch:   func() { CostBudgetConsumedTotal.WithLabelValues("default") },
 	},
 	{
-		Name: "sorotrail_cost_actual_to_estimate_ratio", Scope: scopeGlobal, Kind: "histogram",
-		Help:    "Ratio of actual to estimated query cost for requests charged against a cost budget.",
-		Meaning: "Reconciliation of the pre-execution cost estimate against the cost recomputed from what the request actually returned. A mass near 1 means the estimator is sound; a mass well below 1 means requests are over-charged up front and refunded.",
+		Name: "sorotrail_cost_estimated_total", Scope: scopeGlobal, Kind: "counter",
+		Help:    "Total query cost units estimated before execution for requests charged against a cost budget.",
+		Meaning: "Pre-execution cost estimates. Divide the rate of sorotrail_cost_budget_consumed_total (actual units) by this to reconcile actual against estimate: near 1 means the estimator is sound, well below 1 means requests are over-charged up front and refunded.",
+		touch:   func() { CostEstimatedTotal.Add(0) },
 	},
 	{
 		Name: "sorotrail_db_attributed_queries_total", Scope: scopeGlobal, Kind: "counter",
