@@ -56,6 +56,8 @@ type exitError struct {
 	err  error
 }
 
+// Error returns the wrapped error's message, or "exit <code>" when there is
+// no wrapped error.
 func (e *exitError) Error() string {
 	if e.err == nil {
 		return fmt.Sprintf("exit %d", e.code)
@@ -63,6 +65,7 @@ func (e *exitError) Error() string {
 	return e.err.Error()
 }
 
+// Unwrap returns the underlying error so errors.Is and errors.As can inspect it.
 func (e *exitError) Unwrap() error {
 	return e.err
 }
