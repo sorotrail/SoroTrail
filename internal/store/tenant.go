@@ -35,8 +35,23 @@ type Tenant struct {
 	// MaxWatchedContracts caps how many contracts this tenant may add to
 	// the ingestion watch list. Nil means unlimited, still subject to the
 	// instance-wide cap.
-	MaxWatchedContracts *int      `json:"max_watched_contracts,omitempty"`
-	CreatedAt           time.Time `json:"created_at"`
+	MaxWatchedContracts *int `json:"max_watched_contracts,omitempty"`
+	// RetentionMaxAgeSeconds is the tenant's own event-retention horizon.
+	// Nil inherits the instance default. Because events are shared between
+	// tenants, this is what the tenant is entitled to, not a promise that
+	// rows are deleted at exactly this age: see tenant_retention.go.
+	RetentionMaxAgeSeconds *int64    `json:"retention_max_age_seconds,omitempty"`
+	CreatedAt              time.Time `json:"created_at"`
+}
+
+// RetentionOverride returns the tenant's retention horizon as a duration,
+// or nil when it inherits the instance default.
+func (t Tenant) RetentionOverride() *time.Duration {
+	if t.RetentionMaxAgeSeconds == nil || *t.RetentionMaxAgeSeconds <= 0 {
+		return nil
+	}
+	d := time.Duration(*t.RetentionMaxAgeSeconds) * time.Second
+	return &d
 }
 
 // TenantAPIKey is a credential belonging to a tenant. The secret itself is never

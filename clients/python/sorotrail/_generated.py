@@ -1424,6 +1424,8 @@ class Tenant:
     name: str = ""
     rate_limit_burst: int | None = None
     rate_limit_rps: Decimal | None = None
+    # The tenant's own event-retention horizon in seconds. Absent or null means it inherits the instance default.
+    retention_max_age_seconds: int | None = None
     wildcard: bool = False
 
     @classmethod
@@ -1437,6 +1439,7 @@ class Tenant:
             name=_as_str(data.get("name")),
             rate_limit_burst=_as_opt_int(data.get("rate_limit_burst")),
             rate_limit_rps=_as_opt_decimal(data.get("rate_limit_rps")),
+            retention_max_age_seconds=_as_opt_int(data.get("retention_max_age_seconds")),
             wildcard=_as_bool(data.get("wildcard")),
         )
 
@@ -1453,6 +1456,8 @@ class Tenant:
             out["rate_limit_burst"] = self.rate_limit_burst
         if self.rate_limit_rps is not None:
             out["rate_limit_rps"] = self.rate_limit_rps
+        if self.retention_max_age_seconds is not None:
+            out["retention_max_age_seconds"] = self.retention_max_age_seconds
         out["wildcard"] = self.wildcard
         return out
 
@@ -1554,6 +1559,8 @@ class TenantCreateRequest:
     rate_limit_burst: int = 0
     # Optional requests-per-second override. Set together with rate_limit_burst; omit both to inherit the instance limit.
     rate_limit_rps: Decimal = Decimal(0)
+    # The tenant's event-retention horizon in seconds. Omit or send 0 to inherit the instance default (RETENTION_MAX_AGE). A shared contract's events are kept for the longest horizon among the tenants entitled to it, and each tenant reads only within its own horizon. See docs/multi-tenancy.md#retention.
+    retention_max_age_seconds: int = 0
     # When true, the tenant can read events for every contract.
     wildcard: bool = False
 
@@ -1566,6 +1573,7 @@ class TenantCreateRequest:
             name=_as_str(data.get("name")),
             rate_limit_burst=_as_int(data.get("rate_limit_burst")),
             rate_limit_rps=_as_decimal(data.get("rate_limit_rps")),
+            retention_max_age_seconds=_as_int(data.get("retention_max_age_seconds")),
             wildcard=_as_bool(data.get("wildcard")),
         )
 
@@ -1582,6 +1590,8 @@ class TenantCreateRequest:
             out["rate_limit_burst"] = self.rate_limit_burst
         if self.rate_limit_rps != Decimal(0):
             out["rate_limit_rps"] = self.rate_limit_rps
+        if self.retention_max_age_seconds != 0:
+            out["retention_max_age_seconds"] = self.retention_max_age_seconds
         if self.wildcard:
             out["wildcard"] = self.wildcard
         return out
@@ -1611,6 +1621,8 @@ class TenantUpdateRequest:
 
     # When true, the tenant may use the administrative API.
     admin: bool = False
+    # Must be true when the update shortens the tenant's effective retention horizon. Shortening is irreversible once the next prune sweep runs, so without it the request is refused with 409.
+    confirm_retention_shortening: bool = False
     # Whether the tenant is enabled for requests.
     enabled: bool = False
     # Maximum number of contracts this tenant may watch.
@@ -1621,6 +1633,8 @@ class TenantUpdateRequest:
     rate_limit_burst: int = 0
     # Requests-per-second override. Set together with rate_limit_burst; omit both to inherit the instance limit.
     rate_limit_rps: Decimal = Decimal(0)
+    # Replacement event-retention horizon in seconds; 0 clears the override so the tenant inherits the instance default again.
+    retention_max_age_seconds: int = 0
     # When true, the tenant can read events for every contract.
     wildcard: bool = False
 
@@ -1628,11 +1642,13 @@ class TenantUpdateRequest:
     def from_dict(cls, data: Mapping[str, JSONValue]) -> TenantUpdateRequest:
         return cls(
             admin=_as_bool(data.get("admin")),
+            confirm_retention_shortening=_as_bool(data.get("confirm_retention_shortening")),
             enabled=_as_bool(data.get("enabled")),
             max_watched_contracts=_as_int(data.get("max_watched_contracts")),
             name=_as_str(data.get("name")),
             rate_limit_burst=_as_int(data.get("rate_limit_burst")),
             rate_limit_rps=_as_decimal(data.get("rate_limit_rps")),
+            retention_max_age_seconds=_as_int(data.get("retention_max_age_seconds")),
             wildcard=_as_bool(data.get("wildcard")),
         )
 
@@ -1640,6 +1656,8 @@ class TenantUpdateRequest:
         out: JSONObject = {}
         if self.admin:
             out["admin"] = self.admin
+        if self.confirm_retention_shortening:
+            out["confirm_retention_shortening"] = self.confirm_retention_shortening
         if self.enabled:
             out["enabled"] = self.enabled
         if self.max_watched_contracts != 0:
@@ -1650,6 +1668,8 @@ class TenantUpdateRequest:
             out["rate_limit_burst"] = self.rate_limit_burst
         if self.rate_limit_rps != Decimal(0):
             out["rate_limit_rps"] = self.rate_limit_rps
+        if self.retention_max_age_seconds != 0:
+            out["retention_max_age_seconds"] = self.retention_max_age_seconds
         if self.wildcard:
             out["wildcard"] = self.wildcard
         return out

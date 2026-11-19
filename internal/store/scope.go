@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Scope is the authorization boundary for every read of event data. It
@@ -37,6 +39,11 @@ type Scope struct {
 	// contracts is sorted and deduplicated so Fingerprint is stable across
 	// two Scopes granting the same set in different orders.
 	contracts []string
+	// retention hides events older than this age (#1249). Zero means no
+	// age bound. It exists because the pruner keeps a shared contract's
+	// events for the longest horizon among its tenants, so a tenant with a
+	// shorter policy would otherwise read rows past its own horizon.
+	retention time.Duration
 }
 
 // WildcardScope returns a Scope that can read every contract in the store,
@@ -113,6 +120,30 @@ func (s Scope) Allows(contractID string) bool {
 	return false
 }
 
+// WithRetention returns a copy of s that additionally hides events older
+// than maxAge. A non-positive maxAge returns s unchanged. Narrowing only:
+// it can never make a denying scope permit anything.
+func (s Scope) WithRetention(maxAge time.Duration) Scope {
+	if maxAge <= 0 {
+		return s
+	}
+	s.retention = maxAge
+	return s
+}
+
+// Retention returns the scope's age bound, zero when there is none.
+func (s Scope) Retention() time.Duration { return s.retention }
+
+// RetentionCutoff returns the oldest created_at visible under s at now, and
+// false when the scope has no age bound. Read paths AND
+// "created_at >= cutoff" into their SQL when it is set.
+func (s Scope) RetentionCutoff(now time.Time) (time.Time, bool) {
+	if s.retention <= 0 {
+		return time.Time{}, false
+	}
+	return now.Add(-s.retention), true
+}
+
 // Contracts returns the granted contract IDs, sorted. The result is a copy;
 // callers cannot widen a Scope by writing through it.
 func (s Scope) Contracts() []string {
@@ -135,6 +166,17 @@ func (s Scope) Contracts() []string {
 // makes those two requests distinct representations, which is what they
 // actually are.
 func (s Scope) Fingerprint() string {
+	fp := s.grantsFingerprint()
+	// Two tenants with the same grants but different horizons see
+	// different rows, so the horizon is part of the representation. The
+	// duration, not the moving cutoff, keeps the key stable over time.
+	if s.retention > 0 && fp != "none" {
+		fp += "~r" + strconv.FormatInt(int64(s.retention/time.Second), 10)
+	}
+	return fp
+}
+
+func (s Scope) grantsFingerprint() string {
 	if s.wildcard {
 		return "wildcard"
 	}

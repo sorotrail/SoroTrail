@@ -1604,6 +1604,63 @@ func (s *BudgetedStore) PruneEventsBefore(ctx context.Context, cutoff time.Time)
 	return inner.PruneEventsBefore(ctx, cutoff)
 }
 
+// ListTenantRetention forwards to the inner store's RetentionPolicyStore,
+// or reports ErrUnsupported for a backend without tenant storage.
+func (s *BudgetedStore) ListTenantRetention(ctx context.Context) ([]TenantRetention, error) {
+	inner, ok := s.inner.(RetentionPolicyStore)
+	if !ok {
+		return nil, ErrUnsupported
+	}
+	ctx, release, err := s.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return inner.ListTenantRetention(ctx)
+}
+
+// DeleteEventsBeforeIn forwards to the inner store's RetentionPolicyStore.
+func (s *BudgetedStore) DeleteEventsBeforeIn(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int, set ContractSet) (int64, error) {
+	inner, ok := s.inner.(RetentionPolicyStore)
+	if !ok {
+		return 0, ErrUnsupported
+	}
+	ctx, release, err := s.acquire(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	return inner.DeleteEventsBeforeIn(ctx, maxLedger, beforeTime, limit, set)
+}
+
+// CountEventsBeforeIn forwards to the inner store's RetentionPolicyStore.
+func (s *BudgetedStore) CountEventsBeforeIn(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int, set ContractSet) (int64, error) {
+	inner, ok := s.inner.(RetentionPolicyStore)
+	if !ok {
+		return 0, ErrUnsupported
+	}
+	ctx, release, err := s.acquire(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	return inner.CountEventsBeforeIn(ctx, maxLedger, beforeTime, limit, set)
+}
+
+// PruneEventsBeforeIn forwards to the inner store's RetentionPolicyStore.
+func (s *BudgetedStore) PruneEventsBeforeIn(ctx context.Context, cutoff time.Time, set ContractSet) (int64, error) {
+	inner, ok := s.inner.(RetentionPolicyStore)
+	if !ok {
+		return 0, ErrUnsupported
+	}
+	ctx, release, err := s.acquire(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	return inner.PruneEventsBeforeIn(ctx, cutoff, set)
+}
+
 func (s *BudgetedStore) ClaimIdempotencyKey(ctx context.Context, rec IdempotencyRecord, now time.Time) (IdempotencyOutcome, IdempotencyRecord, error) {
 	inner, ok := s.inner.(IdempotencyStore)
 	if !ok {

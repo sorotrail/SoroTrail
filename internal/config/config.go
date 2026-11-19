@@ -911,6 +911,21 @@ func (c Config) RetentionEnabled() bool {
 	return c.RetentionMaxAge > 0 || c.RetentionMinLedger > 0
 }
 
+// DefaultEventRetention is the instance-wide retention horizon a tenant
+// without its own policy inherits (#1249): the shorter of RETENTION_MAX_AGE
+// and RETENTION_AGE when both are set, because either job deletes at its
+// own age. Zero means events are not aged out.
+func (c Config) DefaultEventRetention() time.Duration {
+	switch {
+	case c.RetentionMaxAge > 0 && c.RetentionAge > 0:
+		return min(c.RetentionMaxAge, c.RetentionAge)
+	case c.RetentionMaxAge > 0:
+		return c.RetentionMaxAge
+	default:
+		return max(c.RetentionAge, 0)
+	}
+}
+
 // ArchiveEnabled reports whether the S3-compatible archive backend
 // is configured. When true, pruned events can be exported before
 // deletion.

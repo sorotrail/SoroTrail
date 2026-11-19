@@ -233,7 +233,7 @@ func (s *Server) authenticateMTLS(w http.ResponseWriter, r **http.Request) (hand
 			return false, true
 		}
 
-		scope, err := s.tenants.ScopeForTenant(req.Context(), tenant)
+		scope, err := s.tenantScope(req.Context(), tenant)
 		if err != nil {
 			loggerFromContext(req.Context()).Error("resolving mTLS tenant scope", "tenant", tenant.ID, "error", err)
 			writeMTLSRejection(w, http.StatusInternalServerError, CodeInternalError, "authentication failed")

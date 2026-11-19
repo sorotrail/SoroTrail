@@ -31,6 +31,23 @@ type actionAuditHolder struct {
 	hasPrincipal bool
 	principal    Principal
 	apiKey       *store.APIKey
+	// metadata carries handler-supplied details (for example the old and
+	// new retention horizon) into the audit entry for this request.
+	metadata map[string]any
+}
+
+// setActionAuditMetadata attaches a detail to the audit entry the
+// middleware writes for the current request. It is a no-op outside an
+// audited request.
+func setActionAuditMetadata(ctx context.Context, key string, value any) {
+	h := auditHolderFrom(ctx)
+	if h == nil {
+		return
+	}
+	if h.metadata == nil {
+		h.metadata = map[string]any{}
+	}
+	h.metadata[key] = value
 }
 
 func auditHolderFrom(ctx context.Context) *actionAuditHolder {
@@ -282,6 +299,11 @@ func (s *Server) buildHTTPActionAuditRecord(
 	capture *actionAuditResponseCapture,
 ) store.ActionAuditRecord {
 	meta := make(map[string]any)
+	if holder != nil {
+		for k, v := range holder.metadata {
+			meta[k] = v
+		}
+	}
 	reqMap := parseJSONObject(reqBody)
 	respMap := parseJSONObject(capture.buf.Bytes())
 

@@ -54,6 +54,11 @@ type Options struct {
 	// pruneOnce defers sweeps (and yields between batches) while ingestion
 	// is lagging, up to the coordinator's maximum deferral window.
 	LagController LagYieldController
+	// Policies, when set, applies per-tenant retention (#1249): each sweep
+	// plans the tenants' horizons with MaxAge as the instance default and
+	// deletes each contract's events only past the longest horizon of the
+	// tenants entitled to it. Nil keeps the single instance-wide sweep.
+	Policies store.RetentionPolicyStore
 }
 
 // DefaultValues used when Options fields are zero.
@@ -86,6 +91,12 @@ type Metrics struct {
 	DryRunEligibleRows   int64  `json:"dry_run_eligible_rows,omitempty"`
 	LagYields            uint64 `json:"lag_yields,omitempty"`
 	MaxDeferralOverrides uint64 `json:"max_deferral_overrides,omitempty"`
+	// RetentionPolicyGroups is how many distinct retention horizons the
+	// last sweep applied; 1 means only the instance default was in force.
+	RetentionPolicyGroups int64 `json:"retention_policy_groups,omitempty"`
+	// TenantPolicyRowsPurged counts rows deleted under a tenant-set or
+	// wildcard-tenant horizon rather than the instance default.
+	TenantPolicyRowsPurged int64 `json:"tenant_policy_rows_purged,omitempty"`
 }
 
 // Pruner is the background retention-policy job.
@@ -108,6 +119,8 @@ type Pruner struct {
 	dryRunEligible       atomic.Int64
 	lagYields            atomic.Uint64
 	maxDeferralOverrides atomic.Uint64
+	policyGroups         atomic.Int64
+	tenantPolicyPurged   atomic.Int64
 }
 
 // Metrics returns a value-copy snapshot of the pruner's counters.
@@ -115,12 +128,14 @@ type Pruner struct {
 // forcing callers to take a lock.
 func (p *Pruner) Metrics() Metrics {
 	return Metrics{
-		RunsCompleted:        p.runsCompleted.Load(),
-		TotalRowsPurged:      p.rowsPurged.Load(),
-		ArchivedRanges:       p.archivedRanges.Load(),
-		DryRunEligibleRows:   p.dryRunEligible.Load(),
-		LagYields:            p.lagYields.Load(),
-		MaxDeferralOverrides: p.maxDeferralOverrides.Load(),
+		RunsCompleted:          p.runsCompleted.Load(),
+		TotalRowsPurged:        p.rowsPurged.Load(),
+		ArchivedRanges:         p.archivedRanges.Load(),
+		DryRunEligibleRows:     p.dryRunEligible.Load(),
+		LagYields:              p.lagYields.Load(),
+		MaxDeferralOverrides:   p.maxDeferralOverrides.Load(),
+		RetentionPolicyGroups:  p.policyGroups.Load(),
+		TenantPolicyRowsPurged: p.tenantPolicyPurged.Load(),
 	}
 }
 
@@ -158,8 +173,10 @@ func NewWithArchiver(st store.Store, log *slog.Logger, opts Options, arch *archi
 }
 
 // Enabled reports whether at least one retention policy is configured.
+// Per-tenant policies count: a tenant may set a horizon on an instance
+// whose own default is "keep forever".
 func (p *Pruner) Enabled() bool {
-	return p.opts.MaxAge > 0 || p.opts.MinLedger > 0
+	return p.opts.MaxAge > 0 || p.opts.MinLedger > 0 || p.opts.Policies != nil
 }
 
 // Run loops until ctx is canceled, performing one retention sweep per
@@ -242,13 +259,6 @@ func (p *Pruner) pruneOnce(ctx context.Context) (int64, error) {
 		return 0, nil
 	}
 
-	// Compute the time cutoff. BeforeTime is set to now - MaxAge. Events
-	// strictly older than this are eligible for deletion.
-	var beforeTime time.Time
-	if p.opts.MaxAge > 0 {
-		beforeTime = time.Now().Add(-p.opts.MaxAge)
-	}
-
 	// If MinLedger is set and is lower than maxLedger, tighten the bound
 	// so we never delete above the last ingested ledger. A MinLedger that
 	// is >= last_ingested naturally falls through unchanged — the bound
@@ -257,10 +267,25 @@ func (p *Pruner) pruneOnce(ctx context.Context) (int64, error) {
 		maxLedger = int64(p.opts.MinLedger)
 	}
 
+	// The plan is reloaded every sweep, so a policy change takes effect at
+	// the next sweep and never mid-sweep. Without Policies it is the single
+	// instance-wide group, which is exactly the pre-#1249 sweep.
+	plan, err := store.LoadRetentionPlan(ctx, p.opts.Policies, p.opts.MaxAge)
+	if err != nil {
+		return 0, fmt.Errorf("loading retention policies: %w", err)
+	}
+	p.policyGroups.Store(int64(len(plan.Groups)))
+
 	// Archive events before deleting them when archival is enabled.
 	// The archive covers the full range [0, maxLedger) that will be
 	// pruned. This is a single export call; the archiver pages through
 	// events using QueryEvents and uploads compressed NDJSON to S3.
+	//
+	// Archival is per row, not per tenant: the range holds every
+	// contract's events, and every retention group below deletes only
+	// inside it. So whichever group eventually deletes a row, that row is
+	// already in the archive — no tenant's deletion relies on an archive
+	// made "for" another tenant.
 	if p.opts.ArchiveBeforePrune && p.arch != nil {
 		archiveStart := time.Now()
 		_, _, err := p.arch.ArchiveRange(ctx, 0, maxLedger)
@@ -276,16 +301,53 @@ func (p *Pruner) pruneOnce(ctx context.Context) (int64, error) {
 		p.archivedRanges.Add(1)
 		p.log.Info("archive before prune complete",
 			"max_ledger", maxLedger,
-			"before_time", beforeTime,
 			"duration", time.Since(archiveStart),
 		)
 	}
 
-	start := time.Now()
+	var total int64
+	for _, g := range plan.Groups {
+		// A group with no age bound is pruned by ledger alone, and only
+		// when RETENTION_MIN_LEDGER asks for that. Without either bound
+		// the delete would cover everything below the last ingested
+		// ledger, so such a group is skipped outright.
+		if g.MaxAge <= 0 && p.opts.MinLedger == 0 {
+			continue
+		}
+		// BeforeTime is now - MaxAge. Events strictly older than this are
+		// eligible for deletion.
+		var beforeTime time.Time
+		if g.MaxAge > 0 {
+			beforeTime = time.Now().Add(-g.MaxAge)
+		}
+		n, err := p.sweepGroup(ctx, g, maxLedger, beforeTime, len(plan.Groups) > 1)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+// sweepGroup deletes (or, in dry-run mode, counts) one retention group's
+// eligible events in batches. logGroup adds the group's policy to the
+// sweep log; it is false for the single-group plan so an instance without
+// tenant policies logs exactly what it did before.
+func (p *Pruner) sweepGroup(ctx context.Context, g store.RetentionGroup, maxLedger int64, beforeTime time.Time, logGroup bool) (int64, error) {
+	attrs := []any{"max_ledger", maxLedger, "before_time", beforeTime}
+	if logGroup {
+		attrs = append(attrs,
+			"policy", g.Policy,
+			"max_age", g.MaxAge,
+			"contracts_listed", len(g.Contracts.IDs),
+			"contracts_excluded", g.Contracts.Exclude,
+		)
+	}
 	if p.opts.DryRun {
-		return p.dryRunSweep(ctx, maxLedger, beforeTime)
+		return p.dryRunSweep(ctx, g, maxLedger, beforeTime, attrs)
 	}
 
+	start := time.Now()
 	var total int64
 	for {
 		if total > 0 && p.opts.LagController != nil {
@@ -300,12 +362,23 @@ func (p *Pruner) pruneOnce(ctx context.Context) (int64, error) {
 				p.maxDeferralOverrides.Add(1)
 			}
 		}
-		affected, err := p.store.DeleteEventsBefore(ctx, maxLedger, beforeTime, p.opts.BatchSize)
+		var (
+			affected int64
+			err      error
+		)
+		if g.Contracts.All() {
+			affected, err = p.store.DeleteEventsBefore(ctx, maxLedger, beforeTime, p.opts.BatchSize)
+		} else {
+			affected, err = p.opts.Policies.DeleteEventsBeforeIn(ctx, maxLedger, beforeTime, p.opts.BatchSize, g.Contracts)
+		}
 		if err != nil {
 			return total, fmt.Errorf("delete batch: %w", err)
 		}
 		total += affected
 		p.rowsPurged.Add(affected)
+		if g.Policy != store.RetentionPolicyDefault {
+			p.tenantPolicyPurged.Add(affected)
+		}
 
 		if affected < int64(p.opts.BatchSize) {
 			break
@@ -318,29 +391,30 @@ func (p *Pruner) pruneOnce(ctx context.Context) (int64, error) {
 		}
 	}
 
-	dur := time.Since(start)
 	if total > 0 {
 		p.log.Info("prune sweep complete",
-			"rows_deleted", total,
-			"duration", dur,
-			"max_ledger", maxLedger,
-			"before_time", beforeTime,
-		)
+			append([]any{"rows_deleted", total, "duration", time.Since(start)}, attrs...)...)
 	} else {
-		p.log.Debug("prune sweep: nothing to delete",
-			"max_ledger", maxLedger,
-			"before_time", beforeTime,
-		)
+		p.log.Debug("prune sweep: nothing to delete", attrs...)
 	}
 	return total, nil
 }
 
-// dryRunSweep reports what pruneOnce would delete without removing any
-// rows. It uses CountEventsBefore to count eligible rows in batches.
-func (p *Pruner) dryRunSweep(ctx context.Context, maxLedger int64, beforeTime time.Time) (int64, error) {
+// dryRunSweep reports what sweepGroup would delete without removing any
+// rows. It uses CountEventsBefore (or its contract-scoped form) to count
+// eligible rows in batches.
+func (p *Pruner) dryRunSweep(ctx context.Context, g store.RetentionGroup, maxLedger int64, beforeTime time.Time, attrs []any) (int64, error) {
 	var total int64
 	for {
-		affected, err := p.store.CountEventsBefore(ctx, maxLedger, beforeTime, p.opts.BatchSize)
+		var (
+			affected int64
+			err      error
+		)
+		if g.Contracts.All() {
+			affected, err = p.store.CountEventsBefore(ctx, maxLedger, beforeTime, p.opts.BatchSize)
+		} else {
+			affected, err = p.opts.Policies.CountEventsBeforeIn(ctx, maxLedger, beforeTime, p.opts.BatchSize, g.Contracts)
+		}
 		if err != nil {
 			return total, fmt.Errorf("dry-run count batch: %w", err)
 		}
@@ -357,16 +431,9 @@ func (p *Pruner) dryRunSweep(ctx context.Context, maxLedger int64, beforeTime ti
 	p.dryRunEligible.Add(total)
 
 	if total > 0 {
-		p.log.Info("dry-run prune sweep: would delete",
-			"rows_eligible", total,
-			"max_ledger", maxLedger,
-			"before_time", beforeTime,
-		)
+		p.log.Info("dry-run prune sweep: would delete", append([]any{"rows_eligible", total}, attrs...)...)
 	} else {
-		p.log.Debug("dry-run prune sweep: nothing to delete",
-			"max_ledger", maxLedger,
-			"before_time", beforeTime,
-		)
+		p.log.Debug("dry-run prune sweep: nothing to delete", attrs...)
 	}
 	return total, nil
 }

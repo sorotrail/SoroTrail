@@ -2943,7 +2943,7 @@ func (s *Server) syncStreamScope(ctx context.Context, sub *broadcast.Subscriptio
 				sub.SetScope(store.Scope{})
 				return false
 			}
-			scope, err := s.tenants.ScopeForTenant(ctx, tenant)
+			scope, err := s.tenantScope(ctx, tenant)
 			if err != nil {
 				loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
 				return true
