@@ -31,6 +31,23 @@ type actionAuditHolder struct {
 	hasPrincipal bool
 	principal    Principal
 	apiKey       *store.APIKey
+	// metadata carries handler-supplied details (for example the old and
+	// new retention horizon) into the audit entry for this request.
+	metadata map[string]any
+}
+
+// setActionAuditMetadata attaches a detail to the audit entry the
+// middleware writes for the current request. It is a no-op outside an
+// audited request.
+func setActionAuditMetadata(ctx context.Context, key string, value any) {
+	h := auditHolderFrom(ctx)
+	if h == nil {
+		return
+	}
+	if h.metadata == nil {
+		h.metadata = map[string]any{}
+	}
+	h.metadata[key] = value
 }
 
 func auditHolderFrom(ctx context.Context) *actionAuditHolder {
@@ -81,6 +98,8 @@ func (f *fallbackActionAuditStore) RecordActionAudit(ctx context.Context, rec st
 	return out, err
 }
 
+// QueryActionAuditLogs reads from the primary store and falls back to the
+// in-memory store only when the primary backend reports ErrUnsupported.
 func (f *fallbackActionAuditStore) QueryActionAuditLogs(ctx context.Context, filter store.ActionAuditFilter) ([]store.ActionAuditRecord, error) {
 	out, err := f.primary.QueryActionAuditLogs(ctx, filter)
 	if errors.Is(err, store.ErrUnsupported) {
@@ -89,6 +108,9 @@ func (f *fallbackActionAuditStore) QueryActionAuditLogs(ctx context.Context, fil
 	return out, err
 }
 
+// PruneActionAuditLogsBefore deletes up to limit entries older than cutoff
+// from the primary store, and from the in-memory fallback only when the
+// primary backend reports ErrUnsupported.
 func (f *fallbackActionAuditStore) PruneActionAuditLogsBefore(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
 	out, err := f.primary.PruneActionAuditLogsBefore(ctx, cutoff, limit)
 	if errors.Is(err, store.ErrUnsupported) {
@@ -137,6 +159,9 @@ type actionAuditResponseCapture struct {
 	buf         bytes.Buffer
 }
 
+// WriteHeader records the first status code written, so the audit entry
+// reports the status the client actually received, then forwards the call
+// to the underlying response writer.
 func (c *actionAuditResponseCapture) WriteHeader(code int) {
 	if !c.wroteHeader {
 		c.status = code
@@ -274,6 +299,11 @@ func (s *Server) buildHTTPActionAuditRecord(
 	capture *actionAuditResponseCapture,
 ) store.ActionAuditRecord {
 	meta := make(map[string]any)
+	if holder != nil {
+		for k, v := range holder.metadata {
+			meta[k] = v
+		}
+	}
 	reqMap := parseJSONObject(reqBody)
 	respMap := parseJSONObject(capture.buf.Bytes())
 

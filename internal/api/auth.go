@@ -455,7 +455,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 
 		if !cached {
 			var err error
-			scope, err = s.tenants.ScopeForTenant(r.Context(), tenant)
+			scope, err = s.tenantScope(r.Context(), tenant)
 			if err != nil {
 				loggerFromContext(r.Context()).Error("resolving tenant scope", "tenant", tenant.ID, "error", err)
 				writeError(w, http.StatusInternalServerError, errors.New("authentication failed"))

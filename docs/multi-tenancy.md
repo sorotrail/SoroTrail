@@ -16,6 +16,7 @@ when it is switched on.
 - [Tenant self-service API](#tenant-self-service-api)
 - [Watch lists and ingestion](#watch-lists-and-ingestion)
 - [Quotas and usage](#quotas-and-usage)
+- [Retention](#retention)
 - [Streams](#streams)
 - [Webhook subscriptions](#webhook-subscriptions)
 - [Caching](#caching)
@@ -167,6 +168,11 @@ Requires a tenant with `admin: true`.
 `rate_limit_burst` must be set together — `null` inherits the instance
 default, `0` is an explicit deny.
 
+`retention_max_age_seconds` sets the tenant's own retention horizon; `0`
+clears it so the tenant inherits the instance default. An update that
+shortens the tenant's effective horizon is refused with `409` unless it also
+sends `"confirm_retention_shortening": true` — see [Retention](#retention).
+
 Deleting a tenant never deletes ingested events; they may be shared with
 other tenants.
 
@@ -277,6 +283,107 @@ rather than one write per request. The store applies increments with `+=`,
 so several API servers behind a load balancer can flush independently. An
 ungraceful termination loses at most one interval; shutdown flushes
 explicitly.
+
+## Retention
+
+Each tenant can have its own event-retention horizon
+(`retention_max_age_seconds` on the tenant). A tenant without one inherits
+the instance default: the shorter of `RETENTION_MAX_AGE` and `RETENTION_AGE`
+when both are set, or whichever is set. With no tenant policy set anywhere,
+retention behaves exactly as it did before per-tenant policies existed.
+
+### Shared contracts: the longest entitled horizon wins
+
+Events belong to contracts, not tenants. One contract granted to two tenants
+produces one set of rows, so the shorter tenant's policy cannot be applied by
+deleting them. The rule is:
+
+> A contract's events are kept for the **longest** horizon among the tenants
+> entitled to read it.
+
+A tenant is entitled to a contract when it holds a grant for it. A
+**wildcard** tenant is entitled to every contract, so its horizon is a floor
+under all of them. That includes the seeded `default` tenant, which inherits
+the instance default. A contract granted to nobody keeps the floor, or the
+instance default when there is no wildcard tenant. Disabled tenants still
+count, because suspension is reversible.
+
+The pruner therefore never deletes a row a tenant is still entitled to. The
+other half of the policy is enforced at **read time**. A tenant's scope
+carries its own horizon, and every event read (`QueryEvents`, `CountEvents`,
+aggregates, `GetEvent`, `EventExists`, address reads, and so GraphQL and
+exports too) ANDs `created_at >= now() - horizon` into its SQL. A 7-day
+tenant sharing a contract with a 365-day tenant sees 7 days of it, although
+the rows are kept for 365. The horizon is part of the cache fingerprint, so
+two tenants with the same grants and different horizons never share a
+cached page.
+
+| Tenants granted contract `C` | `C`'s events are deleted after |
+| --- | --- |
+| A (7d) and B (365d) | 365d — B is still entitled to them |
+| A (7d) only, no wildcard tenant | 7d |
+| A (7d) and B (no policy, instance default 30d) | 30d |
+| A (7d), plus a wildcard tenant on the 30d default | 30d |
+
+To let a tenant go *below* the instance default, every tenant entitled to
+the same contracts has to allow it, wildcard tenants included.
+
+### How the pruner applies it
+
+Once per sweep the pruner reads every tenant's horizon and grants in one
+query and reduces them to a handful of groups, one per distinct horizon.
+Each group is a batched `DELETE … WHERE ledger < $max AND created_at < $cutoff
+AND contract_id = ANY($ids)`, served by the contract/ledger index. The
+default group deletes `NOT (contract_id = ANY($listed))`. Cost scales with
+the number of distinct horizons, not rows, and no per-row rule is
+evaluated. With no tenant policies the plan is a single group, and the
+pruner issues exactly the statement it always did. `RETENTION_MIN_LEDGER`
+and the last-ingested-ledger guard still bound every group. A group with
+no age bound is pruned by ledger only when `RETENTION_MIN_LEDGER` is set,
+and is otherwise never touched.
+
+Each sweep logs its groups with `policy` (`instance_default`,
+`wildcard_tenant` or `tenant`), `max_age`, and the contract counts.
+`/stats` reports `retention_policy_groups` (how many horizons the last sweep
+applied) and `tenant_policy_rows_purged` (rows deleted under a tenant or
+wildcard horizon rather than the instance default).
+
+### Archival
+
+Archive-before-prune exports a ledger range containing every contract's
+events, before any group deletes inside that range. Archival is a property
+of the row, not of a tenant: whichever group eventually deletes a row, that
+row is already in the archive. No tenant's deletion relies on an archive
+taken "for" another tenant.
+
+### Partitions
+
+`events` is partitioned by ledger, and dropping a partition is all-or-nothing
+across tenants. The pruner does not drop partitions; it deletes rows, as
+before. A partition can be dropped safely only once all its rows are past the
+**longest** horizon in the plan (`RetentionPlan.LongestMaxAge`). An unlimited
+horizon means never. Per-tenant retention therefore never makes partition
+dropping unsafe, but a single long-retention tenant does postpone it for the
+whole instance. That is the price of keeping shared rows.
+
+### Changing a policy
+
+- **Reads** follow the change immediately: the update invalidates the
+  tenant's cached authentication, and the next request carries the new
+  horizon.
+- **Deletion** follows at the next prune sweep (`RETENTION_INTERVAL`, default
+  1h). The plan is reloaded at the start of every sweep, never mid-sweep.
+- **Shortening is destructive.** A `PATCH` that shortens the tenant's
+  effective horizon is refused with `409` unless it sends
+  `"confirm_retention_shortening": true`. Clearing a long override back to a
+  shorter default also counts. The audit log entry for the update records
+  who made it, when, `retention_max_age_seconds_before`,
+  `retention_max_age_seconds_after` and `retention_shortened`, and the
+  server logs a `tenant retention shortened` warning.
+- Revoking a grant, deleting a tenant or clearing `wildcard` removes that
+  tenant's claim on the contracts. From the next sweep their events fall
+  back to whatever the remaining tenants are entitled to. These actions are
+  in the audit log too.
 
 ## Streams
 

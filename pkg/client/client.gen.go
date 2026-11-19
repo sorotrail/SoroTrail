@@ -427,7 +427,9 @@ type Tenant struct {
 	Name                string          `json:"name"`
 	RateLimitBurst      json.RawMessage `json:"rate_limit_burst,omitempty"`
 	RateLimitRps        json.RawMessage `json:"rate_limit_rps,omitempty"`
-	Wildcard            bool            `json:"wildcard"`
+	// RetentionMaxAgeSeconds The tenant's own event-retention horizon in seconds. Absent or null means it inherits the instance default.
+	RetentionMaxAgeSeconds json.RawMessage `json:"retention_max_age_seconds,omitempty"`
+	Wildcard               bool            `json:"wildcard"`
 }
 
 // TenantAPIKey Tenant API key metadata; secret is returned only on creation.
@@ -468,6 +470,8 @@ type TenantCreateRequest struct {
 	RateLimitBurst int64 `json:"rate_limit_burst,omitempty"`
 	// RateLimitRps Optional requests-per-second override. Set together with rate_limit_burst; omit both to inherit the instance limit.
 	RateLimitRps float64 `json:"rate_limit_rps,omitempty"`
+	// RetentionMaxAgeSeconds The tenant's event-retention horizon in seconds. Omit or send 0 to inherit the instance default (RETENTION_MAX_AGE). A shared contract's events are kept for the longest horizon among the tenants entitled to it, and each tenant reads only within its own horizon. See docs/multi-tenancy.md#retention.
+	RetentionMaxAgeSeconds int64 `json:"retention_max_age_seconds,omitempty"`
 	// Wildcard When true, the tenant can read events for every contract.
 	Wildcard bool `json:"wildcard,omitempty"`
 }
@@ -481,6 +485,8 @@ type TenantList struct {
 type TenantUpdateRequest struct {
 	// Admin When true, the tenant may use the administrative API.
 	Admin bool `json:"admin,omitempty"`
+	// ConfirmRetentionShortening Must be true when the update shortens the tenant's effective retention horizon. Shortening is irreversible once the next prune sweep runs, so without it the request is refused with 409.
+	ConfirmRetentionShortening bool `json:"confirm_retention_shortening,omitempty"`
 	// Enabled Whether the tenant is enabled for requests.
 	Enabled bool `json:"enabled,omitempty"`
 	// MaxWatchedContracts Maximum number of contracts this tenant may watch.
@@ -491,6 +497,8 @@ type TenantUpdateRequest struct {
 	RateLimitBurst int64 `json:"rate_limit_burst,omitempty"`
 	// RateLimitRps Requests-per-second override. Set together with rate_limit_burst; omit both to inherit the instance limit.
 	RateLimitRps float64 `json:"rate_limit_rps,omitempty"`
+	// RetentionMaxAgeSeconds Replacement event-retention horizon in seconds; 0 clears the override so the tenant inherits the instance default again.
+	RetentionMaxAgeSeconds int64 `json:"retention_max_age_seconds,omitempty"`
 	// Wildcard When true, the tenant can read events for every contract.
 	Wildcard bool `json:"wildcard,omitempty"`
 }

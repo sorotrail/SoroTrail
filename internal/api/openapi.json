@@ -987,7 +987,7 @@
       "patch": {
         "operationId": "updateTenant",
         "summary": "Update a tenant",
-        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential. PATCH semantics apply: fields omitted from the JSON object retain their stored values.",
+        "description": "Administrative endpoint, available only when MULTI_TENANT is enabled and gated behind the admin credential. PATCH semantics apply: fields omitted from the JSON object retain their stored values. An update that shortens the tenant's effective retention horizon is refused with 409 unless confirm_retention_shortening is true, and is recorded in the administrative audit log with the old and new horizon.",
         "tags": [
           "Admin"
         ],
@@ -5905,6 +5905,13 @@
             "format": "int32",
             "minimum": 0,
             "description": "Maximum number of contracts this tenant may watch."
+          },
+          "retention_max_age_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 3153600000,
+            "description": "The tenant's event-retention horizon in seconds. Omit or send 0 to inherit the instance default (RETENTION_MAX_AGE). A shared contract's events are kept for the longest horizon among the tenants entitled to it, and each tenant reads only within its own horizon. See docs/multi-tenancy.md#retention."
           }
         }
       },
@@ -5947,6 +5954,18 @@
             "format": "int32",
             "minimum": 0,
             "description": "Maximum number of contracts this tenant may watch."
+          },
+          "retention_max_age_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 3153600000,
+            "description": "Replacement event-retention horizon in seconds; 0 clears the override so the tenant inherits the instance default again."
+          },
+          "confirm_retention_shortening": {
+            "type": "boolean",
+            "default": false,
+            "description": "Must be true when the update shortens the tenant's effective retention horizon. Shortening is irreversible once the next prune sweep runs, so without it the request is refused with 409."
           }
         }
       },
@@ -6056,6 +6075,18 @@
               {
                 "type": "integer",
                 "format": "int32"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retention_max_age_seconds": {
+            "description": "The tenant's own event-retention horizon in seconds. Absent or null means it inherits the instance default.",
+            "oneOf": [
+              {
+                "type": "integer",
+                "format": "int64"
               },
               {
                 "type": "null"

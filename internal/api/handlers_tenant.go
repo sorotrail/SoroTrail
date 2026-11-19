@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -34,6 +35,56 @@ type tenantRequest struct {
 	RateLimitRPS        *float64 `json:"rate_limit_rps"`
 	RateLimitBurst      *int     `json:"rate_limit_burst"`
 	MaxWatchedContracts *int     `json:"max_watched_contracts"`
+	// RetentionMaxAgeSeconds sets the tenant's retention horizon (#1249).
+	// 0 clears it so the tenant inherits the instance default again.
+	RetentionMaxAgeSeconds *int64 `json:"retention_max_age_seconds"`
+	// ConfirmRetentionShortening must be true for an update that shortens
+	// the tenant's effective horizon: the next sweep may then delete rows
+	// irreversibly.
+	ConfirmRetentionShortening bool `json:"confirm_retention_shortening"`
+}
+
+// maxRetentionSeconds bounds retention_max_age_seconds at 100 years, well
+// inside what time.Duration can represent.
+const maxRetentionSeconds = 100 * 365 * 24 * 60 * 60
+
+// errRetentionShorteningUnconfirmed refuses an update that would shorten a
+// tenant's history without the caller saying it means to.
+var errRetentionShorteningUnconfirmed = errors.New(
+	"this update shortens the tenant's retention and the next prune sweep may permanently delete events; " +
+		"resend with confirm_retention_shortening set to true")
+
+// applyRetentionRequest copies a requested retention horizon onto t, where
+// 0 means "inherit the instance default". Range checks happen in
+// validateTenantQuotas so every tenant validation error has one source.
+func applyRetentionRequest(t *store.Tenant, seconds *int64) {
+	if seconds == nil {
+		return
+	}
+	if *seconds == 0 {
+		t.RetentionMaxAgeSeconds = nil
+		return
+	}
+	v := *seconds
+	t.RetentionMaxAgeSeconds = &v
+}
+
+// tenantScope resolves a tenant's read scope, including its retention
+// horizon (#1249). Every authentication path goes through here, so a tenant
+// can never read events past its own horizon even when the pruner keeps
+// them for a longer-retention tenant sharing the contract.
+func (s *Server) tenantScope(ctx context.Context, t store.Tenant) (store.Scope, error) {
+	scope, err := s.tenants.ScopeForTenant(ctx, t)
+	if err != nil {
+		return store.Scope{}, err
+	}
+	return scope.WithRetention(s.tenantRetention(t)), nil
+}
+
+// tenantRetention is the horizon the tenant is entitled to: its own policy,
+// or the instance default.
+func (s *Server) tenantRetention(t store.Tenant) time.Duration {
+	return store.EffectiveRetention(t.RetentionOverride(), s.defaultRetention)
 }
 
 func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
@@ -61,6 +112,7 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 	if req.Enabled != nil {
 		t.Enabled = *req.Enabled
 	}
+	applyRetentionRequest(&t, req.RetentionMaxAgeSeconds)
 	if err := validateTenantQuotas(t); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -95,6 +147,9 @@ func validateTenantQuotas(t store.Tenant) error {
 	// throttle. Same rule the instance-wide RATE_LIMIT_* pair enforces.
 	if (t.RateLimitRPS == nil) != (t.RateLimitBurst == nil) {
 		return errors.New("rate_limit_rps and rate_limit_burst must be set together")
+	}
+	if r := t.RetentionMaxAgeSeconds; r != nil && (*r < 0 || *r > maxRetentionSeconds) {
+		return fmt.Errorf("retention_max_age_seconds must be between 1 and %d, or 0 to inherit the instance default", maxRetentionSeconds)
 	}
 	return nil
 }
@@ -153,9 +208,24 @@ func (s *Server) handleUpdateTenant(w http.ResponseWriter, r *http.Request) {
 	if req.MaxWatchedContracts != nil {
 		t.MaxWatchedContracts = req.MaxWatchedContracts
 	}
+	before := s.tenantRetention(t)
+	applyRetentionRequest(&t, req.RetentionMaxAgeSeconds)
 	if err := validateTenantQuotas(t); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	after := s.tenantRetention(t)
+	shortens := store.RetentionShortens(before, after)
+	if shortens && !req.ConfirmRetentionShortening {
+		writeError(w, http.StatusConflict, errRetentionShorteningUnconfirmed)
+		return
+	}
+	if before != after {
+		// The audit entry already names who acted and when; this adds what
+		// changed, because a shortened horizon is a data-loss decision.
+		setActionAuditMetadata(r.Context(), "retention_max_age_seconds_before", int64(before/time.Second))
+		setActionAuditMetadata(r.Context(), "retention_max_age_seconds_after", int64(after/time.Second))
+		setActionAuditMetadata(r.Context(), "retention_shortened", shortens)
 	}
 
 	updated, err := s.tenants.UpdateTenant(r.Context(), t)
@@ -167,6 +237,12 @@ func (s *Server) handleUpdateTenant(w http.ResponseWriter, r *http.Request) {
 		loggerFromContext(r.Context()).Error("updating tenant", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("updating tenant failed"))
 		return
+	}
+	if shortens {
+		loggerFromContext(r.Context()).Warn("tenant retention shortened",
+			"tenant_id", updated.ID,
+			"retention_before", before,
+			"retention_after", after)
 	}
 	s.notifyTenantInvalidation(r.Context(), updated.ID)
 	writeCacheHeaders(w, cacheNoStore, 0, "")
