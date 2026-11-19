@@ -145,6 +145,8 @@ func (c *actionAuditResponseCapture) WriteHeader(code int) {
 	c.ResponseWriter.WriteHeader(code)
 }
 
+// Write captures the response status and a bounded body prefix for auditing,
+// then forwards the write to the underlying response writer.
 func (c *actionAuditResponseCapture) Write(b []byte) (int, error) {
 	if !c.wroteHeader {
 		c.status = http.StatusOK
@@ -160,6 +162,8 @@ func (c *actionAuditResponseCapture) Write(b []byte) (int, error) {
 	return c.ResponseWriter.Write(b)
 }
 
+// Flush forwards buffered response data to the underlying ResponseWriter when it
+// implements http.Flusher.
 func (c *actionAuditResponseCapture) Flush() {
 	if f, ok := c.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
@@ -191,6 +195,8 @@ type auditBodySniffer struct {
 	buf bytes.Buffer
 }
 
+// Read reads from the wrapped request body and captures up to
+// maxAuditBodyPeekBytes of the body for auditing.
 func (s *auditBodySniffer) Read(p []byte) (int, error) {
 	n, err := s.ReadCloser.Read(p)
 	if n > 0 {
