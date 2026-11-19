@@ -91,6 +91,9 @@ func (f *fallbackActionAuditStore) QueryActionAuditLogs(ctx context.Context, fil
 	return out, err
 }
 
+// PruneActionAuditLogsBefore deletes up to limit entries older than cutoff
+// from the primary store, and from the in-memory fallback only when the
+// primary backend reports ErrUnsupported.
 func (f *fallbackActionAuditStore) PruneActionAuditLogsBefore(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
 	out, err := f.primary.PruneActionAuditLogsBefore(ctx, cutoff, limit)
 	if errors.Is(err, store.ErrUnsupported) {
