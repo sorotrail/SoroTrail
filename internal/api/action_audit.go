@@ -81,6 +81,8 @@ func (f *fallbackActionAuditStore) RecordActionAudit(ctx context.Context, rec st
 	return out, err
 }
 
+// QueryActionAuditLogs reads from the primary store and falls back to the
+// in-memory store only when the primary backend reports ErrUnsupported.
 func (f *fallbackActionAuditStore) QueryActionAuditLogs(ctx context.Context, filter store.ActionAuditFilter) ([]store.ActionAuditRecord, error) {
 	out, err := f.primary.QueryActionAuditLogs(ctx, filter)
 	if errors.Is(err, store.ErrUnsupported) {
