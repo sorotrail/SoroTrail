@@ -55,18 +55,24 @@ func (m *routeMux) Patch(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodPatch, pattern, handler)
 }
 
+// Delete registers a handler for HTTP DELETE requests at pattern and
+// rejects a duplicate DELETE registration for the same pattern.
 func (m *routeMux) Delete(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodDelete, pattern, handler)
 }
 
+// Head registers a handler for HTTP HEAD requests at pattern.
 func (m *routeMux) Head(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodHead, pattern, handler)
 }
 
+// Options registers a handler for HTTP OPTIONS requests matching pattern.
 func (m *routeMux) Options(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodOptions, pattern, handler)
 }
 
+// Connect registers handler for HTTP CONNECT requests on pattern and rejects
+// a duplicate CONNECT registration for the same pattern.
 func (m *routeMux) Connect(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodConnect, pattern, handler)
 }
