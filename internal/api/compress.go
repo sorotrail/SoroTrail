@@ -127,6 +127,8 @@ func (b *boundedDecompressedReader) fireRejected() {
 	}
 }
 
+// Close closes the decompressor and the underlying request body, returning
+// the first error encountered.
 func (b *boundedDecompressedReader) Close() error {
 	var firstErr error
 	if b.reader != nil {
