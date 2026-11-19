@@ -138,6 +138,7 @@ func (b *boundedDecompressedReader) Close() error {
 	return firstErr
 }
 
+// Pretty reports whether the request has requested pretty-printed JSON output.
 // isStreamingResponse reports whether a request or response header indicates a
 // streaming transport (SSE, NDJSON/CSV export, or WebSocket) that must not be
 // buffered by the response size limiter (#1283).
@@ -252,6 +253,8 @@ func (w *boundedResponseWriter) Flush() {
 	}
 }
 
+// Hijack implements http.Hijacker, permitting connection hijacking
+// and marking the response as hijacked.
 func (w *boundedResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	hj, ok := w.ResponseWriter.(http.Hijacker)
 	if !ok {
