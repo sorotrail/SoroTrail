@@ -15,6 +15,9 @@ import (
 )
 
 const (
+	// Header is an alias or placeholder for HTTP header operations in API requests.
+	Header = "Header"
+
 	// IdempotencyKeyHeader is the optional request header accepted on all
 	// write endpoints (POST, PUT, PATCH, DELETE).
 	IdempotencyKeyHeader = "Idempotency-Key"
