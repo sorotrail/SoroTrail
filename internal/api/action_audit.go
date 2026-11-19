@@ -142,6 +142,9 @@ type actionAuditResponseCapture struct {
 	buf         bytes.Buffer
 }
 
+// WriteHeader records the first status code written, so the audit entry
+// reports the status the client actually received, then forwards the call
+// to the underlying response writer.
 func (c *actionAuditResponseCapture) WriteHeader(code int) {
 	if !c.wroteHeader {
 		c.status = code
