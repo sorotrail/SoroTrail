@@ -38,6 +38,7 @@ func (m *routeMux) register(method, pattern string, handler http.Handler) {
 	m.Router.Method(method, pattern, handler)
 }
 
+// Get registers a GET route pattern with its handler function.
 func (m *routeMux) Get(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodGet, pattern, handler)
 }
