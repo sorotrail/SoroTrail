@@ -367,6 +367,7 @@ LOG_LEVEL=debug LOG_FORMAT=json ./sorotrail
 ```
 
 - **`LOG_LEVEL`** — Sets the logging verbosity level (`debug`, `info`, `warn`, `error`). Hot-reloadable at runtime via SIGHUP. Default: `info`. Example: `LOG_LEVEL=debug`.
+- **`LOG_FORMAT`** — Sets the structured log output format (`text` or `json`). JSON emits one JSON object per line. Default: `text`. Example: `LOG_FORMAT=json`.
 
 ### API server
 
@@ -418,6 +419,11 @@ curl -s http://localhost:8080/health
 See [Rate limits and quotas](docs/rate-limits.md) for the evaluation order,
 client-key derivation, response headers, per-tenant overrides, and the
 multi-replica caveat.
+
+```sh
+# Run with per-client rate limiting enabled (10 req/s with burst of 20)
+RATE_LIMIT_RPS=10 RATE_LIMIT_BURST=20 ./sorotrail
+```
 
 ### Audit
 
