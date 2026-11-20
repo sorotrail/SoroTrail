@@ -354,6 +354,11 @@ once. A single process still ingests one network — the one named by
 | `LOG_FORMAT` | string | `text` | `text` \| `json`. JSON emits one JSON object per line, compatible with Loki, CloudWatch, and ELK. | restart |
 | `LAG_WARN_LEDGERS` | uint32 | `100` | Ingest-lag alarm threshold in ledgers. When the gap between chain head and last ingested ledger exceeds this, a WARN is logged; an INFO fires once the gap closes. `0` disables the alarm. | restart |
 
+```sh
+# Run with JSON-formatted logs at debug level
+LOG_LEVEL=debug LOG_FORMAT=json ./sorotrail
+```
+
 ### API server
 
 | Variable | Type | Default | Description | Reload |
