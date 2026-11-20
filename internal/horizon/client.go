@@ -58,6 +58,8 @@ func (c *HTTPClient) WithHTTPClient(hc *http.Client) *HTTPClient {
 	return c
 }
 
+// ListContractTransactions returns contractID's transactions from Horizon in
+// ascending ledger order. A limit outside 1..200 is clamped to 200.
 func (c *HTTPClient) ListContractTransactions(ctx context.Context, contractID, cursor string, limit int, includeFailed bool) (TransactionsResponse, error) {
 	if contractID == "" {
 		return TransactionsResponse{}, errors.New("horizon: contractID is required")

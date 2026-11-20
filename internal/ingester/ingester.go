@@ -59,6 +59,7 @@ type Clock interface {
 // RealClock is the wall-clock implementation of Clock.
 type RealClock struct{}
 
+// Now returns the current wall-clock time.
 func (RealClock) Now() time.Time { return time.Now() }
 func (RealClock) SleepCtx(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)

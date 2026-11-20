@@ -313,6 +313,11 @@ once. A single process still ingests one network — the one named by
 | `DB_MAX_CONN_LIFETIME` | duration | `0` | Max lifetime of a DB connection (`0` = no limit, e.g. `30m`). | restart |
 | `DB_MAX_CONN_IDLE_TIME` | duration | `0` | Max idle time of a DB connection (`0` = no limit, e.g. `5m`). | restart |
 
+```sh
+# Connect to PostgreSQL
+DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable' ./sorotrail
+```
+
 ### Ingestion
 
 | Variable | Type | Default | Description | Reload |
@@ -460,6 +465,20 @@ RATE_LIMIT_RPS=10 RATE_LIMIT_BURST=20 ./sorotrail
 | `ARCHIVE_BEFORE_PRUNE` | bool | `false` | Export events to the archive before the pruner deletes them. | restart |
 | `ARCHIVE_MAX_RETRIES` | int | `3` | Maximum upload retry attempts per event batch. | restart |
 
+If you have configured `RETENTION_MAX_AGE` or `RETENTION_MIN_LEDGER`, add
+these settings to `.env` to archive events before pruning. This example uses
+an existing `sorotrail-archive` bucket on local MinIO. Replace the sample
+credentials with your MinIO credentials.
+
+```dotenv
+ARCHIVE_BUCKET=sorotrail-archive
+ARCHIVE_ENDPOINT=localhost:9000
+ARCHIVE_ACCESS_KEY_ID=your-minio-access-key
+ARCHIVE_SECRET_ACCESS_KEY=your-minio-secret-key
+ARCHIVE_USE_SSL=false
+ARCHIVE_BEFORE_PRUNE=true
+```
+
 ### Export
 
 | Variable | Type | Default | Description | Reload |
@@ -480,7 +499,7 @@ RATE_LIMIT_RPS=10 RATE_LIMIT_BURST=20 ./sorotrail
 
 | Variable | Type | Default | Description | Reload |
 | --- | --- | --- | --- | --- |
-| `HORIZON_URL` | URL | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. | restart |
+| `HORIZON_URL` | URL | `https://horizon-testnet.stellar.org` | Stellar Horizon REST base URL used by `sorotrail backfill` only. Set it to a Horizon endpoint for the network you are backfilling, for example `HORIZON_URL=https://horizon.example.com` for a private instance. | restart |
 | `BACKFILL_RATE_RPS` | float | `10` | Pace against Horizon when backfilling. 10 req/s matches the public-instance cap; private deployments can lift this. | restart |
 
 ### GraphQL

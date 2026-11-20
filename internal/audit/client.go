@@ -28,6 +28,8 @@ func (c *budgetedClient) GetEvents(ctx context.Context, req rpc.GetEventsRequest
 	return c.inner.GetEvents(ctx, req)
 }
 
+// GetLatestLedger queries the latest ledger sequence from the network,
+// reserving tokens from the audit budget pool.
 func (c *budgetedClient) GetLatestLedger(ctx context.Context) (rpc.LatestLedger, error) {
 	if err := c.budget.WaitAudit(ctx); err != nil {
 		return rpc.LatestLedger{}, err

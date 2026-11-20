@@ -846,5 +846,49 @@ func TestIntervalRateLimiter_EnforcesAggregateSpacing(t *testing.T) {
 	assert.GreaterOrEqual(t, elapsed, 12*time.Millisecond)
 }
 
+func TestIntervalRateLimiter_WaitCount(t *testing.T) {
+	ctx := context.Background()
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	tests := []struct {
+		name        string
+		minInterval time.Duration
+		ctx         context.Context
+		calls       int
+		wantErr     error
+		wantCount   int64
+	}{
+		{
+			name:        "no wait calls",
+			minInterval: time.Millisecond,
+			ctx:         ctx,
+			wantCount:   0,
+		},
+		{
+			name:      "zero interval counts each wait",
+			ctx:       ctx,
+			calls:     2,
+			wantCount: 2,
+		},
+		{
+			name:      "already canceled context leaves count unchanged",
+			ctx:       canceledCtx,
+			calls:     1,
+			wantErr:   context.Canceled,
+			wantCount: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			limiter := NewIntervalRateLimiter(tt.minInterval)
+			for range tt.calls {
+				require.ErrorIs(t, limiter.Wait(tt.ctx), tt.wantErr)
+			}
+			assert.Equal(t, tt.wantCount, limiter.WaitCount())
+		})
+	}
+}
+
 // avoid `errors` import flagging by referencing it once.
 var _ = errors.New
