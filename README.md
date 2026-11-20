@@ -414,6 +414,11 @@ See [Rate limits and quotas](docs/rate-limits.md) for the evaluation order,
 client-key derivation, response headers, per-tenant overrides, and the
 multi-replica caveat.
 
+```sh
+# Run with per-client rate limiting enabled (10 req/s with burst of 20)
+RATE_LIMIT_RPS=10 RATE_LIMIT_BURST=20 ./sorotrail
+```
+
 ### Audit
 
 | Variable | Type | Default | Description | Reload |
