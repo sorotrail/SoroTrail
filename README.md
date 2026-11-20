@@ -313,6 +313,11 @@ once. A single process still ingests one network — the one named by
 | `DB_MAX_CONN_LIFETIME` | duration | `0` | Max lifetime of a DB connection (`0` = no limit, e.g. `30m`). | restart |
 | `DB_MAX_CONN_IDLE_TIME` | duration | `0` | Max idle time of a DB connection (`0` = no limit, e.g. `5m`). | restart |
 
+```sh
+# Connect to PostgreSQL
+DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable' ./sorotrail
+```
+
 ### Ingestion
 
 | Variable | Type | Default | Description | Reload |
