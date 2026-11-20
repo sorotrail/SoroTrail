@@ -1901,3 +1901,21 @@ func TestConfig_FieldLevelEncryptionValidationAndRedaction(t *testing.T) {
 		assert.Equal(t, "***", redact("ENCRYPTION_KEYS", "v2:"+hexKey2+",v1:"+hexKey1))
 	})
 }
+
+func TestParseLogLevel_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want slog.Level
+	}{
+		{name: "empty string defaults to info", raw: "", want: slog.LevelInfo},
+		{name: "whitespace only defaults to info", raw: " \t\n ", want: slog.LevelInfo},
+		{name: "unknown level defaults to info", raw: "verbose", want: slog.LevelInfo},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, ParseLogLevel(tt.raw))
+		})
+	}
+}

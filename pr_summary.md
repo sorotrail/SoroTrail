@@ -40,6 +40,12 @@ in a useful way.
   JSON report. Flags: `--db`, `--events-per-ledger`, `--ledgers`,
   `--page-limit`, `--duration`, `--batch-size`, `--write-batch-size`,
   `--force`.
+
+  ```bash
+  # Run a 30-second smoke load test against a local database
+  sorotrail loadtest --db="$DATABASE_URL" --events-per-ledger=100 --ledgers=1000 --duration=30s
+  ```
+
 - **It refuses to run against a database that already holds data** unless
   `--force` is passed: the run writes a lot of synthetic rows, and silently
   mixing them into a real dataset would be unrecoverable.
