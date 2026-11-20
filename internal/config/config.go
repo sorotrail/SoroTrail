@@ -452,7 +452,7 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// IsSQLite reports whether the database URL points to a SQLite database.
+// resolveFileEnv reads secrets from files indicated by *_FILE environment variables.
 func resolveFileEnv() error {
 	for _, kv := range os.Environ() {
 		parts := strings.SplitN(kv, "=", 2)
@@ -478,6 +478,7 @@ func resolveFileEnv() error {
 	return nil
 }
 
+// IsSQLite reports whether the database URL points to a SQLite database.
 func IsSQLite(databaseURL string) bool {
 	return strings.HasPrefix(databaseURL, "sqlite:")
 }
