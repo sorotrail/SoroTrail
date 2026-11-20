@@ -21,6 +21,8 @@ field halts the process mid-flight; every problem is printed before `os.Exit(1)`
 endpoint and Stellar network passphrase. Ingestion state and persisted events
 are keyed by this network, so changing networks does not reuse cursors.
 
+`RPC_URL` sets the Soroban RPC endpoint URL used for ledger polling and event ingestion. When left unset, a default endpoint is automatically selected based on the configured `NETWORK` (e.g., the standard public testnet RPC URL for `testnet`). Default: empty (derived from `NETWORK`). Example: `RPC_URL=https://soroban-testnet.stellar.org:443`.
+
 ## URL format
 | Variable   | Rule                                 |
 |------------|--------------------------------------|
