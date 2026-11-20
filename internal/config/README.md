@@ -56,6 +56,8 @@ are keyed by this network, so changing networks does not reuse cursors.
 |-------------|------------------------------|
 | `LOG_LEVEL` | `debug`, `info`, `warn`, `error` |
 
+`LOG_LEVEL` sets the logging verbosity level (`debug`, `info`, `warn`, or `error`). Hot-reloadable at runtime via SIGHUP. Default: `info`. Example: `LOG_LEVEL=debug`.
+
 ## Mutual dependency
 - `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST`: must both be set or both be unset
   (zero). Setting only one silently disables the rate limiter, which is

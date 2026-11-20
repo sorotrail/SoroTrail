@@ -361,6 +361,8 @@ once. A single process still ingests one network — the one named by
 LOG_LEVEL=debug LOG_FORMAT=json ./sorotrail
 ```
 
+- **`LOG_LEVEL`** — Sets the logging verbosity level (`debug`, `info`, `warn`, `error`). Hot-reloadable at runtime via SIGHUP. Default: `info`. Example: `LOG_LEVEL=debug`.
+
 ### API server
 
 | Variable | Type | Default | Description | Reload |
