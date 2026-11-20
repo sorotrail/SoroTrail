@@ -43,6 +43,9 @@ func TestParseTypes_Table(t *testing.T) {
 		{name: "one bad element rejects the whole list", raw: "contract,bogus", wantErr: `invalid type "bogus" (want contract|system|diagnostic)`},
 		{name: "a numeric type is not a type", raw: "1", wantErr: `invalid type "1" (want contract|system|diagnostic)`},
 		{name: "the plural spelling is not a type", raw: "types", wantErr: `invalid type "types" (want contract|system|diagnostic)`},
+		{name: "only whitespace and separators is no constraint", raw: " , , , ", want: nil},
+		{name: "tabs and newlines around types are trimmed", raw: "\tcontract\t,\nsystem\n", want: []string{"contract", "system"}},
+		{name: "invalid type with special characters is rejected", raw: "contract,system!", wantErr: `invalid type "system!" (want contract|system|diagnostic)`},
 	}
 	for _, tt := range tests {
 		tt := tt
