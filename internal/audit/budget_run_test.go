@@ -234,6 +234,67 @@ func TestBudgetedClientWithNilBudgetIsUnpaced(t *testing.T) {
 	}
 }
 
+// TestBudgetedClientAuditPoolBoundaries checks the burst sizes NewBudgetedClient
+// inherits at the edges of the audit share: a pool with no refill and a
+// fractional rate both still allow exactly one call before making the next one
+// wait.
+func TestBudgetedClientAuditPoolBoundaries(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		maxRPS     float64
+		auditShare float64
+	}{
+		{name: "no audit share never refills", maxRPS: 1, auditShare: 0},
+		{name: "audit share of one takes the whole rate", maxRPS: 1, auditShare: 1},
+		{name: "fractional rate still bursts to one token", maxRPS: 0.5, auditShare: 0.5},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			b, err := rpc.NewBudget(tt.maxRPS, tt.auditShare)
+			require.NoError(t, err)
+			inner := &spyRPC{}
+			c := NewBudgetedClient(inner, b)
+
+			_, err = c.GetHealth(context.Background())
+			require.NoError(t, err, "the minimum burst is always one call")
+			_, err = c.GetHealth(shortCtx(t))
+			assert.Error(t, err, "the pool is empty, so the next call waits past its deadline")
+			assert.Equal(t, int64(1), inner.health.Load(), "a waiting call never reaches the inner client")
+		})
+	}
+}
+
+// TestNewBudgetedClientRejectsInvalidBudgets checks the invalid inputs that must
+// be refused before a client can be wrapped around them: a non-positive rate
+// and an audit share outside [0,1].
+func TestNewBudgetedClientRejectsInvalidBudgets(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		maxRPS     float64
+		auditShare float64
+	}{
+		{name: "zero max rate", maxRPS: 0, auditShare: 0.5},
+		{name: "negative max rate", maxRPS: -1, auditShare: 0.5},
+		{name: "audit share above one", maxRPS: 10, auditShare: 1.5},
+		{name: "negative audit share", maxRPS: 10, auditShare: -0.1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			b, err := rpc.NewBudget(tt.maxRPS, tt.auditShare)
+			assert.Error(t, err, "an invalid budget is rejected instead of wrapping a client")
+			assert.Nil(t, b)
+		})
+	}
+}
+
 func TestBudgetedClientPassesRequestsAndResponsesThrough(t *testing.T) {
 	t.Parallel()
 

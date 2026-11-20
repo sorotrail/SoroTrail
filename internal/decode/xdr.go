@@ -63,6 +63,9 @@ var decodeScratchPool = sync.Pool{
 	},
 }
 
+// DecodeScVal decodes a base64-encoded XDR ScVal into its JSON representation.
+// Un-decodable input does not fail the call: the raw value is returned in a
+// lossless fallback envelope so ingestion can continue.
 func (XDRDecoder) DecodeScVal(base64XDR string) (json.RawMessage, error) {
 	sc := decodeScratchPool.Get().(*decodeScratch)
 	defer decodeScratchPool.Put(sc)
