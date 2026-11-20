@@ -227,6 +227,7 @@ func (r *SyntheticRPC) event(ledger uint32, n int) rpc.Event {
 	}
 }
 
+// LatestLedger reports the highest ledger sequence available from the synthetic RPC.
 func (r *SyntheticRPC) LatestLedger() uint32 { return r.latest }
 func (r *SyntheticRPC) GetHealth(context.Context) (rpc.Health, error) {
 	return rpc.Health{LatestLedger: r.latest, OldestLedger: 2}, nil

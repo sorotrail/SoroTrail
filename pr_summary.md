@@ -117,6 +117,15 @@ comment twice.
 - **`docs/errors.md`** and the error catalogue are regenerated, so the code,
   the docs and the spec cannot drift.
 
+**Example.** The same decoder now rejects trailing data with `400` and an oversized body with `413`, regardless of which handler receives it:
+
+```bash
+# Trailing data after the JSON value -> 400 invalid JSON body
+curl -i -X POST http://localhost:8080/subscriptions \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/hook","secret":"whsec_test","filters":{}} garbage'
+```
+
 **Behaviour changes for existing clients** (as the issue asks to be listed):
 
 1. **Tenant routes now reject trailing data.** `POST /admin/tenants`,
