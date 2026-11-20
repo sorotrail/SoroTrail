@@ -1745,7 +1745,7 @@ func TestParseEndpointBodyLimitsAndOverrides(t *testing.T) {
 			name: "whitespace and empty entries are ignored",
 			raw:  "  , POST /watched-contracts=4194304 ,  , PUT /contracts/{id}/spec=2097152 , ",
 			want: map[string]int64{
-				"POST /watched-contracts":   4194304,
+				"POST /watched-contracts":  4194304,
 				"PUT /contracts/{id}/spec": 2097152,
 			},
 		},
