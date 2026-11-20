@@ -846,6 +846,64 @@ func TestIntervalRateLimiter_EnforcesAggregateSpacing(t *testing.T) {
 	assert.GreaterOrEqual(t, elapsed, 12*time.Millisecond)
 }
 
+func TestIntervalRateLimiter_EdgeCases(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name        string
+		minInterval time.Duration
+		calls       int
+		wantCount   int64
+	}{
+		{
+			name:        "negative interval is treated as disabled",
+			minInterval: -time.Second,
+			calls:       3,
+			wantCount:   3,
+		},
+		{
+			name:        "smallest positive interval does not delay the first call",
+			minInterval: time.Nanosecond,
+			calls:       1,
+			wantCount:   1,
+		},
+		{
+			name:        "maximum duration interval does not delay the first call",
+			minInterval: time.Duration(1<<63 - 1),
+			calls:       1,
+			wantCount:   1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			limiter := NewIntervalRateLimiter(tt.minInterval)
+			for range tt.calls {
+				require.NoError(t, limiter.Wait(ctx))
+			}
+			assert.Equal(t, tt.wantCount, limiter.WaitCount())
+		})
+	}
+}
+
+func TestIntervalRateLimiter_CancelWhileWaiting(t *testing.T) {
+	// The first Wait is granted immediately; the second must block for the
+	// full interval, so cancelling its context returns the context error
+	// rather than sleeping for the interval.
+	limiter := NewIntervalRateLimiter(time.Hour)
+	require.NoError(t, limiter.Wait(context.Background()))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- limiter.Wait(ctx) }()
+
+	require.Eventually(t, func() bool {
+		return limiter.WaitCount() == 2
+	}, time.Second, time.Millisecond, "second Wait must register before blocking")
+	cancel()
+
+	require.ErrorIs(t, <-done, context.Canceled)
+	assert.Equal(t, int64(2), limiter.WaitCount())
+}
+
 func TestIntervalRateLimiter_WaitCount(t *testing.T) {
 	ctx := context.Background()
 	canceledCtx, cancel := context.WithCancel(ctx)

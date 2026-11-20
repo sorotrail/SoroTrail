@@ -368,6 +368,7 @@ LOG_LEVEL=debug LOG_FORMAT=json ./sorotrail
 
 - **`LOG_LEVEL`** — Sets the logging verbosity level (`debug`, `info`, `warn`, `error`). Hot-reloadable at runtime via SIGHUP. Default: `info`. Example: `LOG_LEVEL=debug`.
 - **`LOG_FORMAT`** — Sets the structured log output format (`text` or `json`). JSON emits one JSON object per line. Default: `text`. Example: `LOG_FORMAT=json`.
+- **`LAG_WARN_LEDGERS`** — Ingest-lag alarm threshold in ledgers. When the gap between the chain head and the last ingested ledger exceeds this value, one WARN log is emitted; one INFO log fires when the gap closes. `0` disables the alarm. Default: `100`. Example: `LAG_WARN_LEDGERS=250`.
 
 ### API server
 
@@ -450,6 +451,20 @@ RATE_LIMIT_RPS=10 RATE_LIMIT_BURST=20 ./sorotrail
 | `RETENTION_PAUSE` | duration | `100ms` | Sleep between pruner batches to avoid holding a long lock. | restart |
 | `RETENTION_INTERVAL` | duration | `1h` | How often the pruner runs. | restart |
 | `RETENTION_DRY_RUN` | bool | `false` | Report what the pruner would delete without removing any rows. | restart |
+
+For example, to keep roughly the last 7 days of events and prune anything
+older, dry-run first to see what would be deleted:
+
+```sh
+RETENTION_MAX_AGE=168h RETENTION_DRY_RUN=true ./sorotrail
+```
+
+Then drop `RETENTION_DRY_RUN` to delete for real (the pruner runs hourly by
+default):
+
+```sh
+RETENTION_MAX_AGE=168h ./sorotrail
+```
 
 ### Archive
 
