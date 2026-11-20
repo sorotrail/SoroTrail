@@ -344,6 +344,8 @@ DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=di
 | `BATCH_MAX_BACKOFF` | duration | `1s` | Maximum backpressure sleep between batch writes. Only effective when both `BATCH_SIZE` and `BATCH_TARGET_LATENCY` are set. | restart |
 | `INGESTION_LOCK_ENABLED` | bool | `false` | Acquire a Postgres advisory lock keyed by the RPC URL before starting ingestion. A second instance skips ingestion (but keeps serving the API), preventing double-processing. | restart |
 
+- **`PARTITION_LEDGER_SPAN`** — Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. Default: `120960`. Example: `PARTITION_LEDGER_SPAN=120960`.
+
 ### Reorg detection
 
 | Variable | Type | Default | Description | Reload |
@@ -363,6 +365,8 @@ DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=di
 # Run with JSON-formatted logs at debug level
 LOG_LEVEL=debug LOG_FORMAT=json ./sorotrail
 ```
+
+- **`LOG_LEVEL`** — Sets the logging verbosity level (`debug`, `info`, `warn`, `error`). Hot-reloadable at runtime via SIGHUP. Default: `info`. Example: `LOG_LEVEL=debug`.
 
 ### API server
 
@@ -384,6 +388,11 @@ LOG_LEVEL=debug LOG_FORMAT=json ./sorotrail
 | `COMPRESS_MIN_SIZE` | int | `0` | Response body size (bytes) at or above which gzip/deflate encoding is applied. Negative disables compression entirely; `0` uses the built-in default. | restart |
 | `ENABLE_METRICS` | bool | `false` | Expose the Prometheus `/metrics` endpoint. | restart |
 | `SHUTDOWN_TIMEOUT` | duration | `15s` | Maximum time for graceful HTTP server drain and component shutdown before the process is killed. `0` waits indefinitely. | restart |
+
+```sh
+# Query the API server health check
+curl -s http://localhost:8080/health
+```
 
 ### CORS
 

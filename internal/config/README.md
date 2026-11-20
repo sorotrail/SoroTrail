@@ -49,10 +49,14 @@ are keyed by this network, so changing networks does not reuse cursors.
 | `RATE_LIMIT_RPS`            | >= 0                    |
 | `RATE_LIMIT_BURST`          | >= 0                    |
 
+`PARTITION_LEDGER_SPAN` sets the ledger span per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. Default: `120960`. Example: `PARTITION_LEDGER_SPAN=120960`.
+
 ## Allowed values
 | Variable    | Allowed values               |
 |-------------|------------------------------|
 | `LOG_LEVEL` | `debug`, `info`, `warn`, `error` |
+
+`LOG_LEVEL` sets the logging verbosity level (`debug`, `info`, `warn`, or `error`). Hot-reloadable at runtime via SIGHUP. Default: `info`. Example: `LOG_LEVEL=debug`.
 
 ## Mutual dependency
 - `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST`: must both be set or both be unset
