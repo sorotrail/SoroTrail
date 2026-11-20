@@ -404,6 +404,58 @@ func TestIsArchivedRequiresManifestCoverageAndData(t *testing.T) {
 	})
 }
 
+func TestIsArchivedEdgeCases(t *testing.T) {
+	const uri = "test-prefix/events/schema=1/ledger_start=0000100"
+	manifestBytes, err := json.Marshal(Manifest{
+		SchemaVersion: SchemaVersion,
+		Chunk:         ChunkInfo{LedgerStart: 100, LedgerEnd: 200, RowCount: 1},
+	})
+	require.NoError(t, err)
+
+	client := newArchiveObjectClient()
+	client.objects[uri+"/manifest.json"] = manifestBytes
+	client.objects[uri+"/data.ndjson.gz"] = []byte("archive data")
+	a := newTestArchiver(nil, client)
+
+	tests := []struct {
+		name        string
+		archiver    *Archiver
+		start       int64
+		end         int64
+		wantCovered bool
+	}{
+		{
+			name:        "nil archiver returns false",
+			archiver:    nil,
+			start:       100,
+			end:         200,
+			wantCovered: false,
+		},
+		{
+			name:        "boundary value single ledger at start boundary",
+			archiver:    a,
+			start:       100,
+			end:         100,
+			wantCovered: true,
+		},
+		{
+			name:        "boundary value start prior to manifest start",
+			archiver:    a,
+			start:       99,
+			end:         200,
+			wantCovered: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.archiver.IsArchived(context.Background(), tc.start, tc.end)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantCovered, got)
+		})
+	}
+}
+
 func TestGetObject(t *testing.T) {
 	const key = "events/schema=1/ledger_start=0000010/data.ndjson.gz"
 	t.Run("object found", func(t *testing.T) {
