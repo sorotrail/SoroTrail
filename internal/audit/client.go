@@ -49,6 +49,8 @@ func (c *budgetedClient) GetLedgerEntries(ctx context.Context, req rpc.GetLedger
 	return c.inner.GetLedgerEntries(ctx, req)
 }
 
+// SimulateTransaction simulates a transaction against the current ledger state
+// using the underlying RPC client, reserving tokens from the audit budget pool.
 func (c *budgetedClient) SimulateTransaction(ctx context.Context, req rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error) {
 	if err := c.budget.WaitAudit(ctx); err != nil {
 		return rpc.SimulateTransactionResponse{}, err
