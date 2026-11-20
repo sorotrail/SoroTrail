@@ -382,6 +382,11 @@ LOG_LEVEL=debug LOG_FORMAT=json ./sorotrail
 | `ENABLE_METRICS` | bool | `false` | Expose the Prometheus `/metrics` endpoint. | restart |
 | `SHUTDOWN_TIMEOUT` | duration | `15s` | Maximum time for graceful HTTP server drain and component shutdown before the process is killed. `0` waits indefinitely. | restart |
 
+```sh
+# Query the API server health check
+curl -s http://localhost:8080/health
+```
+
 ### CORS
 
 | Variable | Type | Default | Description | Reload |
