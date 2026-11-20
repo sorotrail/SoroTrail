@@ -362,6 +362,7 @@ LOG_LEVEL=debug LOG_FORMAT=json ./sorotrail
 ```
 
 - **`LOG_LEVEL`** — Sets the logging verbosity level (`debug`, `info`, `warn`, `error`). Hot-reloadable at runtime via SIGHUP. Default: `info`. Example: `LOG_LEVEL=debug`.
+- **`LOG_FORMAT`** — Sets the structured log output format (`text` or `json`). JSON emits one JSON object per line. Default: `text`. Example: `LOG_FORMAT=json`.
 
 ### API server
 
