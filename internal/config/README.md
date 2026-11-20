@@ -49,6 +49,8 @@ are keyed by this network, so changing networks does not reuse cursors.
 | `RATE_LIMIT_RPS`            | >= 0                    |
 | `RATE_LIMIT_BURST`          | >= 0                    |
 
+`PARTITION_LEDGER_SPAN` sets the ledger span per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. Default: `120960`. Example: `PARTITION_LEDGER_SPAN=120960`.
+
 ## Allowed values
 | Variable    | Allowed values               |
 |-------------|------------------------------|

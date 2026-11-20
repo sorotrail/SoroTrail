@@ -339,6 +339,8 @@ once. A single process still ingests one network — the one named by
 | `BATCH_MAX_BACKOFF` | duration | `1s` | Maximum backpressure sleep between batch writes. Only effective when both `BATCH_SIZE` and `BATCH_TARGET_LATENCY` are set. | restart |
 | `INGESTION_LOCK_ENABLED` | bool | `false` | Acquire a Postgres advisory lock keyed by the RPC URL before starting ingestion. A second instance skips ingestion (but keeps serving the API), preventing double-processing. | restart |
 
+- **`PARTITION_LEDGER_SPAN`** — Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. Default: `120960`. Example: `PARTITION_LEDGER_SPAN=120960`.
+
 ### Reorg detection
 
 | Variable | Type | Default | Description | Reload |
