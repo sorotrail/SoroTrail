@@ -1441,6 +1441,15 @@ const watchedContractsUnion = `
 		SELECT network, contract_id, added_at FROM tenant_watched_contracts
 	) w GROUP BY network, contract_id`
 
+// ListWatchedContracts returns the union of the operator-configured
+// watch list and every tenant's requests, all networks included,
+// which is what ingestion must fetch. It is intentionally not
+// scoped by a caller-side tenant: ingestion serves all tenants at
+// once, and a contract watched on one network is not fetched
+// with the filters of another.
+//
+// Removal is implicit per network — an entry disappears from the
+// union when the last row naming it on that network is gone.
 func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	return p.ListWatchedContractsScoped(ctx, WildcardScope())
 }

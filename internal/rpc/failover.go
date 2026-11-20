@@ -129,6 +129,8 @@ const (
 	StateDown ProviderState = 2
 )
 
+// String returns the human-readable name of the provider state.
+// Used for logging and diagnostics when the provider's status changes.
 func (s ProviderState) String() string {
 	switch s {
 	case StateActive:
