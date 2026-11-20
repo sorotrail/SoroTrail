@@ -383,6 +383,19 @@ func effectiveActionAuditLimit(limit int) int {
 // --- Postgres implementation ---
 
 // RecordActionAudit implements ActionAuditStore on Postgres.
+//
+// RecordActionAudit persists an administrative action audit record to the
+// database, maintaining a tamper-evident hash chain. Each record's
+// EntryHash is computed from the previous record's EntryHash and the
+// current record's fields, ensuring chain integrity. The method acquires
+// an exclusive lock on the audit table to serialize concurrent writes.
+//
+// The record is normalized (actor identifiers are sanitized, defaults are
+// filled in) before persistence. The metadata is sanitized to remove any
+// secret material before being stored as JSONB.
+//
+// The method returns the persisted record with its assigned ID and created-at
+// timestamp, or an error if the operation fails.
 func (p *Postgres) RecordActionAudit(ctx context.Context, rec ActionAuditRecord) (ActionAuditRecord, error) {
 	rec = NormalizeActionAuditRecord(rec)
 	metaBytes := []byte(canonicalMetadataJSON(rec.Metadata))
