@@ -43,14 +43,18 @@ func (m *routeMux) Get(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodGet, pattern, handler)
 }
 
+// Post registers a handler for HTTP POST requests at pattern and
+// rejects a duplicate POST registration for the same pattern.
 func (m *routeMux) Post(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodPost, pattern, handler)
 }
 
+// Put registers a PUT route pattern with its handler function.
 func (m *routeMux) Put(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodPut, pattern, handler)
 }
 
+// Patch registers a handler for HTTP PATCH requests at pattern.
 func (m *routeMux) Patch(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodPatch, pattern, handler)
 }
