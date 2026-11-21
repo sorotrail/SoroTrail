@@ -16,16 +16,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/coder/websocket"
+	"github.com/sorotrail/sorotrail/internal/api"
+	"github.com/sorotrail/sorotrail/internal/broadcast"
+	"github.com/sorotrail/sorotrail/internal/store"
 	"github.com/vektah/gqlparser/v2/ast"
 	"github.com/vektah/gqlparser/v2/parser"
-
-	"github.com/sorotrail/sorotrail/internal/api"
-	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // Handler is the runtime for the GraphQL transport: one Resolver,
 // one parsed schema, plus a slog logger. Safe for use across
-// goroutines.
+// goroutines.routines.
 type Handler struct {
 	resolver *Resolver
 	log      *slog.Logger
@@ -424,4 +425,189 @@ func (h *Handler) PlaygroundHandler() http.Handler {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(graphiqlHTML))
 	})
+}
+// SubscriptionManager enforces per-connection/per-tenant limits, periodic re-authorization,
+// backpressure bounds, and query cost limits for GraphQL subscriptions.
+type SubscriptionManager struct {
+	mux           sync.Mutex
+	activeConns   int
+	tenantConns   map[string]int
+	maxConns      int
+	maxTenantConn int
+	logger        *slog.Logger
+	closing       bool
+	closedCh      chan struct{}
+}
+
+func NewSubscriptionManager(maxConns, maxTenantConn int, logger *slog.Logger) *SubscriptionManager {
+	if maxConns <= 0 {
+		maxConns = 1000
+	}
+	if maxTenantConn <= 0 {
+		maxTenantConn = 100
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &SubscriptionManager{
+		tenantConns:   make(map[string]int),
+		maxConns:      maxConns,
+		maxTenantConn: maxTenantConn,
+		logger:        logger,
+		closedCh:      make(chan struct{}),
+	}
+}
+
+func (sm *SubscriptionManager) Acquire(tenantID string) error {
+	sm.mux.Lock()
+	defer sm.mux.Unlock()
+	if sm.closing {
+		return errors.New("server is shutting down")
+	}
+	if sm.activeConns >= sm.maxConns {
+		return errors.New("server subscription connection limit reached")
+	}
+	if tenantID != "" && sm.tenantConns[tenantID] >= sm.maxTenantConn {
+		return errors.New("tenant subscription connection limit reached")
+	}
+	sm.activeConns++
+	if tenantID != "" {
+		sm.tenantConns[tenantID]++
+	}
+	return nil
+}
+
+func (sm *SubscriptionManager) Release(tenantID string) {
+	sm.mux.Lock()
+	defer sm.mux.Unlock()
+	sm.activeConns--
+	if sm.activeConns < 0 {
+		sm.activeConns = 0
+	}
+	if tenantID != "" {
+		sm.tenantConns[tenantID]--
+		if sm.tenantConns[tenantID] <= 0 {
+			delete(sm.tenantConns, tenantID)
+		}
+	}
+}
+
+func (sm *SubscriptionManager) Shutdown() {
+	sm.mux.Lock()
+	if sm.closing {
+		sm.mux.Unlock()
+		return
+	}
+	sm.closing = true
+	close(sm.closedCh)
+	sm.mux.Unlock()
+}
+
+// AssertSubscriptionTenant checks that an event belongs to the client's tenant and tenant scope matches at depth.
+func AssertSubscriptionTenant(eventData any, clientTenant string) bool {
+	if clientTenant == "" {
+		return true
+	}
+	// Inspect event structure recursively at every nested field level to ensure tenancy isolation
+	return assertTenantRecursive(eventData, clientTenant)
+}
+
+func assertTenantRecursive(v any, clientTenant string) bool {
+	if v == nil {
+		return true
+	}
+	switch val := v.(type) {
+	case map[string]any:
+		for k, sub := range val {
+			if k == "tenantId" || k == "tenant_id" {
+				if s, ok := sub.(string); ok && s != "" && s != clientTenant {
+					return false
+				}
+			}
+			if !assertTenantRecursive(sub, clientTenant) {
+				return false
+			}
+		}
+	case []any:
+		for _, item := range val {
+			if !assertTenantRecursive(item, clientTenant) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// CheckSubscriptionQueryCost verifies query cost limits for subscriptions.
+func CheckSubscriptionQueryCost(query string, vars map[string]any, maxCost int) error {
+	cost := EstimateQueryCost(query, vars)
+	if maxCost > 0 && cost > maxCost {
+		return fmt.Errorf("subscription query cost %d exceeds limit %d", cost, maxCost)
+	}
+	return nil
+}
+
+// RunSubscriptionStream manages a subscription lifecycle with periodic re-auth, backpressure, and tenancy isolation.
+func RunSubscriptionStream(ctx context.Context, sm *SubscriptionManager, tenantID string, authCheck func(context.Context) bool, broker *broadcast.Broker, writeMsg func(any) error) error {
+	if err := sm.Acquire(tenantID);
+	err != nil {
+		return err
+	}
+	defer sm.Release(tenantID)
+
+	sub := broker.Subscribe()
+	defer broker.Unsubscribe(sub)
+
+	// Bounded backpressure buffer with gap indicator
+	msgChan := make(chan any, 64)
+	defer close(msgChan)
+
+	// Non-blocking fan-out pump worker
+	stopPump := make(chan struct{})
+	defer close(stopPump)
+	go func() {
+		for {
+			select {
+			case <-stopPump:
+				return
+			case event, ok := <-sub:
+				if !ok {
+					return
+				}
+				select {
+				case msgChan <- event:
+				default:
+					// Backpressure: drop with gap indicator message
+					select {
+					case msgChan <- map[string]any{"__gap": true, "message": "subscription buffer overflow, events dropped"}:
+					default:
+					}
+				}
+			}
+		}
+	}()
+
+	// Periodic re-authorization check (bound: 10 seconds)
+	authTicker := time.NewTicker(10 * time.Second)
+	defer authTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-sm.closedCh:
+			return errors.New("server shutdown")
+		case <-authTicker.C:
+			if authCheck != nil && !authCheck(ctx) {
+				return errors.New("authorization revoked")
+			}
+		case ev := <-msgChan:
+			if !AssertSubscriptionTenant(ev, tenantID) {
+				continue
+			}
+			if err := writeMsg(ev); err != nil {
+				return err
+			}
+		}
+	}
 }
