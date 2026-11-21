@@ -8,6 +8,8 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
+// ContractSpec is defined in spec.go
+
 // ContractSpec represents a parsed contract spec with events.
 type ContractSpec struct {
 	ContractID string      `json:"contract_id"`
@@ -31,9 +33,9 @@ type FieldSpec struct {
 
 // SpecResolver resolves contract specs respecting history and caching with bounding.
 type SpecResolver struct {
-	store  store.Store
-	mu     sync.RWMutex
-	cache  map[string][]*ContractSpec
+	store store.Store
+	mu    sync.RWMutex
+	cache map[string][]*ContractSpec
 }
 
 // NewSpecResolver creates a new spec resolver backed by store.
