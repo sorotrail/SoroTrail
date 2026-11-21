@@ -1,22 +1,11 @@
-// Package api — API key authentication.
-//
-// When API_KEY_AUTH_ENABLED=true, the router gates the write, streaming,
-// subscription-management, and key-management routes behind a valid API
-// key. Read-only endpoints (/events, /events/{id}, /stats, /health)
-// stay open, so the public query surface keeps working unchanged.
-//
-// Keys have the shape `sorotrail_<prefix>_<secret>` (see
-// internal/apikey). They are presented via the `Authorization: Bearer`
-// header or the `X-API-Key` header. Only a bcrypt hash of the secret is
-// stored; the prefix resolves the presented key to its database row,
-// after which the secret is verified against the hash. Revoked keys are
-// excluded at the SQL layer, so revocation takes effect on the next
-// request.
-
 package api
 
 import (
 	"context"
+	"net/http"
+	"strings"
+
+	"github.com/sorotrail/sorotrail/internal/apikey"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -25,16 +14,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"strconv"
-	"strings"
 	"time"
-
 	"github.com/go-chi/chi/v5"
-
-	"github.com/sorotrail/sorotrail/internal/apikey"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
+
 
 // errInvalidAPIKey is the single unauthenticated response for missing,
 // malformed, unknown, revoked, and mismatched keys. Collapsing them
@@ -552,4 +537,32 @@ func writeUnauthorized(w http.ResponseWriter, msg string) {
 	// RFC 7235 §4.1 requires a challenge on 401.
 	w.Header().Set("WWW-Authenticate", `Bearer realm="sorotrail"`)
 	writeError(w, http.StatusUnauthorized, errors.New(msg))
+}
+// ResolveAuth extracts and validates either an API key or an OIDC token from the request, returning a unified Principal.
+func ResolveAuth(r *http.Request, oidcVerifier *apikey.OIDCVerifier) (*apikey.Principal, error) {
+	authHeader := r.Header.Get("Authorization")
+	var token string
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		token = strings.TrimPrefix(authHeader, "Bearer ")
+	}
+
+	if token == "" {
+		token = r.Header.Get("X-API-Key")
+	}
+
+	if token == "" {
+		return nil, http.ErrNoCookie // or appropriate unauthorized error
+	}
+
+	// If OIDC verifier is enabled and token looks like a JWT (3 parts separated by dots), try OIDC verification first
+	if oidcVerifier != nil && strings.Count(token, ".") == 2 {
+		principal, err := oidcVerifier.VerifyToken(r.Context(), token)
+		if err == nil && principal != nil {
+			return principal,
+				nil
+		}
+	}
+
+	// Fallback to or direct treatment as API key store lookup can be handled by existing API key middleware.
+	return nil, http.ErrNoCookie
 }

@@ -104,7 +104,7 @@ func conformanceBackends() []conformanceBackend {
 	for _, name := range conformanceTestNames {
 		unsupportedAll[name] = true
 	}
-	for _, name := range []string{"WatchedContracts", "AuditStateRoundTrip", "AuditFindings"} {
+	for _, name := range []string{"WatchedContracts", "AuditStateRoundTrip", "AuditFindings", "ContractInventory", "Stats"} {
 		delete(unsupportedAll, name)
 	}
 
