@@ -67,6 +67,56 @@ func TestApplyInvalidation(t *testing.T) {
 	})
 }
 
+func TestAuthCacheClear(t *testing.T) {
+	now := time.Now()
+	key := store.TenantAPIKey{ID: 7, TenantID: 42, Prefix: "pfx1", Name: "deploy"}
+	tenant := store.Tenant{ID: 42, Name: "acme", Enabled: true}
+	scope := store.NewScope([]string{"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"})
+	singleKey := store.APIKey{ID: 9, Prefix: "pfx2", Name: "single"}
+
+	t.Run("happy path evicts every cached entry", func(t *testing.T) {
+		c := NewAuthCache(time.Minute)
+		c.PutTenantAuth(key, []byte("digest-bytes"), tenant, scope, now)
+		c.PutAPIKey(singleKey, now)
+
+		_, _, _, _, ok := c.GetTenantAuth("pfx1", now)
+		require.True(t, ok, "the tenant entry is cached before Clear")
+		_, ok = c.GetAPIKey("pfx2", now)
+		require.True(t, ok, "the single API key is cached before Clear")
+
+		c.Clear()
+
+		_, _, _, _, ok = c.GetTenantAuth("pfx1", now)
+		assert.False(t, ok, "Clear must evict tenant auth entries")
+		_, ok = c.GetAPIKey("pfx2", now)
+		assert.False(t, ok, "Clear must evict single-tenant API keys")
+		_, _, invalidations := c.Stats()
+		assert.Equal(t, uint64(2), invalidations, "Clear counts each evicted entry as an invalidation")
+
+		// The cache remains usable after Clear.
+		c.PutTenantAuth(key, []byte("new-digest"), tenant, scope, now)
+		_, _, _, _, ok = c.GetTenantAuth("pfx1", now)
+		assert.True(t, ok, "the cache accepts entries again after Clear")
+	})
+
+	t.Run("empty or nil cache counts no invalidations", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			cache *AuthCache
+		}{
+			{name: "empty cache", cache: NewAuthCache(time.Minute)},
+			{name: "nil cache", cache: nil},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				assert.NotPanics(t, func() { tt.cache.Clear() })
+				_, _, invalidations := tt.cache.Stats()
+				assert.Zero(t, invalidations, "nothing was cached, so nothing was evicted")
+			})
+		}
+	})
+}
+
 func TestAuthCacheGetTenantAuth(t *testing.T) {
 	now := time.Now()
 	key := store.TenantAPIKey{ID: 7, TenantID: 42, Prefix: "pfx1", Name: "deploy"}
