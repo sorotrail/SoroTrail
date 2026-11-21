@@ -21,6 +21,8 @@ field halts the process mid-flight; every problem is printed before `os.Exit(1)`
 endpoint and Stellar network passphrase. Ingestion state and persisted events
 are keyed by this network, so changing networks does not reuse cursors.
 
+`RPC_URL` sets a custom Soroban RPC endpoint URL. When not set, defaults to the standard RPC endpoint corresponding to the configured `NETWORK`. Example: `RPC_URL=https://soroban-testnet.stellar.org`.
+
 ## URL format
 | Variable   | Rule                                 |
 |------------|--------------------------------------|
