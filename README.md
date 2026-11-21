@@ -502,6 +502,29 @@ ARCHIVE_BEFORE_PRUNE=true
 
 ### Multi-tenancy
 
+Set `MULTI_TENANT=true` and provide a `MULTI_TENANT_BOOTSTRAP_KEY` to serve several consumers from one deployment, each scoped to its own contracts. Off = no authentication, no tenant boundary. See [Multi-tenancy](docs/multi-tenancy.md).
+
+**Example: start a multi-tenant deployment**
+
+```sh
+# 1. Bring up Postgres and the indexer
+docker compose --profile prod up -d --build
+
+# 2. Create an API key for the first tenant (admin access required)
+sorotrail apikey create --name "tenant-a"
+
+# 3. Add the first watched contract for tenant A
+sorotrail contracts add --url http://localhost:8080 --confirm \
+  -k "$(sorotrail apikey list --format '{{.Key}}' | head -1)" \
+  CDBLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+
+# 4. Add a second watched contract for tenant B (using a different key)
+sorotrail apikey create --name "tenant-b"
+sorotrail contracts add --url http://localhost:8080 --confirm \
+  -k "$(sorotrail apikey list --format '{{.Key}}' | tail -1)" \
+  CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+```
+
 | Variable | Type | Default | Description | Reload |
 | --- | --- | --- | --- | --- |
 | `MULTI_TENANT` | bool | `false` | Serve several consumers from one deployment, each scoped to its own contracts. Off = no authentication, no tenant boundary. See [Multi-tenancy](docs/multi-tenancy.md). | restart |

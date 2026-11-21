@@ -305,3 +305,16 @@ func TestClientCertIdentity_AllIdentities(t *testing.T) {
 		})
 	}
 }
+
+func TestClientCertIdentityFrom_HappyPath(t *testing.T) {
+	identity := ClientCertIdentity{
+		SubjectCN: "test-cn",
+		SANURIs:   []string{"spiffe://example.com/id"},
+		SANDNS:    []string{"test.dns.example"},
+	}
+
+	ctx := context.WithValue(context.Background(), clientCertCtxKey{}, identity)
+	got, ok := ClientCertIdentityFrom(ctx)
+	require.True(t, ok)
+	assert.Equal(t, identity, got)
+}
