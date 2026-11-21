@@ -20,6 +20,14 @@ The completed sink must provide:
 - a `--from-ledger` reset flow; and
 - HA leadership enforcement so only the active leader publishes.
 
+## Fairness Policy and Capacity Bounds
+
+- **Tenant and Subscription Capacity Isolation:** Delivery capacity is managed via bounded per-tenant queues and a shared worker pool with per-tenant semaphores/concurrency limits. No single noisy tenant or slow consumer endpoint can starve other tenants or subscriptions.
+- **Retries Starvation Prevention:** Retries are scheduled with backoff and processed through separate or lower priority/bounded paths so a retry storm cannot consume capacity needed for new event deliveries.
+- **Non-Blocking Ingestion:** The broadcast and webhook delivery path never blocks ingestion. Events are ingested durably and dispatched asynchronously to the delivery layer.
+- **Backlog Visibility & Dead Letters:** Queue depths and backlogs are tracked per tenant and per subscription. Persistently failing subscriptions are disabled after consecutive failures and route to the dead-letter sink rather than retrying indefinitely.
+- **Ordering & Head-of-Line Protection:** Ordering within a subscription is preserved by serializing delivery per subscription while concurrent deliveries are isolated across separate subscriptions and tenants.
+
 Consumers must deduplicate on the event `id` because a crash after broker
 acknowledgement and before cursor persistence intentionally replays the event.
 The payload must be identical to the API event JSON, with headers `id`,
