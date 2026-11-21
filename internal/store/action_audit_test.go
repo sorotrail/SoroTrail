@@ -28,6 +28,37 @@ func actionAuditTestBackends(t *testing.T) map[string]ActionAuditStore {
 	}
 }
 
+func TestSanitizeActorIdentifier(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		// Happy path: identifiers without secret material pass through, with
+		// surrounding whitespace trimmed.
+		{name: "plain identifier is preserved", input: "operator@example.com", want: "operator@example.com"},
+		{name: "surrounding whitespace is trimmed", input: "  ci-deployer\t", want: "ci-deployer"},
+		{name: "empty identifier stays empty", input: "   ", want: ""},
+		{name: "already redacted key is unchanged", input: "sorotrail_0123456789abcdef", want: "sorotrail_0123456789abcdef"},
+
+		// Error path: a secret-bearing actor ID must never be returned raw.
+		{name: "full api key keeps only public prefix", input: "sorotrail_0123456789abcdef_supersecret", want: "sorotrail_0123456789abcdef"},
+		{name: "tenant api key keeps only public prefix", input: "st_9988776655443322_supersecret", want: "st_9988776655443322"},
+		{name: "bearer api key keeps only public prefix", input: "Bearer sorotrail_0123456789abcdef_supersecret", want: "sorotrail_0123456789abcdef"},
+		{name: "opaque bearer token is fully redacted", input: "Bearer opaque-token-value", want: "bearer-redacted"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SanitizeActorIdentifier(tt.input)
+
+			assert.Equal(t, tt.want, got)
+			assert.NotContains(t, got, "supersecret", "raw key secret must never be returned")
+			assert.NotContains(t, got, "opaque-token-value", "raw bearer token must never be returned")
+		})
+	}
+}
+
 func TestActionAuditStore_RecordQueryAndHashChain(t *testing.T) {
 	for name, st := range actionAuditTestBackends(t) {
 		t.Run(name, func(t *testing.T) {
