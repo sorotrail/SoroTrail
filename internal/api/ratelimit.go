@@ -463,7 +463,20 @@ type QuotaStore interface {
 }
 
 func (l *RateLimiter) checkQuota(ctx context.Context, key string, now time.Time) (remaining int64, retryAfter time.Duration, ok bool) {
-	if storeVal, okStore := l.resolve.(QuotaStore); okStore {
+	var storeVal QuotaStore
+	if qs, ok := l.resolve.(QuotaStore); ok {
+		storeVal = qs
+	} else if rs, ok := l.resolve.(interface {
+		IncrementQuota(context.Context, string, time.Time) (int64, int64, error)
+	}); ok {
+		storeVal = struct{ QuotaStore }{QuotaStore: struct {
+			IncrementQuota func(context.Context, string, time.Time) (int64, int64, error)
+		}{
+			IncrementQuota: rs.IncrementQuota,
+		}}
+	}
+
+	if storeVal != nil {
 		hUsed, dUsed, err := storeVal.IncrementQuota(ctx, key, now)
 		if err == nil {
 			q := l.quotas[key]
@@ -521,21 +534,8 @@ func (l *RateLimiter) checkQuota(ctx context.Context, key string, now time.Time)
 			return 0, retryAfter, false
 		}
 	}
-	if storeVal, okStore := l.resolve.(interface {
-		IncrementQuota(context.Context, string, time.Time) (int64, int64, error)
-	}); okStore {
-		hUsed, dUsed, err := storeVal.IncrementQuota(context.Background(), key, now)
-		if err == nil {
-			q.hourUsed = hUsed
-			q.dayUsed = dUsed
-		} else {
-			q.hourUsed++
-			q.dayUsed++
-		}
-	} else {
-		q.hourUsed++
-		q.dayUsed++
-	}
+	q.hourUsed++
+	q.dayUsed++
 	remaining = l.hourlyQuota - q.hourUsed
 	if l.dailyQuota > 0 {
 		dailyRemaining := l.dailyQuota - q.dayUsed
