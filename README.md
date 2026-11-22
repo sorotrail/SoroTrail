@@ -496,6 +496,24 @@ ARCHIVE_BEFORE_PRUNE=true
 
 ### Export
 
+Export streams a contract's stored events for a closed ledger range as an
+attachment download. Supports CSV (default) or NDJSON format.
+
+```sh
+# CSV — id, ledger, type, tx_hash, topics (JSON string), value (JSON string)
+sorotrail contracts export \
+  --contract CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC \
+  --from-ledger 250000 --to-ledger 260000 \
+  --output contract_events.csv
+
+# NDJSON — one event object per line, same shape as /events
+sorotrail contracts export \
+  --contract CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC \
+  --from-ledger 250000 --to-ledger 260000 \
+  --format ndjson \
+  --output contract_events.ndjson
+```
+
 | Variable | Type | Default | Description | Reload |
 | --- | --- | --- | --- | --- |
 | `EXPORT_MAX_RANGE` | int64 | `17280` | Maximum ledger span a single `/contracts/{id}/export` call may request (~24h at 5s/ledger). Returns 400 if exceeded. | restart |
