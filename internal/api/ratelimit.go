@@ -38,6 +38,18 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// QuotaStore defines the interface for shared quota persistence across replicas.
+type QuotaStore interface {
+	IncrementQuota(ctx context.Context, clientKey string, now time.Time, batchSize int) (int64, int64, error)
+}
+
+// WithQuotaStore configures a shared store for hourly and daily quotas.
+func WithQuotaStore(store QuotaStore) LimiterOption {
+	return func(l *RateLimiter) {
+		l.quotaStore = store
+	}
+}
+
 // exemptPaths are HTTP paths that bypass the limiter. /health is polled
 // by orchestrators and /metrics is scraped by Prometheus — throttling
 // either of those degrades observability without slowing an abuser.
@@ -178,18 +190,6 @@ func WithDailyQuota(limit int64) LimiterOption {
 		if limit >= 0 {
 			l.dailyQuota = limit
 		}
-	}
-}
-
-// QuotaStore defines the interface for shared quota persistence across replicas.
-type QuotaStore interface {
-	IncrementQuota(ctx context.Context, clientKey string, now time.Time, batchSize int) (int64, int64, error)
-}
-
-// WithQuotaStore configures a shared store for hourly and daily quotas.
-func WithQuotaStore(store QuotaStore) LimiterOption {
-	return func(l *RateLimiter) {
-		l.quotaStore = store
 	}
 }
 
