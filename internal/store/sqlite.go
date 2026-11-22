@@ -1,6 +1,7 @@
 package store
 
 import (
+	"log/slog"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -79,6 +80,7 @@ var _ Store = (*SQLite)(nil)
 // owns the DB's lifecycle. Pragma settings for WAL mode and busy timeout
 // are applied automatically.
 func NewSQLite(db *sql.DB) *SQLite {
+	slog.Info("sqlite store initialized, quota enforcement is single-node in-process by definition")
 	return &SQLite{db: db}
 }
 
