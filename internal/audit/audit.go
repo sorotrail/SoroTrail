@@ -647,7 +647,7 @@ func (v *Verifier) VerifyChain(ctx context.Context, fromSequence int64, tenantID
 	if v == nil || v.pool == nil {
 		return 0, errors.New("verifier uninitialized")
 	}
-	var rows interface{}
+	var rows pgx.Rows
 	var err error
 	if tenantID != nil {
 		rows, err = v.pool.Query(ctx, `SELECT sequence, timestamp, tenant_id, action, actor, target, prev_hash, hash FROM audit_records WHERE sequence >= $1 AND (tenant_id = $2 OR tenant_id IS NULL) ORDER BY sequence ASC`, fromSequence, *tenantID)
