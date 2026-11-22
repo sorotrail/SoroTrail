@@ -2,15 +2,14 @@ package api
 
 import (
 	"context"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"golang.org/x/time/rate"
 )
 
 func mkReq(method, path string) *http.Request {
@@ -654,6 +653,33 @@ func TestRateLimiterQuotaCountersSurviveBucketRecreation(t *testing.T) {
 	// The refusals touched the bucket (lastSeen), not the quota counters.
 	assert.Equal(t, int64(1), lim.quotas["203.0.113.83"].dayUsed,
 		"a refused request must not consume quota or reset the window")
+}
+
+type mockQuotaStore struct {
+	hourUsed, dayUsed int64
+}
+
+func (m *mockQuotaStore) IncrementQuota(ctx context.Context, clientKey string, now time.Time, batchSize int) (int64, int64, error) {
+	m.hourUsed += int64(batchSize)
+	m.dayUsed += int64(batchSize)
+	return m.hourUsed, m.dayUsed, nil
+}
+
+func TestMultiInstanceRateLimiterQuotaShared(t *testing.T) {
+	store := &mockQuotaStore{}
+	limiter1 := NewRateLimiter(10, 100, false, WithQuotaStore(store), WithDailyQuota(10))
+	limiter2 := NewRateLimiter(10, 100, false, WithQuotaStore(store), WithDailyQuota(10))
+
+	for i := 0; i < 5; i++ {
+		rec := sendFrom(limiter1, "203.0.113.99:1234")
+		require.Equal(t, http.StatusOK, rec.Code)
+	}
+	for i := 0; i < 5; i++ {
+		rec := sendFrom(limiter2, "203.0.113.99:1234")
+		require.Equal(t, http.StatusOK, rec.Code)
+	}
+	rec := sendFrom(limiter1, "203.0.113.99:1234")
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
 }
 
 // TestClearBuckets drops all cached token buckets.
