@@ -263,6 +263,33 @@ because what costs the operator RPC budget is the number of distinct
 contracts polled. A contract another tenant already watches is therefore
 free to add.
 
+## Usage Metering & Attribution
+
+SoroTrail meters consumption per tenant to answer operational and billing questions without multiplying Prometheus cardinality by the tenant population.
+
+### What is Metered
+
+- **Requests by Outcome**: Success and error counts (`sorotrail_tenant_requests_total`).
+- **Query Duration**: Cumulative milliseconds spent executing queries (`sorotrail_tenant_query_duration_ms_sum`).
+- **Events Ingested**: Events ingested on behalf of a tenant's watched contracts (`sorotrail_tenant_events_ingested_total`).
+- **Rows Stored**: Database rows written for tenant data (`sorotrail_tenant_rows_stored_total`).
+- **Subscription Deliveries**: Webhook and stream delivery counts (`sorotrail_tenant_subscription_deliveries_total`).
+- **Bytes Exported**: Data volume streamed out via exports (`sorotrail_tenant_bytes_exported_total`).
+
+### Attribution Rules for Non-Request Work
+
+- **Ingestion**: Ingestion runs on the poller's schedule, not inside a request. Events ingested for a contract watched by multiple tenants are attributed to all watching tenants (shared-contract counting rule).
+- **Storage Footprint**: Storage is approximated per tenant based on their active grants and ingested event volume on shared tables.
+
+### Durable Rollups and Invoicing
+
+Usage counters accumulate in memory and flush periodically into durable daily rollups (`tenant_usage` table). This survives process restarts and provides historical records suitable for invoices or reports.
+
+Query usage via the API:
+
+- **Tenant Self-Service**: `GET /tenant/usage?days=N`
+- **Operator Admin View**: `GET /admin/tenants/{id}/usage?days=N`
+
 ## Quotas and usage
 
 Rate limits key on the **tenant**, not the source IP. IP keying is wrong on
