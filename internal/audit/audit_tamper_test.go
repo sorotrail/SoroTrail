@@ -1,3 +1,5 @@
+//go:build integration
+
 package audit
 
 import (
@@ -82,7 +84,7 @@ func TestAuditChainIntegrityAndScenarios(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verification starting from remaining sequence 2 should succeed because a checkpoint exists for prior state
-	lastRet, err := v.VerifyChain(ctx, 2)
+	lastRet, err := v.VerifyChain(ctx, 2, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, int64(2), lastRet)
 
@@ -93,7 +95,7 @@ func TestAuditChainIntegrityAndScenarios(t *testing.T) {
 	// 3. Truncated table / missing records simulation (without checkpoint covering gap)
 	_, err = db.Exec(ctx, `DELETE FROM audit_records WHERE sequence = 2`)
 	require.NoError(t, err)
-	_, err = v.VerifyChain(ctx, 1)
+	_, err = v.VerifyChain(ctx, 1, nil)
 	assert.Error(t, err, "truncated table must fail verification")
 
 	// Restore row 2
@@ -103,6 +105,6 @@ func TestAuditChainIntegrityAndScenarios(t *testing.T) {
 	// 4. Altered record verification failure
 	_, err = db.Exec(ctx, `UPDATE audit_records SET hash = 'tampered' WHERE sequence = 1`)
 	require.NoError(t, err)
-	_, err = v.VerifyChain(ctx, 1)
+	_, err = v.VerifyChain(ctx, 1, nil)
 	assert.Error(t, err, "altered record must fail verification")
 }
