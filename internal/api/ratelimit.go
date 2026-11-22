@@ -59,6 +59,7 @@ type RateLimiter struct {
 
 	hourlyQuota int64
 	dailyQuota  int64
+	quotaStore  QuotaStore
 
 	// idleTTL is the wall-clock age beyond which an untouched bucket is
 	// evicted. sweepEvery is the cleanup tick. Both are tunable for tests
@@ -177,6 +178,18 @@ func WithDailyQuota(limit int64) LimiterOption {
 		if limit >= 0 {
 			l.dailyQuota = limit
 		}
+	}
+}
+
+// QuotaStore defines the interface for shared quota persistence across replicas.
+type QuotaStore interface {
+	IncrementQuota(ctx context.Context, clientKey string, now time.Time, batchSize int) (int64, int64, error)
+}
+
+// WithQuotaStore configures a shared store for hourly and daily quotas.
+func WithQuotaStore(store QuotaStore) LimiterOption {
+	return func(l *RateLimiter) {
+		l.quotaStore = store
 	}
 }
 
@@ -457,19 +470,10 @@ func (l *RateLimiter) quotaEnabled() bool {
 
 // checkQuota enforces the fixed quota windows for key and increments the
 // counters when the request is admitted. The caller holds l.mu.
-// QuotaStore defines the interface for shared quota enforcement across replicas.
-type QuotaStore interface {
-	IncrementQuota(ctx context.Context, clientKey string, now time.Time) (hourUsed, dayUsed int64, err error)
-}
 
 func (l *RateLimiter) checkQuota(ctx context.Context, key string, now time.Time) (remaining int64, retryAfter time.Duration, ok bool) {
-	var storeVal QuotaStore
-	if qs, ok := interface{}(l.resolve).(QuotaStore); ok {
-		storeVal = qs
-	}
-
-	if storeVal != nil {
-		hUsed, dUsed, err := storeVal.IncrementQuota(ctx, key, now)
+	if l.quotaStore != nil {
+		hUsed, dUsed, err := l.quotaStore.IncrementQuota(ctx, key, now, 1)
 		if err == nil {
 			q := l.quotas[key]
 			if q == nil {

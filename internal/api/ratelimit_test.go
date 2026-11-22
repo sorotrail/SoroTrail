@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
-
 
 func TestMultiInstanceRateLimiterQuotaShared(t *testing.T) {
 	store := &mockQuotaStore{}
@@ -673,10 +673,13 @@ func TestRateLimiterQuotaCountersSurviveBucketRecreation(t *testing.T) {
 }
 
 type mockQuotaStore struct {
+	mu                sync.Mutex
 	hourUsed, dayUsed int64
 }
 
 func (m *mockQuotaStore) IncrementQuota(ctx context.Context, clientKey string, now time.Time, batchSize int) (int64, int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.hourUsed += int64(batchSize)
 	m.dayUsed += int64(batchSize)
 	return m.hourUsed, m.dayUsed, nil
