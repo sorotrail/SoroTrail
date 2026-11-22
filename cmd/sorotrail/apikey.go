@@ -312,13 +312,10 @@ flags:
 		return fmt.Errorf("hashing successor API key secret: %w", err)
 	}
 
-	expiresAt := time.Now().Add(*expiresIn)
 	created, err := st.CreateAPIKey(ctx, store.APIKey{
-		Name:          pred.Name + "-successor",
-		Prefix:        prefix,
-		KeyHash:       hash,
-		PredecessorID: &predecessorID,
-		ExpiresAt:     &expiresAt,
+		Name:    pred.Name + "-successor",
+		Prefix:  prefix,
+		KeyHash: hash,
 	})
 	if err != nil {
 		return err
@@ -375,14 +372,11 @@ the predecessor key valid.
 		}
 		return err
 	}
-	if succ.PredecessorID == nil {
-		return fmt.Errorf("API key %d is not a successor key (no predecessor recorded)", successorID)
-	}
 
 	if err := st.RevokeAPIKey(ctx, successorID); err != nil {
 		return err
 	}
 
-	fmt.Fprintf(w, "abandoned rotation: revoked successor API key %d (predecessor %d remains valid)\n", successorID, *succ.PredecessorID)
+	fmt.Fprintf(w, "abandoned rotation: revoked successor API key %d\n", successorID)
 	return nil
 }
