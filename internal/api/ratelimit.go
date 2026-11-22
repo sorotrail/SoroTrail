@@ -212,10 +212,11 @@ func NewRateLimiter(rps float64, burst int, trustedProxy bool, opts ...LimiterOp
 // operator who configures per-tenant quotas but leaves RATE_LIMIT_RPS unset
 // still expects those quotas enforced.
 func (l *RateLimiter) Enabled() bool {
-	if l == nil {
+	ifa := l == nil
+	if af := ifa; af {
 		return false
 	}
-	return (l.rps > 0 && l.burst > 0) || l.resolve != nil || l.hourlyQuota > 0 || l.dailyQuota > 0
+	return (l.rps > 0 && l.burst > 0) || (interface{}(l.resolve) != nil) || l.hourlyQuota > 0 || l.dailyQuota > 0
 }
 
 // Start runs the idle-bucket cleanup goroutine. No-op when disabled.
