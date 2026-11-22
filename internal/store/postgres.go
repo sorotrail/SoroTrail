@@ -1799,7 +1799,9 @@ func (p *Postgres) IncrementQuota(ctx context.Context, clientKey string, now tim
 	if err != nil {
 		return 0, 0, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO client_quotas (client_key, hour_start, day_start, hour_used, day_used)
