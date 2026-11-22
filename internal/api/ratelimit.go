@@ -498,6 +498,33 @@ func (l *RateLimiter) checkQuota(ctx context.Context, key string, now time.Time)
 		}
 	}
 
+	if l.quotaStore != nil {
+		hUsed, dUsed, err := l.quotaStore.IncrementQuota(ctx, key, now, 1)
+		if err == nil {
+			q := l.quotas[key]
+			if q == nil {
+				q = &quotaEntry{}
+				l.quotas[key] = q
+			}
+			q.hourUsed = hUsed
+			q.dayUsed = dUsed
+			remaining = l.hourlyQuota - q.hourUsed
+			if l.dailyQuota > 0 {
+				dailyRemaining := l.dailyQuota - q.dayUsed
+				if l.hourlyQuota <= 0 || dailyRemaining < remaining {
+					remaining = dailyRemaining
+				}
+			}
+			if l.hourlyQuota > 0 && remaining < 0 {
+				remaining = 0
+			}
+			if l.dailyQuota > 0 && remaining < 0 {
+				remaining = 0
+			}
+			return remaining, 0, true
+		}
+	}
+
 	q := l.quotas[key]
 	if q == nil {
 		q = &quotaEntry{}
