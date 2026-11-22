@@ -464,16 +464,8 @@ type QuotaStore interface {
 
 func (l *RateLimiter) checkQuota(ctx context.Context, key string, now time.Time) (remaining int64, retryAfter time.Duration, ok bool) {
 	var storeVal QuotaStore
-	if qs, ok := l.resolve.(QuotaStore); ok {
+	if qs, ok := interface{}(l.resolve).(QuotaStore); ok {
 		storeVal = qs
-	} else if rs, ok := l.resolve.(interface {
-		IncrementQuota(context.Context, string, time.Time) (int64, int64, error)
-	}); ok {
-		storeVal = struct{ QuotaStore }{QuotaStore: struct {
-			IncrementQuota func(context.Context, string, time.Time) (int64, int64, error)
-		}{
-			IncrementQuota: rs.IncrementQuota,
-		}}
 	}
 
 	if storeVal != nil {
