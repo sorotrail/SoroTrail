@@ -49,43 +49,43 @@ func TestNewStoreBreaker_ClampsInvalidOptions(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		opts        BreakerOptions
-		wantFT      int
-		wantBase    time.Duration
-		wantMax     time.Duration
+		name string
+		in   BreakerOptions
+		ft   int
+		base time.Duration
+		max  time.Duration
 	}{
 		{
-			name:     "zero FailureThreshold replaced by default",
-			opts:     BreakerOptions{FailureThreshold: 0, BaseCooldown: time.Second, MaxCooldown: 5 * time.Second},
-			wantFT:   3,
-			wantBase: time.Second,
-			wantMax:  5 * time.Second,
+			name: "zero FailureThreshold replaced by default",
+			in:   BreakerOptions{FailureThreshold: 0, BaseCooldown: time.Second, MaxCooldown: 5 * time.Second},
+			ft:   3,
+			base: time.Second,
+			max:  5 * time.Second,
 		},
 		{
-			name:     "negative FailureThreshold replaced by default",
-			opts:     BreakerOptions{FailureThreshold: -1, BaseCooldown: time.Second, MaxCooldown: 5 * time.Second},
-			wantFT:   3,
-			wantBase: time.Second,
-			wantMax:  5 * time.Second,
+			name: "negative FailureThreshold replaced by default",
+			in:   BreakerOptions{FailureThreshold: -1, BaseCooldown: time.Second, MaxCooldown: 5 * time.Second},
+			ft:   3,
+			base: time.Second,
+			max:  5 * time.Second,
 		},
 		{
-			name:     "MaxCooldown below BaseCooldown is raised to BaseCooldown",
-			opts:     BreakerOptions{FailureThreshold: 2, BaseCooldown: 4 * time.Second, MaxCooldown: time.Second},
-			wantFT:   2,
-			wantBase: 4 * time.Second,
-			wantMax:  4 * time.Second,
+			name: "MaxCooldown below BaseCooldown is raised to BaseCooldown",
+			in:   BreakerOptions{FailureThreshold: 2, BaseCooldown: 4 * time.Second, MaxCooldown: time.Second},
+			ft:   2,
+			base: 4 * time.Second,
+			max:  4 * time.Second,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			b := NewStoreBreaker(tc.opts)
+			b := NewStoreBreaker(tc.in)
 			require.NotNil(t, b)
-			assert.Equal(t, tc.wantFT, b.opts.FailureThreshold)
-			assert.Equal(t, tc.wantBase, b.opts.BaseCooldown)
-			assert.Equal(t, tc.wantMax, b.opts.MaxCooldown)
+			assert.Equal(t, tc.ft, b.opts.FailureThreshold)
+			assert.Equal(t, tc.base, b.opts.BaseCooldown)
+			assert.Equal(t, tc.max, b.opts.MaxCooldown)
 			assert.Equal(t, BreakerClosed, b.State())
 		})
 	}

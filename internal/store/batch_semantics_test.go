@@ -14,8 +14,8 @@ import (
 // stubNetError is a minimal net.Error for testing the transient-network branch.
 type stubNetError struct{}
 
-func (stubNetError) Error() string   { return "stub network error" }
-func (stubNetError) Timeout() bool   { return false }
+func (stubNetError) Error() string { return "stub network error" }
+func (stubNetError) Timeout() bool { return false }
 func (stubNetError) Temporary() bool { return true }
 
 var _ net.Error = stubNetError{}
@@ -23,9 +23,9 @@ var _ net.Error = stubNetError{}
 func TestIsPermanentEventError(t *testing.T) {
 	t.Parallel()
 
-	pgData := &pgconn.PgError{Code: "22001"} // invalid_text_representation — class 22
-	pgIntegrity := &pgconn.PgError{Code: "23505"} // unique_violation — class 23
-	pgOther := &pgconn.PgError{Code: "42601"} // syntax_error — class 42, not permanent
+	pgData := &pgconn.PgError{Code: "22001"}
+	pgIntegrity := &pgconn.PgError{Code: "23505"}
+	pgOther := &pgconn.PgError{Code: "42601"}
 
 	tests := []struct {
 		name string
