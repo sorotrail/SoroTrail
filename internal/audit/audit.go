@@ -4,12 +4,16 @@ package audit
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 
@@ -575,4 +579,177 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+// Record represents an immutable, tamper-evident audit log entry.
+type Record struct {
+	Sequence  int64     `json:"sequence"`
+	Timestamp time.Time `json:"timestamp"`
+	TenantID  *int64    `json:"tenant_id,omitempty"`
+	Action    string    `json:"action"`
+	Actor     string    `json:"actor"`
+	Target    string    `json:"target"`
+	PrevHash  string    `json:"prev_hash"`
+	Hash      string    `json:"hash"`
+}
+
+// Checkpoint represents an external checkpoint of the current chain head.
+type Checkpoint struct {
+	Sequence  int64     `json:"sequence"`
+	Hash      string    `json:"hash"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// Verifier checks audit chain integrity.
+type Verifier struct {
+	pool *pgxpool.Pool
+}
+
+// NewVerifier creates a new Verifier backed by Postgres.
+func NewVerifier(pool *pgxpool.Pool) *Verifier {
+	return &Verifier{pool: pool}
+}
+
+// Canonicalize produces a stable JSON representation of the audit record fields excluding the hash itself.
+func Canonicalize(r Record) ([]byte, error) {
+	payload := struct {
+		Sequence  int64  `json:"sequence"`
+		Timestamp string `json:"timestamp"`
+		TenantID  *int64 `json:"tenant_id,omitempty"`
+		Action    string `json:"action"`
+		Actor     string `json:"actor"`
+		Target    string `json:"target"`
+		PrevHash  string `json:"prev_hash"`
+	}{
+		Sequence:  r.Sequence,
+		Timestamp: r.Timestamp.UTC().Format(time.RFC3339Nano),
+		TenantID:  r.TenantID,
+		Action:    r.Action,
+		Actor:     r.Actor,
+		Target:    r.Target,
+		PrevHash:  r.PrevHash,
+	}
+	return json.Marshal(payload)
+}
+
+// ComputeHash computes the SHA-256 hash for a record given its predecessor's hash.
+func ComputeHash(r Record) (string, error) {
+	canonical, err := Canonicalize(r)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// VerifyChain verifies audit record integrity starting from a given sequence or full history, optionally filtered by tenant.
+func (v *Verifier) VerifyChain(ctx context.Context, fromSequence int64, tenantID *int64) (int64, error) {
+	if v == nil || v.pool == nil {
+		return 0, errors.New("verifier uninitialized")
+	}
+	var rows pgx.Rows
+	var err error
+	if tenantID != nil {
+		rows, err = v.pool.Query(ctx, `SELECT sequence, timestamp, tenant_id, action, actor, target, prev_hash, hash FROM audit_records WHERE sequence >= $1 AND (tenant_id = $2 OR tenant_id IS NULL) ORDER BY sequence ASC`, fromSequence, *tenantID)
+	} else {
+		rows, err = v.pool.Query(ctx, `SELECT sequence, timestamp, tenant_id, action, actor, target, prev_hash, hash FROM audit_records WHERE sequence >= $1 ORDER BY sequence ASC`, fromSequence)
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	var expectedPrev = ""
+	if fromSequence > 1 {
+		var prevHash string
+		err := v.pool.QueryRow(ctx, `SELECT hash FROM audit_records WHERE sequence = $1`, fromSequence-1).Scan(&prevHash)
+		if err == nil {
+			expectedPrev = prevHash
+		} else {
+			// Checkpoint grace for retention sweeps
+			var cpHash string
+			errCP := v.pool.QueryRow(ctx, `SELECT hash FROM audit_checkpoints WHERE sequence = $1`, fromSequence-1).Scan(&cpHash)
+			if errCP == nil {
+				expectedPrev = cpHash
+			}
+		}
+	}
+
+	var lastSeq int64 = fromSequence - 1
+	first := true
+
+	for rows.Next() {
+		var r Record
+		var ts time.Time
+		var tid *int64
+		err := rows.Scan(&r.Sequence, &ts, &tid, &r.Action, &r.Actor, &r.Target, &r.PrevHash, &r.Hash)
+		if err != nil {
+			return lastSeq, err
+		}
+		r.Timestamp = ts
+		r.TenantID = tid
+
+		if tenantID != nil && tid != nil && *tid != *tenantID {
+			continue
+		}
+
+		if first {
+			if r.Sequence > 1 && fromSequence > 1 && r.PrevHash != expectedPrev {
+				return r.Sequence, fmt.Errorf("chain divergence at sequence %d: expected prev_hash %s, got %s", r.Sequence, expectedPrev, r.PrevHash)
+			}
+			first = false
+		} else {
+			if r.PrevHash != expectedPrev {
+				return r.Sequence, fmt.Errorf("chain divergence at sequence %d: prev_hash mismatch", r.Sequence)
+			}
+		}
+
+		calcHash, err := ComputeHash(r)
+		if err != nil {
+			return r.Sequence, err
+		}
+		if calcHash != r.Hash {
+			return r.Sequence, fmt.Errorf("hash mismatch at sequence %d", r.Sequence)
+		}
+
+		expectedPrev = r.Hash
+		lastSeq = r.Sequence
+	}
+	return lastSeq, nil
+}
+
+// EmitCheckpoint publishes the current chain head as an external checkpoint log line and records it in the checkpoints table.
+func EmitCheckpoint(ctx context.Context, pool *pgxpool.Pool) (*Checkpoint, error) {
+	var r Record
+	var ts time.Time
+	err := pool.QueryRow(ctx, `SELECT sequence, timestamp, tenant_id, action, actor, target, prev_hash, hash FROM audit_records ORDER BY sequence DESC LIMIT 1`).Scan(&r.Sequence, &ts, &r.TenantID, &r.Action, &r.Actor, &r.Target, &r.PrevHash, &r.Hash)
+	if err != nil {
+		return nil, err
+	}
+	cp := &Checkpoint{
+		Sequence:  r.Sequence,
+		Hash:      r.Hash,
+		Timestamp: time.Now().UTC(),
+	}
+	_, _ = pool.Exec(ctx, `INSERT INTO audit_checkpoints (sequence, hash, timestamp) VALUES ($1, $2, $3) ON CONFLICT (sequence) DO NOTHING`, cp.Sequence, cp.Hash, cp.Timestamp)
+	slog.Info("audit_checkpoint", "sequence", cp.Sequence, "hash", cp.Hash, "timestamp", cp.Timestamp)
+	return cp, nil
+}
+
+// EmitCheckpointForRange checkpoints up to a given sequence before retention sweeps.
+func EmitCheckpointForRange(ctx context.Context, pool *pgxpool.Pool, upToSequence int64) (*Checkpoint, error) {
+	var r Record
+	var ts time.Time
+	err := pool.QueryRow(ctx, `SELECT sequence, timestamp, tenant_id, action, actor, target, prev_hash, hash FROM audit_records WHERE sequence <= $1 ORDER BY sequence DESC LIMIT 1`, upToSequence).Scan(&r.Sequence, &ts, &r.TenantID, &r.Action, &r.Actor, &r.Target, &r.PrevHash, &r.Hash)
+	if err != nil {
+		return nil, err
+	}
+	cp := &Checkpoint{
+		Sequence:  r.Sequence,
+		Hash:      r.Hash,
+		Timestamp: time.Now().UTC(),
+	}
+	_, _ = pool.Exec(ctx, `INSERT INTO audit_checkpoints (sequence, hash, timestamp) VALUES ($1, $2, $3) ON CONFLICT (sequence) DO NOTHING`, cp.Sequence, cp.Hash, cp.Timestamp)
+	slog.Info("audit_checkpoint", "sequence", cp.Sequence, "hash", cp.Hash, "timestamp", cp.Timestamp)
+	return cp, nil
 }

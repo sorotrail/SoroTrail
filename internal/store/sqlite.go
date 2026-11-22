@@ -82,6 +82,107 @@ func NewSQLite(db *sql.DB) *SQLite {
 	return &SQLite{db: db}
 }
 
+func (s *SQLite) CreateAPIKey(ctx context.Context, key APIKey) (APIKey, error) {
+	query := `INSERT INTO api_keys (name, prefix, key_hash, scopes, created_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?)`
+	createdAt := key.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	var revokedAt any
+	if key.RevokedAt != nil {
+		revokedAt = *key.RevokedAt
+	}
+	scopesJSON := "[]"
+	res, err := s.db.ExecContext(ctx, query, key.Name, key.Prefix, key.KeyHash, scopesJSON, createdAt, revokedAt)
+	if err != nil {
+		return APIKey{}, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return APIKey{}, err
+	}
+	key.ID = id
+	key.CreatedAt = createdAt
+	return key, nil
+}
+
+func (s *SQLite) GetAPIKey(ctx context.Context, id int64) (APIKey, error) {
+	query := `SELECT id, name, prefix, key_hash, created_at, revoked_at FROM api_keys WHERE id = ?`
+	row := s.db.QueryRowContext(ctx, query, id)
+	var k APIKey
+	var revokedAt sql.NullTime
+	err := row.Scan(&k.ID, &k.Name, &k.Prefix, &k.KeyHash, &k.CreatedAt, &revokedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return APIKey{}, ErrNotFound
+	}
+	if err != nil {
+		return APIKey{}, err
+	}
+	if revokedAt.Valid {
+		t := revokedAt.Time
+		k.RevokedAt = &t
+	}
+	return k, nil
+}
+
+func (s *SQLite) LookupAPIKeyByPrefix(ctx context.Context, prefix string) (APIKey, error) {
+	query := `SELECT id, name, prefix, key_hash, created_at, revoked_at FROM api_keys WHERE prefix = ? AND revoked_at IS NULL`
+	row := s.db.QueryRowContext(ctx, query, prefix)
+	var k APIKey
+	var revokedAt sql.NullTime
+	err := row.Scan(&k.ID, &k.Name, &k.Prefix, &k.KeyHash, &k.CreatedAt, &revokedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return APIKey{}, ErrNotFound
+	}
+	if err != nil {
+		return APIKey{}, err
+	}
+	if revokedAt.Valid {
+		t := revokedAt.Time
+		k.RevokedAt = &t
+	}
+	return k, nil
+}
+
+func (s *SQLite) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+	query := `SELECT id, name, prefix, key_hash, created_at, revoked_at FROM api_keys ORDER BY id DESC`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []APIKey
+	for rows.Next() {
+		var k APIKey
+		var revokedAt sql.NullTime
+		if err := rows.Scan(&k.ID, &k.Name, &k.Prefix, &k.KeyHash, &k.CreatedAt, &revokedAt); err != nil {
+			return nil, err
+		}
+		if revokedAt.Valid {
+			t := revokedAt.Time
+			k.RevokedAt = &t
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
+func (s *SQLite) RevokeAPIKey(ctx context.Context, id int64) error {
+	query := `UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`
+	res, err := s.db.ExecContext(ctx, query, time.Now(), id)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 const eventColumnsSQLite = `network, id, contract_id, ledger, type, tx_hash, tx_index, op_index,
 	in_successful_call, topics, value, created_at, topics_xdr, value_xdr`
 
@@ -2033,29 +2134,6 @@ func contractsCursorValue(sortCol, sortType, value string) (any, error) {
 	default:
 		return value, nil
 	}
-}
-
-// API keys are not implemented for the SQLite backend: single-node
-// deployments authenticate via the operator's own reverse proxy or run
-// without the HTTP API's key check entirely.
-func (s *SQLite) CreateAPIKey(context.Context, APIKey) (APIKey, error) {
-	return APIKey{}, errUnsupported("sqlite", "CreateAPIKey")
-}
-
-func (s *SQLite) GetAPIKey(context.Context, int64) (APIKey, error) {
-	return APIKey{}, errUnsupported("sqlite", "GetAPIKey")
-}
-
-func (s *SQLite) LookupAPIKeyByPrefix(context.Context, string) (APIKey, error) {
-	return APIKey{}, errUnsupported("sqlite", "LookupAPIKeyByPrefix")
-}
-
-func (s *SQLite) ListAPIKeys(context.Context) ([]APIKey, error) {
-	return nil, errUnsupported("sqlite", "ListAPIKeys")
-}
-
-func (s *SQLite) RevokeAPIKey(context.Context, int64) error {
-	return errUnsupported("sqlite", "RevokeAPIKey")
 }
 
 // GetContractSummary returns a single contract's summary row. Like the
