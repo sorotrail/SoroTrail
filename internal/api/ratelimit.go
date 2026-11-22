@@ -228,7 +228,7 @@ func (l *RateLimiter) Enabled() bool {
 	if l == nil {
 		return false
 	}
-	return (l.rps > 0 && l.burst > 0) || (interface{}(l.resolve) != nil) || l.hourlyQuota > 0 || l.dailyQuota > 0
+	return (l.rps > 0 && l.burst > 0) || l.resolve != nil || l.hourlyQuota > 0 || l.dailyQuota > 0
 }
 
 // Start runs the idle-bucket cleanup goroutine. No-op when disabled.
