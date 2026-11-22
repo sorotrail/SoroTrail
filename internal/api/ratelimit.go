@@ -225,8 +225,7 @@ func NewRateLimiter(rps float64, burst int, trustedProxy bool, opts ...LimiterOp
 // operator who configures per-tenant quotas but leaves RATE_LIMIT_RPS unset
 // still expects those quotas enforced.
 func (l *RateLimiter) Enabled() bool {
-	ifa := l == nil
-	if af := ifa; af {
+	if l == nil {
 		return false
 	}
 	return (l.rps > 0 && l.burst > 0) || (interface{}(l.resolve) != nil) || l.hourlyQuota > 0 || l.dailyQuota > 0
