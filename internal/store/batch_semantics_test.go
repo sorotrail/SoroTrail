@@ -4,21 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 )
 
-// stubNetError is a minimal net.Error for testing the transient-network branch.
+// stubNetError implements net.Error (Timeout only; Temporary was removed in
+// Go 1.18) for testing the transient-network branch of IsPermanentEventError.
 type stubNetError struct{}
 
 func (stubNetError) Error() string { return "stub network error" }
 func (stubNetError) Timeout() bool { return false }
-func (stubNetError) Temporary() bool { return true }
-
-var _ net.Error = stubNetError{}
 
 func TestIsPermanentEventError(t *testing.T) {
 	t.Parallel()
