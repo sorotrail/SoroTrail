@@ -2706,3 +2706,9 @@ promtool check rules deploy/prometheus/sorotrail-rules.yml
 ## License
 
 [Apache-2.0](LICENSE)
+
+token bucket before its quota is examined. Token buckets remain per-process to smooth bursts, but request quotas are stored in Postgres and enforced atomically across all replicas.
+
+## Quota Semantics Across Replicas
+
+Request quotas (`HOURLY_QUOTA` and `DAILY_QUOTA`) are enforced atomically across all replicas using Postgres-backed shared quota storage to ensure strict cost and contractual limits. Token buckets remain per-process to smooth request bursts. When using SQLite, quotas remain per-process (single-node by definition). If the shared store is unreachable, enforcement falls back according to the configured `QUOTA_FAIL_MODE` (open or closed), which is logged appropriately.
