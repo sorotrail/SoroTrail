@@ -14,8 +14,8 @@ import (
 
 func TestMultiInstanceRateLimiterQuotaSharedPostgres(t *testing.T) {
 	dbPool := testdb.Setup(t, store.Migrate)
-	st := store.New(dbPool)
-
+	st, err := store.New(dbPool)
+	require.NoError(t, err)
 	limiter1 := NewRateLimiter(10, 100, false, WithQuotaStore(st), WithDailyQuota(5))
 	limiter2 := NewRateLimiter(10, 100, false, WithQuotaStore(st), WithDailyQuota(5))
 
