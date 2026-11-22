@@ -426,6 +426,7 @@ func (h *Handler) PlaygroundHandler() http.Handler {
 		_, _ = w.Write([]byte(graphiqlHTML))
 	})
 }
+
 // SubscriptionManager enforces per-connection/per-tenant limits, periodic re-authorization,
 // backpressure bounds, and query cost limits for GraphQL subscriptions.
 type SubscriptionManager struct {
@@ -549,14 +550,13 @@ func CheckSubscriptionQueryCost(query string, vars map[string]any, maxCost int) 
 
 // RunSubscriptionStream manages a subscription lifecycle with periodic re-auth, backpressure, and tenancy isolation.
 func RunSubscriptionStream(ctx context.Context, sm *SubscriptionManager, tenantID string, authCheck func(context.Context) bool, broker *broadcast.Broker, writeMsg func(any) error) error {
-	if err := sm.Acquire(tenantID);
-	err != nil {
+	if err := sm.Acquire(tenantID); err != nil {
 		return err
 	}
 	defer sm.Release(tenantID)
 
-	sub := broker.Subscribe()
-	defer broker.Unsubscribe(sub)
+	sub := broker.Subscribe(ctx, store.EventFilter{})
+	defer broker.Unsubscribe(ctx, sub)
 
 	// Bounded backpressure buffer with gap indicator
 	msgChan := make(chan any, 64)
