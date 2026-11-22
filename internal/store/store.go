@@ -122,11 +122,12 @@ type DecodedEventResponse struct {
 // the decoded columns currently stored for it. It is used by the replay
 // engine (internal/replay) to re-derive Topics and Value from the raw XDR.
 type DecodedEvent struct {
-	ID          string
-	ContractID  string
-	Ledger      int64
-	Network     string
-	RawTopicXDR []string
+	ID             string
+	ContractID     string
+	Ledger         int64
+	Network        string
+	RawTopicXDR    []string
+	DecoderVersion int32
 
 	// RawValueXDR is the base64-encoded value XDR the RPC delivered.
 	// Same semantics as [DecodedEvent.RawTopicXDR].
@@ -175,6 +176,9 @@ type ReplayState struct {
 	// CompletedAt is non-nil when the run finished its whole range. Nil
 	// means the run is still in progress or was interrupted.
 	CompletedAt *time.Time
+
+	// DecoderVersion is the decoder version used for the replay run.
+	DecoderVersion int32
 }
 
 // ContractMeta holds cached token metadata fetched via RPC simulation.
@@ -832,8 +836,9 @@ type AuditStats struct {
 
 // ReplayBatch is one transactional unit of replay work.
 type ReplayBatch struct {
-	Events []EventDecoding
-	State  ReplayState
+	Events         []EventDecoding
+	State          ReplayState
+	DecoderVersion int32
 }
 
 // EventDecoding is a freshly decoded events row, keyed by event ID. It
