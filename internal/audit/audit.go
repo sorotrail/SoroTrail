@@ -676,7 +676,7 @@ func (v *Verifier) VerifyChain(ctx context.Context, fromSequence int64, tenantID
 		}
 	}
 
-	var lastSeq int64 = fromSequence - 1
+	var lastSeq = fromSequence - 1
 	first := true
 
 	for rows.Next() {
