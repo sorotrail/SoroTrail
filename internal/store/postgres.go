@@ -1791,6 +1791,65 @@ func (p *Postgres) DeleteEventsBeforeIn(ctx context.Context, maxLedger int64, be
 	return tag.RowsAffected(), nil
 }
 
+func (p *Postgres) IncrementQuota(ctx context.Context, clientKey string, now time.Time) (int64, int64, error) {
+	hourStart := now.Truncate(time.Hour)
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO client_quotas (client_key, hour_start, day_start, hour_used, day_used)
+		VALUES ($1, $2, $3, 0, 0)
+		ON CONFLICT (client_key) DO NOTHING
+	`, clientKey, hourStart, dayStart)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	var dbHourStart, dbDayStart time.Time
+	var hourUsed, dayUsed int64
+	err = tx.QueryRow(ctx, `
+		SELECT hour_start, day_start, hour_used, day_used
+		FROM client_quotas
+		WHERE client_key = $1
+		FOR UPDATE
+	`, clientKey).Scan(&dbHourStart, &dbDayStart, &hourUsed, &dayUsed)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	if !dbHourStart.Equal(hourStart) {
+		hourStart = dbHourStart
+		hourUsed = 0
+	}
+	if !dbDayStart.Equal(dayStart) {
+		dayStart = dbDayStart
+		dayUsed = 0
+	}
+
+	hourUsed++
+	dayUsed++
+
+	_, err = tx.Exec(ctx, `
+		UPDATE client_quotas
+		SET hour_start = $2, day_start = $3, hour_used = $4, day_used = $5
+		WHERE client_key = $1
+	`, clientKey, hourStart, dayStart, hourUsed, dayUsed)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, 0, err
+	}
+
+	return hourUsed, dayUsed, nil
+}
+
 func (p *Postgres) Ping(ctx context.Context) error {
 	p.healthMu.RLock()
 	defer p.healthMu.RUnlock()
