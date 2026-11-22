@@ -82,7 +82,18 @@ func NewSQLite(db *sql.DB) *SQLite {
 	return &SQLite{db: db}
 }
 
+func (s *SQLite) checkAPIKeysTable(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, "SELECT 1 FROM api_keys LIMIT 1")
+	if err != nil {
+		return fmt.Errorf("sqlite: %w: %v", ErrUnsupported, err)
+	}
+	return nil
+}
+
 func (s *SQLite) CreateAPIKey(ctx context.Context, key APIKey) (APIKey, error) {
+	if err := s.checkAPIKeysTable(ctx); err != nil {
+		return APIKey{}, err
+	}
 	query := `INSERT INTO api_keys (name, prefix, key_hash, scopes, created_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?)`
 	createdAt := key.CreatedAt
 	if createdAt.IsZero() {
@@ -107,6 +118,9 @@ func (s *SQLite) CreateAPIKey(ctx context.Context, key APIKey) (APIKey, error) {
 }
 
 func (s *SQLite) GetAPIKey(ctx context.Context, id int64) (APIKey, error) {
+	if err := s.checkAPIKeysTable(ctx); err != nil {
+		return APIKey{}, err
+	}
 	query := `SELECT id, name, prefix, key_hash, created_at, revoked_at FROM api_keys WHERE id = ?`
 	row := s.db.QueryRowContext(ctx, query, id)
 	var k APIKey
@@ -126,6 +140,9 @@ func (s *SQLite) GetAPIKey(ctx context.Context, id int64) (APIKey, error) {
 }
 
 func (s *SQLite) LookupAPIKeyByPrefix(ctx context.Context, prefix string) (APIKey, error) {
+	if err := s.checkAPIKeysTable(ctx); err != nil {
+		return APIKey{}, err
+	}
 	query := `SELECT id, name, prefix, key_hash, created_at, revoked_at FROM api_keys WHERE prefix = ? AND revoked_at IS NULL`
 	row := s.db.QueryRowContext(ctx, query, prefix)
 	var k APIKey
@@ -145,6 +162,9 @@ func (s *SQLite) LookupAPIKeyByPrefix(ctx context.Context, prefix string) (APIKe
 }
 
 func (s *SQLite) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+	if err := s.checkAPIKeysTable(ctx); err != nil {
+		return nil, err
+	}
 	query := `SELECT id, name, prefix, key_hash, created_at, revoked_at FROM api_keys ORDER BY id DESC`
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
@@ -168,6 +188,9 @@ func (s *SQLite) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 }
 
 func (s *SQLite) RevokeAPIKey(ctx context.Context, id int64) error {
+	if err := s.checkAPIKeysTable(ctx); err != nil {
+		return err
+	}
 	query := `UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`
 	res, err := s.db.ExecContext(ctx, query, time.Now(), id)
 	if err != nil {
