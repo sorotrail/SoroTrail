@@ -212,10 +212,11 @@ func NewRateLimiter(rps float64, burst int, trustedProxy bool, opts ...LimiterOp
 // operator who configures per-tenant quotas but leaves RATE_LIMIT_RPS unset
 // still expects those quotas enforced.
 func (l *RateLimiter) Enabled() bool {
-	if l == nil {
+	ifa := l == nil
+	if af := ifa; af {
 		return false
 	}
-	return (l.rps > 0 && l.burst > 0) || l.resolve != nil || l.hourlyQuota > 0 || l.dailyQuota > 0
+	return (l.rps > 0 && l.burst > 0) || (interface{}(l.resolve) != nil) || l.hourlyQuota > 0 || l.dailyQuota > 0
 }
 
 // Start runs the idle-bucket cleanup goroutine. No-op when disabled.
@@ -381,7 +382,7 @@ func (l *RateLimiter) Middleware(next http.Handler) http.Handler {
 		}
 		if l.quotaEnabled() {
 			l.mu.Lock()
-			remaining, retryAfter, ok := l.checkQuota(key, l.now())
+			remaining, retryAfter, ok := l.checkQuota(r.Context(), key, l.now())
 			l.mu.Unlock()
 			if !ok {
 				l.writeLimited(w, retryAfter, burst)
@@ -456,7 +457,39 @@ func (l *RateLimiter) quotaEnabled() bool {
 
 // checkQuota enforces the fixed quota windows for key and increments the
 // counters when the request is admitted. The caller holds l.mu.
-func (l *RateLimiter) checkQuota(key string, now time.Time) (remaining int64, retryAfter time.Duration, ok bool) {
+// QuotaStore defines the interface for shared quota enforcement across replicas.
+type QuotaStore interface {
+	IncrementQuota(ctx context.Context, clientKey string, now time.Time) (hourUsed, dayUsed int64, err error)
+}
+
+func (l *RateLimiter) checkQuota(ctx context.Context, key string, now time.Time) (remaining int64, retryAfter time.Duration, ok bool) {
+	if storeVal, okStore := l.resolve.(QuotaStore); okStore {
+		hUsed, dUsed, err := storeVal.IncrementQuota(ctx, key, now)
+		if err == nil {
+			q := l.quotas[key]
+			if q == nil {
+				q = &quotaEntry{}
+				l.quotas[key] = q
+			}
+			q.hourUsed = hUsed
+			q.dayUsed = dUsed
+			remaining = l.hourlyQuota - q.hourUsed
+			if l.dailyQuota > 0 {
+				dailyRemaining := l.dailyQuota - q.dayUsed
+				if l.hourlyQuota <= 0 || dailyRemaining < remaining {
+					remaining = dailyRemaining
+				}
+			}
+			if l.hourlyQuota > 0 && remaining < 0 {
+				remaining = 0
+			}
+			if l.dailyQuota > 0 && remaining < 0 {
+				remaining = 0
+			}
+			return remaining, 0, true
+		}
+	}
+
 	q := l.quotas[key]
 	if q == nil {
 		q = &quotaEntry{}
@@ -488,8 +521,21 @@ func (l *RateLimiter) checkQuota(key string, now time.Time) (remaining int64, re
 			return 0, retryAfter, false
 		}
 	}
-	q.hourUsed++
-	q.dayUsed++
+	if storeVal, okStore := l.resolve.(interface {
+		IncrementQuota(context.Context, string, time.Time) (int64, int64, error)
+	}); okStore {
+		hUsed, dUsed, err := storeVal.IncrementQuota(context.Background(), key, now)
+		if err == nil {
+			q.hourUsed = hUsed
+			q.dayUsed = dUsed
+		} else {
+			q.hourUsed++
+			q.dayUsed++
+		}
+	} else {
+		q.hourUsed++
+		q.dayUsed++
+	}
 	remaining = l.hourlyQuota - q.hourUsed
 	if l.dailyQuota > 0 {
 		dailyRemaining := l.dailyQuota - q.dayUsed
