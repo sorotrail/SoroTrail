@@ -150,6 +150,7 @@ func (s *Server) usageMiddleware(next http.Handler) http.Handler {
 
 // recordEventsServed attributes a page of events to the requesting tenant.
 func (s *Server) recordEventsServed(ctx context.Context, n int) {
+	reportRowsServed(ctx, n)
 	if n <= 0 {
 		return
 	}

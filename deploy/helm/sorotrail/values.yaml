@@ -146,3 +146,28 @@ serviceMonitor:
   interval: "30s"
   scrapeTimeout: "10s"
   path: /metrics
+
+# ── Mutual TLS (mTLS) ─────────────────────────────────────────────────────────
+#
+# Mounts cert-manager or SPIFFE/SPIRE TLS Secrets into the pod and enables
+# mutual TLS on the HTTP API listener and/or outbound database/archive clients.
+# Certificates are reloaded live from the mounted volume on rotation without
+# restarting the pod.
+#
+mtls:
+  enabled: false
+  # Name of the Kubernetes Secret containing tls.crt, tls.key, and ca.crt for
+  # the HTTP API server.
+  secretName: ""
+  # Optional separate Secret containing ca.crt for verifying client certs.
+  # Defaults to secretName when empty.
+  clientCASecretName: ""
+  mountPath: "/etc/sorotrail/tls"
+  # Optional comma-separated allowlist of client certificate CNs or SPIFFE URIs.
+  allowedIdentities: ""
+  # Optional comma-separated <cert_identity>=<tenant_name> mappings.
+  tenantMap: ""
+  # Optional Secret containing tls.crt, tls.key, and ca.crt for outbound Postgres mTLS.
+  dbSecretName: ""
+  # Optional Secret containing tls.crt, tls.key, and ca.crt for outbound Archive mTLS.
+  archiveSecretName: ""

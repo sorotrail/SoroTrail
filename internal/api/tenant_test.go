@@ -332,6 +332,28 @@ func (f *fakeTenants) ListTenantWatchedContracts(_ context.Context, tenantID int
 	}
 	return f.watched[tenantID][network], nil
 }
+func (f *fakeTenants) CountTenantWatchedContracts(_ context.Context, tenantID int64) (int, error) {
+	n := 0
+	for _, contracts := range f.watched[tenantID] {
+		n += len(contracts)
+	}
+	return n, nil
+}
+
+// CountInstanceWatchedContracts counts distinct (network, contract) pairs
+// across every tenant, as the Postgres union does.
+func (f *fakeTenants) CountInstanceWatchedContracts(_ context.Context) (int, error) {
+	seen := map[[2]string]bool{}
+	for _, byNetwork := range f.watched {
+		for network, contracts := range byNetwork {
+			for _, c := range contracts {
+				seen[[2]string{network, c}] = true
+			}
+		}
+	}
+	return len(seen), nil
+}
+
 func (f *fakeTenants) AddTenantWatchedContract(_ context.Context, t store.Tenant, network, contractID string, _ int) error {
 	network = defaultNetworkLabel(network)
 	if f.watched[t.ID] == nil {

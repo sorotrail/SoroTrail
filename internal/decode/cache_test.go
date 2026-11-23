@@ -213,3 +213,50 @@ func TestCachingDecoder_WrapsXDRDecoder(t *testing.T) {
 	assert.Equal(t, uint64(1), hits)
 	assert.Equal(t, uint64(1), misses)
 }
+
+func TestCachingDecoder_EdgeCases(t *testing.T) {
+	t.Run("empty payload is cached like any other key", func(t *testing.T) {
+		inner := newCountingDecoder()
+		c := NewCachingDecoder(inner, 0)
+
+		first, err := c.DecodeScVal("")
+		require.NoError(t, err)
+		second, err := c.DecodeScVal("")
+		require.NoError(t, err)
+
+		assert.JSONEq(t, string(first), string(second))
+		assert.Equal(t, 1, inner.count(""))
+		hits, misses := c.Stats()
+		assert.Equal(t, uint64(1), hits)
+		assert.Equal(t, uint64(1), misses)
+	})
+
+	t.Run("maxEntries of one evicts on every new key", func(t *testing.T) {
+		inner := newCountingDecoder()
+		c := NewCachingDecoder(inner, 1)
+
+		for _, p := range []string{"a", "b", "a"} {
+			_, err := c.DecodeScVal(p)
+			require.NoError(t, err)
+		}
+
+		assert.Equal(t, 1, c.Len())
+		assert.Equal(t, 2, inner.count("a"), "a must be re-decoded after b evicted it")
+		assert.Equal(t, 1, inner.count("b"))
+	})
+
+	t.Run("maxEntries of one serves repeated hits for the same key", func(t *testing.T) {
+		inner := newCountingDecoder()
+		c := NewCachingDecoder(inner, 1)
+
+		for i := 0; i < 3; i++ {
+			_, err := c.DecodeScVal("same")
+			require.NoError(t, err)
+		}
+
+		assert.Equal(t, 1, inner.count("same"))
+		hits, misses := c.Stats()
+		assert.Equal(t, uint64(2), hits)
+		assert.Equal(t, uint64(1), misses)
+	})
+}

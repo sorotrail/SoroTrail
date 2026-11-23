@@ -212,8 +212,15 @@ func TestWorker_DeliversToMatchingSubscription(t *testing.T) {
 		assert.NotEmpty(t, r.Header.Get(SignatureHeader))
 
 		body, _ := io.ReadAll(r.Body)
-		expectedSig := Sign("secret123", body)
+		expectedSig := SignDelivery(
+			"secret123",
+			r.Header.Get(IdempotencyKeyHeader),
+			r.Header.Get(DeliveryAttemptHeader),
+			r.Header.Get(DeliveryTimestampHeader),
+			body,
+		)
 		assert.Equal(t, expectedSig, r.Header.Get(SignatureHeader))
+		assert.True(t, VerifyDelivery("secret123", r.Header, body))
 
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -771,4 +778,331 @@ func TestNotifyEvents_DeliversAsynchronouslyWithoutBlockingIngestion(t *testing.
 
 func TestWebhookDeliveryLifecycle(t *testing.T) {
 	t.Log("Covered the webhook delivery lifecycle end to end")
+}
+
+// --- Deduplication contract (#1235) ---
+
+type capturedDelivery struct {
+	idempotencyKey    string
+	soroTrailIdempKey string
+	attempt           string
+	timestamp         string
+	signature         string
+	body              []byte
+	headers           http.Header
+}
+
+func TestDeduplicationContract_RetriesCarrySameKeyAndOriginalTimestamp(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		received []capturedDelivery
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		mu.Lock()
+		received = append(received, capturedDelivery{
+			idempotencyKey:    r.Header.Get(IdempotencyKeyHeader),
+			soroTrailIdempKey: r.Header.Get(SoroTrailIdempotencyKeyHeader),
+			attempt:           r.Header.Get(DeliveryAttemptHeader),
+			timestamp:         r.Header.Get(DeliveryTimestampHeader),
+			signature:         r.Header.Get(SignatureHeader),
+			body:              body,
+			headers:           r.Header.Clone(),
+		})
+		callNum := len(received)
+		mu.Unlock()
+
+		if callNum < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	st := newStubSubscriptionStore()
+	sub := store.Subscription{
+		ID:      42,
+		URL:     server.URL,
+		Secret:  "dedup-secret",
+		Enabled: true,
+	}
+	st.enabledSubs = []store.Subscription{sub}
+
+	n := NewNotifier(st, testLogger())
+	n.maxAttempts = 5
+	n.clock = &recordingClock{}
+
+	baseTime := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	var tick int
+	n.nowFunc = func() time.Time {
+		tick++
+		return baseTime.Add(time.Duration(tick-1) * 5 * time.Second)
+	}
+
+	ev := testEvent("00001073741824-0000000001")
+	n.deliverWithRetry(context.Background(), deliveryTask{
+		Subscription: sub,
+		Event:        ev,
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, received, 3, "expected two failures followed by success on third attempt")
+
+	wantKey := "sub-42:00001073741824-0000000001"
+	wantTimestamp := "2026-07-24T12:00:00Z"
+
+	for i, d := range received {
+		assert.Equal(t, wantKey, d.idempotencyKey, "attempt %d must carry stable Idempotency-Key", i+1)
+		assert.Equal(t, wantKey, d.soroTrailIdempKey, "attempt %d must mirror X-SoroTrail-Idempotency-Key", i+1)
+		assert.Equal(t, wantTimestamp, d.timestamp, "attempt %d must preserve original delivery timestamp", i+1)
+		assert.True(t, VerifyDelivery(sub.Secret, d.headers, d.body), "attempt %d signature must verify", i+1)
+	}
+	assert.Equal(t, "1", received[0].attempt)
+	assert.Equal(t, "2", received[1].attempt)
+	assert.Equal(t, "3", received[2].attempt)
+	// Because the attempt counter changes on each retry and is covered by
+	// X-SoroTrail-Signature, each attempt has a distinct signature over its
+	// attempt header while sharing the same Idempotency-Key.
+	assert.NotEqual(t, received[0].signature, received[1].signature)
+	assert.NotEqual(t, received[1].signature, received[2].signature)
+}
+
+func TestDeduplicationContract_DistinctEventsAndSubscriptionsCarryDifferentKeys(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		keys []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		assert.True(t, VerifyDelivery("shared-secret", r.Header, body))
+		mu.Lock()
+		keys = append(keys, r.Header.Get(IdempotencyKeyHeader))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	st := newStubSubscriptionStore()
+	subA := store.Subscription{ID: 7, URL: server.URL, Secret: "shared-secret", Enabled: true}
+	subB := store.Subscription{ID: 8, URL: server.URL, Secret: "shared-secret", Enabled: true}
+
+	n := NewNotifier(st, testLogger())
+	n.clock = &recordingClock{}
+
+	ev1 := testEvent("00001073741824-0000000001")
+	ev2 := testEvent("00001073741824-0000000002")
+
+	// Two distinct events for subscription 7, plus the first event fanned out
+	// to subscription 8.
+	n.deliverWithRetry(context.Background(), deliveryTask{Subscription: subA, Event: ev1})
+	n.deliverWithRetry(context.Background(), deliveryTask{Subscription: subA, Event: ev2})
+	n.deliverWithRetry(context.Background(), deliveryTask{Subscription: subB, Event: ev1})
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{
+		"sub-7:00001073741824-0000000001",
+		"sub-7:00001073741824-0000000002",
+		"sub-8:00001073741824-0000000001",
+	}, keys, "keys must differ across events and across subscriptions")
+}
+
+func TestDeduplicationContract_DeadLetterReplayReusesKeyAndOriginalTimestamp(t *testing.T) {
+	// Simulate a consumer that processes attempt 1 before its response fails
+	// (e.g. a reverse proxy returning 502 after the handler committed), causing
+	// all initial attempts to fail and land in delivery_attempts as failed.
+	// When the operator replays the dead-lettered delivery later, the replay
+	// carries the identical Idempotency-Key and original timestamp so the
+	// consumer deduplicates it instead of executing a second time.
+	var (
+		mu              sync.Mutex
+		seenKeys        = map[string]int{}
+		businessApplied int
+		deliveries      []capturedDelivery
+		failResponses   = true
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		require.True(t, VerifyDelivery("dlq-secret", r.Header, body))
+
+		key := r.Header.Get(IdempotencyKeyHeader)
+		mu.Lock()
+		deliveries = append(deliveries, capturedDelivery{
+			idempotencyKey: key,
+			attempt:        r.Header.Get(DeliveryAttemptHeader),
+			timestamp:      r.Header.Get(DeliveryTimestampHeader),
+		})
+		seenKeys[key]++
+		if seenKeys[key] == 1 {
+			businessApplied++
+		}
+		shouldFail := failResponses
+		mu.Unlock()
+
+		if shouldFail {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	st := newStubSubscriptionStore()
+	sub := store.Subscription{ID: 19, URL: server.URL, Secret: "dlq-secret", Enabled: true}
+	st.enabledSubs = []store.Subscription{sub}
+
+	n := NewNotifier(st, testLogger())
+	n.maxAttempts = 2
+	n.clock = &recordingClock{}
+	origTime := time.Date(2026, 7, 24, 15, 30, 0, 0, time.UTC)
+	n.nowFunc = func() time.Time { return origTime }
+
+	ev := testEvent("00001073741824-0000000009")
+
+	// Initial delivery exhausts all attempts.
+	n.deliverWithRetry(context.Background(), deliveryTask{Subscription: sub, Event: ev})
+
+	// Endpoint recovers; dead-letter replay runs 1 hour later.
+	mu.Lock()
+	failResponses = false
+	mu.Unlock()
+	n.nowFunc = func() time.Time { return origTime.Add(time.Hour) }
+
+	n.ReplayDelivery(context.Background(), sub, ev, origTime)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, deliveries, 3, "2 initial failed attempts + 1 dead-letter replay")
+	assert.Equal(t, 1, businessApplied, "consumer deduplication must apply the event only once across retries and dead-letter replay")
+	for _, d := range deliveries {
+		assert.Equal(t, "sub-19:00001073741824-0000000009", d.idempotencyKey)
+		assert.Equal(t, "2026-07-24T15:30:00Z", d.timestamp, "replay preserves original delivery timestamp")
+	}
+}
+
+func TestDeduplicationContract_ReorgRedeliveryReusesKeyForSameCoordinate(t *testing.T) {
+	// When a ledger range is re-applied (reorg or operator replay), an event at
+	// the same canonical coordinate (event.ID) carries the same Idempotency-Key.
+	// A standard forward-only consumer deduplicates the re-applied event so
+	// downstream side effects (transfers, alerts) are not double-executed; a
+	// ledger-aware consumer that explicitly evicts keys for rolled-back ledgers
+	// re-processes it.
+	var (
+		mu              sync.Mutex
+		dedupSet        = map[string]int64{}
+		appliedEvents   int
+		deliveredHeader []string
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		require.True(t, VerifyDelivery("reorg-secret", r.Header, body))
+
+		var p Payload
+		require.NoError(t, json.Unmarshal(body, &p))
+
+		key := r.Header.Get(IdempotencyKeyHeader)
+		mu.Lock()
+		deliveredHeader = append(deliveredHeader, key)
+		if _, exists := dedupSet[key]; !exists {
+			dedupSet[key] = p.Event.Ledger
+			appliedEvents++
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	st := newStubSubscriptionStore()
+	sub := store.Subscription{ID: 3, URL: server.URL, Secret: "reorg-secret", Enabled: true}
+	n := NewNotifier(st, testLogger())
+	n.clock = &recordingClock{}
+
+	ev := testEvent("00000000000100-0000000001")
+	ev.Ledger = 100
+
+	// 1. Original ingestion delivers the event.
+	n.deliverWithRetry(context.Background(), deliveryTask{Subscription: sub, Event: ev})
+
+	// 2. Re-applied ledger re-emits the event with the same canonical ID;
+	// forward-only consumer deduplicates it away.
+	n.deliverWithRetry(context.Background(), deliveryTask{Subscription: sub, Event: ev})
+
+	mu.Lock()
+	assert.Equal(t, 1, appliedEvents, "re-applied event with the same ID is deduplicated by default")
+	assert.Equal(t, []string{
+		"sub-3:00000000000100-0000000001",
+		"sub-3:00000000000100-0000000001",
+	}, deliveredHeader)
+
+	// 3. If the consumer performs an explicit ledger rollback for ledger >= 100
+	// and evicts keys in that range, a subsequent re-delivery is accepted.
+	for k, ledger := range dedupSet {
+		if ledger >= 100 {
+			delete(dedupSet, k)
+		}
+	}
+	mu.Unlock()
+
+	n.deliverWithRetry(context.Background(), deliveryTask{Subscription: sub, Event: ev})
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 2, appliedEvents, "after evicting rolled-back ledger keys, consumer accepts re-applied delivery")
+}
+
+func TestDeduplicationContract_SignatureCoversDeduplicationHeaders(t *testing.T) {
+	secret := "signing-secret"
+	key := IdempotencyKey(12, "00001073741824-0000000005")
+	attempt := "1"
+	ts := "2026-07-24T12:00:00Z"
+	body := []byte(`{"event":{"id":"00001073741824-0000000005"}}`)
+
+	sig := SignDelivery(secret, key, attempt, ts, body)
+
+	validHeaders := func() http.Header {
+		h := make(http.Header)
+		h.Set(IdempotencyKeyHeader, key)
+		h.Set(SoroTrailIdempotencyKeyHeader, key)
+		h.Set(DeliveryAttemptHeader, attempt)
+		h.Set(DeliveryTimestampHeader, ts)
+		h.Set(SignatureHeader, sig)
+		return h
+	}
+
+	assert.True(t, VerifyDelivery(secret, validHeaders(), body), "unmodified delivery must verify")
+
+	t.Run("tampering with Idempotency-Key fails verification", func(t *testing.T) {
+		h := validHeaders()
+		h.Set(IdempotencyKeyHeader, "sub-12:00001073741824-9999999999")
+		h.Set(SoroTrailIdempotencyKeyHeader, "sub-12:00001073741824-9999999999")
+		assert.False(t, VerifyDelivery(secret, h, body))
+	})
+
+	t.Run("mismatch between Idempotency-Key and X-SoroTrail-Idempotency-Key fails verification", func(t *testing.T) {
+		h := validHeaders()
+		h.Set(SoroTrailIdempotencyKeyHeader, "sub-12:different")
+		assert.False(t, VerifyDelivery(secret, h, body))
+	})
+
+	t.Run("tampering with X-SoroTrail-Delivery-Attempt fails verification", func(t *testing.T) {
+		h := validHeaders()
+		h.Set(DeliveryAttemptHeader, "2")
+		assert.False(t, VerifyDelivery(secret, h, body))
+	})
+
+	t.Run("tampering with X-SoroTrail-Delivery-Timestamp fails verification", func(t *testing.T) {
+		h := validHeaders()
+		h.Set(DeliveryTimestampHeader, "2026-07-24T12:00:01Z")
+		assert.False(t, VerifyDelivery(secret, h, body))
+	})
+
+	t.Run("tampering with body fails verification", func(t *testing.T) {
+		h := validHeaders()
+		assert.False(t, VerifyDelivery(secret, h, []byte(`{"event":{"id":"tampered"}}`)))
+	})
 }

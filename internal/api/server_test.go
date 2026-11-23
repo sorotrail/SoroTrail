@@ -221,3 +221,42 @@ func TestRouter_RegistersEachRouteOnce(t *testing.T) {
 	}))
 	assert.NotEmpty(t, seen)
 }
+
+// TestEffectiveDecompressedBodyLimit_HappyPath asserts that when
+// SetMaxDecompressedBodySize is configured, EffectiveDecompressedBodyLimit
+// returns that configured value regardless of the request.
+func TestEffectiveDecompressedBodyLimit_HappyPath(t *testing.T) {
+	s := newTestServer(&stubStore{}, nil)
+	s.SetMaxDecompressedBodySize(2048)
+
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	got := s.EffectiveDecompressedBodyLimit(req)
+	require.Equal(t, int64(2048), got)
+}
+
+// TestEffectiveDecompressedBodyLimit_FallsBackToRequestBodyLimit asserts that
+// when maxDecompressedBodySize is not set, EffectiveDecompressedBodyLimit
+// falls back to the effective request body limit.
+func TestEffectiveDecompressedBodyLimit_FallsBackToRequestBodyLimit(t *testing.T) {
+	s := newTestServer(&stubStore{}, nil)
+	// Do not set maxDecompressedBodySize; fall through to path 2
+
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	// Set a per-endpoint body limit so path 2 is exercised
+	s.SetEndpointRequestBodyLimit("/events", 4096)
+
+	got := s.EffectiveDecompressedBodyLimit(req)
+	require.Equal(t, int64(4096), got)
+}
+
+// TestEffectiveDecompressedBodyLimit_DefaultFallback asserts that when neither
+// maxDecompressedBodySize nor a request body limit is configured, the function
+// returns DefaultMaxDecompressedBodyBytes.
+func TestEffectiveDecompressedBodyLimit_DefaultFallback(t *testing.T) {
+	s := newTestServer(&stubStore{}, nil)
+	// Ensure no custom limits are set
+
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	got := s.EffectiveDecompressedBodyLimit(req)
+	require.Equal(t, DefaultMaxDecompressedBodyBytes, got)
+}

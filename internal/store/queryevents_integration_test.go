@@ -109,6 +109,10 @@ func TestQueryEvents_FilterCombinations(t *testing.T) {
 		extra[1].Topics = json.RawMessage(`[{"symbol":"transfer"},{"address":"GDEF"}]`)
 		_, err := st.UpsertEvents(ctx, extra)
 		require.NoError(t, err)
+		t.Cleanup(func() {
+			// Remove the extra rows so they don't bleed into subsequent subtests.
+			_, _ = pool.Exec(ctx, `DELETE FROM events WHERE ledger_sequence IN (200, 201)`)
+		})
 
 		got, _, err := st.QueryEvents(ctx, EventFilter{
 			Topic0: json.RawMessage(`{"symbol":"transfer"}`),

@@ -53,12 +53,16 @@ type Clock interface {
 	Now() time.Time
 	// SleepCtx sleeps for d or until ctx is done; it reports whether the
 	// full sleep completed. This is the only sleep seam in the ingester.
+	// The clock is consulted on every poll cycle to sleep between ingestion
+	// cycles; implementations may advance time without blocking (e.g. a
+	// virtual clock for tests) or use wall time (RealClock).
 	SleepCtx(ctx context.Context, d time.Duration) bool
 }
 
 // RealClock is the wall-clock implementation of Clock.
 type RealClock struct{}
 
+// Now returns the current wall-clock time.
 func (RealClock) Now() time.Time { return time.Now() }
 func (RealClock) SleepCtx(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)
@@ -196,6 +200,35 @@ type Options struct {
 	// zero value — that's deliberate so tests/MSG-built Ingester instances
 	// honor an explicit "0 = off" without surprise.
 	LagWarnLedgers uint32
+	// LagRecoverLedgers is the lower hysteresis bound at or below which
+	// the ingester exits the lagging state once entered. Requiring the gap
+	// to close below LagRecoverLedgers (rather than merely dropping one
+	// ledger below LagWarnLedgers) prevents oscillation when ingestion
+	// hovers near the threshold. When zero, it defaults to 75% of
+	// LagWarnLedgers when LagBackpressureEnabled is true (or when a
+	// LagCoordinator is attached), and to LagWarnLedgers otherwise so
+	// legacy log-only callers see unchanged single-threshold behavior.
+	LagRecoverLedgers uint32
+	// LagBackpressureEnabled turns the lag signal from a passive gauge/log
+	// into active backpressure: background tasks (pruner, archiver,
+	// auditor) yield up to LagMaxDeferral while lagging, and the ingester
+	// widens its sweep window by LagCatchUpSweepMultiplier and holds its
+	// poll interval at PollIntervalMin until caught up. False (the default)
+	// preserves pre-#1275 behavior as a single setting.
+	LagBackpressureEnabled bool
+	// LagMaxDeferral is the maximum continuous duration background tasks
+	// may defer while the ingester is lagging before a pass is forced
+	// through anyway. Default 15m (DefaultMaxLagDeferral).
+	LagMaxDeferral time.Duration
+	// LagCatchUpSweepMultiplier scales SweepWindow while lag backpressure
+	// is active (clamped to [1, MaxCatchUpSweepMultiplier]). Default 2 when
+	// LagBackpressureEnabled is true.
+	LagCatchUpSweepMultiplier int
+	// LagCoordinator is an optional shared coordinator consulted by
+	// background tasks (pruner, archiver, auditor). When nil, New builds
+	// one from the Lag* options above and exposes it via
+	// Ingester.LagCoordinator().
+	LagCoordinator *LagCoordinator
 	// LagMetrics is the optional sink for ingest-lag signals. The default
 	// is a no-op so the alarm works end-to-end as log-only today, and a
 	// future Prometheus /metrics endpoint can opt in by passing a real
@@ -374,6 +407,9 @@ type Ingester struct {
 	// mutex/atomic or document that the new caller is also single-
 	// threaded relative to Run().
 	lagging bool
+	// lagCoordinator coordinates lag-driven background job deferral and
+	// catch-up sizing across goroutines. Always non-nil after New.
+	lagCoordinator *LagCoordinator
 	// pollInterval is the current effective poll interval, in nanoseconds
 	// (time.Duration's underlying unit). It is initialized in New to the
 	// post-defaults Options.PollInterval and thereafter mutated either by
@@ -407,6 +443,18 @@ type Ingester struct {
 	// accessed by the Run goroutine (or the single goroutine driving
 	// RunOnceForTest), so it needs no synchronization.
 	dryRunPosition *dryRunPosition
+	// reorgTracker tracks ledger fingerprints across ReorgConfirmationWindow
+	// and enforces the configured reorg depth limit.
+	reorgTracker *ReorgTracker
+	// reorgCoord serializes and coalesces overlapping reorg reconciliations.
+	reorgCoord reorgCoordinator
+	// reorgNotifier receives explicit ReorgRetractionNotice callbacks when
+	// previously persisted events are retracted by a chain reorganisation.
+	reorgNotifier ReorgNotifier
+	// archivedThroughLedger and archiveBoundaryFn guard immutable cold storage
+	// against reorg retractions.
+	archivedThroughLedger atomic.Uint32
+	archiveBoundaryFn     ArchiveBoundaryFunc
 }
 
 // cycleCounters holds the per-poll-cycle totals behind the structured
@@ -475,9 +523,33 @@ func New(client rpc.Client, st store.Store, dec decode.Decoder, log *slog.Logger
 		opts:          opts,
 		skipContracts: skipMap,
 		tracer:        noop.NewTracerProvider().Tracer("github.com/sorotrail/sorotrail/internal/ingester"),
+		reorgTracker:  NewReorgTracker(opts.ReorgConfirmationWindow),
+	}
+	if opts.LagCoordinator != nil {
+		ing.lagCoordinator = opts.LagCoordinator
+	} else {
+		recoverLedgers := opts.LagRecoverLedgers
+		if recoverLedgers == 0 && !opts.LagBackpressureEnabled {
+			recoverLedgers = opts.LagWarnLedgers
+		}
+		ing.lagCoordinator = NewLagCoordinator(LagBackpressureOptions{
+			Enabled:                opts.LagBackpressureEnabled,
+			EnterLagLedgers:        opts.LagWarnLedgers,
+			RecoverLagLedgers:      recoverLedgers,
+			MaxDeferral:            opts.LagMaxDeferral,
+			CatchUpSweepMultiplier: opts.LagCatchUpSweepMultiplier,
+			Downstream:             opts.LagMetrics,
+			Logger:                 ing.log,
+		})
 	}
 	ing.pollInterval.Store(int64(opts.PollInterval))
 	return ing
+}
+
+// LagCoordinator returns the ingester's lag backpressure coordinator so
+// background tasks (pruner, archiver, auditor) can share it directly.
+func (ing *Ingester) LagCoordinator() *LagCoordinator {
+	return ing.lagCoordinator
 }
 
 // PollInterval returns the poll interval Run currently sleeps for between
@@ -847,8 +919,16 @@ func (ing *Ingester) singlePageWatched(ctx context.Context, filters []rpc.EventF
 		return false, fmt.Errorf("getEvents from ledger %d: %w", startLedger, err)
 	}
 
+	if regressed, rerr := ing.maybeHandleTipRegression(ctx, resp.LatestLedger); rerr != nil {
+		return false, rerr
+	} else if regressed {
+		ing.setIngestionLag(int64(resp.LatestLedger), int64(resp.LatestLedger))
+		return true, nil
+	}
+
 	ing.cycle.addFetched(len(resp.Events))
-	if err := ing.persistEvents(ctx, resp.Events, resp.LatestLedger); err != nil {
+	caughtUp := uint(len(resp.Events)) < limit
+	if err := ing.persistEventsWithReorgCheck(ctx, resp.Events, resp.LatestLedger, caughtUp && cursor == ""); err != nil {
 		return false, err
 	}
 
@@ -856,7 +936,6 @@ func (ing *Ingester) singlePageWatched(ctx context.Context, filters []rpc.EventF
 		return false, err
 	}
 
-	caughtUp := uint(len(resp.Events)) < limit
 	return caughtUp, nil
 }
 
@@ -881,12 +960,18 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 		return false, fmt.Errorf("getEvents from ledger %d: %w", startLedger, err)
 	}
 
-	ing.cycle.addFetched(len(resp.Events))
-	if err := ing.persistEvents(ctx, resp.Events, resp.LatestLedger); err != nil {
-		return false, err
+	if regressed, rerr := ing.maybeHandleTipRegression(ctx, resp.LatestLedger); rerr != nil {
+		return false, rerr
+	} else if regressed {
+		ing.setIngestionLag(int64(resp.LatestLedger), int64(resp.LatestLedger))
+		return true, nil
 	}
 
+	ing.cycle.addFetched(len(resp.Events))
 	state, caughtUp := nextState(resp, limit)
+	if err := ing.persistEventsWithReorgCheck(ctx, resp.Events, resp.LatestLedger, caughtUp && cursor == ""); err != nil {
+		return false, err
+	}
 	if state.LastCursor == "" && state.LastIngestedLedger <= 0 {
 		state.LastIngestedLedger = int64(startLedger) - 1
 	}
@@ -904,7 +989,13 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 	return caughtUp, nil
 }
 
-// ReingestRange re-fetches events for the closed range [fromLedger, toLedger].
+// ReingestRange re-fetches events for the closed range [fromLedger, toLedger]
+// across all watched filter batches and replaces stored events and derived
+// address references in place while enforcing cold-archive immutability.
+// Unlike HandleReorgRange, ReingestRange is a non-destructive gap-repair and
+// rescan helper: it does not delete dead_letters, clamp audit_state, rewind
+// cursors, or fire reorg retraction notices, and it aborts without mutating
+// the store if any batch hits rpc.IsLedgerOutOfRange.
 func (ing *Ingester) ReingestRange(ctx context.Context, client rpc.Client, fromLedger, toLedger uint32) (int, error) {
 	if fromLedger > toLedger {
 		return 0, fmt.Errorf("ReingestRange: from %d > %d", fromLedger, toLedger)
@@ -912,91 +1003,62 @@ func (ing *Ingester) ReingestRange(ctx context.Context, client rpc.Client, fromL
 	if client == nil {
 		client = ing.client
 	}
+
+	archivedThrough, err := ing.resolveArchivedBoundary(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if archivedThrough > 0 && fromLedger <= archivedThrough {
+		ReorgArchivedBoundaryViolationsTotal.Inc()
+		ing.log.Error("reingest touches archived immutable ledger range",
+			"from_ledger", fromLedger,
+			"to_ledger", toLedger,
+			"archived_through_ledger", archivedThrough,
+		)
+		return 0, fmt.Errorf(
+			"%w: reingest range [%d,%d] intersects archived ledgers (archived through %d)",
+			ErrReorgTouchesArchivedRange, fromLedger, toLedger, archivedThrough,
+		)
+	}
+
 	filters, err := ing.BuildFilterBatches(ctx)
 	if err != nil {
 		return 0, err
 	}
-	repaired := 0
-	for _, batch := range filters {
-		inserted, err := ing.reingestBatch(ctx, client, fromLedger, toLedger, batch)
-		if err != nil {
-			return repaired, err
-		}
-		repaired += inserted
-	}
-	return repaired, nil
-}
 
-func (ing *Ingester) reingestBatch(ctx context.Context, client rpc.Client, fromLedger, toLedger uint32, batch []rpc.EventFilter) (int, error) {
-	endLedgerExcl := toLedger + 1
-	var collected []rpc.Event
-	cursor := ""
-	for {
-		resp, err := client.GetEvents(ctx, rpc.GetEventsRequest{
-			StartLedger: fromLedger,
-			EndLedger:   endLedgerExcl,
-			Filters:     batch,
-			Pagination:  &rpc.Pagination{Cursor: cursor, Limit: ing.opts.PageLimit},
-		})
-		if rpc.IsLedgerOutOfRange(err) {
+	var allStoreEvents []store.Event
+	for _, batch := range filters {
+		collected, outOfRange, berr := ing.collectBatchEventsInRange(ctx, client, fromLedger, toLedger, batch, true)
+		if berr != nil {
+			return 0, berr
+		}
+		if outOfRange {
 			return 0, nil
 		}
-		if err != nil {
-			return 0, fmt.Errorf("ReingestRange getEvents [%d,%d]: %w", fromLedger, toLedger, err)
-		}
-		for _, e := range resp.Events {
-			if e.Ledger <= toLedger {
-				collected = append(collected, e)
-			}
-		}
-		if len(resp.Events) == 0 {
-			break
-		}
-		last := resp.Events[len(resp.Events)-1]
-		// A short page is only terminal when the RPC supplies no
-		// continuation cursor: some endpoints return fewer results than
-		// requested while more data remains, and stopping here would make
-		// ReplaceEventsInRange delete rows that were never re-fetched.
-		if uint(len(resp.Events)) < ing.opts.PageLimit && resp.Cursor == "" {
-			break
-		}
-		if last.Ledger > toLedger {
-			break
-		}
-		next := resp.Cursor
-		if next == "" {
-			next = last.CursorValue()
-		}
-		if next == cursor {
-			break // non-advancing cursor: stop rather than spin forever
-		}
-		cursor = next
+		allStoreEvents = append(allStoreEvents, collected...)
 	}
-	storeEvents := make([]store.Event, 0, len(collected))
-	for _, re := range collected {
-		ev, err := ing.toStoreEvent(re)
-		if err != nil {
-			return 0, err
-		}
-		ev.Network = ing.opts.Network
-		storeEvents = append(storeEvents, ev)
-	}
+	allStoreEvents = removeDuplicateEvents(allStoreEvents)
+
 	if ing.opts.DryRun {
-		ids := make([]string, len(storeEvents))
-		for i, event := range storeEvents {
+		ids := make([]string, len(allStoreEvents))
+		for i, event := range allStoreEvents {
 			ids[i] = event.ID
 		}
 		ing.log.Info("dry-run: would replace events",
 			"from_ledger", fromLedger,
 			"to_ledger", toLedger,
-			"count", len(storeEvents),
+			"count", len(allStoreEvents),
 			"event_ids", ids)
-		return len(storeEvents), nil
+		return len(allStoreEvents), nil
 	}
-	if err := ing.store.ReplaceEventsInRange(ctx, storeEvents, int64(fromLedger), int64(toLedger)); err != nil {
+
+	if err := ing.store.ReplaceEventsInRange(ctx, allStoreEvents, int64(fromLedger), int64(toLedger)); err != nil {
 		return 0, fmt.Errorf("ReplaceEventsInRange [%d,%d]: %w", fromLedger, toLedger, err)
 	}
-	return len(storeEvents), nil
+	if err := ing.indexEventAddresses(ctx, allStoreEvents); err != nil {
+		ing.log.Error("indexing event addresses", "error", err)
+	}
+	return len(allStoreEvents), nil
 }
 
 // BuildFilterBatches converts the watched-contract list into getEvents
@@ -1106,15 +1168,31 @@ func nextState(resp rpc.GetEventsResponse, pageLimit uint) (store.IngestionState
 //     mid-sweep leaves the frontier at the last fully-completed window so
 //     restart resumes from there (idempotent upserts cover the in-flight
 //     rows on the next pass).
+func (ing *Ingester) effectiveSweepWindow() uint32 {
+	mult := uint32(1)
+	if ing.lagCoordinator != nil {
+		if m := ing.lagCoordinator.EffectiveSweepMultiplier(); m > 1 {
+			mult = uint32(m)
+		}
+	}
+	return ing.opts.SweepWindow * mult
+}
+
 func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]rpc.EventFilter) (bool, error) {
 	health, err := ing.client.GetHealth(ctx)
 	if err != nil {
 		return false, fmt.Errorf("getHealth for sweep window: %w", err)
 	}
+	if regressed, rerr := ing.maybeHandleTipRegression(ctx, health.LatestLedger); rerr != nil {
+		return false, rerr
+	} else if regressed {
+		ing.setIngestionLag(int64(health.LatestLedger), int64(health.LatestLedger))
+		return true, nil
+	}
 	if start > health.LatestLedger {
 		return true, nil
 	}
-	end := min(start+ing.opts.SweepWindow-1, health.LatestLedger)
+	end := min(start+ing.effectiveSweepWindow()-1, health.LatestLedger)
 
 	// Per-cycle event cap: all batches share one budget. capHit is set
 	// out-of-band (same pattern as ledgerOutOfRange) because errgroup
@@ -1195,6 +1273,12 @@ func (ing *Ingester) windowSweepWatched(ctx context.Context, batches [][]rpc.Eve
 	if err != nil {
 		return false, fmt.Errorf("getHealth for sweep window: %w", err)
 	}
+	if regressed, rerr := ing.maybeHandleTipRegression(ctx, health.LatestLedger); rerr != nil {
+		return false, rerr
+	} else if regressed {
+		ing.setIngestionLag(int64(health.LatestLedger), int64(health.LatestLedger))
+		return true, nil
+	}
 	start, err := ing.earliestStartLedger(ctx, health)
 	if err != nil {
 		return false, err
@@ -1202,7 +1286,7 @@ func (ing *Ingester) windowSweepWatched(ctx context.Context, batches [][]rpc.Eve
 	if start > health.LatestLedger {
 		return true, nil // nothing new yet
 	}
-	end := min(start+ing.opts.SweepWindow-1, health.LatestLedger)
+	end := min(start+ing.effectiveSweepWindow()-1, health.LatestLedger)
 
 	remaining := ing.newCycleBudget()
 	var capHit atomic.Bool
@@ -1382,11 +1466,14 @@ func (ing *Ingester) sweepBatch(ctx context.Context, ledgerOutOfRange *atomic.Bo
 // due to RPC quirks or re-fetches), the ingester does not write duplicates
 // in a single batch before the store's own idempotent upserts can absorb them.
 func removeDuplicateEvents(events []store.Event) []store.Event {
-	seen := make(map[string]bool, len(events))
+	if len(events) <= 1 {
+		return events
+	}
+	seen := make(map[string]struct{}, len(events))
 	result := events[:0]
 	for _, ev := range events {
-		if !seen[ev.ID] {
-			seen[ev.ID] = true
+		if _, exists := seen[ev.ID]; !exists {
+			seen[ev.ID] = struct{}{}
 			result = append(result, ev)
 		}
 	}
@@ -1394,6 +1481,10 @@ func removeDuplicateEvents(events []store.Event) []store.Event {
 }
 
 func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, latestLedger uint32) error {
+	return ing.persistEventsWithReorgCheck(ctx, rpcEvents, latestLedger, false)
+}
+
+func (ing *Ingester) persistEventsWithReorgCheck(ctx context.Context, rpcEvents []rpc.Event, latestLedger uint32, checkDivergence bool) error {
 	if len(rpcEvents) == 0 {
 		return nil
 	}
@@ -1422,8 +1513,7 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 			if ing.deadLetterStore == nil {
 				return err
 			}
-			dlCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			if _, derr := ing.deadLetterStore.DeadLetterEvent(dlCtx, store.DeadLetterInput{
+			if derr := ing.recordDeadLetter(ctx, store.DeadLetterInput{
 				EventID:    re.ID,
 				ContractID: re.ContractID,
 				Ledger:     int64(re.Ledger),
@@ -1432,10 +1522,9 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 				TopicXDR:   re.Topic,
 				ValueXDR:   re.Value,
 				Err:        err,
-			}); derr != nil {
-				ing.log.Warn("dead-lettering failed", "event_id", re.ID, "error", derr)
+			}, "decode"); derr != nil {
+				return fmt.Errorf("dead-lettering decode failure for event %s: %w (original error: %v)", re.ID, derr, err)
 			}
-			cancel()
 			ing.cycle.addSkipped(1)
 			continue
 		}
@@ -1449,6 +1538,11 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 	for start := 0; start < len(events); start += int(ing.opts.WriteBatchSize) {
 		end := min(start+int(ing.opts.WriteBatchSize), len(events))
 		if err := ing.persistEventBatch(ctx, events[start:end], rpcEvents[len(rpcEvents)-1].Ledger, latestLedger); err != nil {
+			return err
+		}
+	}
+	if !ing.opts.DryRun {
+		if err := ing.recordIngestedLedgerFingerprints(ctx, events, latestLedger, checkDivergence); err != nil {
 			return err
 		}
 	}
@@ -1513,11 +1607,11 @@ func (ing *Ingester) writeEventsPersist(ctx context.Context, events []store.Even
 		return 0, nil
 	}
 
-	// Batching disabled: single write of the whole page, exactly as the
-	// ingester has always done.
+	// Batching disabled: single write of the whole page, with per-event
+	// fallback isolation when a permanent event-level failure occurs (#1240).
 	if ing.opts.BatchSize == 0 {
 		timer := prometheus.NewTimer(metrics.DBWriteLatency)
-		inserted, err := ing.store.UpsertEvents(ctx, events)
+		inserted, err := ing.upsertChunkWithIsolation(ctx, events)
 		timer.ObserveDuration()
 		if err != nil {
 			return 0, err
@@ -1544,7 +1638,7 @@ func (ing *Ingester) writeEventsPersist(ctx context.Context, events []store.Even
 
 		begin := ing.opts.Clock.Now()
 		timer := prometheus.NewTimer(metrics.DBWriteLatency)
-		got, err := ing.store.UpsertEvents(ctx, chunk)
+		got, err := ing.upsertChunkWithIsolation(ctx, chunk)
 		timer.ObserveDuration()
 		latency := ing.opts.Clock.Now().Sub(begin)
 		if err != nil {
@@ -1571,6 +1665,72 @@ func (ing *Ingester) writeEventsPersist(ctx context.Context, events []store.Even
 		}
 	}
 	return inserted, nil
+}
+
+// recordDeadLetter persists a poison event to the dead-letter sink and updates
+// the DeadLettersTotal metric. If the dead-letter write itself fails, the error
+// is returned so the caller refuses to advance the ingestion cursor (#1240: no
+// event may be silently dropped without either landing in events or in
+// dead_letters).
+func (ing *Ingester) recordDeadLetter(ctx context.Context, in store.DeadLetterInput, reason string) error {
+	dlCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if _, err := ing.deadLetterStore.DeadLetterEvent(dlCtx, in); err != nil {
+		ing.log.Error("dead-lettering failed; aborting batch to preserve cursor invariant",
+			"event_id", in.EventID, "ledger", in.Ledger, "reason", reason, "error", err)
+		return err
+	}
+	metrics.DeadLettersTotal.WithLabelValues(reason).Inc()
+	ing.log.Warn("poison event recorded in dead_letters",
+		"event_id", in.EventID,
+		"contract_id", in.ContractID,
+		"ledger", in.Ledger,
+		"reason", reason,
+		"error", in.Err,
+	)
+	return nil
+}
+
+// upsertChunkWithIsolation attempts a batch UpsertEvents call. If the batch
+// fails with a permanent per-event error (store.IsPermanentEventError) and a
+// dead-letter sink is configured, it isolates each event in the chunk: valid
+// events are persisted and poison events are dead-lettered. Transient failures
+// (connection drops, timeouts) return immediately so the cursor never advances
+// past uncommitted data.
+func (ing *Ingester) upsertChunkWithIsolation(ctx context.Context, chunk []store.Event) (int64, error) {
+	inserted, err := ing.store.UpsertEvents(ctx, chunk)
+	if err == nil {
+		return inserted, nil
+	}
+	if ing.deadLetterStore == nil || !store.IsPermanentEventError(err) {
+		return 0, err
+	}
+
+	var totalInserted int64
+	for _, ev := range chunk {
+		n, singleErr := ing.store.UpsertEvents(ctx, []store.Event{ev})
+		if singleErr == nil {
+			totalInserted += n
+			continue
+		}
+		if !store.IsPermanentEventError(singleErr) {
+			return totalInserted, singleErr
+		}
+		if derr := ing.recordDeadLetter(ctx, store.DeadLetterInput{
+			EventID:    ev.ID,
+			ContractID: ev.ContractID,
+			Ledger:     ev.Ledger,
+			Type:       ev.Type,
+			TxHash:     ev.TxHash,
+			TopicXDR:   ev.RawTopicXDR,
+			ValueXDR:   ev.RawValueXDR,
+			Err:        singleErr,
+		}, "store"); derr != nil {
+			return totalInserted, derr
+		}
+		ing.cycle.addSkipped(1)
+	}
+	return totalInserted, nil
 }
 
 // newBatchController builds a fresh batch controller from Options. It is
@@ -1682,9 +1842,11 @@ func (ing *Ingester) setDryRunPosition(cursor string, lastIngestedLedger int64) 
 }
 
 func (ing *Ingester) logDryRunAddressRefs(events []store.Event) {
-	var refs []store.AddressRef
+	refs := make([]store.AddressRef, 0, len(events)*2)
+	decoded := make([]decode.AddressRef, 0, 8)
 	for _, ev := range events {
-		for _, ref := range decode.ExtractAddresses(ev.Topics, ev.Value) {
+		decoded = decode.AppendAddresses(decoded[:0], ev.ID, ev.Topics, ev.Value)
+		for _, ref := range decoded {
 			refs = append(refs, store.AddressRef{Address: ref.Address, EventID: ev.ID, Role: ref.Role})
 		}
 	}
@@ -1895,6 +2057,26 @@ func (ing *Ingester) discardCursor(ctx context.Context) {
 // what the store already has — RPC reorg or stale cache) is ambiguous
 // data we can't interpret; we leave hysteresis alone and republish the
 // current value so the gauge stays consistent.
+func (ing *Ingester) effectiveLagRecoverLedgers() uint32 {
+	if ing.opts.LagRecoverLedgers > 0 {
+		if ing.opts.LagRecoverLedgers > ing.opts.LagWarnLedgers {
+			return ing.opts.LagWarnLedgers
+		}
+		return ing.opts.LagRecoverLedgers
+	}
+	if ing.opts.LagBackpressureEnabled || ing.opts.LagCoordinator != nil {
+		return (ing.opts.LagWarnLedgers * 3) / 4
+	}
+	return ing.opts.LagWarnLedgers
+}
+
+func (ing *Ingester) publishLagging(lagging bool) {
+	if ing.opts.LagCoordinator != nil {
+		ing.opts.LagCoordinator.SetLagging(lagging)
+	}
+	ing.opts.LagMetrics.SetLagging(lagging)
+}
+
 func (ing *Ingester) checkLag(ctx context.Context) {
 	if ing.opts.DryRun {
 		return
@@ -1923,7 +2105,11 @@ func (ing *Ingester) checkLag(ctx context.Context) {
 			// is "ingestion_state row never gets deleted", so any
 			// prior ing.lagging=true flips to false on the next
 			// non-ErrNotFound cycle, realigning gauge and memory.
-			ing.opts.LagMetrics.SetLagging(false)
+			if ing.lagCoordinator != nil && ing.opts.LagCoordinator == nil {
+				ing.lagCoordinator.ObserveLag(int64(latest.Sequence), 0)
+			} else {
+				ing.publishLagging(false)
+			}
 			return
 		}
 		// Other store errors leave the alarm silent too: gaps in
@@ -1946,17 +2132,32 @@ func (ing *Ingester) checkLag(ctx context.Context) {
 			// hysteresis (don't flip to "recovered" on data we
 			// can't trust) and republish the gauge so scrapers
 			// see a consistent value.
-			ing.opts.LagMetrics.SetLagging(ing.lagging)
+			if ing.lagCoordinator != nil && ing.opts.LagCoordinator == nil {
+				ing.lagCoordinator.ObserveLag(int64(latest.Sequence), state.LastIngestedLedger)
+			} else {
+				ing.publishLagging(ing.lagging)
+			}
 			return
 		}
-		lagging = rawLag > int64(ing.opts.LagWarnLedgers)
+		if !ing.lagging {
+			lagging = rawLag > int64(ing.opts.LagWarnLedgers)
+		} else {
+			lagging = rawLag > int64(ing.effectiveLagRecoverLedgers())
+		}
 	}
 
 	// Publish BEFORE the early-return below so the gauge stays fresh
 	// on every cycle (a freshly-attached scraper sees 0 right away
 	// and a restart never leaks a stale value). The hysteresis
 	// transition check still gates the log line.
-	ing.opts.LagMetrics.SetLagging(lagging)
+	if ing.lagCoordinator != nil {
+		ing.lagCoordinator.ObserveLag(int64(latest.Sequence), state.LastIngestedLedger)
+		if ing.opts.LagCoordinator != nil {
+			ing.opts.LagMetrics.SetLagging(lagging)
+		}
+	} else {
+		ing.opts.LagMetrics.SetLagging(lagging)
+	}
 	if lagging == ing.lagging {
 		return // no edge → no log (this is the spam-suppression rule)
 	}
@@ -2123,6 +2324,9 @@ func (ing *Ingester) EffectivePollInterval() time.Duration {
 // [PollIntervalMin, PollIntervalMax], so the interval can never escape
 // its configured range no matter how long the process has been running.
 func (ing *Ingester) adjustPollInterval(caughtUp bool) {
+	if ing.lagCoordinator != nil && ing.lagCoordinator.Enabled() && ing.lagCoordinator.IsLagging() {
+		caughtUp = false
+	}
 	current := time.Duration(ing.pollInterval.Load())
 	var next time.Duration
 	if caughtUp {
@@ -2158,9 +2362,10 @@ func (ing *Ingester) indexEventAddresses(ctx context.Context, events []store.Eve
 	if len(events) == 0 {
 		return nil
 	}
-	var refs []store.AddressRef
+	refs := make([]store.AddressRef, 0, len(events)*2)
+	decoded := make([]decode.AddressRef, 0, 8)
 	for _, ev := range events {
-		decoded := decode.ExtractAddresses(ev.Topics, ev.Value)
+		decoded = decode.AppendAddresses(decoded[:0], ev.ID, ev.Topics, ev.Value)
 		for _, r := range decoded {
 			refs = append(refs, store.AddressRef{
 				Address: r.Address,

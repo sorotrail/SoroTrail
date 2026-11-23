@@ -41,6 +41,17 @@ groups:
       - record: sorotrail:backpressure:rate5m
         expr: rate(sorotrail_event_backpressure_total[5m])
 
+      # SLO indicators (issue #1258). The Overview dashboard reads these
+      # series, so the dashboard and the alerts cannot disagree on what an
+      # indicator means.
+      - record: sorotrail:http_availability:ratio5m
+        expr: 1 - ((sum(rate(http_request_duration_seconds_count{status=~"5.."}[5m])) or vector(0)) / clamp_min(sum(rate(http_request_duration_seconds_count[5m])), 1e-9))
+      - record: sorotrail:http_latency:p95_5m
+        expr: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+      - record: sorotrail:ingestion_lag:max
+        expr: max(sorotrail_ingestion_lag_ledgers)
+
+
   # ── Alerting rules ─────────────────────────────────────────────────────
   - name: sorotrail_alerts
     rules:
@@ -74,7 +85,8 @@ groups:
             (threshold: 200, ≈ 16 min at ~5 s/ledger). Sustained lag risks an
             unrecoverable data gap if the RPC retention window closes.
             Check RPC latency, ingestion errors, and DB backpressure.
-          runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+          runbook_url: "https://github.com/sorotrail/SoroTrail/blob/main/docs/runbook.md#dashboards-and-alerts"
+          dashboard_url: "/d/sorotrail-overview"
 
       # ── Ingestion Errors ────────────────────────────────────────────────
       # Terminal ingestion pass failures (RPC errors, decode failures,
@@ -105,7 +117,8 @@ groups:
             SoroTrail ingestion pass error rate is {{ $value | humanize }} errors/s
             for the last 10 minutes. Any sustained error rate means events are
             being dropped. Check RPC reachability, rate limiting, and database health.
-          runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+          runbook_url: "https://github.com/sorotrail/SoroTrail/blob/main/docs/runbook.md#dashboards-and-alerts"
+          dashboard_url: "/d/sorotrail-overview"
 
       # ── RPC P99 Latency ─────────────────────────────────────────────────
       # Slow RPC calls indicate provider issues or network problems.
@@ -135,7 +148,8 @@ groups:
             Stellar RPC call P99 latency is {{ $value | humanizeDuration }} (threshold: 5 s).
             The default poll interval is 5 s, so the ingester cannot keep up.
             Check RPC provider status, network connectivity, and rate limiting.
-          runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+          runbook_url: "https://github.com/sorotrail/SoroTrail/blob/main/docs/runbook.md#dashboards-and-alerts"
+          dashboard_url: "/d/sorotrail-overview"
 
       # ── DB Write P99 Latency ────────────────────────────────────────────
       # Slow database writes indicate Postgres saturation or connection
@@ -169,7 +183,8 @@ groups:
             Postgres may be saturated. Check connection pool, disk I/O, locks,
             and vacuum status. The adaptive batch controller is likely throttling
             — check sorotrail_event_batch_size.
-          runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+          runbook_url: "https://github.com/sorotrail/SoroTrail/blob/main/docs/runbook.md#dashboards-and-alerts"
+          dashboard_url: "/d/sorotrail-overview"
 
       # ── Backpressure Active ─────────────────────────────────────────────
       # The ingester is deliberately throttling because the DB can't keep up.
@@ -199,7 +214,8 @@ groups:
             The event write backpressure has been active for 15+ minutes
             at {{ $value | humanize }}/s. The DB cannot absorb the ingester's
             write rate. Check DB health, batch size, and write latency.
-          runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+          runbook_url: "https://github.com/sorotrail/SoroTrail/blob/main/docs/runbook.md#dashboards-and-alerts"
+          dashboard_url: "/d/sorotrail-overview"
 
       # ── Batch Size Critical ─────────────────────────────────────────────
       # The adaptive batch controller has scaled down to near-minimum.
@@ -229,4 +245,5 @@ groups:
             The adaptive batch size is {{ $value }} (threshold: < 10).
             The DB is severely strained and ingestion throughput is near zero.
             Check DB write latency and Postgres health immediately.
-          runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+          runbook_url: "https://github.com/sorotrail/SoroTrail/blob/main/docs/runbook.md#dashboards-and-alerts"
+          dashboard_url: "/d/sorotrail-overview"

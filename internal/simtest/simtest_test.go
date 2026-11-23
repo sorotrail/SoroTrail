@@ -2,8 +2,12 @@ package simtest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +15,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/sorotrail/sorotrail/internal/decode"
+	"github.com/sorotrail/sorotrail/internal/ingester"
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
@@ -795,4 +801,322 @@ func (f *faultClient) GetEvents(ctx context.Context, req rpc.GetEventsRequest) (
 
 func (m *mockStore) CountEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
 	return 0, nil
+}
+
+// ---------- Multi-Provider Failover Simulation Tests ----------
+
+// simProviderClient wraps a VirtualChain to model provider-specific failure
+// modes in multi-provider failover simulations: failing after N GetEvents
+// calls, reporting a lagging chain head, reporting a truncated retention
+// window, or mutating event payloads on a target ledger.
+type simProviderClient struct {
+	chain          *VirtualChain
+	passphrase     string
+	failAfterCalls int
+	overrideLatest uint32
+	overrideOldest uint32
+	corruptLedger  uint32
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (p *simProviderClient) GetNetwork(_ context.Context) (rpc.NetworkInfo, error) {
+	pass := p.passphrase
+	if pass == "" {
+		pass = rpc.MainnetNetworkPassphrase
+	}
+	return rpc.NetworkInfo{Passphrase: pass}, nil
+}
+
+func (p *simProviderClient) GetHealth(ctx context.Context) (rpc.Health, error) {
+	h, err := p.chain.GetHealth(ctx)
+	if err != nil {
+		return h, err
+	}
+	if p.overrideLatest > 0 {
+		h.LatestLedger = p.overrideLatest
+	}
+	if p.overrideOldest > 0 {
+		h.OldestLedger = p.overrideOldest
+	}
+	return h, nil
+}
+
+func (p *simProviderClient) GetLatestLedger(ctx context.Context) (rpc.LatestLedger, error) {
+	ll, err := p.chain.GetLatestLedger(ctx)
+	if err != nil {
+		return ll, err
+	}
+	if p.overrideLatest > 0 {
+		ll.Sequence = p.overrideLatest
+	}
+	return ll, nil
+}
+
+func (p *simProviderClient) GetEvents(ctx context.Context, req rpc.GetEventsRequest) (rpc.GetEventsResponse, error) {
+	p.mu.Lock()
+	p.calls++
+	callNum := p.calls
+	p.mu.Unlock()
+
+	if p.failAfterCalls > 0 && callNum > p.failAfterCalls {
+		return rpc.GetEventsResponse{}, fmt.Errorf("getEvents returned HTTP 503: provider down after %d calls", p.failAfterCalls)
+	}
+
+	resp, err := p.chain.GetEvents(ctx, req)
+	if err != nil {
+		return resp, err
+	}
+
+	if p.overrideLatest > 0 {
+		resp.LatestLedger = p.overrideLatest
+		filtered := resp.Events[:0]
+		for _, ev := range resp.Events {
+			if ev.Ledger <= p.overrideLatest {
+				filtered = append(filtered, ev)
+			}
+		}
+		resp.Events = filtered
+	}
+
+	if p.overrideOldest > 0 {
+		resp.OldestLedger = p.overrideOldest
+		// Simulate a provider with a shorter retention window that silently omits
+		// events older than overrideOldest rather than returning an RPC error.
+		var retained []rpc.Event
+		for _, ev := range resp.Events {
+			if ev.Ledger >= p.overrideOldest {
+				retained = append(retained, ev)
+			}
+		}
+		resp.Events = retained
+	}
+
+	if p.corruptLedger > 0 {
+		mutated := make([]rpc.Event, len(resp.Events))
+		copy(mutated, resp.Events)
+		for i := range mutated {
+			if mutated[i].Ledger == p.corruptLedger {
+				mutated[i].ValueJSON = json.RawMessage(`{"u64":999999}`)
+			}
+		}
+		resp.Events = mutated
+	}
+
+	return resp, nil
+}
+
+func (p *simProviderClient) GetLedgerEntries(ctx context.Context, req rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
+	return p.chain.GetLedgerEntries(ctx, req)
+}
+
+func (p *simProviderClient) SimulateTransaction(ctx context.Context, req rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error) {
+	return p.chain.SimulateTransaction(ctx, req)
+}
+
+func buildPopulatedVirtualChain(scenario Scenario) (*VirtualChain, *VirtualClock) {
+	now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	clock := NewVirtualClock(now)
+	scenario.applyDefaults()
+	chain := NewVirtualChain(clock, now, scenario.RetentionLedgers)
+	for i, ep := range scenario.Events {
+		id := fmt.Sprintf("%010d-%09d", ep.Ledger, i)
+		ev := BuildEvent(id, ep.Ledger, ep.ContractID)
+		chain.AddEvents(ep.Ledger, ev)
+	}
+	if scenario.ChainLedgers > 0 {
+		chain.AdvanceTo(scenario.ChainLedgers)
+	}
+	return chain, clock
+}
+
+func runIngesterWithClient(t *testing.T, scenario Scenario, client rpc.Client, oracleChain *VirtualChain) ([]store.Event, *mockStore) {
+	t.Helper()
+	ctx := context.Background()
+	st := newMockStore()
+	_, clock := buildPopulatedVirtualChain(scenario)
+	rng := rand.New(rand.NewPCG(42, 42))
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	ing := ingester.New(
+		client,
+		st,
+		decode.XDRDecoder{},
+		log,
+		ingester.Options{
+			PollInterval:     time.Second,
+			StartLedger:      scenario.StartLedger,
+			RetentionLedgers: scenario.RetentionLedgers,
+			PageLimit:        scenario.PageLimit,
+			SweepWindow:      scenario.SweepWindow,
+			Clock:            clock,
+			Jitter:           DeterministicJitter(rng),
+		},
+	)
+
+	caughtUpCount := 0
+	for step := 1; step <= 25; step++ {
+		caughtUp, _ := ing.RunOnceForTest(ctx)
+		if caughtUp {
+			caughtUpCount++
+			if caughtUpCount >= 2 {
+				break
+			}
+		} else {
+			caughtUpCount = 0
+		}
+	}
+
+	oracle := NewOracle(oracleChain)
+	require.NoError(t, oracle.Verify(ctx, st), "oracle verification must pass")
+
+	stored, _, err := st.QueryEvents(ctx, store.EventFilter{Limit: 10000, Order: "asc"})
+	require.NoError(t, err)
+	return stored, st
+}
+
+func TestMultiProviderFailover_CorrectnessMatchesSingleHealthyProvider(t *testing.T) {
+	baseScenario := findScenario("multi_provider_failover_mid_batch")
+	require.NotNil(t, baseScenario, "curated scenario multi_provider_failover_mid_batch must exist")
+	scenario := *baseScenario
+	scenario.Faults = nil // Faults are injected at the provider layer below.
+
+	// 1. Run against a single healthy provider to produce the reference event set.
+	refChain, _ := buildPopulatedVirtualChain(scenario)
+	expectedEvents, _ := runIngesterWithClient(t, scenario, refChain, refChain)
+	require.Len(t, expectedEvents, len(scenario.Events), "reference single-provider run must ingest all events")
+
+	t.Run("failover_mid_batch_reanchors_without_gap_or_duplicate", func(t *testing.T) {
+		c1, _ := buildPopulatedVirtualChain(scenario)
+		c2, _ := buildPopulatedVirtualChain(scenario)
+
+		providers := map[string]rpc.Client{
+			"https://primary.sim.test":   &simProviderClient{chain: c1, failAfterCalls: 1},
+			"https://secondary.sim.test": &simProviderClient{chain: c2},
+		}
+		fc := rpc.NewFailoverClient(
+			[]string{"https://primary.sim.test", "https://secondary.sim.test"},
+			1000.0,
+			func(u string, _ float64) rpc.Client { return providers[u] },
+			rpc.WithFailoverMaxErrors(1),
+			rpc.WithFailoverExpectedNetwork("mainnet"),
+			rpc.WithFailoverLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		)
+
+		gotEvents, _ := runIngesterWithClient(t, scenario, fc, c2)
+		assert.Equal(t, expectedEvents, gotEvents, "stored events after mid-batch failover must equal single healthy provider")
+	})
+
+	t.Run("provider_behind_cursor_is_skipped", func(t *testing.T) {
+		c1, _ := buildPopulatedVirtualChain(scenario)
+		cBehind, _ := buildPopulatedVirtualChain(scenario)
+		cHealthy, _ := buildPopulatedVirtualChain(scenario)
+
+		providers := map[string]rpc.Client{
+			"https://primary.sim.test": &simProviderClient{chain: c1, failAfterCalls: 1},
+			"https://behind.sim.test":  &simProviderClient{chain: cBehind, overrideLatest: 4},
+			"https://healthy.sim.test": &simProviderClient{chain: cHealthy},
+		}
+		fc := rpc.NewFailoverClient(
+			[]string{"https://primary.sim.test", "https://behind.sim.test", "https://healthy.sim.test"},
+			1000.0,
+			func(u string, _ float64) rpc.Client { return providers[u] },
+			rpc.WithFailoverMaxErrors(1),
+			rpc.WithFailoverLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		)
+
+		gotEvents, _ := runIngesterWithClient(t, scenario, fc, cHealthy)
+		assert.Equal(t, expectedEvents, gotEvents, "stored events when skipping behind provider must equal single healthy provider")
+		states := fc.ProviderStates()
+		assert.Equal(t, rpc.StateDegraded, states[1].State, "behind provider must be demoted")
+	})
+
+	t.Run("provider_with_shorter_retention_window_is_skipped", func(t *testing.T) {
+		c1, _ := buildPopulatedVirtualChain(scenario)
+		cShort, _ := buildPopulatedVirtualChain(scenario)
+		cHealthy, _ := buildPopulatedVirtualChain(scenario)
+
+		providers := map[string]rpc.Client{
+			"https://primary.sim.test":   &simProviderClient{chain: c1, failAfterCalls: 1},
+			"https://short-ret.sim.test": &simProviderClient{chain: cShort, overrideOldest: 25},
+			"https://healthy.sim.test":   &simProviderClient{chain: cHealthy},
+		}
+		fc := rpc.NewFailoverClient(
+			[]string{"https://primary.sim.test", "https://short-ret.sim.test", "https://healthy.sim.test"},
+			1000.0,
+			func(u string, _ float64) rpc.Client { return providers[u] },
+			rpc.WithFailoverMaxErrors(1),
+			rpc.WithFailoverLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		)
+
+		gotEvents, _ := runIngesterWithClient(t, scenario, fc, cHealthy)
+		assert.Equal(t, expectedEvents, gotEvents, "stored events when skipping short-retention provider must equal single healthy provider")
+		states := fc.ProviderStates()
+		assert.Equal(t, rpc.StateDegraded, states[1].State, "short-retention provider must be demoted")
+	})
+
+	t.Run("provider_returning_subtly_different_data_is_rejected", func(t *testing.T) {
+		c1, _ := buildPopulatedVirtualChain(scenario)
+		cDivergent, _ := buildPopulatedVirtualChain(scenario)
+		cHealthy, _ := buildPopulatedVirtualChain(scenario)
+
+		// Page 1 (limit 3) fetches the 2 events at ledger 5 and 1 event at ledger 10.
+		// Primary then fails mid-batch at ledger 10. Re-anchor re-scans from ledger 10,
+		// where cDivergent returns a mutated ValueJSON for ledger 10.
+		providers := map[string]rpc.Client{
+			"https://primary.sim.test":   &simProviderClient{chain: c1, failAfterCalls: 1},
+			"https://divergent.sim.test": &simProviderClient{chain: cDivergent, corruptLedger: 10},
+			"https://healthy.sim.test":   &simProviderClient{chain: cHealthy},
+		}
+		fc := rpc.NewFailoverClient(
+			[]string{"https://primary.sim.test", "https://divergent.sim.test", "https://healthy.sim.test"},
+			1000.0,
+			func(u string, _ float64) rpc.Client { return providers[u] },
+			rpc.WithFailoverMaxErrors(1),
+			rpc.WithFailoverLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		)
+
+		gotEvents, _ := runIngesterWithClient(t, scenario, fc, cHealthy)
+		assert.Equal(t, expectedEvents, gotEvents, "stored events when rejecting divergent provider must equal single healthy provider")
+		states := fc.ProviderStates()
+		assert.Equal(t, rpc.StateDown, states[1].State, "divergent provider must be demoted to StateDown")
+		assert.NotEmpty(t, fc.Divergences(), "divergence must be recorded on FailoverClient")
+	})
+
+	t.Run("combined_multi_provider_gauntlet", func(t *testing.T) {
+		c1, _ := buildPopulatedVirtualChain(scenario)
+		cWrongNet, _ := buildPopulatedVirtualChain(scenario)
+		cBehind, _ := buildPopulatedVirtualChain(scenario)
+		cShort, _ := buildPopulatedVirtualChain(scenario)
+		cDivergent, _ := buildPopulatedVirtualChain(scenario)
+		cHealthy, _ := buildPopulatedVirtualChain(scenario)
+
+		providers := map[string]rpc.Client{
+			"https://primary.sim.test":   &simProviderClient{chain: c1, failAfterCalls: 1},
+			"https://testnet.sim.test":   &simProviderClient{chain: cWrongNet, passphrase: rpc.TestnetNetworkPassphrase},
+			"https://behind.sim.test":    &simProviderClient{chain: cBehind, overrideLatest: 4},
+			"https://short-ret.sim.test": &simProviderClient{chain: cShort, overrideOldest: 25},
+			"https://divergent.sim.test": &simProviderClient{chain: cDivergent, corruptLedger: 10},
+			"https://healthy.sim.test":   &simProviderClient{chain: cHealthy},
+		}
+		fc := rpc.NewFailoverClient(
+			[]string{
+				"https://primary.sim.test",
+				"https://testnet.sim.test",
+				"https://behind.sim.test",
+				"https://short-ret.sim.test",
+				"https://divergent.sim.test",
+				"https://healthy.sim.test",
+			},
+			1000.0,
+			func(u string, _ float64) rpc.Client { return providers[u] },
+			rpc.WithFailoverMaxErrors(1),
+			rpc.WithFailoverExpectedNetwork("mainnet"),
+			rpc.WithFailoverLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		)
+
+		gotEvents, _ := runIngesterWithClient(t, scenario, fc, cHealthy)
+		assert.Equal(t, expectedEvents, gotEvents, "combined multi-provider gauntlet must produce identical stored events to a single healthy provider")
+	})
 }

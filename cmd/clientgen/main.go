@@ -13,18 +13,35 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/sorotrail/sorotrail/internal/clientgen"
 )
 
+const (
+	defaultOutput   = "pkg/client/client.gen.go"
+	defaultPyOutput = "clients/python/sorotrail/_generated.py"
+)
+
 func main() {
 	in := flag.String("in", "api/openapi.yaml", "path to the YAML source spec")
-	out := flag.String("out", "pkg/client/client.gen.go", "path to the generated client")
+	out := flag.String("out", defaultOutput, "path to the generated client")
+	pyOut := flag.String("py-out", "", "path to the generated Python client")
 	flag.Parse()
 
 	if err := run(*in, *out); err != nil {
 		fmt.Fprintln(os.Stderr, "clientgen:", err)
 		os.Exit(1)
+	}
+	resolvedPyOut := *pyOut
+	if resolvedPyOut == "" && *out == defaultOutput {
+		resolvedPyOut = defaultPyOutput
+	}
+	if resolvedPyOut != "" {
+		if err := runPython(*in, resolvedPyOut); err != nil {
+			fmt.Fprintln(os.Stderr, "clientgen:", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -34,4 +51,17 @@ func run(in, out string) error {
 		return err
 	}
 	return os.WriteFile(out, code, 0o644)
+}
+
+func runPython(in, out string) error {
+	code, err := clientgen.GeneratePythonFromFile(in)
+	if err != nil {
+		return err
+	}
+	if dir := filepath.Dir(out); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(out, code, 0o600)
 }

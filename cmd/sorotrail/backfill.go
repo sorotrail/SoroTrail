@@ -27,6 +27,8 @@ type backfillFlags struct {
 	fromLedger       int64
 	toLedger         int64
 	batchSize        int
+	workers          int
+	rangeSize        int64
 	rps              float64
 	horizonURL       string
 	includeFail      bool
@@ -73,6 +75,8 @@ flags:
 	fs.Int64Var(&f.toLedger, "to-ledger", 0, "last ledger to backfill (inclusive; 0 = no upper bound)")
 	fs.Int64Var(&f.toLedger, "to", 0, "alias for --to-ledger")
 	fs.IntVar(&f.batchSize, "batch-size", backfill.DefaultBatchSize, "transactions per Horizon page (max 200)")
+	fs.IntVar(&f.workers, "workers", backfill.DefaultWorkers, "concurrent backfill workers across ledger sub-ranges (default 1)")
+	fs.Int64Var(&f.rangeSize, "range-size", 0, "ledgers per sub-range when splitting work across workers (0 = adaptive)")
 	fs.Float64Var(&f.rps, "rps", 0, "horizon requests per second (overrides BACKFILL_RATE_RPS env)")
 	fs.StringVar(&f.horizonURL, "horizon-url", "", "horizon REST base URL (overrides HORIZON_URL env)")
 	fs.BoolVar(&f.includeFail, "include-failed", true, "include transactions whose tx-level result was failed")
@@ -95,6 +99,15 @@ flags:
 	}
 	if f.batchSize <= 0 || f.batchSize > 200 {
 		return backfillFlags{}, fmt.Errorf("--batch-size must be in 1..200, got %d", f.batchSize)
+	}
+	if f.workers <= 0 {
+		return backfillFlags{}, fmt.Errorf("--workers must be >= 1, got %d", f.workers)
+	}
+	if f.rangeSize < 0 {
+		return backfillFlags{}, fmt.Errorf("--range-size must be >= 0, got %d", f.rangeSize)
+	}
+	if (f.workers > 1 || f.rangeSize > 0) && f.toLedger <= 0 {
+		return backfillFlags{}, errors.New("--to-ledger is required when --workers > 1 or --range-size > 0")
 	}
 	return f, nil
 }
@@ -165,6 +178,8 @@ func runBackfill(args []string) error {
 		FromLedger:    f.fromLedger,
 		ToLedger:      f.toLedger,
 		BatchSize:     f.batchSize,
+		Workers:       f.workers,
+		RangeSize:     f.rangeSize,
 		HorizonURL:    hURL,
 		MinInterval:   minInterval,
 		IncludeFailed: f.includeFail,
@@ -334,6 +349,13 @@ func printBackfillSummary(s backfill.Summary, dryRun bool) {
 `,
 		status, mode, s.PagesFetched, s.Transactions, s.Skipped, s.Failed,
 		s.Extracted, s.Inserted, s.ThroughLedger, s.Duration.Round(time.Millisecond))
+	if s.TotalRanges > 1 || len(s.FailedRanges) > 0 {
+		fmt.Printf("  ranges:         %d/%d completed (%d in-flight, %d failed)\n",
+			s.CompletedRanges, s.TotalRanges, s.InFlightRanges, len(s.FailedRanges))
+		for _, fr := range s.FailedRanges {
+			fmt.Printf("  failed range:   %s\n", fr.String())
+		}
+	}
 	if resumed != "" {
 		fmt.Printf("  %s\n", resumed[:len(resumed)-1])
 	}

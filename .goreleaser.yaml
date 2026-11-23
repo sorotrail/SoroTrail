@@ -20,9 +20,10 @@ builds:
     main: ./cmd/sorotrail
     binary: sorotrail
     ldflags:
+      - -s -w
       - -X github.com/sorotrail/sorotrail/internal/buildinfo.Version={{ .Version }}
       - -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit={{ .ShortCommit }}
-      - -X github.com/sorotrail/sorotrail/internal/buildinfo.BuildDate={{ .Date }}
+      - -X github.com/sorotrail/sorotrail/internal/buildinfo.BuildDate={{ .CommitDate }}
     env:
       - CGO_ENABLED=0
     goos:
@@ -35,9 +36,11 @@ builds:
     # The project has no CGO dependencies (SQLite, if merged, uses a
     # pure-Go driver), so CGO_ENABLED=0 is safe across all platforms.
     mod_timestamp: "{{ .CommitTimestamp }}"
-    # Strip debug info to keep binaries small.
+    # Strip host paths and disable automatic VCS stamping so two builds of the
+    # same commit from different directories or worktrees produce identical bytes.
     flags:
       - -trimpath
+      - -buildvcs=false
 
 archives:
   - id: default

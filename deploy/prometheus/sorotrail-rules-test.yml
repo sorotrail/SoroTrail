@@ -34,7 +34,8 @@ tests:
             exp_annotations:
               summary: "SoroTrail ingestion lag exceeds 200 ledgers"
               description: "SoroTrail indexer is 300 ledgers behind the Stellar RPC chain head (threshold: 200, ≈ 16 min at ~5 s/ledger). Sustained lag risks an unrecoverable data gap if the RPC retention window closes. Check RPC latency, ingestion errors, and DB backpressure."
-              runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+              runbook_url: "https://github.com/sorotrail/SoroTrail/blob/main/docs/runbook.md#dashboards-and-alerts"
+              dashboard_url: "/d/sorotrail-overview"
 
   # A steady 50-ledger lag is below the threshold and must stay silent.
   - interval: 1m
@@ -66,7 +67,8 @@ tests:
             exp_annotations:
               summary: "SoroTrail ingestion errors detected"
               description: "SoroTrail ingestion pass error rate is 100m errors/s for the last 10 minutes. Any sustained error rate means events are being dropped. Check RPC reachability, rate limiting, and database health."
-              runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+              runbook_url: "https://github.com/sorotrail/SoroTrail/blob/main/docs/runbook.md#dashboards-and-alerts"
+              dashboard_url: "/d/sorotrail-overview"
 
   # ── RPCP99LatencyHigh ─────────────────────────────────────────────────
   # All observations land in the (5s, 10s] bucket, so the P99 quantile
@@ -90,7 +92,8 @@ tests:
             exp_annotations:
               summary: "SoroTrail RPC P99 latency exceeds 5 seconds"
               description: "Stellar RPC call P99 latency is 9.95s (threshold: 5 s). The default poll interval is 5 s, so the ingester cannot keep up. Check RPC provider status, network connectivity, and rate limiting."
-              runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+              runbook_url: "https://github.com/sorotrail/SoroTrail/blob/main/docs/runbook.md#dashboards-and-alerts"
+              dashboard_url: "/d/sorotrail-overview"
       # Mostly-fast calls: half the observations sit in the (2s, 5s]
       # bucket, which puts the P99 at 4.94s — below the threshold.
   - interval: 1m
@@ -128,7 +131,8 @@ tests:
             exp_annotations:
               summary: "SoroTrail DB write P99 latency exceeds 10 seconds"
               description: "Database write P99 latency is 14.9s (threshold: 10 s). Postgres may be saturated. Check connection pool, disk I/O, locks, and vacuum status. The adaptive batch controller is likely throttling — check sorotrail_event_batch_size."
-              runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+              runbook_url: "https://github.com/sorotrail/SoroTrail/blob/main/docs/runbook.md#dashboards-and-alerts"
+              dashboard_url: "/d/sorotrail-overview"
 
   # ── BackpressureActive ────────────────────────────────────────────────
   # A steady 6 throttle sleeps/min = 0.1/s; the 15m `for` makes the alert
@@ -148,7 +152,8 @@ tests:
             exp_annotations:
               summary: "SoroTrail backpressure sustained for 15+ minutes"
               description: "The event write backpressure has been active for 15+ minutes at 100m/s. The DB cannot absorb the ingester's write rate. Check DB health, batch size, and write latency."
-              runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+              runbook_url: "https://github.com/sorotrail/SoroTrail/blob/main/docs/runbook.md#dashboards-and-alerts"
+              dashboard_url: "/d/sorotrail-overview"
 
   # ── EventBatchSizeCritical ────────────────────────────────────────────
   # The adaptive batch controller has scaled down to 3 and stays there
@@ -168,7 +173,8 @@ tests:
             exp_annotations:
               summary: "SoroTrail event batch size below 10 — ingestion nearly stalled"
               description: "The adaptive batch size is 3 (threshold: < 10). The DB is severely strained and ingestion throughput is near zero. Check DB write latency and Postgres health immediately."
-              runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+              runbook_url: "https://github.com/sorotrail/SoroTrail/blob/main/docs/runbook.md#dashboards-and-alerts"
+              dashboard_url: "/d/sorotrail-overview"
 
   # ── Recording rules ───────────────────────────────────────────────────
   # 60 events/min = 1/s and 6 errors/min = 0.1/s; assert the recorded
