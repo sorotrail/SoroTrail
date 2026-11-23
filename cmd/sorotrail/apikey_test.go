@@ -42,7 +42,6 @@ func (s *stubAPIKeyStore) RotateAPIKey(_ context.Context, predecessorID int64, n
 	if !ok {
 		return store.APIKey{}, store.ErrNotFound
 	}
-	newKey.ID = s.nextID
 	s.nextID++
 	newKey.CreatedAt = time.Now().UTC().Truncate(time.Second)
 	now := time.Now().UTC()
