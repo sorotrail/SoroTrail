@@ -37,6 +37,21 @@ func newStubAPIKeyStore() *stubAPIKeyStore {
 	}
 }
 
+func (s *stubAPIKeyStore) RotateAPIKey(_ context.Context, id int64, k store.APIKey) (store.APIKey, error) {
+	return store.APIKey{}, nil
+}
+
+func (s *stubAPIKeyStore) GetAPIKey(_ context.Context, id int64) (store.APIKey, error) {
+	if s.listErr != nil {
+		return store.APIKey{}, s.listErr
+	}
+	k, ok := s.keys[id]
+	if !ok {
+		return store.APIKey{}, store.ErrNotFound
+	}
+	return k, nil
+}
+
 func (s *stubAPIKeyStore) CreateAPIKey(_ context.Context, k store.APIKey) (store.APIKey, error) {
 	if s.createErr != nil {
 		return store.APIKey{}, s.createErr
