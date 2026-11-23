@@ -259,6 +259,14 @@ All configuration comes from environment variables (see `.env.example`).
 Every variable the code reads is listed here — the table is generated from
 the struct tags in `internal/config/config.go` to prevent drift.
 
+```sh
+# Minimal local run: SQLite storage, testnet RPC, API on :8080
+NETWORK=testnet \
+DATABASE_URL='sqlite:./sorotrail.db' \
+HTTP_ADDR=:8080 \
+./sorotrail
+```
+
 The Reload column states when a change takes effect. `SIGHUP` marks the
 two values the running indexer re-reads and applies live; `restart` marks
 every other value, which is read exactly once at startup and held for the
@@ -390,6 +398,8 @@ LOG_LEVEL=debug LOG_FORMAT=json ./sorotrail
 | `COMPRESS_MIN_SIZE` | int | `0` | Response body size (bytes) at or above which gzip/deflate encoding is applied. Negative disables compression entirely; `0` uses the built-in default. | restart |
 | `ENABLE_METRICS` | bool | `false` | Expose the Prometheus `/metrics` endpoint. | restart |
 | `SHUTDOWN_TIMEOUT` | duration | `15s` | Maximum time for graceful HTTP server drain and component shutdown before the process is killed. `0` waits indefinitely. | restart |
+
+- **`HTTP_ADDR`** — Host and port the API server binds to, in `host:port` form (`:8080` listens on all interfaces). Default: `:8080`. Example: `HTTP_ADDR=127.0.0.1:9090`.
 
 ```sh
 # Query the API server health check
