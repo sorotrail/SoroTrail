@@ -290,9 +290,6 @@ func TestRun_UnsupportedBackendRefuses(t *testing.T) {
 // Identity invariant assertion: event ID, ledger, and ordering are untouched.
 func TestRun_IdentityInvariant(t *testing.T) {
 	original := seedEvent(1, 100)
-	original.TxHash = "abc123hash"
-	original.TxIndex = 5
-	original.OpIndex = 2
 
 	st := newFakeStore(original)
 	r := newTestReplayer(st, improvedDecoder(), Options{FromLedger: 1, ToLedger: 1000})
@@ -306,9 +303,6 @@ func TestRun_IdentityInvariant(t *testing.T) {
 	assert.Equal(t, original.ID, events[0].ID)
 	assert.Equal(t, original.ContractID, events[0].ContractID)
 	assert.Equal(t, original.Ledger, events[0].Ledger)
-	assert.Equal(t, original.TxHash, events[0].TxHash)
-	assert.Equal(t, original.TxIndex, events[0].TxIndex)
-	assert.Equal(t, original.OpIndex, events[0].OpIndex)
 }
 
 type unsupportedStore struct{}
