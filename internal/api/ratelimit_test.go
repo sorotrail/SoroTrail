@@ -18,7 +18,6 @@ func TestMultiInstanceRateLimiterQuotaShared(t *testing.T) {
 	store := &mockQuotaStore{}
 	limiter1 := NewRateLimiter(10, 100, false, WithQuotaStore(store), WithDailyQuota(10))
 	limiter2 := NewRateLimiter(10, 100, false, WithQuotaStore(store), WithDailyQuota(10))
-
 	for i := 0; i < 5; i++ {
 		rec := sendFrom(limiter1, "203.0.113.99:1234")
 		require.Equal(t, http.StatusOK, rec.Code)
