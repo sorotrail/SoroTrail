@@ -313,9 +313,10 @@ flags:
 	}
 
 	created, err := st.CreateAPIKey(ctx, store.APIKey{
-		Name:    pred.Name + "-successor",
-		Prefix:  prefix,
-		KeyHash: hash,
+		Name:          pred.Name + "-successor",
+		Prefix:        prefix,
+		KeyHash:       hash,
+		PredecessorID: predecessorID,
 	})
 	if err != nil {
 		return err
@@ -324,7 +325,6 @@ flags:
 	fmt.Fprintf(w, "rotated API key %d -> successor %d (%s)\n", predecessorID, created.ID, created.Name)
 	fmt.Fprintf(w, "prefix:        %s\n", created.Prefix)
 	fmt.Fprintf(w, "key:           %s\n", key)
-	fmt.Fprintf(w, "expires-at:    %s\n", expiresAt.Format("2006-01-02 15:04:05"))
 	fmt.Fprintln(w, "store this key now — it will not be shown again.")
 	return nil
 }
