@@ -17,6 +17,8 @@ import (
 	"fmt"
 )
 
+// ContractSpec types and parsing utilities.
+
 // ContractSpec holds the parsed contract specification — the set of event
 // definitions that describe the event shapes a contract can emit.
 type ContractSpec struct {
