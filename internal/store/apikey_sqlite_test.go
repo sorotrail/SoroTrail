@@ -10,6 +10,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+
 func testAPIKey(name, prefix string) APIKey {
 	return APIKey{Name: name, Prefix: prefix, KeyHash: "bcrypt-hash-placeholder"}
 }
