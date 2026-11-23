@@ -1,11 +1,11 @@
 package decode
 
 import (
+	"github.com/sorotrail/sorotrail/internal/spec"
 	"fmt"
 	"math/big"
-
-	"github.com/sorotrail/sorotrail/internal/spec"
 )
+
 
 // SpecDecodedEvent wraps structural event decoding with spec-derived field names and types.
 type SpecDecodedEvent struct {
@@ -103,4 +103,13 @@ func formatFieldValue(val interface{}, typ string) interface{} {
 	default:
 		return val
 	}
+}
+// SpecDecoder provides helper utilities for decoding event payloads against a contract spec.
+type SpecDecoder struct {
+	spec *spec.ContractSpec
+}
+
+// NewSpecDecoder creates a new SpecDecoder instance.
+func NewSpecDecoder(s *spec.ContractSpec) *SpecDecoder {
+	return &SpecDecoder{spec: s}
 }
