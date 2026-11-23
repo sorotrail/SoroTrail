@@ -2,13 +2,10 @@
 
 package store
 
-// Integration tests for API key persistence. They need a real database
-// and are skipped unless TEST_DATABASE_URL is set, like the rest of the
-// Postgres suite (see postgres_test.go).
-
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -102,4 +99,52 @@ func TestAPIKeyPrefixIsUnique(t *testing.T) {
 	require.NoError(t, err)
 	_, err = st.CreateAPIKey(ctx, testAPIKey("two", "same-prefix"))
 	require.Error(t, err, "prefix collision must be rejected by the unique index")
+}
+func TestAPIKeyRotationAndOverlap(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	pred, err := st.CreateAPIKey(ctx, testAPIKey("predecessor", "predprefix001"))
+	require.NoError(t, err)
+
+	// Rotate: create successor linked to predecessor with an expiry
+	expiresAt := time.Now().Add(1 * time.Hour)
+	succ, err := st.CreateAPIKey(ctx, APIKey{
+		Name:          "successor",
+		Prefix:        "succprefix002",
+		KeyHash:       "bcrypt-hash-succ",
+		PredecessorID: &pred.ID,
+		ExpiresAt:     &expiresAt,
+	})
+	require.NoError(t, err)
+
+	// Both keys are valid simultaneously during the overlap period
+	gotPred, err := st.LookupAPIKeyByPrefix(ctx, "predprefix001")
+	require.NoError(t, err)
+	assert.Equal(t, pred.ID, gotPred.ID)
+
+	gotSucc, err := st.LookupAPIKeyByPrefix(ctx, "succprefix002")
+	require.NoError(t, err)
+	assert.Equal(t, succ.ID, gotSucc.ID)
+	assert.Equal(t, pred.ID, *gotSucc.PredecessorID)
+
+	// Last-used tracking test
+	now := time.Now().UTC()
+	err = st.UpdateAPIKeyLastUsed(ctx, gotPred.ID, now)
+	require.NoError(t, err)
+
+	updatedPred, err := st.GetAPIKey(ctx, pred.ID)
+	require.NoError(t, err)
+	require.NotNil(t, updatedPred.LastUsedAt)
+
+	// Abandon rotation: revoke successor, predecessor remains valid
+	err = st.RevokeAPIKey(ctx, succ.ID)
+	require.NoError(t, err)
+
+	_, err = st.LookupAPIKeyByPrefix(ctx, "succprefix002")
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	validPred, err := st.LookupAPIKeyByPrefix(ctx, "predprefix001")
+	require.NoError(t, err)
+	assert.Equal(t, pred.ID, validPred.ID)
 }
