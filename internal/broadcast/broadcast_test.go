@@ -200,3 +200,39 @@ func TestBroadcaster_DisconnectDuringPublishDoesNotPanic(t *testing.T) {
 		wg.Wait()
 	}
 }
+
+// TestSubscriberCount_EmptyBroadcaster verifies that a freshly created
+// broadcaster reports zero subscribers.
+func TestSubscriberCount_EmptyBroadcaster(t *testing.T) {
+	b := New(64)
+	assert.Equal(t, 0, b.SubscriberCount(), "new broadcaster must have no subscribers")
+}
+
+// TestSubscriberCount_AfterClose verifies that SubscriberCount returns 0
+// after all subscribers have been closed.
+func TestSubscriberCount_AfterClose(t *testing.T) {
+	b := New(64)
+	sub := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
+	assert.Equal(t, 1, b.SubscriberCount(), "one subscriber registered")
+
+	sub.Close()
+	assert.Equal(t, 0, b.SubscriberCount(), "subscriber count must be 0 after close")
+}
+
+// TestSubscriberCount_AddThenRemove verifies that SubscriberCount reflects
+// the current number of active subscribers after add and remove cycles.
+func TestSubscriberCount_AddThenRemove(t *testing.T) {
+	b := New(64)
+
+	sub1 := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
+	assert.Equal(t, 1, b.SubscriberCount(), "one subscriber")
+
+	sub2 := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
+	assert.Equal(t, 2, b.SubscriberCount(), "two subscribers")
+
+	sub1.Close()
+	assert.Equal(t, 1, b.SubscriberCount(), "one subscriber after first close")
+
+	sub2.Close()
+	assert.Equal(t, 0, b.SubscriberCount(), "zero subscribers after all close")
+}
