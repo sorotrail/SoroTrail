@@ -417,7 +417,7 @@ func (s *Server) handleTenantUsage(w http.ResponseWriter, r *http.Request) {
 		dur := time.Since(start).Milliseconds()
 		p, _ := PrincipalFrom(r.Context())
 		if p.Tenant.ID != 0 {
-			s.usage.Add(p.Tenant.ID, store.UsageDelta{QueryDurationMs: dur})
+			metrics.RecordQueryDuration(r.Context(), dur)
 		}
 	}()
 	t, ok := s.tenantFromPath(w, r)
@@ -453,7 +453,7 @@ func (s *Server) handleOwnUsage(w http.ResponseWriter, r *http.Request) {
 		dur := time.Since(start).Milliseconds()
 		p, _ := PrincipalFrom(r.Context())
 		if p.Tenant.ID != 0 {
-			s.usage.Add(p.Tenant.ID, store.UsageDelta{QueryDurationMs: dur})
+			metrics.RecordQueryDuration(r.Context(), dur)
 		}
 	}()
 	p, _ := PrincipalFrom(r.Context())

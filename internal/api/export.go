@@ -206,8 +206,7 @@ func (s *Server) handleContractExport(w http.ResponseWriter, r *http.Request) {
 	} else {
 		p, _ := PrincipalFrom(ctx)
 		if p.Tenant.ID != 0 {
-			// Approximation of bytes exported based on response header / content length or written bytes
-			s.usage.Add(p.Tenant.ID, store.UsageDelta{BytesExported: 1024})
+			metrics.RecordExportBytes(ctx, 1024)
 		}
 	}
 }
@@ -265,7 +264,7 @@ func (s *Server) handleEventsCSV(w http.ResponseWriter, r *http.Request) {
 	} else {
 		p, _ := PrincipalFrom(r.Context())
 		if p.Tenant.ID != 0 {
-			s.usage.Add(p.Tenant.ID, store.UsageDelta{BytesExported: 1024})
+			metrics.RecordExportBytes(r.Context(), 1024)
 		}
 	}
 }
