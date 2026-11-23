@@ -1,0 +1,393 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Is SoroTrail healthy? SLO indicators first, then pressure points, with links to focused dashboards.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "title": "Operator runbook",
+      "type": "link",
+      "url": "https://github.com/sorotrail/SoroTrail/blob/main/docs/runbook.md",
+      "targetBlank": true,
+      "icon": "doc"
+    },
+    {
+      "title": "Ingestion",
+      "type": "link",
+      "url": "/d/sorotrail-ingestion",
+      "icon": "dashboard"
+    },
+    {
+      "title": "Read path",
+      "type": "link",
+      "url": "/d/sorotrail-read-path",
+      "icon": "dashboard"
+    },
+    {
+      "title": "Storage",
+      "type": "link",
+      "url": "/d/sorotrail-storage",
+      "icon": "dashboard"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Is it meeting its targets? (SLO indicators from recording rules)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "HTTP availability (non-5xx)",
+      "description": "SLO indicator sorotrail:http_availability:ratio5m. Good: >= 99.9% (green). Below 99% is red: see runbook 'API returning stale or missing data'.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.99
+              },
+              {
+                "color": "green",
+                "value": 0.999
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sorotrail:http_availability:ratio5m",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "HTTP P95 latency",
+      "description": "SLO indicator sorotrail:http_latency:p95_5m across all routes. Good: under 0.5s. Above 2s is red; open the Read path dashboard.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sorotrail:http_latency:p95_5m",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Ingestion lag (ledgers)",
+      "description": "SLO indicator sorotrail:ingestion_lag:max. Good: under 50. The IngestionLagHigh alert fires at 200 (about 16 minutes). Open the Ingestion dashboard.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 200
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sorotrail:ingestion_lag:max",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Ingestion errors / sec",
+      "description": "sorotrail:ingest_errors:rate5m. Good: 0. Any sustained value means data is being dropped (alert IngestionErrorsBurst).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.0001
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sorotrail:ingest_errors:rate5m",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "Where is the pressure?",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Throughput: events ingested / sec",
+      "description": "Good: steady and non-zero while the chain produces events. A flat zero with rising lag means ingestion is stalled.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sorotrail:events_ingested:rate5m",
+          "legendFormat": "ingested",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Backpressure / sec",
+      "description": "Good: 0. Non-zero means the store cannot absorb batches as fast as the ingester produces them; see the Storage dashboard.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sorotrail:backpressure:rate5m",
+          "legendFormat": "backpressure",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 38,
+  "tags": [
+    "sorotrail",
+    "operational"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "SoroTrail Overview",
+  "uid": "sorotrail-overview",
+  "version": 1
+}

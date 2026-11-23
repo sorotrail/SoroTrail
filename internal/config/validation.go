@@ -1,10 +1,10 @@
 package config
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
-	"log"
 	"net/url"
-	"os"
 	"strings"
 )
 
@@ -17,6 +17,8 @@ var sensitiveEnvVars = map[string]bool{
 	"API_KEY":                    true,
 	"ARCHIVE_SECRET_ACCESS_KEY":  true,
 	"MULTI_TENANT_BOOTSTRAP_KEY": true,
+	"ENCRYPTION_KEY":             true,
+	"ENCRYPTION_KEYS":            true,
 }
 
 // redact returns value unchanged unless name is a known sensitive variable,
@@ -189,6 +191,12 @@ func (c Config) ValidateAll() error {
 	if c.HourlyQuota < 0 {
 		errs = append(errs, fmt.Sprintf("HOURLY_QUOTA: %d must be non-negative", c.HourlyQuota))
 	}
+	if c.CostBudgetCapacity < 0 {
+		errs = append(errs, fmt.Sprintf("COST_BUDGET_CAPACITY: %v must be non-negative", c.CostBudgetCapacity))
+	}
+	if c.CostBudgetCapacity > 0 && c.CostBudgetRefillPerSec <= 0 {
+		errs = append(errs, "COST_BUDGET_REFILL_PER_SEC: must be positive when COST_BUDGET_CAPACITY is set")
+	}
 	if c.DailyQuota < 0 {
 		errs = append(errs, fmt.Sprintf("DAILY_QUOTA: %d must be non-negative", c.DailyQuota))
 	}
@@ -222,6 +230,9 @@ func (c Config) ValidateAll() error {
 	if (c.RateLimitRPS > 0) != (c.RateLimitBurst > 0) {
 		errs = append(errs, "RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
 	}
+	errs = append(errs, c.collectLegacyValidateErrors()...)
+	errs = append(errs, c.validateMTLS()...)
+	errs = append(errs, c.validateEncryption()...)
 
 	if len(errs) == 0 {
 		return nil
@@ -229,12 +240,100 @@ func (c Config) ValidateAll() error {
 	return multiError(errs)
 }
 
-// MustValidate validates the configuration and exits the process with a fatal
-// log message when any check fails. It is intended for the top-level main
-// function so that boot-time errors are surfaced immediately.
-func (c Config) MustValidate() {
-	if err := c.ValidateAll(); err != nil {
-		log.Printf("FATAL: %s", err)
-		os.Exit(1)
+func (c Config) validateEncryption() []string {
+	var errs []string
+	if raw := strings.TrimSpace(c.EncryptionKeys); raw != "" {
+		if err := validateEncryptionKeyringSpec("ENCRYPTION_KEYS", raw, true); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
+	if raw := strings.TrimSpace(c.EncryptionKey); raw != "" {
+		if err := validateEncryptionKeyringSpec("ENCRYPTION_KEY", raw, false); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	return errs
+}
+
+func validateEncryptionKeyringSpec(envName, raw string, requireVersioned bool) error {
+	parts := strings.Split(raw, ",")
+	seenVersions := make(map[string]struct{}, len(parts))
+	validCount := 0
+	for i, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		version := "v1"
+		keyStr := part
+		if v, k, hasColon := strings.Cut(part, ":"); hasColon {
+			version = strings.TrimSpace(v)
+			keyStr = strings.TrimSpace(k)
+		} else if requireVersioned && len(parts) > 1 {
+			return fmt.Errorf("%s: entry %d is missing a key version prefix (expected <version>:<key>)", envName, i+1)
+		}
+		if !validKeyVersionID(version) {
+			return fmt.Errorf("%s: entry %d has invalid key version identifier %q", envName, i+1, version)
+		}
+		if _, dup := seenVersions[version]; dup {
+			return fmt.Errorf("%s: duplicate key version %q", envName, version)
+		}
+		seenVersions[version] = struct{}{}
+		keyLen, err := decodedAES256KeyLength(keyStr)
+		if err != nil {
+			return fmt.Errorf("%s: version %q: %w", envName, version, err)
+		}
+		if keyLen != 32 {
+			return fmt.Errorf("%s: version %q decoded to %d bytes, want 32-byte AES-256 key", envName, version, keyLen)
+		}
+		validCount++
+	}
+	if validCount == 0 {
+		return fmt.Errorf("%s: no valid encryption keys found", envName)
+	}
+	return nil
+}
+
+func validKeyVersionID(v string) bool {
+	if v == "" || len(v) > 32 {
+		return false
+	}
+	for i, r := range v {
+		isLower := r >= 'a' && r <= 'z'
+		isUpper := r >= 'A' && r <= 'Z'
+		isDigit := r >= '0' && r <= '9'
+		if i == 0 {
+			if !isLower && !isUpper && !isDigit {
+				return false
+			}
+			continue
+		}
+		if !isLower && !isUpper && !isDigit && r != '-' && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func decodedAES256KeyLength(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, fmt.Errorf("empty key material")
+	}
+	if len(raw) == 64 {
+		if decoded, err := hex.DecodeString(raw); err == nil {
+			return len(decoded), nil
+		}
+	}
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if decoded, err := enc.DecodeString(raw); err == nil {
+			return len(decoded), nil
+		}
+	}
+	return 0, fmt.Errorf("key material is neither valid 64-character hex nor valid base64")
 }

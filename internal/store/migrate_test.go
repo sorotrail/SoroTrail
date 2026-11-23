@@ -10,11 +10,20 @@ package store
 //	go test -run 'TestMigrat' ./internal/store/
 
 import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/stretchr/testify/assert"
@@ -449,4 +458,641 @@ func TestMigrate_PendingVersionsWithoutDB(t *testing.T) {
 	}
 
 	t.Logf("embedded migrations: %d versions (1..%d)", len(sorted), sorted[len(sorted)-1])
+}
+
+// TestMigrate_LiveDatabaseSafetyRules enforces the mechanical CI check for
+// schema migrations against a live database (#1228):
+//  1. Every embedded migration in internal/store/migrations/ must pass
+//     LintEmbeddedMigrations() with zero violations (and every entry in
+//     HistoricalMigrationExceptions must match a real violation).
+//  2. Synthetic migrations violating each of the 7 live-database safety rules
+//     must be deterministically flagged with the expected rule ID.
+//  3. Compliant migrations (new table + index in the same file, CONCURRENTLY
+//     with `-- sorotrail:no-transaction`, NOT NULL with DEFAULT, NOT VALID +
+//     VALIDATE CONSTRAINT before SET NOT NULL, and Stage 5 contract drop) must
+//     pass with zero violations.
+func TestMigrate_LiveDatabaseSafetyRules(t *testing.T) {
+	violations, err := LintEmbeddedMigrations()
+	require.NoError(t, err)
+	assert.Empty(t, violations, "embedded migrations must satisfy live-database safety rules")
+
+	t.Run("rejects unsafe DDL patterns", func(t *testing.T) {
+		cases := []struct {
+			name     string
+			filename string
+			sql      string
+			wantRule MigrationRuleID
+			wantLine int
+		}{
+			{
+				name:     "CREATE INDEX on existing table without CONCURRENTLY",
+				filename: "0099_bad_index.up.sql",
+				sql:      "CREATE INDEX IF NOT EXISTS idx_subscriptions_url ON subscriptions (url);\n",
+				wantRule: RuleConcurrentIndexRequired,
+				wantLine: 1,
+			},
+			{
+				name:     "CREATE INDEX CONCURRENTLY without no-transaction directive",
+				filename: "0099_bad_conc_notx.up.sql",
+				sql:      "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_subscriptions_url ON subscriptions (url);\n",
+				wantRule: RuleConcurrentIndexNoTx,
+				wantLine: 1,
+			},
+			{
+				name:     "CREATE INDEX CONCURRENTLY inside explicit BEGIN/COMMIT block",
+				filename: "0099_bad_conc_begin.up.sql",
+				sql:      "-- sorotrail:no-transaction\nBEGIN;\nCREATE INDEX CONCURRENTLY idx_sub_url ON subscriptions (url);\nCOMMIT;\n",
+				wantRule: RuleConcurrentIndexNoTx,
+				wantLine: 3,
+			},
+			{
+				name:     "DROP INDEX CONCURRENTLY in down migration without no-transaction directive",
+				filename: "0099_bad_drop_conc.down.sql",
+				sql:      "DROP INDEX CONCURRENTLY IF EXISTS idx_subscriptions_url;\n",
+				wantRule: RuleConcurrentIndexNoTx,
+				wantLine: 1,
+			},
+			{
+				name:     "no-transaction migration mixing transactional DDL",
+				filename: "0099_bad_notx_mixed.up.sql",
+				sql:      "-- sorotrail:no-transaction\nALTER TABLE subscriptions ADD COLUMN note text;\n",
+				wantRule: RuleConcurrentIndexNoTx,
+				wantLine: 2,
+			},
+			{
+				name:     "no-transaction migration with multiple statements",
+				filename: "0099_bad_notx_multi.up.sql",
+				sql:      "-- sorotrail:no-transaction\nCREATE INDEX CONCURRENTLY idx_sub_a ON subscriptions (url);\nCREATE INDEX CONCURRENTLY idx_sub_b ON subscriptions (enabled);\n",
+				wantRule: RuleConcurrentIndexNoTx,
+				wantLine: 3,
+			},
+			{
+				name:     "ALTER TABLE DROP COLUMN without contract directive",
+				filename: "0099_bad_drop_col.up.sql",
+				sql:      "ALTER TABLE subscriptions DROP COLUMN IF EXISTS secret;\n",
+				wantRule: RuleNoDropColumn,
+				wantLine: 1,
+			},
+			{
+				name:     "ALTER TABLE RENAME COLUMN on live table",
+				filename: "0099_bad_rename_col.up.sql",
+				sql:      "ALTER TABLE subscriptions RENAME COLUMN url TO callback_url;\n",
+				wantRule: RuleNoRenameColumnOrTable,
+				wantLine: 1,
+			},
+			{
+				name:     "ALTER TABLE RENAME TO on live table",
+				filename: "0099_bad_rename_tbl.up.sql",
+				sql:      "ALTER TABLE subscriptions RENAME TO webhook_subscriptions;\n",
+				wantRule: RuleNoRenameColumnOrTable,
+				wantLine: 1,
+			},
+			{
+				name:     "ALTER TABLE ALTER COLUMN TYPE on live table",
+				filename: "0099_bad_alter_type.up.sql",
+				sql:      "ALTER TABLE subscriptions ALTER COLUMN failure_count TYPE bigint;\n",
+				wantRule: RuleNoAlterColumnType,
+				wantLine: 1,
+			},
+			{
+				name:     "ALTER TABLE ADD COLUMN NOT NULL without DEFAULT",
+				filename: "0099_bad_add_notnull.up.sql",
+				sql:      "ALTER TABLE subscriptions ADD COLUMN description text NOT NULL;\n",
+				wantRule: RuleNotNullNeedsDefault,
+				wantLine: 1,
+			},
+			{
+				name:     "ALTER TABLE SET NOT NULL without NOT VALID check",
+				filename: "0099_bad_set_notnull.up.sql",
+				sql:      "ALTER TABLE subscriptions ALTER COLUMN tenant_id SET NOT NULL;\n",
+				wantRule: RuleNotNullNeedsDefault,
+				wantLine: 1,
+			},
+			{
+				name:     "ALTER TABLE SET NOT NULL with NOT VALID check but missing VALIDATE CONSTRAINT",
+				filename: "0099_bad_set_notnull_unvalidated.up.sql",
+				sql:      "ALTER TABLE subscriptions ADD CONSTRAINT chk_sub_tenant CHECK (tenant_id IS NOT NULL) NOT VALID;\nALTER TABLE subscriptions ALTER COLUMN tenant_id SET NOT NULL;\n",
+				wantRule: RuleNotNullNeedsDefault,
+				wantLine: 2,
+			},
+			{
+				name:     "ALTER TABLE SET NOT NULL when NOT VALID check validated a different column",
+				filename: "0099_bad_set_notnull_wrong_col.up.sql",
+				sql:      "ALTER TABLE subscriptions ADD CONSTRAINT chk_sub_url CHECK (url IS NOT NULL) NOT VALID;\nALTER TABLE subscriptions VALIDATE CONSTRAINT chk_sub_url;\nALTER TABLE subscriptions ALTER COLUMN tenant_id SET NOT NULL;\n",
+				wantRule: RuleNotNullNeedsDefault,
+				wantLine: 3,
+			},
+			{
+				name:     "unbounded UPDATE backfill inside DDL migration",
+				filename: "0099_bad_update.up.sql",
+				sql:      "UPDATE subscriptions SET failure_count = 0 WHERE failure_count IS NULL;\n",
+				wantRule: RuleNoUnboundedDataBackfill,
+				wantLine: 1,
+			},
+			{
+				name:     "unbounded DELETE inside DDL migration",
+				filename: "0099_bad_delete.up.sql",
+				sql:      "DELETE FROM delivery_attempts WHERE status = 'failed';\n",
+				wantRule: RuleNoUnboundedDataBackfill,
+				wantLine: 1,
+			},
+			{
+				name:     "unbounded INSERT INTO SELECT backfill inside DDL migration",
+				filename: "0099_bad_insert_select.up.sql",
+				sql:      "INSERT INTO dead_letters (event_id, contract_id, ledger, type, error) SELECT id, contract_id, ledger, type, 'migrated' FROM events;\n",
+				wantRule: RuleNoUnboundedDataBackfill,
+				wantLine: 1,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got := LintMigrationFile(tc.filename, tc.sql, false)
+				require.NotEmpty(t, got, "expected violation for %s", tc.name)
+				assert.Equal(t, tc.wantRule, got[0].Rule)
+				assert.Equal(t, tc.wantLine, got[0].Line)
+				assert.Contains(t, got[0].Error(), string(tc.wantRule))
+			})
+		}
+	})
+
+	t.Run("accepts safe live-database DDL patterns", func(t *testing.T) {
+		safeCases := []struct {
+			name     string
+			filename string
+			sql      string
+		}{
+			{
+				name:     "CREATE TABLE and CREATE INDEX on that new table in the same migration",
+				filename: "0099_new_table.up.sql",
+				sql: `CREATE TABLE IF NOT EXISTS webhook_outbox (
+    id bigserial PRIMARY KEY,
+    subscription_id bigint NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_outbox_sub ON webhook_outbox (subscription_id);`,
+			},
+			{
+				name:     "CREATE INDEX CONCURRENTLY with no-transaction directive",
+				filename: "0099_conc_index.up.sql",
+				sql: `-- sorotrail:no-transaction
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_subscriptions_created_at
+    ON subscriptions (created_at);`,
+			},
+			{
+				name:     "DROP INDEX CONCURRENTLY with no-transaction directive",
+				filename: "0099_conc_index.down.sql",
+				sql: `-- sorotrail:no-transaction
+DROP INDEX CONCURRENTLY IF EXISTS idx_subscriptions_created_at;`,
+			},
+			{
+				name:     "ALTER TABLE ADD COLUMN nullable or NOT NULL with constant DEFAULT",
+				filename: "0099_safe_add_col.up.sql",
+				sql: `ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS description text;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS max_retries int NOT NULL DEFAULT 5;`,
+			},
+			{
+				name:     "NOT VALID check constraint followed by VALIDATE CONSTRAINT and SET NOT NULL",
+				filename: "0099_safe_set_notnull.up.sql",
+				sql: `ALTER TABLE subscriptions ADD CONSTRAINT chk_subscriptions_tenant_not_null CHECK (tenant_id IS NOT NULL) NOT VALID;
+ALTER TABLE subscriptions VALIDATE CONSTRAINT chk_subscriptions_tenant_not_null;
+ALTER TABLE subscriptions ALTER COLUMN tenant_id SET NOT NULL;`,
+			},
+			{
+				name:     "Stage 5 contract DROP COLUMN with explicit directive",
+				filename: "0099_contract_drop.up.sql",
+				sql: `-- sorotrail:allow-contract-drop-column: Stage 5 of #1228 expand-and-contract after dual-write retirement
+ALTER TABLE subscriptions DROP COLUMN IF EXISTS legacy_description;`,
+			},
+			{
+				name:     "Partitioned parent table index with explicit directive",
+				filename: "0099_partitioned_index.up.sql",
+				sql: `-- sorotrail:allow-partitioned-parent-index: events is partitioned by range (ledger)
+CREATE INDEX IF NOT EXISTS idx_events_tx_index ON events (tx_index);`,
+			},
+		}
+
+		for _, tc := range safeCases {
+			t.Run(tc.name, func(t *testing.T) {
+				got := LintMigrationFile(tc.filename, tc.sql, false)
+				assert.Empty(t, got, "unexpected violation for %s: %v", tc.name, got)
+			})
+		}
+	})
+}
+
+// TestMigrate_NoTransactionDirectiveAndSplitStatements verifies that
+// `-- sorotrail:no-transaction` is detected accurately, semicolons inside
+// comments, string literals, and PL/pgSQL dollar-quoted bodies do not split
+// statements prematurely, and execMigrationSQL executes non-transactional
+// statements outside an explicit transaction block.
+func TestMigrate_NoTransactionDirectiveAndSplitStatements(t *testing.T) {
+	sqlWithDirective := `-- Leading comment
+-- sorotrail:no-transaction
+CREATE TABLE IF NOT EXISTS mig_notx_probe (
+    id INTEGER PRIMARY KEY,
+    note TEXT NOT NULL DEFAULT 'semi;inside;literal'
+);
+CREATE INDEX IF NOT EXISTS idx_mig_notx_probe_note ON mig_notx_probe (note);
+`
+	assert.True(t, HasNoTransactionDirective(sqlWithDirective))
+	assert.False(t, HasNoTransactionDirective("CREATE TABLE t (id int);\n-- sorotrail:no-transaction\n"))
+
+	stmts := SplitNoTransactionStatements(sqlWithDirective)
+	require.Len(t, stmts, 2)
+	assert.Contains(t, stmts[0], "CREATE TABLE IF NOT EXISTS mig_notx_probe")
+	assert.Contains(t, stmts[0], "'semi;inside;literal'", "string literal containing semicolons must be preserved verbatim")
+	assert.Contains(t, stmts[1], "CREATE INDEX IF NOT EXISTS idx_mig_notx_probe_note")
+
+	dollarSQL := `-- sorotrail:no-transaction
+CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger AS $fn$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sub_url ON subscriptions (url);
+`
+	dollarStmts := SplitNoTransactionStatements(dollarSQL)
+	require.Len(t, dollarStmts, 2)
+	assert.Contains(t, dollarStmts[0], "NEW.updated_at := now();")
+	assert.Contains(t, dollarStmts[1], "CREATE INDEX CONCURRENTLY")
+
+	url := newTempSQLiteURL(t)
+	db, err := openSQLiteForMigration(url)
+	require.NoError(t, err)
+	defer db.Close()
+
+	require.NoError(t, ensureSQLiteMigrationTable(db))
+	require.NoError(t, execMigrationSQL(
+		context.Background(),
+		db,
+		sqlWithDirective,
+		`INSERT INTO schema_migrations (version, dirty) VALUES (?, 0)`,
+		99,
+	))
+
+	assert.True(t, sqliteTableExists(t, url, "mig_notx_probe"))
+	_, err = db.Exec(`INSERT INTO mig_notx_probe (id) VALUES (1)`)
+	require.NoError(t, err)
+	var gotNote string
+	require.NoError(t, db.QueryRow(`SELECT note FROM mig_notx_probe WHERE id = 1`).Scan(&gotNote))
+	assert.Equal(t, "semi;inside;literal", gotNote, "DEFAULT string literal with semicolons must be stored intact")
+}
+
+// TestMigrate_SessionTimeoutDirectivesAndOptions verifies that
+// DefaultMigrationOptions and FormatMigrationSessionTimeoutSQL produce bounded
+// lock_timeout and statement_timeout settings and that MigrateWithOptions /
+// MigrateUpWithOptions / MigrateDownWithOptions honor custom MigrationOptions.
+func TestMigrate_SessionTimeoutDirectivesAndOptions(t *testing.T) {
+	defaults := DefaultMigrationOptions()
+	assert.Equal(t, 5*time.Second, defaults.LockTimeout)
+	assert.Equal(t, 30*time.Second, defaults.StatementTimeout)
+
+	sqlStmts := FormatMigrationSessionTimeoutSQL(MigrationOptions{
+		LockTimeout:      3 * time.Second,
+		StatementTimeout: 15 * time.Second,
+	})
+	assert.Equal(t, []string{
+		"SET lock_timeout = '3000ms'",
+		"SET statement_timeout = '15000ms'",
+	}, sqlStmts)
+
+	noTxStmts := FormatMigrationSessionTimeoutSQLForMigration(
+		"-- sorotrail:no-transaction\nCREATE INDEX CONCURRENTLY idx_sub_url ON subscriptions (url);\n",
+		MigrationOptions{LockTimeout: 3 * time.Second, StatementTimeout: 15 * time.Second},
+	)
+	assert.Equal(t, []string{
+		"SET lock_timeout = '3000ms'",
+		"SET statement_timeout = 0",
+	}, noTxStmts)
+
+	zeroCfg, err := buildPostgresMigrateConnConfig("postgres://user:pass@localhost:5432/sorotrail?sslmode=disable", MigrationOptions{})
+	require.NoError(t, err)
+	assert.Empty(t, zeroCfg.RuntimeParams["lock_timeout"], "legacy zero MigrationOptions must not force a 5s lock_timeout on pg_advisory_lock")
+	assert.Empty(t, zeroCfg.RuntimeParams["statement_timeout"], "legacy zero MigrationOptions must not force a 30s statement_timeout")
+
+	url := newTempSQLiteURL(t)
+	opts := MigrationOptions{
+		LockTimeout:      2 * time.Second,
+		StatementTimeout: 10 * time.Second,
+	}
+	connCfg, err := buildPostgresMigrateConnConfig("postgres://user:pass@localhost:5432/sorotrail?sslmode=disable", opts)
+	require.NoError(t, err)
+	assert.Equal(t, "2000ms", connCfg.RuntimeParams["lock_timeout"])
+	assert.Equal(t, "10000ms", connCfg.RuntimeParams["statement_timeout"])
+
+	assert.Equal(t,
+		"SELECT a FROM t WHERE b = $1 AND c = $2",
+		rebindMigrationPlaceholders("SELECT a FROM t WHERE b = ? AND c = ?", true),
+	)
+	assert.Equal(t,
+		"SELECT a FROM t WHERE b = ? AND c = ?",
+		rebindMigrationPlaceholders("SELECT a FROM t WHERE b = ? AND c = ?", false),
+	)
+
+	require.NoError(t, MigrateWithOptions(url, opts))
+	st, err := MigrateStatus(url)
+	require.NoError(t, err)
+	assert.Equal(t, sqliteLatestVersion(t), st.Version)
+	assert.Empty(t, st.Pending)
+
+	require.NoError(t, MigrateDownWithOptions(url, 1, opts))
+	require.NoError(t, MigrateUpWithOptions(url, 1, opts))
+
+	// Also verify RunBatchedMigration with UseDollarPlaceholders: true ($1..$5).
+	db, err := openSQLiteForMigration(url)
+	require.NoError(t, err)
+	defer db.Close()
+	prog, err := RunBatchedMigration(context.Background(), db, BatchedMigrationConfig{
+		Name:                  "dollar_placeholder_smoke",
+		BatchSize:             10,
+		UseDollarPlaceholders: true,
+		Step: func(_ context.Context, _ *sql.Tx, _ string, _ int) (string, int64, bool, error) {
+			return "cursor-done", 5, true, nil
+		},
+	})
+	require.NoError(t, err)
+	assert.True(t, prog.Completed)
+	assert.Equal(t, int64(5), prog.RowsProcessed)
+	assert.Equal(t, "cursor-done", prog.LastCursor)
+
+	// Verify RunBatchedMigration optimistic concurrency guard when a competing
+	// runner modifies migration_backfill_state concurrently (both on initial
+	// insert and on subsequent cursor update).
+	_, err = RunBatchedMigration(context.Background(), db, BatchedMigrationConfig{
+		Name:      "concurrent_runner_conflict",
+		BatchSize: 10,
+		Step: func(stepCtx context.Context, tx *sql.Tx, _ string, _ int) (string, int64, bool, error) {
+			_, execErr := tx.ExecContext(stepCtx, `
+				INSERT INTO migration_backfill_state (migration_name, last_cursor, rows_processed, updated_at)
+				VALUES ('concurrent_runner_conflict', 'other-pod-cursor', 10, '2026-01-01T00:00:00Z')
+			`)
+			require.NoError(t, execErr)
+			return "my-cursor", 10, false, nil
+		},
+	})
+	require.ErrorIs(t, err, ErrConcurrentBatchedMigration)
+
+	// Seed a checkpoint with last_cursor = 'batch-1' and verify that if another
+	// runner advances last_cursor before the batch update, ErrConcurrentBatchedMigration is returned.
+	_, err = db.Exec(`
+		INSERT INTO migration_backfill_state (migration_name, last_cursor, rows_processed, updated_at)
+		VALUES ('concurrent_runner_update_conflict', 'batch-1', 10, '2026-01-01T00:00:00Z')
+	`)
+	require.NoError(t, err)
+	_, err = RunBatchedMigration(context.Background(), db, BatchedMigrationConfig{
+		Name:      "concurrent_runner_update_conflict",
+		BatchSize: 10,
+		Step: func(stepCtx context.Context, tx *sql.Tx, _ string, _ int) (string, int64, bool, error) {
+			_, execErr := tx.ExecContext(stepCtx, `
+				UPDATE migration_backfill_state
+				SET last_cursor = 'other-pod-batch-2'
+				WHERE migration_name = 'concurrent_runner_update_conflict'
+			`)
+			require.NoError(t, execErr)
+			return "my-batch-2", 10, true, nil
+		},
+	})
+	require.ErrorIs(t, err, ErrConcurrentBatchedMigration)
+}
+
+// TestMigrate_ExpandAndContractUnderConcurrentWriteLoad exercises the 5-stage
+// expand-and-contract pattern and RunBatchedMigration against a live database
+// while concurrent writer and reader goroutines actively insert and query
+// events (#1228):
+//   - Stage 1 (Expand): Add nullable column `tx_hash_normalized` and index while
+//     live traffic is running.
+//   - Stage 2 (Dual-Write): Writers populate both `tx_hash` and
+//     `tx_hash_normalized`.
+//   - Stage 3 (Resumable Batched Backfill): RunBatchedMigration backfills
+//     pre-existing rows in bounded batches, survives an injected mid-flight
+//     interruption, resumes from the persisted cursor in
+//     `migration_backfill_state`, and emits structured progress logs.
+//   - Stage 4 (Switch Reads & Verify): Confirm every pre-existing and
+//     concurrently written event has `tx_hash_normalized` populated with zero
+//     writer or reader errors.
+//   - Stage 5 (Contract): Verify the contract migration passes
+//     LintMigrationFile when annotated with DirectiveAllowContractDropColumn.
+func TestMigrate_ExpandAndContractUnderConcurrentWriteLoad(t *testing.T) {
+	url := newTempSQLiteURL(t)
+	require.NoError(t, Migrate(url))
+
+	db, err := sql.Open("sqlite", parseSQLiteDSN(url)+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	require.NoError(t, err)
+	defer db.Close()
+	db.SetMaxOpenConns(4)
+
+	st := NewSQLite(db)
+	ctx := context.Background()
+
+	// Seed 45 historical events written before Stage 1 (Expand).
+	const initialEvents = 45
+	seedBatch := make([]Event, 0, initialEvents)
+	for i := 1; i <= initialEvents; i++ {
+		seedBatch = append(seedBatch, Event{
+			ID:               fmt.Sprintf("0000100000-%010d", i),
+			ContractID:       "CCONTRACT1228",
+			Ledger:           int64(1000 + i),
+			Type:             "contract",
+			TxHash:           fmt.Sprintf("0xDEAD%04X", i),
+			InSuccessfulCall: true,
+			Topics:           json.RawMessage(`["transfer"]`),
+			Value:            json.RawMessage(`{"amount":"100"}`),
+		})
+	}
+	_, err = st.UpsertEvents(ctx, seedBatch)
+	require.NoError(t, err)
+
+	// Start concurrent writer and reader traffic against the live database.
+	var (
+		dualWriteEnabled atomic.Bool
+		stopTraffic      atomic.Bool
+		writerErrors     atomic.Int64
+		readerErrors     atomic.Int64
+		writtenDuringMig atomic.Int64
+		wg               sync.WaitGroup
+	)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		seq := 1
+		for !stopTraffic.Load() {
+			evID := fmt.Sprintf("0000200000-%010d", seq)
+			txHash := fmt.Sprintf("0xBEEF%04X", seq)
+			ev := Event{
+				ID:               evID,
+				ContractID:       "CCONTRACT1228",
+				Ledger:           int64(2000 + seq),
+				Type:             "contract",
+				TxHash:           txHash,
+				InSuccessfulCall: true,
+				Topics:           json.RawMessage(`["transfer"]`),
+				Value:            json.RawMessage(`{"amount":"250"}`),
+			}
+			if _, err := st.UpsertEvents(ctx, []Event{ev}); err != nil {
+				writerErrors.Add(1)
+				return
+			}
+			if dualWriteEnabled.Load() {
+				if _, err := db.ExecContext(
+					ctx,
+					`UPDATE events SET tx_hash_normalized = lower(tx_hash) WHERE id = ?`,
+					evID,
+				); err != nil {
+					writerErrors.Add(1)
+					return
+				}
+			}
+			writtenDuringMig.Add(1)
+			seq++
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for !stopTraffic.Load() {
+			_, _, err := st.QueryEvents(ctx, EventFilter{ContractID: "CCONTRACT1228", Limit: 10})
+			if err != nil {
+				readerErrors.Add(1)
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	// Let concurrent traffic warm up before Stage 1 (Expand).
+	time.Sleep(15 * time.Millisecond)
+
+	// Stage 1 (Expand): Add nullable column and non-transactional index while traffic runs.
+	expandSQL := `-- sorotrail:no-transaction
+ALTER TABLE events ADD COLUMN tx_hash_normalized TEXT;
+CREATE INDEX IF NOT EXISTS idx_events_tx_hash_normalized ON events (tx_hash_normalized);
+`
+	require.NoError(t, execMigrationSQL(ctx, db, expandSQL, ""))
+
+	// Stage 2 (Dual-Write): Flip concurrent writers to populate tx_hash_normalized.
+	dualWriteEnabled.Store(true)
+	time.Sleep(15 * time.Millisecond)
+
+	// Stage 3 (Resumable Batched Backfill): Backfill in batches of 15, injecting
+	// a transient interruption on the 3rd batch call to prove cursor checkpoint
+	// durability and resumption.
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	stepCalls := 0
+	injectedErr := errors.New("simulated lock_timeout during batch 3")
+
+	backfillStep := func(stepCtx context.Context, tx *sql.Tx, cursor string, limit int) (string, int64, bool, error) {
+		stepCalls++
+		if stepCalls == 3 {
+			return "", 0, false, injectedErr
+		}
+
+		rows, err := tx.QueryContext(stepCtx, `
+			SELECT id FROM events
+			WHERE id > ? AND (tx_hash_normalized IS NULL OR tx_hash_normalized = '')
+			ORDER BY id ASC
+			LIMIT ?
+		`, cursor, limit)
+		if err != nil {
+			return "", 0, false, err
+		}
+		var ids []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return "", 0, false, err
+			}
+			ids = append(ids, id)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return "", 0, false, err
+		}
+		_ = rows.Close()
+
+		if len(ids) == 0 {
+			return cursor, 0, true, nil
+		}
+
+		var updated int64
+		for _, id := range ids {
+			res, err := tx.ExecContext(stepCtx, `
+				UPDATE events
+				SET tx_hash_normalized = lower(tx_hash)
+				WHERE id = ? AND (tx_hash_normalized IS NULL OR tx_hash_normalized = '')
+			`, id)
+			if err != nil {
+				return "", 0, false, err
+			}
+			n, _ := res.RowsAffected()
+			updated += n
+		}
+		nextCursor := ids[len(ids)-1]
+		done := len(ids) < limit
+		return nextCursor, updated, done, nil
+	}
+
+	cfg := BatchedMigrationConfig{
+		Name:             "0033_backfill_tx_hash_normalized",
+		BatchSize:        15,
+		StatementTimeout: 5 * time.Second,
+		Logger:           logger,
+		Step:             backfillStep,
+	}
+
+	// First run stops at batch 3 with injectedErr after committing 2 batches (30 rows).
+	partialProgress, err := RunBatchedMigration(ctx, db, cfg)
+	require.ErrorIs(t, err, injectedErr)
+	assert.Equal(t, 2, partialProgress.BatchesRun)
+	assert.Equal(t, int64(30), partialProgress.RowsProcessed)
+	assert.Equal(t, "0000100000-0000000030", partialProgress.LastCursor)
+	assert.False(t, partialProgress.Completed)
+
+	// Resume: picks up from cursor "0000100000-0000000030" and finishes the remaining rows.
+	finalProgress, err := RunBatchedMigration(ctx, db, cfg)
+	require.NoError(t, err)
+	assert.True(t, finalProgress.Completed)
+	assert.GreaterOrEqual(t, finalProgress.RowsProcessed, int64(initialEvents))
+	assert.GreaterOrEqual(t, finalProgress.BatchesRun, 1)
+
+	// Calling RunBatchedMigration a third time is an idempotent no-op.
+	noopProgress, err := RunBatchedMigration(ctx, db, cfg)
+	require.NoError(t, err)
+	assert.True(t, noopProgress.Completed)
+	assert.Equal(t, 0, noopProgress.BatchesRun, "completed migration must not re-run batches")
+	assert.Equal(t, finalProgress.RowsProcessed, noopProgress.RowsProcessed)
+
+	// Stop concurrent traffic and verify zero writer/reader errors.
+	stopTraffic.Store(true)
+	wg.Wait()
+
+	assert.Zero(t, writerErrors.Load(), "concurrent writers must not error during expand + batched backfill")
+	assert.Zero(t, readerErrors.Load(), "concurrent readers must not error during expand + batched backfill")
+	assert.Positive(t, writtenDuringMig.Load(), "concurrent writers must have inserted rows during migration")
+
+	// Stage 4 (Switch Reads & Validate): Every row in events now has tx_hash_normalized populated.
+	var unpopulated int
+	require.NoError(t, db.QueryRowContext(
+		ctx,
+		`SELECT count(*) FROM events WHERE tx_hash_normalized IS NULL OR tx_hash_normalized = ''`,
+	).Scan(&unpopulated))
+	assert.Zero(t, unpopulated, "all historical and concurrent rows must have tx_hash_normalized populated")
+
+	// Structured progress logs were emitted with migration_name, batch_rows, total_rows, cursor.
+	logOutput := logBuf.String()
+	assert.Contains(t, logOutput, `"migration_name":"0033_backfill_tx_hash_normalized"`)
+	assert.Contains(t, logOutput, `"batch_rows":15`)
+	assert.Contains(t, logOutput, `"completed":true`)
+
+	// Stage 5 (Contract): Verify the contract DDL passes LintMigrationFile when annotated.
+	contractSQL := `-- sorotrail:allow-contract-drop-column: Stage 5 after switching reads to tx_hash_normalized
+ALTER TABLE events DROP COLUMN IF EXISTS tx_hash;
+`
+	assert.Empty(t, LintMigrationFile("0034_contract_tx_hash.up.sql", contractSQL, false))
 }

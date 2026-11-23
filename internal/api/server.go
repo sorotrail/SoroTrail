@@ -5,8 +5,11 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -166,6 +169,7 @@ type Server struct {
 	log              *slog.Logger
 	apiKey           string
 	limiter          *RateLimiter
+	costBudget       *CostBudget
 	bcast            *broadcast.Broadcaster
 	enricher         Enricher
 	enableMetrics    bool
@@ -185,7 +189,11 @@ type Server struct {
 	// Off by default: the API behaves exactly as before.
 	apiKeyAuth bool
 
-	httpRequestBodyLimit int64 // max accepted request body size, in bytes
+	httpRequestBodyLimit      int64            // max accepted request body size, in bytes
+	httpResponseBodyLimit     int64            // max serialized response body size, in bytes (0 = unbounded)
+	maxDecompressedBodySize   int64            // max decompressed request body size, in bytes
+	endpointBodyLimitsMu      sync.RWMutex     // guards endpointRequestBodyLimits
+	endpointRequestBodyLimits map[string]int64 // per-endpoint request body size overrides
 
 	// specInvalidationPublisher tells the other replicas that a contract's
 	// cached spec must be evicted after a write. Optional: a single-process
@@ -212,6 +220,9 @@ type Server struct {
 	usage           *UsageRecorder
 	maxWatched      int
 	streamScopeSync time.Duration
+	// defaultRetention is the instance-wide horizon a tenant without its own
+	// retention policy inherits; zero means no age bound (#1249).
+	defaultRetention time.Duration
 
 	// statsTTL is how long a /stats result is served from cache before it
 	// is recomputed. Zero disables caching (the pre-cache behavior).
@@ -234,11 +245,165 @@ type Server struct {
 	// /readyz. The zero value means healthCheckTimeout; only tests set it,
 	// so the timeout paths don't sleep through the production budget.
 	checkTimeout time.Duration
+
+	// deprecationPolicy holds the OpenAPI-driven Deprecation / Sunset header
+	// rules. When nil, DefaultDeprecationPolicy() is used.
+	deprecationMu     sync.RWMutex
+	deprecationPolicy *DeprecationPolicy
+	deprecatedCounts  map[string]uint64
+
+	// idempotency coordinates optional Idempotency-Key headers across write
+	// endpoints (#1268).
+	idempotencyOnce sync.Once
+	idempotency     *idempotencyCoordinator
+
+	// actionAudit records every administrative action (#1277).
+	actionAuditOnce     sync.Once
+	actionAuditStore    store.ActionAuditStore
+	fallbackActionAudit *store.MemoryActionAuditStore
 }
 
 // SetHTTPRequestBodyLimit sets the request body size limit, in bytes, for all handlers accepting a body.
 func (s *Server) SetHTTPRequestBodyLimit(n int64) {
 	s.httpRequestBodyLimit = n
+}
+
+// SetHTTPResponseBodyLimit sets the maximum serialized response body size, in
+// bytes, for non-streaming HTTP endpoints (#1283). Values <= 0 disable the cap.
+func (s *Server) SetHTTPResponseBodyLimit(n int64) {
+	s.httpResponseBodyLimit = n
+}
+
+// SetMaxDecompressedBodySize sets the maximum decompressed request body size,
+// in bytes, when Content-Encoding (gzip/deflate) is used (#1283).
+func (s *Server) SetMaxDecompressedBodySize(n int64) {
+	s.maxDecompressedBodySize = n
+}
+
+// SetEndpointRequestBodyLimit configures a per-endpoint request body limit
+// override (e.g. "POST /watched-contracts" or "PUT /contracts/{id}/spec").
+func (s *Server) SetEndpointRequestBodyLimit(endpoint string, limit int64) {
+	s.endpointBodyLimitsMu.Lock()
+	defer s.endpointBodyLimitsMu.Unlock()
+	if s.endpointRequestBodyLimits == nil {
+		s.endpointRequestBodyLimits = make(map[string]int64)
+	}
+	s.endpointRequestBodyLimits[strings.TrimSpace(endpoint)] = limit
+}
+
+// SetEndpointRequestBodyLimits replaces the per-endpoint request body limit
+// override map (#1283).
+func (s *Server) SetEndpointRequestBodyLimits(limits map[string]int64) {
+	s.endpointBodyLimitsMu.Lock()
+	defer s.endpointBodyLimitsMu.Unlock()
+	if len(limits) == 0 {
+		s.endpointRequestBodyLimits = nil
+		return
+	}
+	cp := make(map[string]int64, len(limits))
+	for k, v := range limits {
+		cp[strings.TrimSpace(k)] = v
+	}
+	s.endpointRequestBodyLimits = cp
+}
+
+// EffectiveRequestBodyLimit returns the request body byte limit for r,
+// consulting per-endpoint overrides before falling back to httpRequestBodyLimit.
+func (s *Server) EffectiveRequestBodyLimit(r *http.Request) int64 {
+	if r != nil {
+		s.endpointBodyLimitsMu.RLock()
+		overrides := s.endpointRequestBodyLimits
+		if len(overrides) > 0 {
+			method := strings.ToUpper(r.Method)
+			path := r.URL.Path
+			routePat := s.routePattern(r)
+			candidates := []string{
+				method + " " + routePat,
+				method + " " + path,
+				routePat,
+				path,
+			}
+			for _, key := range candidates {
+				if lim, ok := overrides[key]; ok {
+					s.endpointBodyLimitsMu.RUnlock()
+					return lim
+				}
+			}
+			for pattern, lim := range overrides {
+				if matchEndpointPattern(pattern, method, path) {
+					s.endpointBodyLimitsMu.RUnlock()
+					return lim
+				}
+			}
+		}
+		s.endpointBodyLimitsMu.RUnlock()
+	}
+	return s.httpRequestBodyLimit
+}
+
+// EffectiveDecompressedBodyLimit returns the maximum decompressed request
+// stream size in bytes for r (#1283).
+func (s *Server) EffectiveDecompressedBodyLimit(r *http.Request) int64 {
+	if s.maxDecompressedBodySize > 0 {
+		return s.maxDecompressedBodySize
+	}
+	if reqLim := s.EffectiveRequestBodyLimit(r); reqLim > 0 {
+		return reqLim
+	}
+	return DefaultMaxDecompressedBodyBytes
+}
+
+func matchEndpointPattern(pattern, method, path string) bool {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return false
+	}
+	patMethod := ""
+	patPath := pattern
+	if parts := strings.Fields(pattern); len(parts) == 2 {
+		patMethod = strings.ToUpper(parts[0])
+		patPath = parts[1]
+	}
+	if patMethod != "" && patMethod != method {
+		return false
+	}
+	patSegs := strings.Split(strings.Trim(patPath, "/"), "/")
+	pathSegs := strings.Split(strings.Trim(path, "/"), "/")
+	if len(patSegs) != len(pathSegs) {
+		return false
+	}
+	for i := range patSegs {
+		ps := patSegs[i]
+		if strings.HasPrefix(ps, "{") && strings.HasSuffix(ps, "}") {
+			if pathSegs[i] == "" {
+				return false
+			}
+			continue
+		}
+		if ps != pathSegs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) metricRouteLabel(r *http.Request) string {
+	if r == nil {
+		return "unmatched"
+	}
+	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+		if pat := rctx.RoutePattern(); pat != "" {
+			return pat
+		}
+		if len(rctx.RoutePatterns) > 0 && rctx.RoutePatterns[0] != "" {
+			return rctx.RoutePatterns[0]
+		}
+	}
+	return "unmatched"
+}
+
+func (s *Server) recordPayloadRejection(r *http.Request, reason string) {
+	metrics.HTTPPayloadSizeRejectionsTotal.WithLabelValues(s.metricRouteLabel(r), reason).Inc()
 }
 
 // SpecInvalidationPublisher tells the other replicas that a contract's
@@ -332,6 +497,11 @@ type MultiTenantOptions struct {
 	// StreamScopeSync is how often a live stream re-resolves its tenant's
 	// grants. Zero uses DefaultStreamScopeSync.
 	StreamScopeSync time.Duration
+	// DefaultRetention is the instance-wide event-retention horizon that a
+	// tenant without retention_max_age_seconds inherits. It bounds what the
+	// tenant can read and decides whether a policy change shortens its
+	// history. Zero means no age bound.
+	DefaultRetention time.Duration
 }
 
 // WithMultiTenancy turns on tenant isolation. Without this call the server
@@ -347,6 +517,7 @@ func (s *Server) WithMultiTenancy(ts store.TenantStore, opts MultiTenantOptions)
 	SetTenantScopedCaching(true)
 	s.maxWatched = opts.MaxWatchedContracts
 	s.streamScopeSync = opts.StreamScopeSync
+	s.defaultRetention = opts.DefaultRetention
 	s.usage = NewUsageRecorder(ts, s.log, opts.UsageFlushInterval)
 	return s
 }
@@ -359,6 +530,12 @@ func (s *Server) Usage() *UsageRecorder { return s.usage }
 // The limiter's Start/Stop lifecycle is owned by main, not by the Server.
 func (s *Server) SetRateLimiter(l *RateLimiter) {
 	s.limiter = l
+}
+
+// SetCostBudget wires the per-tenant query cost budget. Nil (the default)
+// leaves it off.
+func (s *Server) SetCostBudget(b *CostBudget) {
+	s.costBudget = b
 }
 
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
@@ -448,33 +625,39 @@ func (s *Server) router() chi.Router {
 	if s.metrics != nil {
 		r.Use(s.metrics.Middleware)
 	}
+	r.Use(s.deprecationMiddleware)
 	// CORS runs before Recoverer/Timeout so a preflight never blocks
 	// nor panics inside the recovery middleware, and so the same-origin
 	// contract (no Origin header) is forwarded as-is. Mounted
 	// unconditionally so an operator can flip the config on without
 	// restarts; CORS() is a no-op when the allowlist is empty.
 	r.Use(CORS(s.cors))
-	// Limit request body size to prevent resource exhaustion.
+	// Limit request and decompressed body sizes, and bound non-streaming
+	// response sizes to prevent resource exhaustion (#1283).
 	// Applied after CORS so preflight requests (OPTIONS) pass through
 	// without body size restrictions.
-	if s.httpRequestBodyLimit > 0 {
-		r.Use(s.bodyLimitMiddleware)
-	}
+	r.Use(s.bodyLimitMiddleware)
+	r.Use(s.responseLimitMiddleware)
+	r.Use(s.adminActionAuditMiddleware)
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
-	if s.limiter != nil {
-		r.Use(s.limiter.Middleware)
-	}
 	// authenticate must run before any handler that reads events: it is what
 	// puts a Principal (and therefore a Scope) on the request context. In
 	// single-tenant mode it injects a wildcard principal, so behavior is
 	// unchanged; without it mounted, scopeFrom returns the zero Scope and
 	// every scoped query silently matches nothing.
 	r.Use(s.authenticate)
+	if s.limiter != nil {
+		r.Use(s.limiter.Middleware)
+	}
+	if s.costBudget != nil {
+		r.Use(s.costBudget.Middleware)
+	}
 
 	// usageMiddleware must run after authenticate: it reads the Principal
 	// that authenticate installs, and counts one request per tenant.
 	r.Use(s.usageMiddleware)
+	r.Use(s.queryAttributionMiddleware)
 
 	// prettyMiddleware must be the innermost wrapper (closest to the handler)
 	// so the type assertion in writeJSON sees the prettyWriter interface.
@@ -506,13 +689,15 @@ func (s *Server) router() chi.Router {
 
 	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.
 	adminMW := apiKeyAuth(s.apiKey)
-	r.With(adminMW).Delete("/events", s.handleDeleteEvents)
+	r.With(adminMW, s.idempotencyMiddleware).Delete("/events", s.handleDeleteEvents)
 	// GraphQL transport — read-only, mounts at /graphql and dev-mode
 	// /graphiql. Built by the graphql package; the API server only
 	// owns the route registration so a misconfigured GraphQL handler
 	// shows up as a 404 instead of a confusing 500.
 	if s.graphqlHandler != nil {
 		r.Handle("/graphql", s.graphqlHandler)
+		r.Handle("/graphql/persisted", s.graphqlHandler)
+		r.Handle("/graphql/persisted/{id}", s.graphqlHandler)
 	}
 	if s.graphqlPlayground != nil {
 		r.Get("/graphiql", func(w http.ResponseWriter, req *http.Request) {
@@ -532,23 +717,23 @@ func (s *Server) router() chi.Router {
 	// watched_contracts table that forms one side of the ingestion union.
 	// Tenants manage their own claims through /tenant/watch below.
 	watchedMW := apiKeyAuth(s.apiKey)
-	r.With(watchedMW).Post("/watched-contracts", s.handleAddWatchedChain)
-	r.With(watchedMW).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
+	r.With(watchedMW, s.idempotencyMiddleware).Post("/watched-contracts", s.handleAddWatchedChain)
+	r.With(watchedMW, s.idempotencyMiddleware).Delete("/watched-contracts/{id}", s.handleRemoveWatchedChain)
 
 	// Contract spec overrides: user-supplied spec JSON per contract_id.
 	// A spec override silently changes how that contract's events decode,
 	// so — like every other management surface — writes are never open.
-	r.With(watchedMW).Put("/contracts/{id}/spec", s.handlePutContractSpecOverride)
+	r.With(watchedMW, s.idempotencyMiddleware).Put("/contracts/{id}/spec", s.handlePutContractSpecOverride)
 	r.With(watchedMW).Get("/contracts/{id}/spec", s.handleGetContractSpecOverride)
-	r.With(watchedMW).Delete("/contracts/{id}/spec", s.handleDeleteContractSpecOverride)
+	r.With(watchedMW, s.idempotencyMiddleware).Delete("/contracts/{id}/spec", s.handleDeleteContractSpecOverride)
 	// The override history answers "did someone change the override?", and
 	// a revert puts a previous version back. Both are management surfaces,
 	// so they sit behind the same key gate as the override itself.
 	r.With(watchedMW).Get("/contracts/{id}/spec/history", s.handleListContractSpecOverrideHistory)
-	r.With(watchedMW).Post("/contracts/{id}/spec/revert", s.handleRevertContractSpecOverride)
+	r.With(watchedMW, s.idempotencyMiddleware).Post("/contracts/{id}/spec/revert", s.handleRevertContractSpecOverride)
 
 	r.With(watchedMW).Get("/dead-letters", s.handleListDeadLetters)
-	r.With(watchedMW).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)
+	r.With(watchedMW, s.idempotencyMiddleware).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)
 
 	// API key management is ALWAYS authenticated: an unauthenticated
 	// create endpoint would let anyone mint keys and walk around auth
@@ -556,9 +741,9 @@ func (s *Server) router() chi.Router {
 	// the first key.
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireAPIKey)
-		r.Post("/apikeys", s.handleCreateAPIKey)
+		r.With(s.idempotencyMiddleware).Post("/apikeys", s.handleCreateAPIKey)
 		r.Get("/apikeys", s.handleListAPIKeys)
-		r.Delete("/apikeys/{id}", s.handleRevokeAPIKey)
+		r.With(s.idempotencyMiddleware).Delete("/apikeys/{id}", s.handleRevokeAPIKey)
 	})
 
 	// The streaming and subscription routes are the surface that auth
@@ -573,9 +758,9 @@ func (s *Server) router() chi.Router {
 	r.Group(func(r chi.Router) {
 		r.Use(protect)
 		r.Get("/events/ws", s.handleEventStreamWS)
-		r.Post("/subscriptions", s.handleCreateSubscription)
-		r.Put("/subscriptions/{id}", s.handleUpdateSubscription)
-		r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
+		r.With(s.idempotencyMiddleware).Post("/subscriptions", s.handleCreateSubscription)
+		r.With(s.idempotencyMiddleware).Put("/subscriptions/{id}", s.handleUpdateSubscription)
+		r.With(s.idempotencyMiddleware).Delete("/subscriptions/{id}", s.handleDeleteSubscription)
 	})
 
 	// Read endpoints. Compression is a deliberate two-way split:
@@ -599,8 +784,9 @@ func (s *Server) router() chi.Router {
 	// (single-object reads) and pass it to the store — see
 	// docs/multi-tenancy.md. Endpoints that skip this return nothing rather
 	// than everything, but "returns nothing" is still a bug.
-	r.Get("/events/count", s.handleCountEvents)
-	r.Get("/contracts/{id}", s.handleGetContract)
+	// Every one of these answers a conditional request: see conditionalGET.
+	r.With(conditionalGET).Get("/events/count", s.handleCountEvents)
+	r.With(conditionalGET).Get("/contracts/{id}", s.handleGetContract)
 	r.Get("/stats", s.handleStats)
 	r.With(protect).Get("/subscriptions/{id}", s.handleGetSubscription)
 
@@ -616,16 +802,19 @@ func (s *Server) router() chi.Router {
 		if s.compressMinSize >= 0 {
 			r.Use(Compress(s.compressMinSize))
 		}
-		r.Get("/events", s.handleListEvents)
-		r.Get("/events/aggregate", s.handleAggregateEvents)
-		r.Get("/events/{id}/raw", s.handleGetEventRaw)
-		r.Get("/events/{id}/transaction", s.handleGetEventTransaction)
-		r.Get("/events/{id}", s.handleGetEvent)
-		r.Get("/contracts", s.handleListContracts)
-		r.Get("/contracts/{id}/events", s.handleContractEvents)
-		r.Get("/contracts/{id}/stats", s.handleContractStats)
-		r.Get("/addresses/{address}/events", s.handleAddressEvents)
-		r.Get("/addresses/{address}/summary", s.handleAddressSummary)
+		// conditionalGET sits inside Compress, so the validator is the hash of
+		// the identity body. Subscriptions, deliveries and the operator watch
+		// list are left out: they are management surfaces, not polled reads.
+		r.With(conditionalGET).Get("/events", s.handleListEvents)
+		r.With(conditionalGET).Get("/events/aggregate", s.handleAggregateEvents)
+		r.With(conditionalGET).Get("/events/{id}/raw", s.handleGetEventRaw)
+		r.With(conditionalGET).Get("/events/{id}/transaction", s.handleGetEventTransaction)
+		r.With(conditionalGET).Get("/events/{id}", s.handleGetEvent)
+		r.With(conditionalGET).Get("/contracts", s.handleListContracts)
+		r.With(conditionalGET).Get("/contracts/{id}/events", s.handleContractEvents)
+		r.With(conditionalGET).Get("/contracts/{id}/stats", s.handleContractStats)
+		r.With(conditionalGET).Get("/addresses/{address}/events", s.handleAddressEvents)
+		r.With(conditionalGET).Get("/addresses/{address}/summary", s.handleAddressSummary)
 		r.With(protect).Get("/subscriptions", s.handleListSubscriptions)
 		r.With(protect).Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
 		r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
@@ -637,27 +826,27 @@ func (s *Server) router() chi.Router {
 		r.Get("/tenant", s.handleWhoAmI)
 		r.Get("/tenant/usage", s.handleOwnUsage)
 		r.Get("/tenant/watch", s.handleListOwnWatched)
-		r.Post("/tenant/watch", s.handleAddOwnWatched)
-		r.Delete("/tenant/watch/{contract_id}", s.handleRemoveOwnWatched)
+		r.With(s.idempotencyMiddleware).Post("/tenant/watch", s.handleAddOwnWatched)
+		r.With(s.idempotencyMiddleware).Delete("/tenant/watch/{contract_id}", s.handleRemoveOwnWatched)
 	})
 
 	// Tenant administration.
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireAdmin)
-		r.Post("/admin/tenants", s.handleCreateTenant)
+		r.With(s.idempotencyMiddleware).Post("/admin/tenants", s.handleCreateTenant)
 		r.Get("/admin/tenants", s.handleListTenants)
 		r.Get("/admin/tenants/{id}", s.handleGetTenant)
-		r.Patch("/admin/tenants/{id}", s.handleUpdateTenant)
-		r.Delete("/admin/tenants/{id}", s.handleDeleteTenant)
+		r.With(s.idempotencyMiddleware).Patch("/admin/tenants/{id}", s.handleUpdateTenant)
+		r.With(s.idempotencyMiddleware).Delete("/admin/tenants/{id}", s.handleDeleteTenant)
 		r.Get("/admin/tenants/{id}/usage", s.handleTenantUsage)
 
 		r.Get("/admin/tenants/{id}/grants", s.handleListTenantGrants)
-		r.Post("/admin/tenants/{id}/grants", s.handleGrantContract)
-		r.Delete("/admin/tenants/{id}/grants/{contract_id}", s.handleRevokeContract)
+		r.With(s.idempotencyMiddleware).Post("/admin/tenants/{id}/grants", s.handleGrantContract)
+		r.With(s.idempotencyMiddleware).Delete("/admin/tenants/{id}/grants/{contract_id}", s.handleRevokeContract)
 
 		r.Get("/admin/tenants/{id}/keys", s.handleListTenantKeys)
-		r.Post("/admin/tenants/{id}/keys", s.handleCreateTenantKey)
-		r.Delete("/admin/keys/{key_id}", s.handleRevokeTenantKey)
+		r.With(s.idempotencyMiddleware).Post("/admin/tenants/{id}/keys", s.handleCreateTenantKey)
+		r.With(s.idempotencyMiddleware).Delete("/admin/keys/{key_id}", s.handleRevokeTenantKey)
 	})
 
 	// Return the underlying *chi.Mux, not the registration guard: callers
@@ -693,6 +882,9 @@ func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 // cardinality.
 func (s *Server) routePattern(r *http.Request) string {
 	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+		if pat := rctx.RoutePattern(); pat != "" {
+			return pat
+		}
 		if len(rctx.RoutePatterns) > 0 {
 			return rctx.RoutePatterns[0]
 		}
@@ -701,6 +893,23 @@ func (s *Server) routePattern(r *http.Request) string {
 		}
 	}
 	return r.URL.Path
+}
+
+// queryAttributionMiddleware attaches the matched route pattern (never the raw
+// URL path) and the authenticated tenant's opaque identifier onto the request
+// context so every downstream Store operation attributes its database cost to
+// the endpoint and tenant that caused it (#1278).
+func (s *Server) queryAttributionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		route := s.metricRouteLabel(r)
+		originator := r.Method + " " + route
+		tenantID := "default"
+		if p, ok := PrincipalFrom(r.Context()); ok && !p.Untenanted && p.Tenant.ID > 0 {
+			tenantID = strconv.FormatInt(p.Tenant.ID, 10)
+		}
+		ctx := store.WithQueryAttribution(r.Context(), originator, tenantID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 func (s *Server) requestLogger(next http.Handler) http.Handler {
@@ -731,15 +940,79 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 }
 
 // bodyLimitMiddleware wraps the request body with http.MaxBytesReader to
-// enforce a maximum request body size. This prevents resource exhaustion
-// from clients sending excessively large request bodies. A limit <= 0 means
-// no limit is enforced.
+// enforce the effective request body size limit (including per-endpoint
+// overrides) and bounds decompressed Content-Encoding streams (#1283).
 func (s *Server) bodyLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.httpRequestBodyLimit > 0 {
-			r.Body = http.MaxBytesReader(w, r.Body, s.httpRequestBodyLimit)
+		limit := s.EffectiveRequestBodyLimit(r)
+		if limit > 0 && r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+		}
+		if r.Body != nil {
+			enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding")))
+			if enc != "" && enc != "identity" {
+				if enc != "gzip" && enc != "deflate" {
+					status := http.StatusBadRequest
+					writeError(w, status, fmt.Errorf("unsupported Content-Encoding %q", enc))
+					return
+				}
+				decompLimit := s.EffectiveDecompressedBodyLimit(r)
+				r.Body = newBoundedDecompressedReader(r.Body, enc, decompLimit, func() {
+					s.recordPayloadRejection(r, "decompressed_body")
+				})
+				r.Header.Del("Content-Encoding")
+				r.Header.Del("Content-Length")
+				r.ContentLength = -1
+			}
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// responseLimitMiddleware caps non-streaming responses at s.httpResponseBodyLimit
+// bytes and returns a structured 413 error with pagination guidance when a
+// serialized response exceeds the ceiling (#1283). Streaming endpoints
+// (SSE, CSV/NDJSON exports, WebSocket upgrades) bypass buffering completely.
+func (s *Server) responseLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		limit := s.httpResponseBodyLimit
+		if limit <= 0 || isStreamingResponse(r, w.Header()) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		bw := &boundedResponseWriter{
+			ResponseWriter: w,
+			req:            r,
+			maxBytes:       limit,
+		}
+		next.ServeHTTP(bw, r)
+		if bw.hijacked || bw.streaming {
+			return
+		}
+		if bw.exceeded {
+			s.recordPayloadRejection(r, "response_body")
+			w.Header().Del("Content-Encoding")
+			w.Header().Del("Content-Length")
+			w.Header().Del("ETag")
+			w.Header().Set("X-Response-Truncated", "true")
+			w.Header().Set("X-Response-Limit-Bytes", strconv.FormatInt(limit, 10))
+			status := http.StatusRequestEntityTooLarge
+			writeError(w, status, fmt.Errorf(
+				"response body exceeds the configured limit of %d bytes: %w (reduce limit or paginate with cursor)",
+				limit, errBodyTooLarge,
+			))
+			return
+		}
+		status := bw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		if bw.wroteHeader || status != http.StatusOK || bw.buf.Len() > 0 {
+			w.WriteHeader(status)
+		}
+		if bw.buf.Len() > 0 {
+			_, _ = w.Write(bw.buf.Bytes())
+		}
 	})
 }
 
@@ -771,5 +1044,8 @@ func RequestIDFrom(ctx context.Context) string {
 func (s *Server) SetGraphQLHandler(handler, playground http.Handler) *Server {
 	s.graphqlHandler = handler
 	s.graphqlPlayground = playground
+	if keyAware, ok := handler.(interface{ SetAPIKey(string) }); ok && s.apiKey != "" {
+		keyAware.SetAPIKey(s.apiKey)
+	}
 	return s
 }

@@ -12,7 +12,7 @@
 
 # Build stage runs on the build host's native platform and cross-compiles,
 # so multi-arch builds don't pay for QEMU-emulated Go compilation.
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -22,8 +22,8 @@ ARG VERSION=unknown
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-	go build \
-	-ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$VERSION -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$COMMIT -X github.com/sorotrail/sorotrail/internal/buildinfo.BuildDate=$BUILD_DATE" \
+	go build -trimpath -buildvcs=false \
+	-ldflags="-s -w -X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$VERSION -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$COMMIT -X github.com/sorotrail/sorotrail/internal/buildinfo.BuildDate=$BUILD_DATE" \
 	-o /out/sorotrail ./cmd/sorotrail
 
 FROM alpine:3.24
@@ -51,7 +51,7 @@ LABEL org.opencontainers.image.title="sorotrail" \
 	org.opencontainers.image.licenses="Apache-2.0"
 
 # Runtime base, pinned by digest for the reason given at the top of the file.
-FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 RUN apk add --no-cache ca-certificates && adduser -D -u 10001 sorotrail
 USER sorotrail
 COPY --from=build /out/sorotrail /usr/local/bin/sorotrail

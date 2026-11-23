@@ -27,7 +27,25 @@ func isAddress(s string) bool {
 	if prefix != 'G' && prefix != 'C' {
 		return false
 	}
-	for _, r := range s[1:] {
+	for i := 1; i < 56; i++ {
+		r := s[i]
+		if (r < 'A' || r > 'Z') && (r < '2' || r > '7') {
+			return false
+		}
+	}
+	return true
+}
+
+func isAddressBytes(b []byte) bool {
+	if len(b) != 56 {
+		return false
+	}
+	prefix := b[0]
+	if prefix != 'G' && prefix != 'C' {
+		return false
+	}
+	for i := 1; i < 56; i++ {
+		r := b[i]
 		if (r < 'A' || r > 'Z') && (r < '2' || r > '7') {
 			return false
 		}
@@ -50,38 +68,92 @@ func isAddress(s string) bool {
 // AddressRef rows (different roles), but duplicate (address, role) pairs are
 // collapsed — each unique combination appears at most once.
 func ExtractAddresses(topics, value json.RawMessage) []AddressRef {
-	seen := map[[2]string]bool{} // (address, role) dedupe key
-	var result []AddressRef
+	return AppendAddresses(nil, "", topics, value)
+}
+
+// AppendAddresses appends every deduplicated (address, role) occurrence from
+// topics and value onto dst, tagging each appended AddressRef with eventID.
+// Using AppendAddresses across a batch of events allows the caller to reuse or
+// pre-size a single destination slice rather than allocating one slice per event.
+func AppendAddresses(dst []AddressRef, eventID string, topics, value json.RawMessage) []AddressRef {
+	// Fast check: a quoted 56-character Stellar address ("G..." or "C...")
+	// requires at least 58 bytes of JSON.
+	if len(topics) < 58 && len(value) < 58 {
+		return dst
+	}
+
+	var seenSmall [8][2]string
+	seenCount := 0
+	var seenMap map[[2]string]bool
 
 	add := func(addr, role string) {
 		if !isAddress(addr) {
 			return
 		}
 		key := [2]string{addr, role}
-		if seen[key] {
-			return
-		}
-		seen[key] = true
-		result = append(result, AddressRef{Address: addr, Role: role})
-	}
-
-	// Walk topic array.
-	if len(topics) > 0 {
-		var topicArr []json.RawMessage
-		if err := json.Unmarshal(topics, &topicArr); err == nil {
-			for i, t := range topicArr {
-				role := formatTopicRole(i)
-				extractFromValue(t, role, add, 0)
+		if seenMap != nil {
+			if seenMap[key] {
+				return
+			}
+			seenMap[key] = true
+		} else {
+			for i := 0; i < seenCount; i++ {
+				if seenSmall[i] == key {
+					return
+				}
+			}
+			if seenCount < len(seenSmall) {
+				seenSmall[seenCount] = key
+				seenCount++
+			} else {
+				seenMap = make(map[[2]string]bool, 16)
+				for i := 0; i < seenCount; i++ {
+					seenMap[seenSmall[i]] = true
+				}
+				seenMap[key] = true
 			}
 		}
+		if cap(dst) == 0 {
+			dst = make([]AddressRef, 0, 4)
+		}
+		dst = append(dst, AddressRef{Address: addr, Role: role, EventID: eventID})
 	}
 
-	// Walk value.
-	if len(value) > 0 {
-		extractFromValue(value, "value", add, 0)
+	if len(topics) >= 58 {
+		walkTopLevelTopics(topics, add)
 	}
+	if len(value) >= 58 {
+		extractFromValue(value, RoleValue, add, 0)
+	}
+	return dst
+}
 
-	return result
+func walkTopLevelTopics(topics json.RawMessage, add func(string, string)) {
+	i := skipWS(topics, 0)
+	if i >= len(topics) || topics[i] != '[' {
+		return
+	}
+	i++
+	topicIdx := 0
+	for {
+		i = skipWS(topics, i)
+		if i >= len(topics) || topics[i] == ']' {
+			return
+		}
+		elemEnd, ok := scanJSONValueEnd(topics, i)
+		if !ok {
+			return
+		}
+		elem := topics[i:elemEnd]
+		if len(elem) >= 58 {
+			extractFromValue(elem, formatTopicRole(topicIdx), add, 0)
+		}
+		topicIdx++
+		i = skipWS(topics, elemEnd)
+		if i < len(topics) && topics[i] == ',' {
+			i++
+		}
+	}
 }
 
 // extractFromValue recursively walks a decoded JSON value looking for string
@@ -93,40 +165,174 @@ func ExtractAddresses(topics, value json.RawMessage) []AddressRef {
 // Objects and arrays are recursed into; {"unknown": ...} shapes are skipped.
 func extractFromValue(raw json.RawMessage, role string, add func(string, string), depth int) {
 	const maxExtractDepth = 32
-	if depth > maxExtractDepth || len(raw) == 0 {
+	if depth > maxExtractDepth {
 		return
 	}
+	i := skipWS(raw, 0)
+	if len(raw)-i < 58 {
+		return
+	}
+	raw = raw[i:]
 
-	// Try object first.
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &obj); err == nil {
-		// Skip {"unknown": ...} shapes — these are decoding fallbacks
-		// and the value inside is not reliably an address.
-		if _, ok := obj["unknown"]; ok && len(obj) == 1 {
+	switch raw[0] {
+	case '"':
+		end, hasEscape, ok := scanJSONStringEnd(raw, 0)
+		if !ok {
 			return
 		}
-		for _, v := range obj {
-			extractFromValue(v, role, add, depth+1)
+		if !hasEscape {
+			if end == 58 && isAddressBytes(raw[1:57]) {
+				add(string(raw[1:57]), role)
+			}
+			return
 		}
-		return
-	}
-
-	// Try array.
-	var arr []json.RawMessage
-	if err := json.Unmarshal(raw, &arr); err == nil {
-		for _, v := range arr {
-			extractFromValue(v, role, add, depth+1)
+		var s string
+		if err := json.Unmarshal(raw[:end], &s); err == nil {
+			add(s, role)
 		}
-		return
-	}
 
-	// Try string.
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		add(s, role)
-		return
+	case '[':
+		pos := 1
+		for {
+			pos = skipWS(raw, pos)
+			if pos >= len(raw) || raw[pos] == ']' {
+				return
+			}
+			elemEnd, ok := scanJSONValueEnd(raw, pos)
+			if !ok {
+				return
+			}
+			if elemEnd-pos >= 58 {
+				extractFromValue(raw[pos:elemEnd], role, add, depth+1)
+			}
+			pos = skipWS(raw, elemEnd)
+			if pos < len(raw) && raw[pos] == ',' {
+				pos++
+			}
+		}
+
+	case '{':
+		// Walk object key-value pairs. If the object is a single-key
+		// {"unknown": ...} fallback shape, skip it entirely.
+		pos := skipWS(raw, 1)
+		if pos >= len(raw) || raw[pos] == '}' {
+			return
+		}
+		firstKeyStart := pos
+		firstKeyEnd, firstKeyEsc, ok := scanJSONStringEnd(raw, firstKeyStart)
+		if !ok {
+			return
+		}
+		pos = skipWS(raw, firstKeyEnd)
+		if pos >= len(raw) || raw[pos] != ':' {
+			return
+		}
+		pos = skipWS(raw, pos+1)
+		firstValStart := pos
+		firstValEnd, ok := scanJSONValueEnd(raw, firstValStart)
+		if !ok {
+			return
+		}
+		afterFirst := skipWS(raw, firstValEnd)
+		isUnknownFirstKey := !firstKeyEsc && string(raw[firstKeyStart+1:firstKeyEnd-1]) == "unknown"
+		if isUnknownFirstKey && afterFirst < len(raw) && raw[afterFirst] == '}' {
+			return
+		}
+		if firstValEnd-firstValStart >= 58 {
+			extractFromValue(raw[firstValStart:firstValEnd], role, add, depth+1)
+		}
+		pos = afterFirst
+		for pos < len(raw) && raw[pos] == ',' {
+			pos = skipWS(raw, pos+1)
+			keyEnd, _, ok := scanJSONStringEnd(raw, pos)
+			if !ok {
+				return
+			}
+			pos = skipWS(raw, keyEnd)
+			if pos >= len(raw) || raw[pos] != ':' {
+				return
+			}
+			pos = skipWS(raw, pos+1)
+			valStart := pos
+			valEnd, ok := scanJSONValueEnd(raw, valStart)
+			if !ok {
+				return
+			}
+			if valEnd-valStart >= 58 {
+				extractFromValue(raw[valStart:valEnd], role, add, depth+1)
+			}
+			pos = skipWS(raw, valEnd)
+		}
 	}
-	// Numbers, booleans, null — no addresses here.
+}
+
+func skipWS(b []byte, i int) int {
+	for i < len(b) {
+		switch b[i] {
+		case ' ', '\t', '\n', '\r':
+			i++
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+func scanJSONStringEnd(b []byte, start int) (end int, hasEscape bool, ok bool) {
+	if start >= len(b) || b[start] != '"' {
+		return 0, false, false
+	}
+	for i := start + 1; i < len(b); i++ {
+		switch b[i] {
+		case '\\':
+			hasEscape = true
+			i++
+		case '"':
+			return i + 1, hasEscape, true
+		}
+	}
+	return 0, hasEscape, false
+}
+
+func scanJSONValueEnd(b []byte, start int) (int, bool) {
+	if start >= len(b) {
+		return 0, false
+	}
+	switch b[start] {
+	case '"':
+		end, _, ok := scanJSONStringEnd(b, start)
+		return end, ok
+	case '{', '[':
+		depth := 0
+		for i := start; i < len(b); i++ {
+			switch b[i] {
+			case '"':
+				strEnd, _, ok := scanJSONStringEnd(b, i)
+				if !ok {
+					return 0, false
+				}
+				i = strEnd - 1
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					return i + 1, true
+				}
+			}
+		}
+		return 0, false
+	default:
+		i := start
+		for i < len(b) {
+			switch b[i] {
+			case ',', '}', ']', ' ', '\t', '\n', '\r':
+				return i, i > start
+			}
+			i++
+		}
+		return i, i > start
+	}
 }
 
 // Role constants.
@@ -137,11 +343,20 @@ const (
 	RoleTopicPrefix = "topic[" // suffix is the 0-based index, e.g. "topic[0]"
 )
 
+var precomputedTopicRoles = [16]string{
+	"topic[0]", "topic[1]", "topic[2]", "topic[3]",
+	"topic[4]", "topic[5]", "topic[6]", "topic[7]",
+	"topic[8]", "topic[9]", "topic[10]", "topic[11]",
+	"topic[12]", "topic[13]", "topic[14]", "topic[15]",
+}
+
 func formatTopicRole(i int) string {
+	if i >= 0 && i < len(precomputedTopicRoles) {
+		return precomputedTopicRoles[i]
+	}
 	var buf strings.Builder
 	buf.Grow(12)
 	buf.WriteString(RoleTopicPrefix)
-	// i fits in a small int; Sprint is fine.
 	buf.WriteString(itoa(i))
 	buf.WriteByte(']')
 	return buf.String()

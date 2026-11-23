@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -33,6 +35,56 @@ type tenantRequest struct {
 	RateLimitRPS        *float64 `json:"rate_limit_rps"`
 	RateLimitBurst      *int     `json:"rate_limit_burst"`
 	MaxWatchedContracts *int     `json:"max_watched_contracts"`
+	// RetentionMaxAgeSeconds sets the tenant's retention horizon (#1249).
+	// 0 clears it so the tenant inherits the instance default again.
+	RetentionMaxAgeSeconds *int64 `json:"retention_max_age_seconds"`
+	// ConfirmRetentionShortening must be true for an update that shortens
+	// the tenant's effective horizon: the next sweep may then delete rows
+	// irreversibly.
+	ConfirmRetentionShortening bool `json:"confirm_retention_shortening"`
+}
+
+// maxRetentionSeconds bounds retention_max_age_seconds at 100 years, well
+// inside what time.Duration can represent.
+const maxRetentionSeconds = 100 * 365 * 24 * 60 * 60
+
+// errRetentionShorteningUnconfirmed refuses an update that would shorten a
+// tenant's history without the caller saying it means to.
+var errRetentionShorteningUnconfirmed = errors.New(
+	"this update shortens the tenant's retention and the next prune sweep may permanently delete events; " +
+		"resend with confirm_retention_shortening set to true")
+
+// applyRetentionRequest copies a requested retention horizon onto t, where
+// 0 means "inherit the instance default". Range checks happen in
+// validateTenantQuotas so every tenant validation error has one source.
+func applyRetentionRequest(t *store.Tenant, seconds *int64) {
+	if seconds == nil {
+		return
+	}
+	if *seconds == 0 {
+		t.RetentionMaxAgeSeconds = nil
+		return
+	}
+	v := *seconds
+	t.RetentionMaxAgeSeconds = &v
+}
+
+// tenantScope resolves a tenant's read scope, including its retention
+// horizon (#1249). Every authentication path goes through here, so a tenant
+// can never read events past its own horizon even when the pruner keeps
+// them for a longer-retention tenant sharing the contract.
+func (s *Server) tenantScope(ctx context.Context, t store.Tenant) (store.Scope, error) {
+	scope, err := s.tenants.ScopeForTenant(ctx, t)
+	if err != nil {
+		return store.Scope{}, err
+	}
+	return scope.WithRetention(s.tenantRetention(t)), nil
+}
+
+// tenantRetention is the horizon the tenant is entitled to: its own policy,
+// or the instance default.
+func (s *Server) tenantRetention(t store.Tenant) time.Duration {
+	return store.EffectiveRetention(t.RetentionOverride(), s.defaultRetention)
 }
 
 func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
@@ -60,6 +112,7 @@ func (s *Server) handleCreateTenant(w http.ResponseWriter, r *http.Request) {
 	if req.Enabled != nil {
 		t.Enabled = *req.Enabled
 	}
+	applyRetentionRequest(&t, req.RetentionMaxAgeSeconds)
 	if err := validateTenantQuotas(t); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -94,6 +147,9 @@ func validateTenantQuotas(t store.Tenant) error {
 	// throttle. Same rule the instance-wide RATE_LIMIT_* pair enforces.
 	if (t.RateLimitRPS == nil) != (t.RateLimitBurst == nil) {
 		return errors.New("rate_limit_rps and rate_limit_burst must be set together")
+	}
+	if r := t.RetentionMaxAgeSeconds; r != nil && (*r < 0 || *r > maxRetentionSeconds) {
+		return fmt.Errorf("retention_max_age_seconds must be between 1 and %d, or 0 to inherit the instance default", maxRetentionSeconds)
 	}
 	return nil
 }
@@ -152,9 +208,24 @@ func (s *Server) handleUpdateTenant(w http.ResponseWriter, r *http.Request) {
 	if req.MaxWatchedContracts != nil {
 		t.MaxWatchedContracts = req.MaxWatchedContracts
 	}
+	before := s.tenantRetention(t)
+	applyRetentionRequest(&t, req.RetentionMaxAgeSeconds)
 	if err := validateTenantQuotas(t); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	after := s.tenantRetention(t)
+	shortens := store.RetentionShortens(before, after)
+	if shortens && !req.ConfirmRetentionShortening {
+		writeError(w, http.StatusConflict, errRetentionShorteningUnconfirmed)
+		return
+	}
+	if before != after {
+		// The audit entry already names who acted and when; this adds what
+		// changed, because a shortened horizon is a data-loss decision.
+		setActionAuditMetadata(r.Context(), "retention_max_age_seconds_before", int64(before/time.Second))
+		setActionAuditMetadata(r.Context(), "retention_max_age_seconds_after", int64(after/time.Second))
+		setActionAuditMetadata(r.Context(), "retention_shortened", shortens)
 	}
 
 	updated, err := s.tenants.UpdateTenant(r.Context(), t)
@@ -167,6 +238,13 @@ func (s *Server) handleUpdateTenant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("updating tenant failed"))
 		return
 	}
+	if shortens {
+		loggerFromContext(r.Context()).Warn("tenant retention shortened",
+			"tenant_id", updated.ID,
+			"retention_before", before,
+			"retention_after", after)
+	}
+	s.notifyTenantInvalidation(r.Context(), updated.ID)
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -194,6 +272,7 @@ func (s *Server) handleDeleteTenant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("deleting tenant failed"))
 		return
 	}
+	s.notifyTenantInvalidation(r.Context(), id)
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -221,6 +300,7 @@ func (s *Server) handleGrantContract(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("granting contract failed"))
 		return
 	}
+	s.notifyTenantInvalidation(r.Context(), t.ID)
 	s.writeGrants(w, r, t.ID)
 }
 
@@ -235,9 +315,7 @@ func (s *Server) handleRevokeContract(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("revoking contract failed"))
 		return
 	}
-	// A revoked grant stops mattering for new requests immediately, because
-	// scope is resolved per request. Open streams pick it up within one
-	// StreamScopeSync interval; see syncStreamScope.
+	s.notifyTenantInvalidation(r.Context(), t.ID)
 	s.writeGrants(w, r, t.ID)
 }
 
@@ -328,6 +406,7 @@ func (s *Server) handleRevokeTenantKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("revoking api key failed"))
 		return
 	}
+	s.notifyAPIKeyInvalidation(r.Context(), id)
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -337,7 +416,7 @@ func (s *Server) handleTenantUsage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.writeUsage(w, r, t.ID)
+	s.writeUsage(w, r, t, true)
 }
 
 // whoAmIResponse is the tenant's own view of its account: identity, what it
@@ -365,10 +444,33 @@ func (s *Server) handleOwnUsage(w http.ResponseWriter, r *http.Request) {
 	// Flush first so a tenant checking its own usage sees the requests it
 	// just made rather than a figure up to one interval stale.
 	s.usage.Flush(r.Context())
-	s.writeUsage(w, r, p.Tenant.ID)
+	s.writeUsage(w, r, p.Tenant, false)
 }
 
-func (s *Server) writeUsage(w http.ResponseWriter, r *http.Request, tenantID int64) {
+// watchHeadroom is how much of a watch-list cap is in use. Limit is null when
+// there is no cap: for a tenant, none of its own (it is still bounded by the
+// instance-wide cap); for the instance, none configured.
+type watchHeadroom struct {
+	Held  int  `json:"held"`
+	Limit *int `json:"limit"`
+}
+
+// usageResponse is the body of both usage endpoints.
+//
+// The instance-wide watch list is the union of every tenant's, so its size is
+// aggregate data about other tenants. A tenant is therefore told only the one
+// bit it can act on (InstanceWatchListFull: adding a contract nobody watches
+// yet would be refused), while the operator view carries the numbers.
+type usageResponse struct {
+	Usage                    []store.TenantUsage `json:"usage"`
+	WatchedContracts         watchHeadroom       `json:"watched_contracts"`
+	InstanceWatchListFull    *bool               `json:"instance_watch_list_full,omitempty"`
+	InstanceWatchedContracts *watchHeadroom      `json:"instance_watched_contracts,omitempty"`
+}
+
+// writeUsage writes the tenant's usage counters and its watch-list headroom.
+// operator selects the admin view, which adds the instance-wide numbers.
+func (s *Server) writeUsage(w http.ResponseWriter, r *http.Request, t store.Tenant, operator bool) {
 	days := 30
 	if raw := r.URL.Query().Get("days"); raw != "" {
 		n, err := strconv.Atoi(raw)
@@ -379,14 +481,52 @@ func (s *Server) writeUsage(w http.ResponseWriter, r *http.Request, tenantID int
 		}
 		days = n
 	}
-	usage, err := s.tenants.ListUsage(r.Context(), tenantID, days)
+	resp, err := s.buildUsage(r.Context(), t, days, operator)
 	if err != nil {
 		loggerFromContext(r.Context()).Error("listing usage", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing usage failed"))
 		return
 	}
 	writeCacheHeaders(w, cacheNoStore, 0, "")
-	writeJSON(w, http.StatusOK, map[string]any{"usage": usage})
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// buildUsage assembles the usage report: the day counters, the tenant's
+// watch-list headroom and, depending on the audience, the instance-wide one.
+func (s *Server) buildUsage(ctx context.Context, t store.Tenant, days int, operator bool) (usageResponse, error) {
+	usage, err := s.tenants.ListUsage(ctx, t.ID, days)
+	if err != nil {
+		return usageResponse{}, fmt.Errorf("listing usage counters: %w", err)
+	}
+	held, err := s.tenants.CountTenantWatchedContracts(ctx, t.ID)
+	if err != nil {
+		return usageResponse{}, fmt.Errorf("counting the tenant watch list: %w", err)
+	}
+	resp := usageResponse{
+		Usage:            usage,
+		WatchedContracts: watchHeadroom{Held: held, Limit: t.MaxWatchedContracts},
+	}
+	if s.maxWatched == 0 && !operator {
+		return resp, nil
+	}
+
+	instanceHeld, err := s.tenants.CountInstanceWatchedContracts(ctx)
+	if err != nil {
+		return usageResponse{}, fmt.Errorf("counting the instance watch list: %w", err)
+	}
+	var limit *int
+	if s.maxWatched > 0 {
+		capacity := s.maxWatched
+		limit = &capacity
+		if !operator {
+			full := instanceHeld >= s.maxWatched
+			resp.InstanceWatchListFull = &full
+		}
+	}
+	if operator {
+		resp.InstanceWatchedContracts = &watchHeadroom{Held: instanceHeld, Limit: limit}
+	}
+	return resp, nil
 }
 
 type watchRequest struct {

@@ -80,3 +80,25 @@ func TestHashSecret_TwoHashesDiffer(t *testing.T) {
 	assert.True(t, VerifySecret("same", h1))
 	assert.True(t, VerifySecret("same", h2))
 }
+
+func TestRedactIdentifier(t *testing.T) {
+	key, prefix, secret, err := Generate()
+	require.NoError(t, err)
+
+	redacted, ok := RedactIdentifier(key)
+	require.True(t, ok)
+	assert.Equal(t, SchemePrefix+prefix, redacted)
+	assert.NotContains(t, redacted, secret, "redacted identifier must never contain the secret")
+
+	tenantRedacted, ok := RedactIdentifier("st_abcd1234_supersecret9999")
+	require.True(t, ok)
+	assert.Equal(t, "st_abcd1234", tenantRedacted)
+	assert.NotContains(t, tenantRedacted, "supersecret9999")
+
+	alreadyRedacted, ok := RedactIdentifier("sorotrail_" + prefix)
+	require.True(t, ok)
+	assert.Equal(t, "sorotrail_"+prefix, alreadyRedacted)
+
+	_, ok = RedactIdentifier("raw-static-bearer-secret")
+	assert.False(t, ok, "arbitrary bearer tokens must not be returned as public identifiers")
+}

@@ -25,6 +25,9 @@ full details.
 - [clickhouse.md](clickhouse.md) — capability matrix for the optional
   analytical backend, distinguishing implemented methods from refusals and silent
   no-ops.
+- [deprecation.md](deprecation.md) — API deprecation and breaking-change policy,
+  `Deprecation` (RFC 9745) and `Sunset` (RFC 8594) HTTP headers, OpenAPI extensions,
+  generated Go/Python client behavior, and GraphQL `@deprecated` conventions.
 - [errors.md](errors.md) — error code reference and handling guide.
 - [graphql.md](graphql.md) — read-only GraphQL endpoint (`/graphql`) and GraphiQL
   playground, top-level query fields, Relay cursor pagination, depth/complexity limits,

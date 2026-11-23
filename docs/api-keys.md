@@ -13,6 +13,7 @@ rotations, and the backend deployment constraints.
 - [Key rotation procedure](#key-rotation-procedure)
 - [Leaked key procedure](#leaked-key-procedure)
 - [Backend constraint: PostgreSQL only](#backend-constraint-postgresql-only)
+- [Idempotency keys on write endpoints](#idempotency-keys-on-write-endpoints)
 - [Secret handling guidance](#secret-handling-guidance)
 
 ## Key format and storage
@@ -223,6 +224,37 @@ running SoroTrail on SQLite:
   (e.g., Caddy, NGINX, Envoy, or an API Gateway).
 - Any production deployment requiring multi-tenancy, per-tenant scopes, or
   built-in API key management **must use PostgreSQL**.
+
+## Idempotency keys on write endpoints
+
+All SoroTrail write endpoints (`POST`, `PUT`, `PATCH`, and `DELETE`), including
+`POST /apikeys`, `POST /admin/tenants/{id}/keys`, `POST /subscriptions`, and
+`POST /watched-contracts`, accept an optional `Idempotency-Key` request header
+(printable ASCII, up to 255 characters).
+
+- **Replay on retry (`2xx` / `4xx`)**: When a write request succeeds or fails
+  with a deterministic `4xx` client error, SoroTrail stores the status code,
+  `Content-Type`, `Location`, and response body keyed by
+  `(scope_key, idempotency_key)` together with a SHA-256 hash of the HTTP
+  method, request path, and request body. Retrying the exact same request with
+  the same `Idempotency-Key` within the retention window returns the stored
+  response verbatim (including one-time plaintext API key secrets or generated
+  subscription IDs) without re-executing the handler, and sets
+  `Idempotency-Replayed: true`.
+- **Conflict on payload mismatch (`409 Conflict`)**: Reusing the same
+  `Idempotency-Key` with a different method, path, or request body within the
+  retention window returns `409 Conflict`.
+- **Concurrent in-flight requests**: Concurrent requests carrying the same
+  `(scope_key, idempotency_key)` coalesce onto a single execution so at most one
+  underlying write runs.
+- **Transient server failures (`5xx`)**: `5xx` responses are not cached; the
+  in-progress reservation is released so the client can safely retry with the
+  same `Idempotency-Key`.
+- **Retention window (24 hours)**: Stored idempotency records expire after 24
+  hours (`DefaultIdempotencyTTL = 24h`) and expired rows are pruned
+  opportunistically on write operations. Twenty-four hours covers automated
+  client retry budgets, webhook orchestrator backoffs, and CI/CD deployment
+  pipelines while bounding storage growth in `idempotency_keys`.
 
 ## Secret handling guidance
 

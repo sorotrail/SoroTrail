@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -136,14 +137,15 @@ var errorCatalogue = []errorCondition{
 	{File: "auth.go", Func: "writeUnauthorized", Status: 401, Arg: `errors.New(msg)`, Message: "missing API key; malformed API key; unknown or revoked API key", Condition: "multi-tenant authentication rejects the credential, with the reason that lets a legitimate caller fix it", SpecExempt: true, AnyNonProbe: true, Notes: "WWW-Authenticate: Bearer realm=\"sorotrail\" per RFC 7235 §4.1"},
 
 	// --- export.go ---
-	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `err`, Message: "invalid format %q (want csv or ndjson)", Condition: "the export's format parameter names something other than csv or ndjson"},
+	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `err`, Count: 2, Message: "invalid format %q (want csv or ndjson); invalid terminator (want true or false)", Condition: "the export's format parameter names something other than csv or ndjson, or its terminator parameter is neither true nor false"},
 	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `errors.New("from_ledger and to_ledger are required for export")`, Message: "from_ledger and to_ledger are required for export", Condition: "the export is requested without explicit ledger bounds"},
 	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `fmt.Errorf("from_ledger %d is after to_ledger %d", fromLedger, toLedger)`, Message: "from_ledger %d is after to_ledger %d", Condition: "the export's ledger bounds are inverted"},
 	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `fmt.Errorf("from_ledger %s", err.Error())`, Message: "from_ledger <detail>", Condition: "the export's from_ledger bound is not a positive integer"},
 	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", contractID)`, Message: "invalid contract id %q (want 56-char C... strkey)", Condition: "the export is requested for a path contract id that is not a strkey"},
 	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `fmt.Errorf("ledger range [%d,%d] spans %d ledgers, exceeding EXPORT_MAX_RANGE=%d", fromLedger, toLedger, span, s.exportMaxRange)`, Message: "ledger range [%d,%d] spans %d ledgers, exceeding EXPORT_MAX_RANGE=%d", Condition: "the export's ledger range is wider than the operator's cap"},
 	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `fmt.Errorf("to_ledger %s", err.Error())`, Message: "to_ledger <detail>", Condition: "the export's to_ledger bound is not a positive integer"},
-	{File: "export.go", Func: "Server.handleEventsCSV", Status: 400, Arg: `err`, Message: "invalid format %q (want csv or ndjson)", Condition: "the CSV export's format parameter names something other than csv or ndjson"},
+	{File: "export.go", Func: "Server.handleEventsCSV", Status: 400, Arg: `err`, Count: 2, Message: "invalid format %q (want csv or ndjson); invalid terminator (want true or false)", Condition: "the CSV export's format parameter names something other than csv or ndjson, or its terminator parameter is neither true nor false"},
+	{File: "export_stream.go", Func: "Server.streamExportOpts", Status: 500, Arg: `errors.New("export failed")`, Message: "export failed", Condition: "the store fails before the first byte of an NDJSON export has been written (after that the stream is aborted instead)"},
 	// --- handlers.go ---
 	{File: "handlers.go", Func: "Server.handleAddWatchedChain", Status: 400, Arg: `errors.New( "adding the first watched contract would switch ingestion from "+ "'all contract events' to a specific list — pass ?confirm=true to acknowledge")`, Message: "adding the first watched contract would switch ingestion from 'all contract events' to a specific list — pass ?confirm=true to acknowledge", Condition: "the first watch would silently narrow ingestion from all contracts to a list, and the caller did not pass ?confirm=true"},
 	{File: "handlers.go", Func: "Server.handleAddWatchedChain", Status: 400, Arg: `fmt.Errorf("invalid contract_id %q (want 56-char C... strkey)", req.ContractID)`, Message: "invalid contract_id %q (want 56-char C... strkey)", Condition: "the body's contract_id is not a strkey"},
@@ -256,6 +258,15 @@ var errorCatalogue = []errorCondition{
 	{File: "handlers_subscription.go", Func: "Server.handleListDeliveries", Status: 400, Arg: `err`, Message: "subscription id must be a positive integer, got %q", Condition: "GET /subscriptions/{id}/deliveries is given a path id that is not a positive integer"},
 	{File: "handlers_subscription.go", Func: "Server.handleListDeliveries", Status: 400, Arg: `fmt.Errorf("limit must be an integer in [1,%d]", maxLimit)`, Message: "limit must be an integer in [1,%d]", Condition: "the delivery-history page size is outside [1, limit]"},
 	{File: "handlers_subscription.go", Func: "Server.handleListDeliveries", Status: 404, Arg: `fmt.Errorf("subscription %d not found", id)`, Message: "subscription %d not found", Condition: "the subscription does not exist or is not visible to the caller"},
+
+	// --- idempotency.go ---
+	{File: "idempotency.go", Func: "Server.executeWithIdempotencySlot", Status: 409, Arg: `errors.New("concurrent request with same Idempotency-Key is still in progress")`, Routes: []string{"DELETE /events", "POST /watched-contracts", "DELETE /watched-contracts/{id}", "PUT /contracts/{id}/spec", "DELETE /contracts/{id}/spec", "POST /contracts/{id}/spec/revert", "DELETE /dead-letters/{id}", "POST /apikeys", "DELETE /apikeys/{id}", "POST /subscriptions", "PUT /subscriptions/{id}", "DELETE /subscriptions/{id}", "POST /tenant/watch", "DELETE /tenant/watch/{contract_id}", "POST /admin/tenants", "PATCH /admin/tenants/{id}", "DELETE /admin/tenants/{id}", "POST /admin/tenants/{id}/grants", "DELETE /admin/tenants/{id}/grants/{contract_id}", "POST /admin/tenants/{id}/keys", "DELETE /admin/keys/{key_id}"}, Message: "concurrent request with same Idempotency-Key is still in progress", Condition: "a concurrent request with the same Idempotency-Key is still in flight when the waiter's context expires"},
+	{File: "idempotency.go", Func: "Server.executeWithIdempotencySlot", Status: 409, Arg: `store.ErrIdempotencyKeyMismatch`, Count: 2, Routes: []string{"DELETE /events", "POST /watched-contracts", "DELETE /watched-contracts/{id}", "PUT /contracts/{id}/spec", "DELETE /contracts/{id}/spec", "POST /contracts/{id}/spec/revert", "DELETE /dead-letters/{id}", "POST /apikeys", "DELETE /apikeys/{id}", "POST /subscriptions", "PUT /subscriptions/{id}", "DELETE /subscriptions/{id}", "POST /tenant/watch", "DELETE /tenant/watch/{contract_id}", "POST /admin/tenants", "PATCH /admin/tenants/{id}", "DELETE /admin/tenants/{id}", "POST /admin/tenants/{id}/grants", "DELETE /admin/tenants/{id}/grants/{contract_id}", "POST /admin/tenants/{id}/keys", "DELETE /admin/keys/{key_id}"}, Message: "idempotency key already used with a different request", Condition: "an Idempotency-Key is reused within its retention window with a different HTTP method, path, or request body"},
+	{File: "idempotency.go", Func: "Server.executeWithIdempotencySlot", Status: 500, Arg: `errors.New("idempotency check failed")`, Message: "idempotency check failed", Condition: "the store fails while claiming or reading an Idempotency-Key record", SpecExempt: true, AnyNonProbe: true},
+	{File: "idempotency.go", Func: "Server.idempotencyMiddleware", Status: 400, Arg: `err`, Message: "Idempotency-Key must contain only printable ASCII characters; reading request body: <io error>", Condition: "the Idempotency-Key header contains non-ASCII characters or the request body cannot be read for hashing", SpecExempt: true, AnyNonProbe: true},
+	{File: "idempotency.go", Func: "Server.idempotencyMiddleware", Status: 400, Arg: `fmt.Errorf("Idempotency-Key must be at most %d characters", MaxIdempotencyKeyLength)`, Message: "Idempotency-Key must be at most %d characters", Condition: "the Idempotency-Key header exceeds MaxIdempotencyKeyLength (255 characters)", SpecExempt: true, AnyNonProbe: true},
+	{File: "idempotency.go", Func: "Server.idempotencyMiddleware", Status: 409, Arg: `store.ErrIdempotencyKeyMismatch`, Routes: []string{"DELETE /events", "POST /watched-contracts", "DELETE /watched-contracts/{id}", "PUT /contracts/{id}/spec", "DELETE /contracts/{id}/spec", "POST /contracts/{id}/spec/revert", "DELETE /dead-letters/{id}", "POST /apikeys", "DELETE /apikeys/{id}", "POST /subscriptions", "PUT /subscriptions/{id}", "DELETE /subscriptions/{id}", "POST /tenant/watch", "DELETE /tenant/watch/{contract_id}", "POST /admin/tenants", "PATCH /admin/tenants/{id}", "DELETE /admin/tenants/{id}", "POST /admin/tenants/{id}/grants", "DELETE /admin/tenants/{id}/grants/{contract_id}", "POST /admin/tenants/{id}/keys", "DELETE /admin/keys/{key_id}"}, Message: "idempotency key already used with a different request", Condition: "an Idempotency-Key is reused on an in-flight request with a different HTTP method, path, or request body"},
+	{File: "idempotency.go", Func: "Server.idempotencyMiddleware", Status: 413, Arg: `err`, Message: "request body too large", Condition: "the idempotency middleware rejects a request body exceeding HTTP_REQUEST_BODY_LIMIT while hashing", SpecExempt: true, AnyNonProbe: true},
 	{File: "handlers_subscription.go", Func: "Server.handleListDeliveries", Status: 500, Arg: `errors.New("listing delivery attempts failed")`, Message: "listing delivery attempts failed", Condition: "the store fails while listing delivery attempts"},
 	{File: "handlers_subscription.go", Func: "Server.handleListSubscriptions", Status: 500, Arg: `errors.New("listing subscriptions failed")`, Message: "listing subscriptions failed", Condition: "the store fails while listing subscriptions"},
 	{File: "handlers_subscription.go", Func: "Server.handleUpdateSubscription", Status: 400, Arg: `err`, Message: "subscription id must be a positive integer, got %q", Condition: "PUT /subscriptions/{id} is given a path id that is not a positive integer"},
@@ -270,7 +281,7 @@ var errorCatalogue = []errorCondition{
 	{File: "handlers_tenant.go", Func: "Server.handleAddOwnWatched", Status: 500, Arg: `errors.New("adding watched contract failed")`, Message: "adding watched contract failed", Condition: "the store fails while recording the tenant's watch"},
 	{File: "handlers_tenant.go", Func: "Server.handleCreateTenantKey", Status: 500, Arg: `errors.New("creating api key failed")`, Message: "creating api key failed", Condition: "the store fails while persisting the tenant key"},
 	{File: "handlers_tenant.go", Func: "Server.handleCreateTenantKey", Status: 500, Arg: `errors.New("generating api key failed")`, Message: "generating api key failed", Condition: "the server cannot generate the tenant key material"},
-	{File: "handlers_tenant.go", Func: "Server.handleCreateTenant", Status: 400, Arg: `err`, Message: "rate_limit_rps must be non-negative; rate_limit_burst must be non-negative; max_watched_contracts must be non-negative; rate_limit_rps and rate_limit_burst must be set together", Condition: "the tenant's quota fields are inconsistent or negative (validateTenantQuotas)"},
+	{File: "handlers_tenant.go", Func: "Server.handleCreateTenant", Status: 400, Arg: `err`, Message: "rate_limit_rps must be non-negative; rate_limit_burst must be non-negative; max_watched_contracts must be non-negative; rate_limit_rps and rate_limit_burst must be set together; retention_max_age_seconds must be between 1 and 3153600000, or 0 to inherit the instance default", Condition: "the tenant's quota or retention fields are inconsistent or out of range (validateTenantQuotas)"},
 	{File: "handlers_tenant.go", Func: "Server.handleCreateTenant", Status: 400, Arg: `errors.New("name is required")`, Message: "name is required", Condition: "the tenant is created without a name"},
 	{File: "handlers_tenant.go", Func: "Server.handleCreateTenant", Status: 409, Arg: `err`, Message: "already exists", Condition: "a tenant with the same name exists (store.ErrDuplicate)"},
 	{File: "handlers_tenant.go", Func: "Server.handleCreateTenant", Status: 500, Arg: `errors.New("creating tenant failed")`, Message: "creating tenant failed", Condition: "the store fails while creating the tenant"},
@@ -286,7 +297,8 @@ var errorCatalogue = []errorCondition{
 	{File: "handlers_tenant.go", Func: "Server.handleRevokeContract", Status: 500, Arg: `errors.New("revoking contract failed")`, Message: "revoking contract failed", Condition: "the store fails while revoking the grant"},
 	{File: "handlers_tenant.go", Func: "Server.handleRevokeTenantKey", Status: 404, Arg: `fmt.Errorf("api key %d not found", id)`, Message: "api key %d not found", Condition: "the tenant key to revoke does not exist"},
 	{File: "handlers_tenant.go", Func: "Server.handleRevokeTenantKey", Status: 500, Arg: `errors.New("revoking api key failed")`, Message: "revoking api key failed", Condition: "the store fails while revoking the tenant key"},
-	{File: "handlers_tenant.go", Func: "Server.handleUpdateTenant", Status: 400, Arg: `err`, Message: "rate_limit_rps must be non-negative; rate_limit_burst must be non-negative; max_watched_contracts must be non-negative; rate_limit_rps and rate_limit_burst must be set together", Condition: "the update would leave the tenant's quota fields inconsistent or negative (validateTenantQuotas)"},
+	{File: "handlers_tenant.go", Func: "Server.handleUpdateTenant", Status: 400, Arg: `err`, Message: "rate_limit_rps must be non-negative; rate_limit_burst must be non-negative; max_watched_contracts must be non-negative; rate_limit_rps and rate_limit_burst must be set together; retention_max_age_seconds must be between 1 and 3153600000, or 0 to inherit the instance default", Condition: "the update would leave the tenant's quota or retention fields inconsistent or out of range (validateTenantQuotas)"},
+	{File: "handlers_tenant.go", Func: "Server.handleUpdateTenant", Status: 409, Arg: `errRetentionShorteningUnconfirmed`, Message: "this update shortens the tenant's retention and the next prune sweep may permanently delete events; resend with confirm_retention_shortening set to true", Condition: "the update shortens the tenant's effective retention horizon without confirm_retention_shortening (#1249)"},
 	{File: "handlers_tenant.go", Func: "Server.handleUpdateTenant", Status: 409, Arg: `err`, Message: "already exists", Condition: "the update would rename the tenant onto an existing name (store.ErrDuplicate)"},
 	{File: "handlers_tenant.go", Func: "Server.handleUpdateTenant", Status: 500, Arg: `errors.New("updating tenant failed")`, Message: "updating tenant failed", Condition: "the store fails while updating the tenant"},
 	{File: "handlers_tenant.go", Func: "Server.tenantFromPath", Status: 404, Arg: `fmt.Errorf("tenant %d not found", id)`, Message: "tenant %d not found", Condition: "the {id} tenant does not exist"},
@@ -345,6 +357,7 @@ var funcRoutes = map[string][]string{
 	"Server.handleContractEvents":      {"GET /contracts/{id}/events"},
 	"Server.handleContractStats":       {"GET /contracts/{id}/stats"},
 	"Server.handleContractExport":      {"GET /contracts/{id}/export"},
+	"Server.streamExportOpts":          {"GET /events.csv", "GET /contracts/{id}/export"},
 	"Server.serveEvents":               {"GET /events", "GET /contracts/{id}/events"},
 	// writeFilterError is shared by every list-shaped filter build (and by
 	// the subscription filter authorizer); writeForbiddenContract is its
@@ -417,7 +430,9 @@ var funcRoutes = map[string][]string{
 	"Server.writeGrants": {"GET /admin/tenants/{id}/grants", "POST /admin/tenants/{id}/grants", "DELETE /admin/tenants/{id}/grants/{contract_id}"},
 	// decodeJSONBody is the shared request-body decoder; its 400/413
 	// rejections can surface on any body-accepting route.
-	"Server.decodeJSONBody": nil,
+	"Server.decodeJSONBody":             nil,
+	"Server.idempotencyMiddleware":      nil,
+	"Server.executeWithIdempotencySlot": nil,
 
 	// Scrape endpoint.
 	"Server.router": {"GET /metrics"},
@@ -684,6 +699,19 @@ func TestErrorCatalogueEntriesAreWellFormed(t *testing.T) {
 				assert.NotEmptyf(t, routes, "%s has no routes and is not SpecExempt", where)
 			}
 		}
+		codes := catalogueEntryCodes(e)
+		assert.NotEmptyf(t, codes, "%s produced no ErrorCode", where)
+		for _, c := range codes {
+			matched := false
+			for _, spec := range allErrorCodeSpecs {
+				if spec.Code == c {
+					matched = true
+					assert.Equalf(t, e.Status, spec.Status, "%s mapped to %s (status %d)", where, c, spec.Status)
+					break
+				}
+			}
+			assert.Truef(t, matched, "%s mapped to unknown ErrorCode %q", where, c)
+		}
 	}
 }
 
@@ -901,19 +929,49 @@ func TestErrorCatalogueDocumentation(t *testing.T) {
 			"\tgo test ./internal/api -run TestErrorCatalogueDocumentation -update-error-catalogue")
 }
 
-// renderErrorCatalogue produces docs/errors.md: header, conventions, one
-// table per status, the filter-validation family, then the responses that
-// are not the shared envelope at all.
+// catalogueEntryCodes returns the stable ErrorCode(s) produced by a
+// catalogued writeError condition.
+func catalogueEntryCodes(e errorCondition) []ErrorCode {
+	if strings.HasPrefix(e.Message, "event-filter validation message") {
+		return []ErrorCode{CodeInvalidParameter, CodeInvalidCursor, CodeLimitExceeded}
+	}
+	parts := strings.Split(e.Message, "; ")
+	seen := make(map[ErrorCode]bool, len(parts))
+	var out []ErrorCode
+	for _, part := range parts {
+		code, _, _ := classifyError(e.Status, errors.New(strings.TrimSpace(part)))
+		if !seen[code] {
+			seen[code] = true
+			out = append(out, code)
+		}
+	}
+	return out
+}
+
+func formatCatalogueCodes(codes []ErrorCode) string {
+	parts := make([]string, len(codes))
+	for i, c := range codes {
+		parts[i] = "`" + string(c) + "`"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// renderErrorCatalogue produces docs/errors.md: header, conventions, the
+// stable error-code taxonomy, one table per status, the filter-validation
+// family, then the responses that are not the shared envelope at all.
 func renderErrorCatalogue() string {
 	var b strings.Builder
 
 	b.WriteString(`# API error catalogue
 
 Every failure the SoroTrail API can return, in one place: the condition
-that produces it, the HTTP status, and the exact message a client sees.
-Error bodies are the shared JSON envelope {"error": "<message>"} (the
-ErrorResponse schema in ` + "`api/openapi.yaml`" + `, with ` + "`Cache-Control: no-store`" + `) — the exceptions
-are listed under "Responses outside the shared envelope" at the end.
+that produces it, the HTTP status, its stable machine-readable ` + "`code`" + `, and
+the exact message a client sees. Error bodies are the shared JSON
+envelope ` + "`{\"error\": \"<message>\", \"code\": \"<CODE>\"}`" + ` (with optional
+` + "`\"field\": \"<param>\"`" + ` when a specific parameter or body field caused a
+validation or conflict failure; see the ` + "`ErrorResponse`" + ` schema in
+` + "`api/openapi.yaml`" + `, with ` + "`Cache-Control: no-store`" + `) — the exceptions are
+listed under "Responses outside the shared envelope" at the end.
 
 This file is generated from the catalogue in
 ` + "`internal/api/error_catalogue_test.go`" + `, which is itself checked against
@@ -933,13 +991,26 @@ they matter rather than on every path.
 
 - Every envelope error carries ` + "`Cache-Control: no-store`" + ` so a CDN cannot pool
   a 4xx/5xx behind a success response's validator.
+- Every envelope error carries a stable ` + "`code`" + ` from the taxonomy below so
+  clients can branch on ` + "`code`" + ` rather than matching human-readable prose.
 - 429 carries ` + "`Retry-After`" + ` (delta-seconds, at least 1) plus the
   ` + "`X-RateLimit-*`" + ` family.
 - 401 carries ` + "`WWW-Authenticate`" + `: ` + "`Bearer realm=\"sorotrail\"`" + ` on the tenant
   credential, ` + "`Bearer`" + ` on the instance key — both per RFC 7235 §4.1.
-- 500 messages are deliberately generic; the specifics are logged
-  against the request's ` + "`X-Request-ID`" + `.
+- 500 messages are deliberately generic (` + "`code: \"INTERNAL_ERROR\"`" + `); the
+  specifics are logged against the request's ` + "`X-Request-ID`" + `.
 
+## Error codes
+
+| Code | HTTP Status | Description |
+| --- | --- | --- |
+`)
+
+	for _, spec := range allErrorCodeSpecs {
+		fmt.Fprintf(&b, "| `%s` | %d | %s |\n", spec.Code, spec.Status, catalogueCell(spec.Description))
+	}
+
+	b.WriteString(`
 ## Errors by status
 
 `)
@@ -960,13 +1031,14 @@ they matter rather than on every path.
 
 	for _, status := range statuses {
 		fmt.Fprintf(&b, "### %d %s\n\n", status, http.StatusText(status))
-		b.WriteString("| Condition | Operations | Message |\n")
-		b.WriteString("| --- | --- | --- |\n")
+		b.WriteString("| Code | Condition | Operations | Message |\n")
+		b.WriteString("| --- | --- | --- | --- |\n")
 		for _, e := range errorCatalogue {
 			if e.Builtin || e.Status != status {
 				continue
 			}
-			fmt.Fprintf(&b, "| %s | %s | `%s` |\n",
+			fmt.Fprintf(&b, "| %s | %s | %s | `%s` |\n",
+				formatCatalogueCodes(catalogueEntryCodes(e)),
 				catalogueCell(e.Condition), catalogueCell(catalogueOperations(e)),
 				catalogueCell(e.Message))
 		}
@@ -1219,11 +1291,16 @@ func TestErrorCatalogueRuntimeMessages(t *testing.T) {
 					"an empty body gets no Content-Type")
 			} else if tc.wantMsg != "" {
 				var env struct {
-					Error string `json:"error"`
+					Error string    `json:"error"`
+					Code  ErrorCode `json:"code"`
+					Field string    `json:"field"`
 				}
 				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env),
 					"envelope errors are JSON: %s", rec.Body.String())
 				assert.Equal(t, tc.wantMsg, env.Error)
+				wantCode, wantField, _ := classifyError(tc.wantStatus, errors.New(tc.wantMsg))
+				assert.Equal(t, wantCode, env.Code)
+				assert.Equal(t, wantField, env.Field)
 			}
 			if tc.after != nil {
 				tc.after(t, rec)

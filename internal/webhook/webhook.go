@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"strconv"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -48,8 +49,27 @@ const (
 	NumWorkers = 4
 
 	// SignatureHeader is the HTTP header carrying the HMAC-SHA256 hex
-	// digest of the request body, signed with the subscription's secret.
+	// digest of the delivery metadata headers and request body, signed
+	// with the subscription's secret.
 	SignatureHeader = "X-SoroTrail-Signature"
+
+	// IdempotencyKeyHeader is the standard HTTP header carrying the stable,
+	// subscription-and-event-scoped deduplication key ("sub-<sub_id>:<event_id>").
+	// It is identical across retries and dead-letter replays of the same delivery.
+	IdempotencyKeyHeader = "Idempotency-Key"
+
+	// SoroTrailIdempotencyKeyHeader mirrors IdempotencyKeyHeader under the
+	// X-SoroTrail-* namespace for consumers that inspect vendor-prefixed headers.
+	SoroTrailIdempotencyKeyHeader = "X-SoroTrail-Idempotency-Key"
+
+	// DeliveryAttemptHeader carries the 1-based attempt number ("1", "2", ...)
+	// so consumers can distinguish an initial delivery from a retry.
+	DeliveryAttemptHeader = "X-SoroTrail-Delivery-Attempt"
+
+	// DeliveryTimestampHeader carries the RFC3339 UTC timestamp of the original
+	// delivery attempt. It remains fixed across retries and dead-letter replays
+	// of the same delivery.
+	DeliveryTimestampHeader = "X-SoroTrail-Delivery-Timestamp"
 )
 
 // Clock abstracts the retry sleep. Production uses RealClock; tests inject a
@@ -77,12 +97,14 @@ type Notifier struct {
 	maxAttempts int
 	backoffFunc func(attempt int) time.Duration
 	clock       Clock
+	nowFunc     func() time.Time
 }
 
 // deliveryTask is one event destined for one subscription.
 type deliveryTask struct {
-	Subscription store.Subscription
-	Event        store.Event
+	Subscription      store.Subscription
+	Event             store.Event
+	OriginalTimestamp time.Time
 }
 
 // Payload is the JSON body POSTed to subscriber endpoints.
@@ -108,8 +130,65 @@ func NewNotifier(st store.Store, log *slog.Logger) *Notifier {
 		maxAttempts: MaxDeliveryAttempts,
 		backoffFunc: backoffDuration,
 		clock:       RealClock{},
+		nowFunc:     time.Now,
 	}
 	return n
+}
+
+func (n *Notifier) now() time.Time {
+	if n.nowFunc != nil {
+		return n.nowFunc()
+	}
+	return time.Now()
+}
+
+// IdempotencyKey returns the deterministic deduplication key for delivering
+// eventID to subscriptionID.
+//
+// Format: "sub-<subscriptionID>:<eventID>" (for example,
+// "sub-42:00001073741824-0000000001").
+//
+// Using the zero-padded event identifier as the basis makes the key a pure
+// function of the event's canonical ledger coordinate, so retries and
+// dead-letter replays of the same delivery always produce the identical key,
+// and re-deliveries after a replay or ledger re-application are deduplicated
+// by default rather than double-triggering downstream side effects. Scoping
+// the prefix by subscriptionID ensures that when a single event fans out to
+// multiple subscriptions, one subscription's deduplication state cannot
+// collide with another's even when both target the same receiver.
+func IdempotencyKey(subscriptionID int64, eventID string) string {
+	return fmt.Sprintf("sub-%d:%s", subscriptionID, eventID)
+}
+
+// ReplayDelivery re-delivers a previously failed (dead-lettered) event to sub
+// using the exact same deterministic Idempotency-Key and original delivery
+// timestamp (when non-zero) as the initial delivery, so replaying never looks
+// like new traffic to a consumer that already processed the event before a
+// timeout.
+func (n *Notifier) ReplayDelivery(ctx context.Context, sub store.Subscription, event store.Event, originalTimestamp time.Time) {
+	n.deliverWithRetry(ctx, deliveryTask{
+		Subscription:      sub,
+		Event:             event,
+		OriginalTimestamp: originalTimestamp,
+	})
+}
+
+// EnqueueReplay schedules a dead-letter replay on the asynchronous worker
+// queue, preserving the original delivery timestamp and deterministic
+// Idempotency-Key. It returns false if the worker queue is full.
+func (n *Notifier) EnqueueReplay(sub store.Subscription, event store.Event, originalTimestamp time.Time) bool {
+	select {
+	case n.sendOnly <- deliveryTask{
+		Subscription:      sub,
+		Event:             event,
+		OriginalTimestamp: originalTimestamp,
+	}:
+		return true
+	default:
+		n.log.Warn("webhook delivery queue full; dropping replay",
+			"event_id", event.ID, "subscription_id", sub.ID)
+		return false
+	}
 }
 
 // webhookTracer returns the OTel tracer for the webhook package.
@@ -202,14 +281,22 @@ func (n *Notifier) deliverWithRetry(ctx context.Context, task deliveryTask) {
 		return
 	}
 
-	sig := Sign(task.Subscription.Secret, body)
+	idempotencyKey := IdempotencyKey(task.Subscription.ID, task.Event.ID)
+	origTime := task.OriginalTimestamp
+	if origTime.IsZero() {
+		origTime = n.now().UTC()
+	}
+	originalTimestamp := origTime.UTC().Format(time.RFC3339)
 
 	for attempt := 0; attempt < n.maxAttempts; attempt++ {
+		attemptNum := attempt + 1
+		attemptStr := strconv.Itoa(attemptNum)
 		attemptCtx, span := webhookTracer().Start(ctx, "webhook.deliver",
 			trace.WithAttributes(
-				attribute.Int("webhook.attempt", attempt+1),
+				attribute.Int("webhook.attempt", attemptNum),
 				attribute.Int64("webhook.subscription_id", task.Subscription.ID),
 				attribute.String("webhook.event_id", task.Event.ID),
+				attribute.String("webhook.idempotency_key", idempotencyKey),
 			))
 
 		if attempt > 0 {
@@ -217,7 +304,7 @@ func (n *Notifier) deliverWithRetry(ctx context.Context, task deliveryTask) {
 			n.log.Debug("webhook retry",
 				"subscription_id", task.Subscription.ID,
 				"event_id", task.Event.ID,
-				"attempt", attempt+1,
+				"attempt", attemptNum,
 				"backoff", backoff)
 			if !n.clock.SleepCtx(ctx, backoff) {
 				span.End()
@@ -232,7 +319,12 @@ func (n *Notifier) deliverWithRetry(ctx context.Context, task deliveryTask) {
 			span.End()
 			return // bad URL is terminal
 		}
+		sig := SignDelivery(task.Subscription.Secret, idempotencyKey, attemptStr, originalTimestamp, body)
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(IdempotencyKeyHeader, idempotencyKey)
+		req.Header.Set(SoroTrailIdempotencyKeyHeader, idempotencyKey)
+		req.Header.Set(DeliveryAttemptHeader, attemptStr)
+		req.Header.Set(DeliveryTimestampHeader, originalTimestamp)
 		req.Header.Set(SignatureHeader, sig)
 
 		// Propagate trace context to the subscriber endpoint.
@@ -340,12 +432,56 @@ func (n *Notifier) recordSuccess(ctx context.Context, subID int64) {
 }
 
 // Sign returns the hex-encoded HMAC-SHA256 digest of body using secret
-// as the key. Subscribers recompute this to verify the payload
-// authenticity and integrity.
+// as the key. For full webhook request signing covering the deduplication
+// headers and body, use SignDelivery / VerifyDelivery.
 func Sign(secret string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// SignDelivery returns the hex-encoded HMAC-SHA256 digest over the canonical
+// delivery envelope:
+//
+//	<idempotency_key>\n<attempt>\n<original_timestamp>\n<raw_body>
+//
+// Covering the deduplication key, attempt counter, and original delivery
+// timestamp inside the HMAC prevents an attacker or misbehaving proxy from
+// mutating the idempotency key or replay metadata in transit without
+// invalidating X-SoroTrail-Signature. When all three metadata strings are
+// empty, SignDelivery falls back to Sign(secret, body).
+func SignDelivery(secret, idempotencyKey, attempt, timestamp string, body []byte) string {
+	if idempotencyKey == "" && attempt == "" && timestamp == "" {
+		return Sign(secret, body)
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(idempotencyKey))
+	mac.Write([]byte("\n"))
+	mac.Write([]byte(attempt))
+	mac.Write([]byte("\n"))
+	mac.Write([]byte(timestamp))
+	mac.Write([]byte("\n"))
+	mac.Write(body)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// VerifyDelivery verifies that h carries a valid X-SoroTrail-Signature covering
+// Idempotency-Key (and X-SoroTrail-Idempotency-Key when present),
+// X-SoroTrail-Delivery-Attempt, X-SoroTrail-Delivery-Timestamp, and body.
+func VerifyDelivery(secret string, h http.Header, body []byte) bool {
+	sig := h.Get(SignatureHeader)
+	key := h.Get(IdempotencyKeyHeader)
+	soroKey := h.Get(SoroTrailIdempotencyKeyHeader)
+	attempt := h.Get(DeliveryAttemptHeader)
+	timestamp := h.Get(DeliveryTimestampHeader)
+	if sig == "" || key == "" || attempt == "" || timestamp == "" {
+		return false
+	}
+	if soroKey != "" && soroKey != key {
+		return false
+	}
+	expected := SignDelivery(secret, key, attempt, timestamp, body)
+	return hmac.Equal([]byte(sig), []byte(expected))
 }
 
 // backoffDuration computes the retry delay for attempt n (0-indexed).

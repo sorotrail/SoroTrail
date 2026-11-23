@@ -227,6 +227,25 @@ func TestClientgen_CLIExecution(t *testing.T) {
 		assert.Contains(t, string(content), "const SpecVersion = \"1.2.3\"")
 	})
 
+	t.Run("success with python output flag", func(t *testing.T) {
+		inPath := filepath.Join(tmpDir, "cli_py_valid.yaml")
+		outPath := filepath.Join(tmpDir, "cli_py_client.gen.go")
+		pyOutPath := filepath.Join(tmpDir, "py", "_generated.py")
+		require.NoError(t, os.WriteFile(inPath, []byte(smallValidSpec), 0o644))
+
+		cmd := exec.Command(bin, "-in", inPath, "-out", outPath, "-py-out", pyOutPath)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		require.NoError(t, err, "binary should exit 0 on valid spec: %s", stderr.String())
+
+		pyContent, err := os.ReadFile(pyOutPath)
+		require.NoError(t, err)
+		assert.Contains(t, string(pyContent), `SPEC_VERSION: Final[str] = "1.2.3"`)
+		assert.Contains(t, string(pyContent), "class StatusResponse:")
+		assert.Contains(t, string(pyContent), "def get_status(self) -> StatusResponse:")
+	})
+
 	t.Run("failure with non-zero exit on malformed spec", func(t *testing.T) {
 		inPath := filepath.Join(tmpDir, "cli_bad.yaml")
 		outPath := filepath.Join(tmpDir, "cli_bad_out.go")

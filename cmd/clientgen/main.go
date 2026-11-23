@@ -14,8 +14,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/sorotrail/sorotrail/internal/clientgen"
+)
+
+const (
+	defaultOutput   = "pkg/client/client.gen.go"
+	defaultPyOutput = "clients/python/sorotrail/_generated.py"
 )
 
 func main() {
@@ -36,6 +42,16 @@ func main() {
 	if err := run(*in, *out); err != nil {
 		fmt.Fprintln(os.Stderr, "clientgen:", err)
 		os.Exit(1)
+	}
+	resolvedPyOut := *pyOut
+	if resolvedPyOut == "" && *out == defaultOutput {
+		resolvedPyOut = defaultPyOutput
+	}
+	if resolvedPyOut != "" {
+		if err := runPython(*in, resolvedPyOut); err != nil {
+			fmt.Fprintln(os.Stderr, "clientgen:", err)
+			os.Exit(1)
+		}
 	}
 }
 

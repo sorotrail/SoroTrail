@@ -40,6 +40,12 @@ in a useful way.
   JSON report. Flags: `--db`, `--events-per-ledger`, `--ledgers`,
   `--page-limit`, `--duration`, `--batch-size`, `--write-batch-size`,
   `--force`.
+
+  ```bash
+  # Run a 30-second smoke load test against a local database
+  sorotrail loadtest --db="$DATABASE_URL" --events-per-ledger=100 --ledgers=1000 --duration=30s
+  ```
+
 - **It refuses to run against a database that already holds data** unless
   `--force` is passed: the run writes a lot of synthetic rows, and silently
   mixing them into a real dataset would be unrecoverable.
@@ -110,6 +116,15 @@ comment twice.
   body-accepting operation now documents **413**.
 - **`docs/errors.md`** and the error catalogue are regenerated, so the code,
   the docs and the spec cannot drift.
+
+**Example.** The same decoder now rejects trailing data with `400` and an oversized body with `413`, regardless of which handler receives it:
+
+```bash
+# Trailing data after the JSON value -> 400 invalid JSON body
+curl -i -X POST http://localhost:8080/subscriptions \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/hook","secret":"whsec_test","filters":{}} garbage'
+```
 
 **Behaviour changes for existing clients** (as the issue asks to be listed):
 

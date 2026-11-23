@@ -97,8 +97,55 @@ func (c *VirtualChain) AddEvents(ledger uint32, events ...rpc.Event) {
 	if ledger > c.headLedger {
 		c.headLedger = ledger
 	}
-	// Rebuild the index. This is efficient enough for simulation-scale event
-	// counts (thousands, not millions).
+	c.rebuildIndexLocked()
+}
+
+// ReorgRange atomically replaces all events in the inclusive range
+// [fromLedger, toLedger] on the virtual chain with replacementEvents and
+// optionally updates the canonical head ledger (when newHeadLedger > 0).
+// If newHeadLedger > 0 and newHeadLedger < c.headLedger, any events strictly
+// above newHeadLedger are also retracted to model a chain rollback.
+func (c *VirtualChain) ReorgRange(fromLedger, toLedger uint32, replacementEvents []rpc.Event, newHeadLedger uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	kept := c.events[:0]
+	for _, ce := range c.events {
+		if ce.Ledger >= fromLedger && ce.Ledger <= toLedger {
+			continue
+		}
+		if newHeadLedger > 0 && ce.Ledger > newHeadLedger {
+			continue
+		}
+		kept = append(kept, ce)
+	}
+	c.events = kept
+
+	for _, ev := range replacementEvents {
+		if ev.Ledger < fromLedger || ev.Ledger > toLedger {
+			continue
+		}
+		if newHeadLedger > 0 && ev.Ledger > newHeadLedger {
+			continue
+		}
+		c.events = append(c.events, ChainEvent{Event: ev, Ledger: ev.Ledger})
+		if newHeadLedger == 0 && ev.Ledger > c.headLedger {
+			c.headLedger = ev.Ledger
+		}
+	}
+	if newHeadLedger > 0 {
+		c.headLedger = newHeadLedger
+	}
+	c.rebuildIndexLocked()
+}
+
+func (c *VirtualChain) rebuildIndexLocked() {
+	sort.Slice(c.events, func(i, j int) bool {
+		if c.events[i].Ledger != c.events[j].Ledger {
+			return c.events[i].Ledger < c.events[j].Ledger
+		}
+		return c.events[i].Event.ID < c.events[j].Event.ID
+	})
 	c.byLedger = make(map[uint32][]rpc.Event)
 	for _, ce := range c.events {
 		c.byLedger[ce.Ledger] = append(c.byLedger[ce.Ledger], ce.Event)
@@ -436,6 +483,25 @@ func BuildEvent(id string, ledger uint32, contractID string) rpc.Event {
 		TxHash:     "abc123",
 		ValueJSON:  json.RawMessage(`{"u64":1}`),
 		TopicJSON:  []json.RawMessage{json.RawMessage(`{"symbol":"test"}`)},
+	}
+}
+
+// BuildEventWithAddress creates an rpc.Event carrying a Stellar address in its
+// topics and a numeric value payload so address indexing and contract/ledger
+// aggregations are exercised together.
+func BuildEventWithAddress(id string, ledger uint32, contractID, txHash, address string, amount uint64) rpc.Event {
+	return rpc.Event{
+		ID:                       id,
+		Type:                     "contract",
+		Ledger:                   ledger,
+		ContractID:               contractID,
+		TxHash:                   txHash,
+		InSuccessfulContractCall: true,
+		TopicJSON: []json.RawMessage{
+			json.RawMessage(`{"symbol":"transfer"}`),
+			json.RawMessage(fmt.Sprintf(`{"address":%q}`, address)),
+		},
+		ValueJSON: json.RawMessage(fmt.Sprintf(`{"u64":%d}`, amount)),
 	}
 }
 

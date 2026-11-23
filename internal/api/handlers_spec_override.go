@@ -66,10 +66,13 @@ func (s *Server) handlePutContractSpecOverride(w http.ResponseWriter, r *http.Re
 	// shape are decoded from the same bytes: r.Body is a stream, so a
 	// second read would see an empty request. The oversized-body case is
 	// reported as 413; everything else that cannot be decoded is 400.
-	raw, err := readJSONBody(r, s.httpRequestBodyLimit)
+	raw, err := readJSONBody(r, s.EffectiveRequestBodyLimit(r))
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, errBodyTooLarge) {
+			if !isDecompressedLimitError(err) {
+				s.recordPayloadRejection(r, "request_body")
+			}
 			status = http.StatusRequestEntityTooLarge
 		}
 		writeError(w, status, err)
