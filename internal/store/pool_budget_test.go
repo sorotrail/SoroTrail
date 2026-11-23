@@ -31,6 +31,39 @@ func TestParsePoolConfigWithTLS_DefaultsAndClamping(t *testing.T) {
 	assert.Equal(t, 2*time.Minute, clamped.MaxConnIdleTime)
 }
 
+func TestNewPoolWithTLS(t *testing.T) {
+	tests := []struct {
+		name        string
+		databaseURL string
+		wantErr     bool
+	}{
+		{
+			name:        "valid database URL creates pool without dialing",
+			databaseURL: "postgres://localhost:5432/sorotrail?sslmode=disable",
+		},
+		{
+			name:        "invalid database URL returns error",
+			databaseURL: "postgres://localhost:not-a-port/sorotrail",
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool, err := NewPoolWithTLS(context.Background(), tt.databaseURL, 0, 0, 0, 0, nil)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Nil(t, pool)
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, pool)
+			pool.Close()
+		})
+	}
+}
+
 func TestPoolBudget_IngesterReservedFloorNeverStarvedByReadFlood(t *testing.T) {
 	budget := NewPoolBudget(PoolBudgetConfig{
 		TotalConns:       8,

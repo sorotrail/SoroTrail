@@ -28,6 +28,91 @@ func actionAuditTestBackends(t *testing.T) map[string]ActionAuditStore {
 	}
 }
 
+func TestSanitizeActorIdentifier(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		// Happy path: identifiers without secret material pass through, with
+		// surrounding whitespace trimmed.
+		{name: "plain identifier is preserved", input: "operator@example.com", want: "operator@example.com"},
+		{name: "surrounding whitespace is trimmed", input: "  ci-deployer\t", want: "ci-deployer"},
+		{name: "empty identifier stays empty", input: "   ", want: ""},
+		{name: "already redacted key is unchanged", input: "sorotrail_0123456789abcdef", want: "sorotrail_0123456789abcdef"},
+
+		// Error path: a secret-bearing actor ID must never be returned raw.
+		{name: "full api key keeps only public prefix", input: "sorotrail_0123456789abcdef_supersecret", want: "sorotrail_0123456789abcdef"},
+		{name: "tenant api key keeps only public prefix", input: "st_9988776655443322_supersecret", want: "st_9988776655443322"},
+		{name: "bearer api key keeps only public prefix", input: "Bearer sorotrail_0123456789abcdef_supersecret", want: "sorotrail_0123456789abcdef"},
+		{name: "opaque bearer token is fully redacted", input: "Bearer opaque-token-value", want: "bearer-redacted"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SanitizeActorIdentifier(tt.input)
+
+			assert.Equal(t, tt.want, got)
+			assert.NotContains(t, got, "supersecret", "raw key secret must never be returned")
+			assert.NotContains(t, got, "opaque-token-value", "raw bearer token must never be returned")
+		})
+	}
+}
+
+func TestSanitizeActionAuditMetadata(t *testing.T) {
+	t.Run("nil and empty metadata return an empty map", func(t *testing.T) {
+		assert.Empty(t, SanitizeActionAuditMetadata(nil))
+		assert.Empty(t, SanitizeActionAuditMetadata(map[string]any{}))
+	})
+
+	t.Run("non-secret values are preserved", func(t *testing.T) {
+		in := map[string]any{
+			"contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+			"attempt":     2,
+		}
+
+		got := SanitizeActionAuditMetadata(in)
+
+		assert.Equal(t, in, got)
+		assert.NotSame(t, &in, &got, "sanitizer must return a copy")
+	})
+
+	t.Run("keys are trimmed and blank keys dropped", func(t *testing.T) {
+		got := SanitizeActionAuditMetadata(map[string]any{"  note  ": "ok", "   ": "dropped"})
+
+		assert.Equal(t, map[string]any{"note": "ok"}, got)
+	})
+
+	t.Run("nested maps are sanitized recursively", func(t *testing.T) {
+		in := map[string]any{
+			"outer": map[string]any{"api_key": "sorotrail_0123456789abcdef_supersecret", "keep": "yes"},
+		}
+
+		got := SanitizeActionAuditMetadata(in)
+
+		inner, ok := got["outer"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "yes", inner["keep"])
+		assert.NotContains(t, inner, "api_key")
+		assert.Equal(t, "sorotrail_0123456789abcdef", inner["key_prefix"])
+	})
+
+	t.Run("secret values are replaced by a public key prefix", func(t *testing.T) {
+		got := SanitizeActionAuditMetadata(map[string]any{
+			"key":    "sorotrail_0123456789abcdef_supersecret",
+			"token":  "opaque-token-value",
+			"secret": "hunter2",
+		})
+
+		assert.Equal(t, "sorotrail_0123456789abcdef", got["key_prefix"])
+		assert.NotContains(t, got, "key")
+		assert.NotContains(t, got, "token")
+		assert.NotContains(t, got, "secret")
+		assert.NotContains(t, got, "opaque-token-value")
+		assert.NotContains(t, got, "hunter2")
+	})
+}
+
 func TestActionAuditStore_RecordQueryAndHashChain(t *testing.T) {
 	for name, st := range actionAuditTestBackends(t) {
 		t.Run(name, func(t *testing.T) {
