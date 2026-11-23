@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+
 type pgQuotaStore struct {
 	pool *pgxpool.Pool
 }
@@ -21,7 +22,6 @@ type pgQuotaStore struct {
 func (p *pgQuotaStore) IncrementQuota(ctx context.Context, clientKey string, now time.Time, batchSize int) (int64, int64, error) {
 	return p.pool.IncrementQuota(ctx, clientKey, now, batchSize)
 }
-
 func TestMultiInstanceRateLimiterQuotaSharedPostgres(t *testing.T) {
 	st := testdb.Setup(t, store.Migrate)
 	qStore := &pgQuotaStore{pool: st}
