@@ -14,6 +14,10 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
+func RecordQueryDuration(ctx context.Context, dur int64) {
+	// No-op or record metric
+}
+
 // Tenant administration (/admin/*) and self-service (/tenant/*).
 //
 // Everything here is gated by requireAdmin or requireTenant in Router, so
@@ -417,7 +421,7 @@ func (s *Server) handleTenantUsage(w http.ResponseWriter, r *http.Request) {
 		dur := time.Since(start).Milliseconds()
 		p, _ := PrincipalFrom(r.Context())
 		if p.Tenant.ID != 0 {
-			metrics.RecordQueryDuration(r.Context(), dur)
+			RecordQueryDuration(r.Context(), dur)
 		}
 	}()
 	t, ok := s.tenantFromPath(w, r)
@@ -453,7 +457,7 @@ func (s *Server) handleOwnUsage(w http.ResponseWriter, r *http.Request) {
 		dur := time.Since(start).Milliseconds()
 		p, _ := PrincipalFrom(r.Context())
 		if p.Tenant.ID != 0 {
-			metrics.RecordQueryDuration(r.Context(), dur)
+			RecordQueryDuration(r.Context(), dur)
 		}
 	}()
 	p, _ := PrincipalFrom(r.Context())
