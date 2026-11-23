@@ -44,7 +44,10 @@ type CompactionResult struct {
 }
 
 // CompactArchiveWithLogger runs compaction with optional progress reporting.
-func CompactArchiveWithLogger(ctx context.Context, client *minio.Client, bucket, prefix string, opts CompactorOptions, logger interface{ Info(string, ...any); Warn(string, ...any) }) (CompactionResult, error) {
+func CompactArchiveWithLogger(ctx context.Context, client *minio.Client, bucket, prefix string, opts CompactorOptions, logger interface {
+	Info(string, ...any)
+	Warn(string, ...any)
+}) (CompactionResult, error) {
 	if opts.TargetChunkSizeBytes <= 0 {
 		opts.TargetChunkSizeBytes = 64 * 1024 * 1024 // default 64MB
 	}
@@ -67,7 +70,7 @@ func CompactArchiveWithLogger(ctx context.Context, client *minio.Client, bucket,
 
 	var man Manifest
 	if err := json.Unmarshal(data, &man); err != nil {
-		return omp, nil
+		return omp, fmt.Errorf("failed to unmarshal manifest for compaction: %w", err)
 	}
 
 	if len(man.Chunks) < 2 {
