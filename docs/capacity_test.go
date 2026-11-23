@@ -340,3 +340,48 @@ func TestSizingConsistency(t *testing.T) {
 			"partition count should match wall-clock calculation")
 	})
 }
+
+func TestPipelineStageBreakdown(t *testing.T) {
+	t.Run("stage shares sum to 1.0 in both XDR and JSON passthrough modes", func(t *testing.T) {
+		for _, withXDR := range []bool{true, false} {
+			bd := PipelineStageBreakdown(1000, 10, withXDR)
+			sum := bd.RPCFetchShare + bd.DecodeShare + bd.FilterTransformShare + bd.StoreWriteShare
+			assert.InDelta(t, 1.0, sum, 1e-6)
+			assert.Equal(t, "store_write", bd.BottleneckStage)
+			assert.Greater(t, bd.StoreWriteShare, 0.70, "store write is the primary stage at batch=1000")
+		}
+	})
+
+	t.Run("XDR decode costs more than JSON passthrough", func(t *testing.T) {
+		xdr := PipelineStageBreakdown(1000, 10, true)
+		jsonPass := PipelineStageBreakdown(1000, 10, false)
+		assert.Greater(t, xdr.DecodeUS, jsonPass.DecodeUS)
+		assert.Greater(t, xdr.TotalUSPerEvent, jsonPass.TotalUSPerEvent)
+	})
+
+	t.Run("watching more contracts increases filter/transform overhead", func(t *testing.T) {
+		c1 := PipelineStageBreakdown(1000, 1, false)
+		c50 := PipelineStageBreakdown(1000, 50, false)
+		c250 := PipelineStageBreakdown(1000, 250, false)
+		assert.Greater(t, c50.FilterTransformUS, c1.FilterTransformUS)
+		assert.Greater(t, c250.FilterTransformUS, c50.FilterTransformUS)
+	})
+}
+
+func TestEstimateSteadyStateAndCatchUp(t *testing.T) {
+	t.Run("steady state at 100 events/ledger has ample 5s ledger headroom", func(t *testing.T) {
+		ss := EstimateSteadyStateHeadroom(100, 10, 1000, false)
+		assert.Less(t, ss.LedgerBudgetUtilization, 0.05, "100 events/ledger uses <5%% of 5s ledger window")
+		assert.Greater(t, ss.MaxSustainableEventsPerLedger, 100_000)
+		assert.Equal(t, "store_write", ss.BottleneckStage)
+	})
+
+	t.Run("catch-up closes ledger gap and scales with backlog", func(t *testing.T) {
+		cu1k := EstimateCatchUpTime(1_000, 100, 10, 1000, false)
+		cu10k := EstimateCatchUpTime(10_000, 100, 10, 1000, false)
+		assert.True(t, cu1k.CanCatchUp)
+		assert.True(t, cu10k.CanCatchUp)
+		assert.Greater(t, cu1k.NetLedgersPerSecond, 200.0)
+		assert.InDelta(t, float64(cu1k.EstimatedCatchUpDuration)*10, float64(cu10k.EstimatedCatchUpDuration), float64(time.Second))
+	})
+}

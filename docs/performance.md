@@ -275,178 +275,40 @@ Query performance measured across standard API filter combinations with `Limit=5
 
 ---
 
-## 5. Lag-Aware Backpressure & Catch-Up Mode
+## 5. Ingestion Capacity Model
 
-When the ingester falls behind the chain head by more than `LagWarnLedgers`, reporting the lag metric (`SetLagging(true)`) is combined with an opt-in lag-aware backpressure coordinator (`ingester.LagCoordinator` in `internal/ingester/backpressure.go`) that actively helps the ingester catch up while yielding competing background store I/O:
+The analytical capacity model in `docs/capacity.go` and the benchmark suite in `internal/ingester/capacity_bench_test.go` decompose each poll cycle into four stages and project steady-state headroom vs. historical catch-up time.
 
-1. **Hysteresis Band (No Oscillation at the Threshold Boundary)**:
-   - Entering the lagging state requires `lag > EnterLagLedgers` (`Options.LagWarnLedgers`).
-   - Clearing the lagging state requires `lag <= RecoverLagLedgers` (`Options.LagRecoverLedgers`, defaulting to `75%` of `LagWarnLedgers`).
-   - While lag fluctuates inside the hysteresis deadband (`RecoverLagLedgers < lag <= EnterLagLedgers`), the coordinator preserves its current state instead of toggling catch-up mode or background job deferral on every ledger.
+### A. Per-Stage Pipeline Breakdown (`batch=1,000`, `watched_contracts=10`)
 
-2. **Ingester Catch-Up Acceleration & Closing-Rate Telemetry**:
-   - While lagging with `LagBackpressureEnabled: true`, `effectiveSweepWindow()` scales `SweepWindow` by `CatchUpSweepMultiplier` (default `2x`) so each multi-contract sweep covers a wider ledger range per RPC round-trip.
-   - `adjustPollInterval` keeps shrinking the poll interval toward `PollIntervalMin` until the hysteresis recovery watermark is crossed.
-   - `LagCoordinator.ObserveLag` tracks the lag closing rate in `ledgers/sec` (`LagBackpressureStats.ClosingRateLedgersPerSec`) and logs structured transition events (`ingester lag backpressure engaged` / `ingester lag backpressure cleared`).
+| Pipeline Stage | XDR Decode Mode (µs/event) | Share (XDR) | JSON Passthrough (µs/event) | Share (JSON) |
+| :--- | :--- | :--- | :--- | :--- |
+| **1. RPC Fetch & Envelope Parse** | 3.60 µs | 12.2% | 3.60 µs | 12.9% |
+| **2. Payload Decode (`ScVal`)** | 1.82 µs | 6.2% | 0.21 µs | 0.8% |
+| **3. Filter & Transform** | 0.70 µs | 2.4% | 0.70 µs | 2.5% |
+| **4. Store Write (`UpsertEvents`)** | 23.00 µs | **79.2%** | 23.00 µs | **83.8%** |
+| **Total per Event** | **29.12 µs** (~34,300 eps) | 100% | **27.51 µs** (~36,300 eps) | 100% |
 
-3. **Bounded Background Job Yielding (`pruner`, `archive`, `audit`)**:
-   - Background jobs that compete with ingestion for database write IOPS and buffer cache (`pruner.Pruner`, `archive.Archiver`, and `audit.Auditor`) accept a `LagYieldController` (`ShouldYield(job string) (yield bool, reason string)`).
-   - While the ingester is lagging, background passes and batch loops yield early (`reason="ingest_lagging"`) and increment per-component yield counters (`LagYields`).
-   - To prevent indefinite starvation of retention pruning, cold-storage archiving, or audit-log verification during prolonged chain catch-up, each job has a configurable maximum deferral window (`LagMaxDeferral`, default `15m`). Once a job has been continuously deferred for `>= MaxDeferral`, `ShouldYield(job)` returns `(false, "max_deferral_reached")`, allowing one bounded maintenance pass to run and resetting that job's deferral timer.
+### B. Scaling Across Watched Contracts, Events/Ledger, and Batch Size
 
----
+| Dimension | Parameter Sweep | Effect on Throughput & Latency |
+| :--- | :--- | :--- |
+| **Watched Contracts** | `1`, `10`, `50`, `250` | Sub-linear overhead (`+8%` filter cost per octave above 5 contracts); when `len(watched) > MaxContractsPerGetEventsFilter` (5), `GetEvents` splits into ceil(N/5) filter groups. |
+| **Events per Ledger** | `10`, `100`, `500`, `1,000` | At 100 events/ledger, a steady-state poll cycle takes **~4.2 ms** (<0.1% of the 5s Stellar ledger budget). Saturation occurs above **~170,000 events/ledger**. |
+| **Batch Size** | `100`, `500`, `1,000`, `2,500`, `5,000` | Throughput peaks at **1,000–2,500 events/batch**; below 100 RPC/DB round-trips dominate, and above 5,000 GIN pending-list flushes increase p99 latency. |
 
-## 6. Deep Pagination Over Wide Ledger Ranges
+### C. Steady-State Tailing vs. Historical Catch-Up
 
-Walking hundreds of pages across wide ledger windows (`GET /events` and `GET /contracts/{id}/events`) stays flat in per-page latency (`O(limit)`) when two query-planner properties hold:
+- **Steady-State Tailing** (`EstimateSteadyStateHeadroom`):
+  - One Stellar ledger closes every 5 seconds (`0.2 ledgers/sec`).
+  - At `100 events/ledger` (`20 events/sec`), SoroTrail consumes `< 0.1%` of the 5-second ledger budget, leaving `> 99%` headroom for concurrent API queries and webhooks.
+- **Historical Catch-Up** (`EstimateCatchUpTime`):
+  - During catch-up (`batch=1,000`, `100 events/ledger`), the ingester sustains **~36,300 events/sec** (`~363 ledgers/sec` gross, `~362.8 ledgers/sec` net of new ledgers closing).
+  - Closing a **10,000-ledger** outage gap (`1,000,000` events) takes **~27.6 seconds** (`~0.45 GB` storage growth).
 
-1. **Cursor-Driven Partition Pruning (`store.CursorLedger` & `buildQueryEventsSQL`)**:
-   - The `events` table is range-partitioned by `ledger` (`PARTITION BY RANGE (ledger)` with `DefaultEventPartitionSpan = 120,960` ledgers per child partition).
-   - Under `order_by=id` (default), canonical 64-bit Stellar SEP-0035 TOIDs (`<20-digit TOID>-<10-digit seq>`) encode the ledger sequence in their upper 32 bits (`toid >> 32`). `CursorLedger` extracts that ledger and `buildQueryEventsSQL` appends an inclusive scalar bound (`ledger >= $N` for `asc`, `ledger <= $N` for `desc`) alongside `id > $M` / `id < $M`.
-   - Under `order_by=ledger`, PostgreSQL row-value comparisons `(ledger, id) > ($1::bigint, $2)` alone do not trigger range partition pruning. `buildQueryEventsSQL` therefore emits the scalar `ledger >= $1::bigint` (or `ledger <= $1::bigint` for `desc`) reusing the same bind parameter alongside `(ledger, id) > ($1::bigint, $2)`.
-   - In both orderings, PostgreSQL prunes every child partition prior to (for `asc`) or after (for `desc`) the cursor's ledger and bounds the `(contract_id, ledger, id)` or `(ledger, id)` index scan without touching earlier partitions.
+### Reproducing the Capacity Benchmarks
 
-2. **Sparse Topic Filter Range Bounding (`store.ValidateSparseFilterRange`)**:
-   - When a query filters on sparse JSONB topic predicates (`topic`, `topic_contains`, `topic0..topic3`) that match few or zero rows across millions of events, an unbounded cursor walk would otherwise scan every partition or intersect large GIN posting lists across the entire retention window before filling a single page.
-   - When `MaxSparseFilterLedgerSpan` is enabled (`store.DefaultMaxSparseFilterLedgerSpan = 500,000` ledgers, ~4 partitions, via `store.Postgres.SetMaxSparseFilterLedgerSpan`, `api.SetMaxSparseFilterLedgerSpan`, or `EventFilter.MaxSparseFilterLedgerSpan`), sparse topic queries that omit `from_ledger`/`to_ledger` or span more than the configured ledger window fail fast with `store.ErrSparseFilterRangeTooWide` (`HTTP 400 Bad Request`, `code: "RANGE_TOO_WIDE"`, `field: "to_ledger"`).
-   - **Consumer Guidance**: For sparse topic searches, bound `[from_ledger, to_ledger]` to `<= 500,000` ledgers per window and advance the window sequentially, or use the streaming bulk export endpoints (`GET /events.csv` and `GET /contracts/{id}/export`) which stream bounded 200-row cursor pages in flat heap memory.
-
-### Deep Pagination Benchmark Results (`BenchmarkDeepPagination_WideRange`)
-
-Measured via `go test -bench=BenchmarkDeepPagination_WideRange -benchmem ./internal/store` across a 6,000-event wide-range dataset spanning 500,000 ledgers (`100,000..599,750`, 3 events/ledger, 8 contracts, `Limit=50`, `ANALYZE` run after seed, Apple M4 `arm64`):
-
-| Scenario | Page 1 (`ns/op`) | Page 20 (`ns/op`) | Page 50 (`ns/op`) | Page 100 (`ns/op`) | Page 20 → 100 Drift | Memory / Page (`B/op`) | Allocs / Page |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `OrderByID_Asc` | 79,954 ns (0.080 ms) | 88,944 ns (0.089 ms) | 88,755 ns (0.089 ms) | **90,183 ns (0.090 ms)** | **+1.4% (flat)** | 96,528 B | 1,381 allocs |
-| `OrderByID_Desc` | 89,503 ns (0.090 ms) | 99,019 ns (0.099 ms) | 97,921 ns (0.098 ms) | **98,444 ns (0.098 ms)** | **-0.6% (flat)** | 96,520 B | 1,381 allocs |
-| `OrderByLedger_Asc` | 81,296 ns (0.081 ms) | 93,606 ns (0.094 ms) | 93,889 ns (0.094 ms) | **93,613 ns (0.094 ms)** | **+0.0% (flat)** | 97,018 B | 1,392 allocs |
-| `OrderByLedger_Desc` | 91,240 ns (0.091 ms) | 103,066 ns (0.103 ms) | 102,843 ns (0.103 ms) | **102,642 ns (0.103 ms)** | **-0.4% (flat)** | 97,020 B | 1,392 allocs |
-| `ContractFiltered_OrderByID` | 93,653 ns (0.094 ms) | 105,583 ns (0.106 ms) | — | — | **flat** | 96,784 B | 1,385 allocs |
-| `SparseTopic_BoundedLedgerRange` | 1,158,714 ns (1.16 ms) | — (page 3: 1.15 ms) | — | — | **-0.5% (flat)** | 56,984 B | 1,001 allocs |
-
----
-
-## 7. Database Connection Pool Budget, Subsystem Isolation & Backpressure
-
-To prevent a burst of slow read, GraphQL, or export queries from starving the ingester or exhausting the PostgreSQL connection pool, SoroTrail partitions pool capacity across logical subsystems via `store.PoolBudget` and `store.BudgetedStore` (`internal/store/pool_budget.go`) and applies fast-fail backpressure (#1231).
-
-### A. Pool Sizing Formula & Defaults
-
-For a PostgreSQL host with $C$ vCPUs and $R$ SoroTrail replicas sharing the database, choose per-replica `DB_MAX_CONNS` ($N$) using:
-
-$$N = \left\lfloor \frac{\min(\text{postgres\_max\_connections} - \text{reserved\_admin\_conns},\; 4 \times C)}{R} \right\rfloor$$
-
-When `DB_MAX_CONNS` is unset (`0`), `store.ParsePoolConfigWithTLS` and `config.Config.ResolvePoolSizing()` apply sensible production defaults for $N = 20$:
-
-| Parameter | Environment Variable | Default ($N = 20$) | Sizing Formula |
-|---|---|---|---|
-| Total pool ceiling | `DB_MAX_CONNS` | `20` | $N$ |
-| Warm minimum idle conns | `DB_MIN_CONNS` | `5` | $\max(2, \lfloor 0.25 \times N \rfloor)$, clamped to $\le N$ |
-| Max connection lifetime | `DB_MAX_CONN_LIFETIME` | `30m` | `30m` |
-| Max connection idle time | `DB_MAX_CONN_IDLE_TIME` | `5m` | `5m` |
-| Ingester reserved floor | `DB_INGESTER_RESERVED_CONNS` | `5` | $F_{\text{ingest}} = \max(2, \lfloor 0.25 \times N \rfloor)$ (`< N`) |
-| Shared non-ingester cap | *(derived)* | `15` | $S_{\text{shared}} = N - F_{\text{ingest}}$ |
-| HTTP read API cap | `DB_API_READ_MAX_CONNS` | `10` | $\min(S_{\text{shared}}, \max(1, \lfloor 0.50 \times N \rfloor))$ |
-| GraphQL cap | `DB_GRAPHQL_MAX_CONNS` | `6` | $\min(S_{\text{shared}}, \max(1, \lfloor 0.30 \times N \rfloor))$ |
-| Subscription / webhook cap | `DB_SUBSCRIPTION_MAX_CONNS` | `4` | $\min(S_{\text{shared}}, \max(1, \lfloor 0.20 \times N \rfloor))$ |
-| Background maintenance cap | `DB_MAINTENANCE_MAX_CONNS` | `3` | $\min(S_{\text{shared}}, \max(1, \lfloor 0.15 \times N \rfloor))$ |
-| Non-ingester acquire timeout | `DB_POOL_ACQUIRE_TIMEOUT` | `50ms` | Bounded fast-fail wait before returning `503` |
-| Maintenance pressure threshold | `DB_POOL_PRESSURE_THRESHOLD` | `0.75` | Shared or total pool utilization ratio (`0.0–1.0`) |
-
-### B. Reserved Ingester Floor & Two-Level Semaphore Isolation
-
-`store.PoolBudget` enforces a strict two-level semaphore invariant:
-
-1. Every non-ingester subsystem (`api_read`, `graphql`, `subscription`, `maintenance`) must acquire both:
-   - a permit from its per-subsystem semaphore (`subsystemSem[sub]`), and
-   - a permit from the shared non-ingester semaphore (`sharedSem`, capacity $S_{\text{shared}} = N - F_{\text{ingest}}$), before acquiring a slot in `totalSem` ($N$).
-2. `SubsystemIngester` acquires directly from `totalSem` ($N$). Because non-ingester subsystems combined can hold at most $N - F_{\text{ingest}}$ permits in `totalSem`, at least $F_{\text{ingest}}$ connections are **mathematically guaranteed** to remain immediately available to the ingester even when all read, GraphQL, subscription, and maintenance queues are 100% saturated.
-3. Context-level permit tracking makes `PoolBudget.Acquire` re-entrant on the same request context so nested store calls never deadlock or double-count permits.
-
-### C. Fast-Fail Backpressure (`503 Service Unavailable` + `Retry-After`)
-
-When a non-ingester subsystem exhausts either its own cap (`reason="subsystem_cap"`) or the shared non-ingester ceiling (`reason="shared_cap"`) and cannot acquire a permit within `DB_POOL_ACQUIRE_TIMEOUT` (`50ms` default):
-
-- `PoolBudget.Acquire` fails fast with `*store.PoolBudgetExhaustedError` (`errors.Is(err, store.ErrPoolBudgetExhausted)`).
-- The HTTP API (`writePoolBudgetExhausted` in `internal/api/handlers.go`) and GraphQL handler (`runQuery` in `internal/api/graphql/server.go`) translate `store.ErrPoolBudgetExhausted` into a retriable `503 Service Unavailable` response with `Retry-After: 1` instead of queueing callers until `API_QUERY_TIMEOUT` (`25s`).
-
-### D. Background Maintenance Yielding Under Pool Pressure
-
-`PoolBudget.ShouldYield(job)` implements the maintenance yield controller interface consumed by `pruner.Pruner`, `archive.Archiver`, and `audit.Auditor`:
-
-- Returns `(true, "pool_pressure")` whenever the ingester has waiting acquisitions (`ingester_waiters > 0`), shared non-ingester utilization reaches `DB_POOL_PRESSURE_THRESHOLD` (`0.75`), total pool utilization reaches `0.75`, or live `pgxpool.Stat` utilization reaches `0.75`.
-- Enforces `MaxMaintenanceDeferral` (`15m` default) so a continuously deferred job is granted one bounded pass (`(false, "max_deferral_reached")`) and cannot starve indefinitely.
-
-### E. Pool Budget Observability Metrics
-
-| Metric | Type | Labels | Description |
-|---|---|---|---|
-| `sorotrail_db_pool_budget_in_use` | GaugeVec | `subsystem` | Permits currently held by each subsystem (`ingester`, `api_read`, `graphql`, `subscription`, `maintenance`) |
-| `sorotrail_db_pool_budget_limit` | GaugeVec | `subsystem` | Configured maximum permits per subsystem |
-| `sorotrail_db_pool_budget_utilization_ratio` | GaugeVec | `subsystem` | Current utilization ratio (`in_use / limit`) per subsystem |
-| `sorotrail_db_pool_budget_wait_duration_seconds` | HistogramVec | `subsystem`, `outcome` | Time spent waiting for a pool budget permit (`acquired`, `rejected`, `canceled`) |
-| `sorotrail_db_pool_budget_rejections_total` | CounterVec | `subsystem`, `reason` | Total fast-fail rejections due to budget exhaustion (`subsystem_cap`, `shared_cap`) |
-| `sorotrail_db_pool_maintenance_yields_total` | CounterVec | `job`, `reason` | Total times background maintenance yielded due to pool pressure |
-| `sorotrail_db_pool_connections` | GaugeVec | `state` | Live connection counts (`acquired`, `idle`, `total`, `max`, `ingester_reserved`, `shared_cap`) |
-
----
-
-## 8. Database Query Cost Attribution (`#1278`)
-
-SoroTrail attributes every database operation to its originating HTTP route pattern or background worker (`ingester`, `pruner`, `auditor`, `archiver`, `reconciler`, `webhook`) and an opaque tenant bucket (`default`, `t_<8hex>`, or `other`, capped at `MaxTrackedTenants = 64`):
-
-1. **Prometheus Cost & Query Counters (`internal/metrics/metrics.go`)**:
-   - `sorotrail_db_attributed_cost_seconds_total{originator, operation, tenant}`: cumulative database wall-clock execution time in seconds.
-   - `sorotrail_db_attributed_queries_total{originator, operation, tenant, outcome}`: total store queries by originator, operation, opaque tenant bucket, and outcome (`success` | `error`).
-2. **PostgreSQL Statement & Session Attribution (`internal/store/attribution.go`, `internal/store/postgres.go`)**:
-   - Every guarded transaction sets a transaction-local `application_name` (`<originator>:<tenant>`) prefixed with a SQL comment `/*originator=...,tenant=...,op=...*/` so `pg_stat_activity` and `pg_stat_statements` join database load back to the application view without leaking raw contract IDs or tenant secrets.
-3. **Slow-Query Log Attribution (`internal/store/guarded_store.go`)**:
-   - Slow queries crossing `SlowQueryThreshold` log `originator`, `tenant`, `query`, `duration`, and `request_id`.
-4. **Measured Overhead**:
-   - Context attribution lookup + opaque tenant hashing + Prometheus counter update adds **< 250 ns/op** (`< 0.03%` of a ~1 ms database query).
-
-
-
-
-## Per-tenant query cost budget
-
-`COST_BUDGET_CAPACITY` (cost units, default `0` = off) and
-`COST_BUDGET_REFILL_PER_SEC` (units/second, required when capacity is set)
-enable a token bucket per tenant that is charged by what a query costs, not
-by how many requests were made. Single-tenant (untenanted) traffic is never
-charged.
-
-**One cost function.** `internal/api/queries/cost.go` decides cost for both the
-GraphQL complexity check and this budget. Drivers: page size (25 units per 50
-rows), ledger-range width (1 unit per 10,000 ledgers, capped at 20; an
-unbounded range costs the cap), no index-backed filter (`contract_id`,
-`contract_ids`, `tx_hash`) (+25), aggregate breadth (1 unit per 100 buckets,
-capped at 50), and GraphQL depth beyond 3 (+2 per level) and list fan-out
-(+10 per extra list field). Any other request costs 1.
-
-**Flow.** The cost is estimated before execution and taken from the bucket;
-an empty bucket returns `429` with `Retry-After` and a JSON body whose
-`budget` is `tenant_query_cost`. After the handler runs, the cost is
-recomputed from the rows actually served and the difference is refunded or
-charged. `sorotrail_cost_estimated_total` and
-`sorotrail_cost_budget_consumed_total{tenant}` (actual units) are both counted;
-their rate ratio is the actual-vs-estimate reconciliation. Endpoints
-that do not report rows settle at their estimate. A single query costing more
-than the capacity is clamped to the capacity.
-
-**Exemptions.** `/health`, `/livez`, `/readyz` and `/metrics` (the rate
-limiter's `exemptPaths`) are never charged. Streaming exports (`/events.csv`,
-`/contracts/{id}/export`) are exempt too: their length is unknown up front and
-they are bounded by `EXPORT_MAX_RANGE` and the request-rate limiter.
-
-**Defaults and reasoning.** None are enabled by default. A starting point is
-capacity 500 with refill 50/s: that allows a burst of about ten indexed
-50-row pages, and a sustained rate of about one such page per half second.
-Tune from the two metrics above.
-
-**Known gap: per instance only.** Buckets are in process memory. With N
-replicas a tenant can consume up to N times its budget, and a restart refills
-every bucket. Coordinating across replicas needs shared state (for example a
-Postgres table) and is not included. GraphQL requests are priced from page
-size, depth and fan-out only; ledger-range arguments are not inspected, and
-time-range (`from_time`/`to_time`) filters are not priced on REST.
+```bash
+go test -bench="BenchmarkIngestionStage|BenchmarkIngestionCapacity" -benchmem ./internal/ingester/...
+go test ./docs/... -run "TestPipelineStageBreakdown|TestEstimateSteadyStateAndCatchUp" -v
+```
