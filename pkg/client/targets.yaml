@@ -1,0 +1,37 @@
+# Manifest of generated API clients covered by the unified client drift gate.
+#
+# Every entry is validated, regenerated from `spec`, diffed against `output`,
+# compiled/type-checked via `typecheck_cmd`, and exercised against the shared
+# contract test server by `make client-check` and `pkg/client/drift_test.go`.
+#
+# Generator versions must be pinned to an exact semantic version (never
+# `latest`, `main`, or `HEAD`) so an upstream generator release cannot silently
+# break unrelated pull requests.
+schema_version: 1
+spec: api/openapi.yaml
+embedded_spec: internal/api/openapi.json
+
+targets:
+  - language: go
+    generator: github.com/sorotrail/sorotrail/cmd/clientgen
+    version: v0.1.0
+    output: pkg/client/client.gen.go
+    generate_cmd:
+      - go
+      - run
+      - ./cmd/clientgen
+      - -in
+      - "{spec}"
+      - -out
+      - "{output}"
+    typecheck_cmd:
+      - go
+      - build
+      - ./pkg/client/...
+    contract_cmd:
+      - go
+      - test
+      - ./pkg/client
+      - -run
+      - TestCrossLanguageContractHarness
+      - -count=1
