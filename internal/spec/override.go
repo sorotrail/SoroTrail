@@ -62,7 +62,6 @@ func ParseOverrideSpec(data []byte) (*ContractSpec, error) {
 
 		out := EventSpec{
 			Name: ev.Name,
-			Doc:  ev.Doc,
 		}
 		for j, fs := range ev.TopicSpecs {
 			if err := validateFieldSpec(fs, fmt.Sprintf("event %q: topic_specs[%d]", ev.Name, j)); err != nil {
