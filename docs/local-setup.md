@@ -45,6 +45,8 @@ Fastest way to see it work; no Docker required:
 
 ```sh
 DATABASE_URL=sqlite:./sorotrail.db make run
+
+Note: Running SQLite without API keys logs a startup security warning; configure API keys via `sorotrail apikey create` for authenticated environments.
 ```
 
 Migrations apply automatically on startup. The API is on `http://localhost:8080`.
