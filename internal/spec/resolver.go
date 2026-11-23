@@ -8,8 +8,6 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
-// Spec types are defined in spec.go
-
 // SpecResolver resolves contract specs respecting history and caching with bounding.
 type SpecResolver struct {
 	store store.Store
