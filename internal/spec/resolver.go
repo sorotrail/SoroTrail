@@ -8,7 +8,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
-// ContractSpec, EventSpec, and FieldSpec are defined in spec.go
+// Spec types are defined in spec.go
 
 // SpecResolver resolves contract specs respecting history and caching with bounding.
 type SpecResolver struct {
