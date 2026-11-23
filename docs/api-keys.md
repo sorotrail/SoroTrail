@@ -163,6 +163,25 @@ For further details on how scopes interact with tenants and caching, see
 
 ## Key rotation procedure
 
+To rotate a credential in production without downtime, follow an **overlapping rotation** workflow. This issues a successor key while keeping the predecessor valid for a configured overlap duration, recording their relationship and assigning an expiry to the outgoing predecessor so it automatically ceases to be valid after clients have migrated.
+
+### Overlapping rotation CLI procedure
+
+1. **Issue a successor key with an overlap expiry**:-
+   ```sh
+   sorotrail apikey rotate <predecessor-key-id> --expires-in 48h
+   ```
+   This generates a successor key, links it to the predecessor via `predecessor_id`, and sets `expires_at` on the predecessor.
+2. **Deploy the successor key**:-
+   Update client applications with the new successor plaintext key and deploy the changes.
+3. **Monitor last-used information**:-
+   Check key activity via `sorotrail apikey list` or database inspection to confirm that the old predecessor key has stopped receiving traffic before revoking it or letting its expiry elapse.
+4. **Revoke immediately or abandon**:-
+   - To finalize early: `sorotrail apikey revoke <predecessor-key-id>`
+   - To abandon rotation (keep predecessor valid, revoke successor): `sorotrail apikey abandon-rotation <successor-key-id>`
+
+### Legacy create-then-revoke procedure
+
 To rotate a credential in production without downtime, follow a
 **create-then-revoke** workflow with an overlap:
 
