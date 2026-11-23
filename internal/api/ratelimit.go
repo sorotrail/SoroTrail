@@ -157,7 +157,9 @@ func WithClock(now func() time.Time) LimiterOption {
 
 // LimitResolver derives a request's bucket identity and limits from the
 // request itself. ok=false falls back to the IP-keyed instance-wide limits.
-type LimitResolver func(r *http.Request) (key string, rps float64, burst int, ok bool)
+type LimitResolver interface {
+	Resolve(r *http.Request) (key string, rps float64, burst int, ok bool)
+}
 
 // WithLimitResolver keys the limiter on something other than the source IP —
 // in practice, on the authenticated tenant.
@@ -572,7 +574,7 @@ func (l *RateLimiter) limitsFor(r *http.Request) (key string, rps float64, burst
 	if l.resolve == nil {
 		return "", 0, 0, false
 	}
-	return l.resolve(r)
+	return l.resolve.Resolve(r)
 }
 
 // clientKey returns the rate-limit key for this request.
