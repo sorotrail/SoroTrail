@@ -381,13 +381,12 @@ func convertScSpecEntry(entry xdr.ScSpecEntry) []EventSpec {
 			return nil
 		}
 		ev := EventSpec{
-			Name: entry.UdtStructV0.Name,
-			Doc:  entry.UdtStructV0.Doc,
+			Name: string(entry.UdtStructV0.Name),
 		}
 		if entry.UdtStructV0.Fields != nil {
 			for _, f := range entry.UdtStructV0.Fields {
 				ev.TopicSpecs = append(ev.TopicSpecs, FieldSpec{
-					Name: f.Name,
+					Name: string(f.Name),
 					Type: typeDefName(f.Type),
 				})
 			}
