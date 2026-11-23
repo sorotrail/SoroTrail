@@ -497,11 +497,52 @@ ARCHIVE_BEFORE_PRUNE=true
 
 ### Export
 
+Export streams a contract's stored events for a closed ledger range as an
+attachment download. Supports CSV (default) or NDJSON format.
+
+```sh
+# CSV — id, ledger, type, tx_hash, topics (JSON string), value (JSON string)
+sorotrail contracts export \
+  --contract CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC \
+  --from-ledger 250000 --to-ledger 260000 \
+  --output contract_events.csv
+
+# NDJSON — one event object per line, same shape as /events
+sorotrail contracts export \
+  --contract CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC \
+  --from-ledger 250000 --to-ledger 260000 \
+  --format ndjson \
+  --output contract_events.ndjson
+```
+
 | Variable | Type | Default | Description | Reload |
 | --- | --- | --- | --- | --- |
 | `EXPORT_MAX_RANGE` | int64 | `17280` | Maximum ledger span a single `/contracts/{id}/export` call may request (~24h at 5s/ledger). Returns 400 if exceeded. | restart |
 
 ### Multi-tenancy
+
+Set `MULTI_TENANT=true` and provide a `MULTI_TENANT_BOOTSTRAP_KEY` to serve several consumers from one deployment, each scoped to its own contracts. Off = no authentication, no tenant boundary. See [Multi-tenancy](docs/multi-tenancy.md).
+
+**Example: start a multi-tenant deployment**
+
+```sh
+# 1. Bring up Postgres and the indexer
+docker compose --profile prod up -d --build
+
+# 2. Create an API key for the first tenant (admin access required)
+sorotrail apikey create --name "tenant-a"
+
+# 3. Add the first watched contract for tenant A
+sorotrail contracts add --url http://localhost:8080 --confirm \
+  -k "$(sorotrail apikey list --format '{{.Key}}' | head -1)" \
+  CDBLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+
+# 4. Add a second watched contract for tenant B (using a different key)
+sorotrail apikey create --name "tenant-b"
+sorotrail contracts add --url http://localhost:8080 --confirm \
+  -k "$(sorotrail apikey list --format '{{.Key}}' | tail -1)" \
+  CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+```
 
 | Variable | Type | Default | Description | Reload |
 | --- | --- | --- | --- | --- |

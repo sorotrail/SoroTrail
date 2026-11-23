@@ -68,6 +68,12 @@ are keyed by this network, so changing networks does not reuse cursors.
   (zero). Setting only one silently disables the rate limiter, which is
   almost certainly an operator mistake.
 
+## Contract selection
+`WATCHED_CONTRACTS` is a comma-separated list of Soroban contract IDs (`C...`)
+to ingest events for. Default: empty, which ingests events for every contract.
+Each watched contract tracks its own resume cursor. Example:
+`WATCHED_CONTRACTS=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`.
+
 ## Contract ID format
 `WATCHED_CONTRACTS` entries must be valid Soroban strkeys (C-prefix, 56 base32
 characters). Only the shape is checked; the checksum is not verified.
