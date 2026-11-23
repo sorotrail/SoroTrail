@@ -416,14 +416,6 @@ func (s *Server) handleRevokeTenantKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTenantUsage(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	defer func() {
-		dur := time.Since(start).Milliseconds()
-		p, _ := PrincipalFrom(r.Context())
-		if p.Tenant.ID != 0 {
-			RecordQueryDuration(r.Context(), dur)
-		}
-	}()
 	t, ok := s.tenantFromPath(w, r)
 	if !ok {
 		return
@@ -452,18 +444,7 @@ func (s *Server) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleOwnUsage(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	defer func() {
-		dur := time.Since(start).Milliseconds()
-		p, _ := PrincipalFrom(r.Context())
-		if p.Tenant.ID != 0 {
-			RecordQueryDuration(r.Context(), dur)
-		}
-	}()
 	p, _ := PrincipalFrom(r.Context())
-	// Flush first so a tenant checking its own usage sees the requests it
-	// just made rather than a figure up to one interval stale.
-	// s.usage.Flush(r.Context())
 	s.writeUsage(w, r, p.Tenant, false)
 }
 

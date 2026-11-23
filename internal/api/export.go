@@ -206,7 +206,8 @@ func (s *Server) handleContractExport(w http.ResponseWriter, r *http.Request) {
 	} else {
 		p, _ := PrincipalFrom(ctx)
 		if p.Tenant.ID != 0 {
-			// metrics.RecordExportBytes(ctx, 1024)
+			s.usage.Add(p.Tenant.ID, 1)
+			metrics.RecordEventServed(ctx, p.Tenant.ID)
 		}
 	}
 }
@@ -264,7 +265,8 @@ func (s *Server) handleEventsCSV(w http.ResponseWriter, r *http.Request) {
 	} else {
 		p, _ := PrincipalFrom(r.Context())
 		if p.Tenant.ID != 0 {
-			// metrics.RecordExportBytes(r.Context(), 1024)
+			s.usage.Add(p.Tenant.ID, 1)
+			metrics.RecordEventServed(r.Context(), p.Tenant.ID)
 		}
 	}
 }
