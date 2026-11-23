@@ -59,6 +59,60 @@ func TestSanitizeActorIdentifier(t *testing.T) {
 	}
 }
 
+func TestSanitizeActionAuditMetadata(t *testing.T) {
+	t.Run("nil and empty metadata return an empty map", func(t *testing.T) {
+		assert.Empty(t, SanitizeActionAuditMetadata(nil))
+		assert.Empty(t, SanitizeActionAuditMetadata(map[string]any{}))
+	})
+
+	t.Run("non-secret values are preserved", func(t *testing.T) {
+		in := map[string]any{
+			"contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+			"attempt":     2,
+		}
+
+		got := SanitizeActionAuditMetadata(in)
+
+		assert.Equal(t, in, got)
+		assert.NotSame(t, &in, &got, "sanitizer must return a copy")
+	})
+
+	t.Run("keys are trimmed and blank keys dropped", func(t *testing.T) {
+		got := SanitizeActionAuditMetadata(map[string]any{"  note  ": "ok", "   ": "dropped"})
+
+		assert.Equal(t, map[string]any{"note": "ok"}, got)
+	})
+
+	t.Run("nested maps are sanitized recursively", func(t *testing.T) {
+		in := map[string]any{
+			"outer": map[string]any{"api_key": "sorotrail_0123456789abcdef_supersecret", "keep": "yes"},
+		}
+
+		got := SanitizeActionAuditMetadata(in)
+
+		inner, ok := got["outer"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "yes", inner["keep"])
+		assert.NotContains(t, inner, "api_key")
+		assert.Equal(t, "sorotrail_0123456789abcdef", inner["key_prefix"])
+	})
+
+	t.Run("secret values are replaced by a public key prefix", func(t *testing.T) {
+		got := SanitizeActionAuditMetadata(map[string]any{
+			"key":    "sorotrail_0123456789abcdef_supersecret",
+			"token":  "opaque-token-value",
+			"secret": "hunter2",
+		})
+
+		assert.Equal(t, "sorotrail_0123456789abcdef", got["key_prefix"])
+		assert.NotContains(t, got, "key")
+		assert.NotContains(t, got, "token")
+		assert.NotContains(t, got, "secret")
+		assert.NotContains(t, got, "opaque-token-value")
+		assert.NotContains(t, got, "hunter2")
+	})
+}
+
 func TestActionAuditStore_RecordQueryAndHashChain(t *testing.T) {
 	for name, st := range actionAuditTestBackends(t) {
 		t.Run(name, func(t *testing.T) {
