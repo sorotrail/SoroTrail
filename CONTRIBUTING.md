@@ -127,6 +127,18 @@ go test ./internal/decode -run '^$' -fuzz FuzzDecodeScVal -fuzztime 30m
 go test ./internal/decode -run '^$' -fuzz FuzzDecodeTopicArray -fuzztime 30m
 ```
 
+The API's input parsers (JSON body decoder, cursors, contract IDs, ledger and
+time parameters, topic filters and the event filter builder) have fuzz targets
+too. They assert invariants, not just "does not panic": an accepted value
+round-trips, a rejected one is an error, and the filter builder never drops or
+widens a constraint. `make fuzz` runs all of them, `FUZZTIME` per target
+(default `10s`; CI uses `3s` so the targets keep compiling):
+
+```sh
+make fuzz
+make fuzz FUZZTIME=2m
+```
+
 Fuzzing may save reproducing inputs under the package's `testdata/fuzz`
 directory. Commit any panic reproducer together with a regression test.
 

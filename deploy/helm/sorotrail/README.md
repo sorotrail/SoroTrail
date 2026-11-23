@@ -92,6 +92,18 @@ helm upgrade sorotrail ./deploy/helm/sorotrail --reuse-values
 | `serviceMonitor.interval` | `30s` | Scrape interval. |
 | `serviceMonitor.scrapeTimeout` | `10s` | Scrape timeout. |
 | `serviceMonitor.path` | `/metrics` | Metrics endpoint path. |
+| `mtls.enabled` | `false` | Enable mutual TLS on the HTTP API (`MTLS_ENABLED=true`). |
+| `mtls.existingSecret` | `""` | Secret containing the server certificate, private key, and client CA bundle. |
+| `mtls.mountPath` | `/etc/sorotrail/tls` | Mount path for the HTTP server TLS Secret. |
+| `mtls.certKey` | `tls.crt` | Key in `mtls.existingSecret` for the server certificate (`TLS_CERT_FILE`). |
+| `mtls.keyKey` | `tls.key` | Key in `mtls.existingSecret` for the server private key (`TLS_KEY_FILE`). |
+| `mtls.caKey` | `ca.crt` | Key in `mtls.existingSecret` for the client CA bundle (`TLS_CLIENT_CA_FILE`). |
+| `mtls.allowedIdentities` | `""` | Comma-separated allowlist of client certificate identities (`TLS_CLIENT_ALLOWED_IDENTITIES`). |
+| `mtls.tenantMap` | `""` | Comma-separated `<identity>=<tenant_id>` pairs (`TLS_CLIENT_TENANT_MAP`). |
+| `mtls.db.existingSecret` | `""` | Optional Secret containing client certificates for outbound PostgreSQL mTLS. |
+| `mtls.db.mountPath` | `/etc/sorotrail/db-tls` | Mount path for the PostgreSQL TLS Secret (`DB_TLS_*`). |
+| `mtls.archive.existingSecret` | `""` | Optional Secret containing client certificates for outbound S3 archive mTLS. |
+| `mtls.archive.mountPath` | `/etc/sorotrail/archive-tls` | Mount path for the S3 archive TLS Secret (`ARCHIVE_TLS_*`). |
 
 ## Health probes
 

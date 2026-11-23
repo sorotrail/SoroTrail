@@ -176,6 +176,42 @@ func TestParseTopic_RejectsMalformedJSONLikeInput(t *testing.T) {
 	assert.Contains(t, err.Error(), "valid JSON")
 }
 
+// TestParseTopic_EdgeCases is table-driven coverage for the boundaries
+// ParseTopic treats as absent, already-valid JSON, or malformed JSON-like
+// input rather than a bare word to auto-quote.
+func TestParseTopic_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr bool
+	}{
+		{name: "empty input is absent", raw: "", want: ""},
+		{name: "whitespace-only input is absent", raw: "  \t\n ", want: ""},
+		{name: "bare word is trimmed and quoted", raw: "  transfer  ", want: `"transfer"`},
+		{name: "json literals pass through", raw: "  null  ", want: "null"},
+		{name: "numeric json passes through", raw: "123", want: "123"},
+		{name: "truncated object is rejected", raw: "{", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseTopic(tt.raw)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "valid JSON")
+				return
+			}
+			require.NoError(t, err)
+			if tt.want == "" {
+				assert.Nil(t, got)
+				return
+			}
+			assert.JSONEq(t, tt.want, string(got))
+		})
+	}
+}
+
 // TestParseTopicContains_RejectsNonJSON mirrors REST's strict JSON
 // requirement on this filter.
 func TestParseTopicContains_RejectsNonJSON(t *testing.T) {

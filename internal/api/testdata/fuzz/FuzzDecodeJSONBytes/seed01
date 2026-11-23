@@ -1,0 +1,2 @@
+go test fuzz v1
+string("{\"name\":\"a\",\"limit\":2,\"tags\":[\"x\"]}")

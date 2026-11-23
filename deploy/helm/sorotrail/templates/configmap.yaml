@@ -28,3 +28,29 @@ data:
   {{- if .Values.config.enableMetrics }}
   ENABLE_METRICS: {{ .Values.config.enableMetrics | quote }}
   {{- end }}
+  {{- if .Values.mtls.enabled }}
+  MTLS_ENABLED: "true"
+  TLS_CERT_FILE: "{{ .Values.mtls.mountPath | default "/etc/sorotrail/tls" }}/tls.crt"
+  TLS_KEY_FILE: "{{ .Values.mtls.mountPath | default "/etc/sorotrail/tls" }}/tls.key"
+  {{- if .Values.mtls.clientCASecretName }}
+  TLS_CLIENT_CA_FILE: "{{ .Values.mtls.mountPath | default "/etc/sorotrail/tls" }}-client-ca/ca.crt"
+  {{- else }}
+  TLS_CLIENT_CA_FILE: "{{ .Values.mtls.mountPath | default "/etc/sorotrail/tls" }}/ca.crt"
+  {{- end }}
+  {{- end }}
+  {{- if .Values.mtls.allowedIdentities }}
+  TLS_CLIENT_ALLOWED_IDENTITIES: {{ .Values.mtls.allowedIdentities | quote }}
+  {{- end }}
+  {{- if .Values.mtls.tenantMap }}
+  TLS_CLIENT_TENANT_MAP: {{ .Values.mtls.tenantMap | quote }}
+  {{- end }}
+  {{- if .Values.mtls.dbSecretName }}
+  DB_TLS_CERT_FILE: "/etc/sorotrail/db-tls/tls.crt"
+  DB_TLS_KEY_FILE: "/etc/sorotrail/db-tls/tls.key"
+  DB_TLS_CA_FILE: "/etc/sorotrail/db-tls/ca.crt"
+  {{- end }}
+  {{- if .Values.mtls.archiveSecretName }}
+  ARCHIVE_TLS_CERT_FILE: "/etc/sorotrail/archive-tls/tls.crt"
+  ARCHIVE_TLS_KEY_FILE: "/etc/sorotrail/archive-tls/tls.key"
+  ARCHIVE_TLS_CA_FILE: "/etc/sorotrail/archive-tls/ca.crt"
+  {{- end }}

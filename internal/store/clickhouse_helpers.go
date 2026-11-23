@@ -165,24 +165,28 @@ func clickHouseEventCursorClause(f EventFilter) (string, error) {
 	}
 	switch f.OrderBy {
 	case "", OrderByID:
-		return "id " + op + " " + clickHouseQuoteString(f.Cursor), nil
+		cursorID, err := DecodeEventIDCursorForBackend(CursorBackendClickHouse, f.Cursor)
+		if err != nil {
+			return "", err
+		}
+		return "id " + op + " " + clickHouseQuoteString(cursorID), nil
 	case OrderByLedger:
-		sortValue, id, err := decodeCompositeCursor(f.Cursor)
+		sortValue, id, err := decodeCompositeCursorForBackend(CursorBackendClickHouse, f.Cursor)
 		if err != nil {
 			return "", err
 		}
 		if _, err := strconv.ParseInt(sortValue, 10, 64); err != nil {
-			return "", fmt.Errorf("%w: ledger cursor", ErrInvalidCursor)
+			return "", fmt.Errorf("%w: %w: ledger cursor", ErrInvalidCursor, ErrStaleCursor)
 		}
 		return fmt.Sprintf("(ledger, id) %s (%s, %s)", op, sortValue, clickHouseQuoteString(id)), nil
 	case OrderByCreatedAt:
-		sortValue, id, err := decodeCompositeCursor(f.Cursor)
+		sortValue, id, err := decodeCompositeCursorForBackend(CursorBackendClickHouse, f.Cursor)
 		if err != nil {
 			return "", err
 		}
 		t, err := parseClickHouseTime(sortValue)
 		if err != nil {
-			return "", fmt.Errorf("%w: created_at cursor", ErrInvalidCursor)
+			return "", fmt.Errorf("%w: %w: created_at cursor", ErrInvalidCursor, ErrStaleCursor)
 		}
 		return fmt.Sprintf("(created_at, id) %s ('%s', %s)", op, formatClickHouseTime(t), clickHouseQuoteString(id)), nil
 	default:

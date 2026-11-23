@@ -2,12 +2,13 @@ package store
 
 import (
 	"context"
-	"encoding/base64"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,31 +36,77 @@ var ErrInvalidCursor = errors.New("invalid cursor")
 const (
 	DefaultEventPartitionSpan = 120960
 
+	// Default Postgres connection pool sizing knobs (#1231).
+	DefaultPoolMaxConns        int32         = 20
+	DefaultPoolMinConns        int32         = 5
+	DefaultPoolMaxConnLifetime time.Duration = 30 * time.Minute
+	DefaultPoolMaxConnIdleTime time.Duration = 5 * time.Minute
+
 	poolHealthCheckInterval  = 5 * time.Second
 	poolHealthCheckTimeout   = 2 * time.Second
 	poolReconnectBaseBackoff = 100 * time.Millisecond
 	poolReconnectMaxBackoff  = 30 * time.Second
 )
 
-// NewPool creates a pgx pool for databaseURL, applying optional sizing knobs
-// (zero means "leave pgx's default"). Use this instead of pgxpool.New so the
-// DB connection pool size is configurable from the environment.
-func NewPool(ctx context.Context, databaseURL string, maxConns, minConns int32, maxConnLifetime, maxConnIdleTime time.Duration) (*pgxpool.Pool, error) {
+// ParsePoolConfigWithTLS parses databaseURL into a *pgxpool.Config and applies
+// explicit sizing knobs or SoroTrail's sensible production defaults (#1231):
+//   - MaxConns defaults to DefaultPoolMaxConns (20)
+//   - MinConns defaults to max(2, MaxConns/4) (5 when MaxConns=20), clamped to MaxConns
+//   - MaxConnLifetime defaults to DefaultPoolMaxConnLifetime (30m)
+//   - MaxConnIdleTime defaults to DefaultPoolMaxConnIdleTime (5m)
+func ParsePoolConfigWithTLS(databaseURL string, maxConns, minConns int32, maxConnLifetime, maxConnIdleTime time.Duration, tlsConfig *tls.Config) (*pgxpool.Config, error) {
 	poolConfig, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, err
 	}
 	if maxConns > 0 {
 		poolConfig.MaxConns = maxConns
+	} else {
+		poolConfig.MaxConns = DefaultPoolMaxConns
 	}
 	if minConns > 0 {
 		poolConfig.MinConns = minConns
+	} else {
+		poolConfig.MinConns = max(int32(2), poolConfig.MaxConns/4)
+	}
+	if poolConfig.MinConns > poolConfig.MaxConns {
+		poolConfig.MinConns = poolConfig.MaxConns
 	}
 	if maxConnLifetime > 0 {
 		poolConfig.MaxConnLifetime = maxConnLifetime
+	} else {
+		poolConfig.MaxConnLifetime = DefaultPoolMaxConnLifetime
 	}
 	if maxConnIdleTime > 0 {
 		poolConfig.MaxConnIdleTime = maxConnIdleTime
+	} else {
+		poolConfig.MaxConnIdleTime = DefaultPoolMaxConnIdleTime
+	}
+	if tlsConfig != nil {
+		cloned := tlsConfig.Clone()
+		if cloned.ServerName == "" && poolConfig.ConnConfig.Host != "" {
+			cloned.ServerName = poolConfig.ConnConfig.Host
+		}
+		poolConfig.ConnConfig.TLSConfig = cloned
+	}
+	return poolConfig, nil
+}
+
+// NewPool creates a pgx pool for databaseURL, applying optional sizing knobs
+// (zero applies SoroTrail's sensible defaults). Use this instead of pgxpool.New
+// so the DB connection pool size is configurable from the environment.
+func NewPool(ctx context.Context, databaseURL string, maxConns, minConns int32, maxConnLifetime, maxConnIdleTime time.Duration) (*pgxpool.Pool, error) {
+	return NewPoolWithTLS(ctx, databaseURL, maxConns, minConns, maxConnLifetime, maxConnIdleTime, nil)
+}
+
+// NewPoolWithTLS creates a pgx pool for databaseURL, applying optional sizing
+// knobs and an explicit outbound *tls.Config when non-nil. When tlsConfig is
+// provided (via DB_TLS_CERT_FILE / DB_TLS_KEY_FILE / DB_TLS_CA_FILE), it takes
+// precedence over any sslcert/sslkey/sslrootcert parameters in databaseURL.
+func NewPoolWithTLS(ctx context.Context, databaseURL string, maxConns, minConns int32, maxConnLifetime, maxConnIdleTime time.Duration, tlsConfig *tls.Config) (*pgxpool.Pool, error) {
+	poolConfig, err := ParsePoolConfigWithTLS(databaseURL, maxConns, minConns, maxConnLifetime, maxConnIdleTime, tlsConfig)
+	if err != nil {
+		return nil, err
 	}
 	return pgxpool.NewWithConfig(ctx, poolConfig)
 }
@@ -70,8 +117,10 @@ func NewPool(ctx context.Context, databaseURL string, maxConns, minConns int32, 
 // Create an instance with [NewPostgres]. The caller owns the pool's
 // lifecycle and must close it when done.
 type Postgres struct {
-	pool          *pgxpool.Pool
-	partitionSpan int64
+	pool                      *pgxpool.Pool
+	partitionSpan             int64
+	maxSparseFilterLedgerSpan atomic.Int64
+	fieldEncryptor            atomic.Pointer[FieldEncryptor]
 
 	// Health monitoring
 	healthMu      sync.RWMutex
@@ -79,6 +128,43 @@ type Postgres struct {
 	lastHealthErr error
 	databaseURL   string
 	stopHealthCk  context.CancelFunc
+}
+
+// SetFieldEncryptor configures the FieldEncryptor used to encrypt and decrypt
+// sensitive columns at rest (such as subscriptions.secret).
+func (p *Postgres) SetFieldEncryptor(enc *FieldEncryptor) {
+	if p == nil {
+		return
+	}
+	p.fieldEncryptor.Store(enc)
+}
+
+// FieldEncryptor returns the configured FieldEncryptor, or nil if field-level
+// encryption is not enabled.
+func (p *Postgres) FieldEncryptor() *FieldEncryptor {
+	if p == nil {
+		return nil
+	}
+	return p.fieldEncryptor.Load()
+}
+
+// SetMaxSparseFilterLedgerSpan configures the maximum ledger span allowed
+// when querying sparse JSONB topic filters (Topic, TopicContains, Topic0..Topic3).
+// A value <= 0 disables the store-level cap unless EventFilter.MaxSparseFilterLedgerSpan > 0.
+func (p *Postgres) SetMaxSparseFilterLedgerSpan(maxSpan int64) {
+	if p == nil {
+		return
+	}
+	p.maxSparseFilterLedgerSpan.Store(maxSpan)
+}
+
+// MaxSparseFilterLedgerSpan returns the currently configured maximum ledger
+// span for sparse JSONB topic filters.
+func (p *Postgres) MaxSparseFilterLedgerSpan() int64 {
+	if p == nil {
+		return 0
+	}
+	return p.maxSparseFilterLedgerSpan.Load()
 }
 
 // Compile-time assertion that *Postgres implements Store.
@@ -238,11 +324,48 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 }
 
 func (p *Postgres) PruneEventsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
-	tag, err := p.pool.Exec(ctx, `DELETE FROM events WHERE created_at < $1`, cutoff)
+	return p.PruneEventsBeforeIn(ctx, cutoff, ContractSet{Exclude: true})
+}
+
+// PruneEventsBeforeIn is PruneEventsBefore restricted to the contracts in
+// set, for per-tenant retention (#1249). A set matching every contract
+// issues exactly the unrestricted statement.
+func (p *Postgres) PruneEventsBeforeIn(ctx context.Context, cutoff time.Time, set ContractSet) (int64, error) {
+	args := []any{cutoff}
+	where := "created_at < $1"
+	pred, ok := contractSetPredicate(set, func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	})
+	if !ok {
+		return 0, nil
+	}
+	if pred != "" {
+		where += " AND " + pred
+	}
+	tag, err := p.pool.Exec(ctx, `DELETE FROM events WHERE `+where, args...)
 	if err != nil {
 		return 0, fmt.Errorf("pruning events before %s: %w", cutoff.Format(time.RFC3339Nano), err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+// contractSetPredicate renders set as a SQL predicate on contract_id,
+// binding its list through arg. It returns ok=false when the set matches
+// nothing, so the caller can skip the statement, and an empty predicate
+// when the set matches everything. contract_id is NOT NULL, so the negated
+// form needs no NULL handling.
+func contractSetPredicate(set ContractSet, arg func(any) string) (string, bool) {
+	switch {
+	case set.All():
+		return "", true
+	case set.Exclude:
+		return "NOT (contract_id = ANY(" + arg(set.IDs) + "))", true
+	case len(set.IDs) == 0:
+		return "", false
+	default:
+		return "contract_id = ANY(" + arg(set.IDs) + ")", true
+	}
 }
 
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
@@ -485,8 +608,11 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 	var sortValue, cursorContractID string
 	if f.Cursor != "" {
 		var err error
-		sortValue, cursorContractID, err = DecodeContractsCursor(f.Cursor)
+		sortValue, cursorContractID, err = DecodeContractsCursorForBackend(CursorBackendPostgres, f.Cursor)
 		if err != nil {
+			return nil, "", err
+		}
+		if _, err := contractsCursorValue(sortCol, sortType, sortValue); err != nil {
 			return nil, "", err
 		}
 	}
@@ -553,7 +679,7 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 	if len(out) > limit {
 		last := out[limit-1]
 		out = out[:limit]
-		next = EncodeContractsCursor(f.SortKey, contractSortValue(last, f.SortKey), last.ContractID)
+		next = EncodeContractsCursorForBackend(CursorBackendPostgres, f.SortKey, contractSortValue(last, f.SortKey), last.ContractID)
 	}
 	return out, next, nil
 }
@@ -742,6 +868,7 @@ func (p *Postgres) GetEvent(ctx context.Context, id string, sc Scope) (Event, er
 		query += ` AND contract_id = ANY($2)`
 		args = append(args, sc.Contracts())
 	}
+	query, args = appendRetentionCutoff(query, args, sc)
 	var e Event
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, query, args...)
@@ -811,6 +938,7 @@ func (p *Postgres) EventExists(ctx context.Context, id string, sc Scope) (bool, 
 		query += ` AND contract_id = ANY($2)`
 		args = append(args, sc.Contracts())
 	}
+	query, args = appendRetentionCutoff(query, args, sc)
 	var one int
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, query, args...).Scan(&one)
@@ -822,6 +950,18 @@ func (p *Postgres) EventExists(ctx context.Context, id string, sc Scope) (bool, 
 		return false, fmt.Errorf("checking event existence: %w", err)
 	}
 	return true, nil
+}
+
+// appendRetentionCutoff ANDs the scope's retention bound (#1249) into a
+// single-event lookup, so an event kept for a longer-retention tenant is
+// "not found" for a tenant whose own horizon it is past.
+func appendRetentionCutoff(query string, args []any, sc Scope) (string, []any) {
+	cutoff, ok := sc.RetentionCutoff(time.Now())
+	if !ok {
+		return query, args
+	}
+	args = append(args, cutoff)
+	return query + fmt.Sprintf(` AND created_at >= $%d`, len(args)), args
 }
 
 // buildEventWhereClause builds the WHERE clause and arguments shared by
@@ -848,6 +988,12 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	// cannot widen the authorization.
 	if !f.Scope.IsWildcard() {
 		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
+	}
+	// The tenant's retention horizon is part of the boundary too (#1249):
+	// rows kept for a longer-retention tenant sharing the contract stay
+	// invisible to this one.
+	if cutoff, ok := f.Scope.RetentionCutoff(time.Now()); ok {
+		where = append(where, "created_at >= "+arg(cutoff))
 	}
 	// When ContractIDs is non-empty, use = ANY(...) (SQL IN). When both
 	// ContractID and ContractIDs are set, combine them via a single
@@ -926,13 +1072,19 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	return where, args
 }
 
-func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
-	// The tenant boundary is evaluated before anything else, and an empty
-	// scope returns an empty page without issuing SQL. No user-supplied
-	// filter is consulted first, so no filter can influence whether the
-	// boundary is applied.
-	if f.Scope.DeniesAll() {
-		return nil, "", nil
+// buildQueryEventsSQL constructs the parameterized SQL query, bind arguments,
+// and clamped page limit for Postgres.QueryEvents.
+//
+// In addition to standard filter predicates, it injects scalar `ledger` range
+// bounds on keyset cursor walks whenever the cursor carries a ledger sequence
+// (canonical 64-bit Stellar TOID cursors under OrderByID, and composite
+// "<ledger>|<id>" cursors under OrderByLedger). Those scalar bounds allow
+// PostgreSQL's partition pruner to skip every `events` range partition prior to
+// (ASC) or after (DESC) the cursor's ledger and let the `(contract_id, ledger, id)`
+// composite index bound its scan instead of walking from partition 0 on every page.
+func buildQueryEventsSQL(f EventFilter, maxSparseSpan int64) (string, []any, int, error) {
+	if err := ValidateSparseFilterRange(f, maxSparseSpan); err != nil {
+		return "", nil, 0, err
 	}
 
 	limit := f.Limit
@@ -950,13 +1102,15 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	}
 
 	if !ValidOrderBy(f.OrderBy) {
-		return nil, "", fmt.Errorf("unsupported order_by %q", f.OrderBy)
+		return "", nil, 0, fmt.Errorf("unsupported order_by %q", f.OrderBy)
 	}
 	orderDir := "ASC"
 	cursorOp := ">"
+	ledgerBoundOp := ">="
 	if f.Order == "desc" {
 		orderDir = "DESC"
 		cursorOp = "<"
+		ledgerBoundOp = "<="
 	}
 
 	// Every ordering ends in id so the sort is total: ledger and created_at
@@ -971,24 +1125,45 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	if f.Cursor != "" {
 		switch f.OrderBy {
 		case "", OrderByID:
-			where = append(where, "id "+cursorOp+" "+arg(f.Cursor))
-		default:
-			sortValue, id, err := decodeCompositeCursor(f.Cursor)
+			cursorID, err := DecodeEventIDCursorForBackend(CursorBackendPostgres, f.Cursor)
 			if err != nil {
-				return nil, "", err
+				return "", nil, 0, err
+			}
+			if cursorLedger, ok := CursorLedger(cursorID); ok {
+				if (f.FromLedger <= 0 || cursorLedger >= f.FromLedger) &&
+					(f.ToLedger <= 0 || cursorLedger <= f.ToLedger) {
+					where = append(where, "ledger "+ledgerBoundOp+" "+arg(cursorLedger))
+				}
+			}
+			where = append(where, "id "+cursorOp+" "+arg(cursorID))
+		default:
+			sortValue, id, err := decodeCompositeCursorForBackend(CursorBackendPostgres, f.Cursor)
+			if err != nil {
+				return "", nil, 0, err
 			}
 			// Row-value comparison gives the correct "everything after this
 			// (value, id) pair" semantics in one predicate, and Postgres can
 			// still drive it from an index on (sort column, id).
-			var typed string
 			switch f.OrderBy {
 			case OrderByLedger:
-				typed = arg(sortValue) + "::bigint"
+				if _, perr := strconv.ParseInt(sortValue, 10, 64); perr != nil {
+					return "", nil, 0, fmt.Errorf("%w: %w: ledger cursor sort value is not an integer", ErrInvalidCursor, ErrStaleCursor)
+				}
+				sortParam := arg(sortValue) + "::bigint"
+				// Emit an explicit scalar ledger bound alongside the row-value
+				// predicate so PostgreSQL range partition pruning eliminates
+				// partitions outside the cursor's ledger.
+				where = append(where, "ledger "+ledgerBoundOp+" "+sortParam)
+				where = append(where, fmt.Sprintf("(ledger, id) %s (%s, %s)",
+					cursorOp, sortParam, arg(id)))
 			case OrderByCreatedAt:
-				typed = arg(sortValue) + "::timestamptz"
+				if _, perr := time.Parse(time.RFC3339Nano, sortValue); perr != nil {
+					return "", nil, 0, fmt.Errorf("%w: %w: created_at cursor sort value is not RFC3339Nano", ErrInvalidCursor, ErrStaleCursor)
+				}
+				typed := arg(sortValue) + "::timestamptz"
+				where = append(where, fmt.Sprintf("(created_at, id) %s (%s, %s)",
+					cursorOp, typed, arg(id)))
 			}
-			where = append(where, fmt.Sprintf("(%s, id) %s (%s, %s)",
-				f.OrderBy, cursorOp, typed, arg(id)))
 		}
 	}
 
@@ -998,10 +1173,26 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 	}
 	// Fetch one extra row to know whether a next page exists.
 	query += " ORDER BY " + orderCols + " LIMIT " + arg(limit+1)
+	return query, args, limit, nil
+}
+
+func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
+	// The tenant boundary is evaluated before anything else, and an empty
+	// scope returns an empty page without issuing SQL. No user-supplied
+	// filter is consulted first, so no filter can influence whether the
+	// boundary is applied.
+	if f.Scope.DeniesAll() {
+		return nil, "", nil
+	}
+
+	query, args, limit, err := buildQueryEventsSQL(f, p.MaxSparseFilterLedgerSpan())
+	if err != nil {
+		return nil, "", err
+	}
 
 	var events []Event
 	next := ""
-	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
+	err = p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {
 			return fmt.Errorf("querying events: %w", err)
@@ -1022,7 +1213,7 @@ func (p *Postgres) QueryEvents(ctx context.Context, f EventFilter) ([]Event, str
 
 		if len(events) > limit {
 			events = events[:limit]
-			next = EncodeCursor(f.OrderBy, events[limit-1])
+			next = EncodeCursorForBackend(CursorBackendPostgres, f.OrderBy, events[limit-1])
 		}
 		return nil
 	})
@@ -1250,6 +1441,15 @@ const watchedContractsUnion = `
 		SELECT network, contract_id, added_at FROM tenant_watched_contracts
 	) w GROUP BY network, contract_id`
 
+// ListWatchedContracts returns the union of the operator-configured
+// watch list and every tenant's requests, all networks included,
+// which is what ingestion must fetch. It is intentionally not
+// scoped by a caller-side tenant: ingestion serves all tenants at
+// once, and a contract watched on one network is not fetched
+// with the filters of another.
+//
+// Removal is implicit per network — an entry disappears from the
+// union when the last row naming it on that network is gone.
 func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	return p.ListWatchedContractsScoped(ctx, WildcardScope())
 }
@@ -1497,6 +1697,12 @@ func (p *Postgres) frontierStats(ctx context.Context) (Stats, error) {
 // beforeTime is non-zero) older than beforeTime. The count is limited
 // by limit, matching DeleteEventsBefore's batching contract.
 func (p *Postgres) CountEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	return p.CountEventsBeforeIn(ctx, maxLedger, beforeTime, limit, ContractSet{Exclude: true})
+}
+
+// CountEventsBeforeIn is CountEventsBefore restricted to the contracts in
+// set (#1249).
+func (p *Postgres) CountEventsBeforeIn(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int, set ContractSet) (int64, error) {
 	if limit <= 0 {
 		return 0, nil
 	}
@@ -1509,6 +1715,13 @@ func (p *Postgres) CountEventsBefore(ctx context.Context, maxLedger int64, befor
 	where = "ledger < " + arg(maxLedger)
 	if !beforeTime.IsZero() {
 		where += " AND created_at < " + arg(beforeTime)
+	}
+	pred, ok := contractSetPredicate(set, arg)
+	if !ok {
+		return 0, nil
+	}
+	if pred != "" {
+		where += " AND " + pred
 	}
 	q := fmt.Sprintf(`SELECT count(*) FROM (SELECT 1 FROM events WHERE %s LIMIT %d) sub`, where, limit)
 	var total int64
@@ -1538,6 +1751,14 @@ func (p *Postgres) CountEventsBefore(ctx context.Context, maxLedger int64, befor
 // real row identities, not a DELETE result set, so dependent rows come
 // along for free once that table lands.
 func (p *Postgres) DeleteEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	return p.DeleteEventsBeforeIn(ctx, maxLedger, beforeTime, limit, ContractSet{Exclude: true})
+}
+
+// DeleteEventsBeforeIn is DeleteEventsBefore restricted to the contracts in
+// set, which is how the pruner applies one per-tenant retention group
+// (#1249) in a single batched statement rather than a rule per row. The
+// contract predicate is served by idx_events_contract_ledger.
+func (p *Postgres) DeleteEventsBeforeIn(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int, set ContractSet) (int64, error) {
 	if limit <= 0 {
 		return 0, nil
 	}
@@ -1553,6 +1774,13 @@ func (p *Postgres) DeleteEventsBefore(ctx context.Context, maxLedger int64, befo
 
 	if !beforeTime.IsZero() {
 		where += " AND created_at < " + arg(beforeTime)
+	}
+	pred, ok := contractSetPredicate(set, arg)
+	if !ok {
+		return 0, nil
+	}
+	if pred != "" {
+		where += " AND " + pred
 	}
 
 	q := fmt.Sprintf(`DELETE FROM events WHERE id IN (SELECT id FROM events WHERE %s LIMIT %d)`, where, limit)
@@ -1760,7 +1988,7 @@ func (p *Postgres) ListContractSpecOverrideHistory(ctx context.Context, contract
 	// everything older than it.
 	var afterID int64 = 0
 	if cursor != "" {
-		id, err := DecodeSpecOverrideHistoryCursor(cursor)
+		id, err := DecodeSpecOverrideHistoryCursorForBackend(CursorBackendPostgres, cursor)
 		if err != nil {
 			return nil, "", err
 		}
@@ -1800,7 +2028,7 @@ func (p *Postgres) ListContractSpecOverrideHistory(ctx context.Context, contract
 
 	next := ""
 	if len(out) == limit {
-		next = EncodeSpecOverrideHistoryCursor(out[len(out)-1].ID)
+		next = EncodeSpecOverrideHistoryCursorForBackend(CursorBackendPostgres, out[len(out)-1].ID)
 	}
 	return out, next, nil
 }
@@ -1962,12 +2190,12 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, contractID string, limit
 		where = append(where, "contract_id = "+arg(contractID))
 	}
 	if cursor != "" {
-		sv, err := base64.RawURLEncoding.DecodeString(cursor)
+		afterID, err := DecodeDeadLetterCursorForBackend(CursorBackendPostgres, cursor)
 		if err != nil {
-			return nil, "", fmt.Errorf("%w: dead letter cursor", ErrInvalidContractsCursor)
+			return nil, "", err
 		}
 		idIdx := len(args) + 1
-		args = append(args, string(sv))
+		args = append(args, strconv.FormatInt(afterID, 10))
 		where = append(where, fmt.Sprintf("dead_letters.id < $%d", idIdx))
 	}
 	query := `SELECT id, event_id, contract_id, ledger, type, tx_hash,
@@ -2010,7 +2238,7 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, contractID string, limit
 	if len(rows) > limit {
 		last := rows[limit-1]
 		rows = rows[:limit]
-		next = base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprint(last.ID)))
+		next = EncodeDeadLetterCursorForBackend(CursorBackendPostgres, last.ID)
 	}
 	return rows, next, nil
 }
@@ -2096,6 +2324,14 @@ func (p *Postgres) withStatementTimeoutTx(ctx context.Context, fn func(pgx.Tx) e
 		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = '%dms'", timeout.Milliseconds())); err != nil {
 			return fmt.Errorf("setting statement_timeout: %w", err)
 		}
+	}
+	opName, _ := ctx.Value(queryNameContextKey{}).(string)
+	if opName == "" {
+		opName = "store.tx"
+	}
+	if _, err := tx.Exec(ctx, FormatSQLComment(ctx, opName)+"SELECT set_config('application_name', $1, true)",
+		AttributionFromContext(ctx).Originator+":"+AttributionFromContext(ctx).Tenant); err != nil {
+		return fmt.Errorf("setting query attribution: %w", err)
 	}
 	if err := fn(tx); err != nil {
 		return err
@@ -2209,6 +2445,9 @@ func (p *Postgres) QueryAddressEvents(ctx context.Context, address string, f Eve
 	if !f.Scope.IsWildcard() {
 		where = append(where, "e.contract_id = ANY("+arg(f.Scope.Contracts())+")")
 	}
+	if cutoff, ok := f.Scope.RetentionCutoff(time.Now()); ok {
+		where = append(where, "e.created_at >= "+arg(cutoff))
+	}
 
 	if f.ContractID != "" {
 		where = append(where, "e.contract_id = "+arg(f.ContractID))
@@ -2233,7 +2472,11 @@ func (p *Postgres) QueryAddressEvents(ctx context.Context, address string, f Eve
 	orderCols := "e.id " + orderDir
 
 	if f.Cursor != "" {
-		where = append(where, "e.id "+cursorOp+" "+arg(f.Cursor))
+		cursorID, err := DecodeEventIDCursorForBackend(CursorBackendPostgres, f.Cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		where = append(where, "e.id "+cursorOp+" "+arg(cursorID))
 	}
 
 	query := `SELECT ` + eventColumns + `

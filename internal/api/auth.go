@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -78,20 +79,30 @@ func (s *Server) requireAPIKey(next http.Handler) http.Handler {
 			s.writeUnauthorized(w)
 			return
 		}
-		stored, err := s.store.LookupAPIKeyByPrefix(r.Context(), prefix)
-		if errors.Is(err, store.ErrNotFound) {
-			s.writeUnauthorized(w)
-			return
-		}
-		if err != nil {
-			s.log.Error("looking up API key", "error", err)
-			writeError(w, http.StatusInternalServerError,
-				errors.New("checking API key failed"))
-			return
+		now := time.Now()
+		stored, cached := s.AuthCache().GetAPIKey(prefix, now)
+		if !cached {
+			var err error
+			stored, err = s.store.LookupAPIKeyByPrefix(r.Context(), prefix)
+			if errors.Is(err, store.ErrNotFound) {
+				s.writeUnauthorized(w)
+				return
+			}
+			if err != nil {
+				s.log.Error("looking up API key", "error", err)
+				writeError(w, http.StatusInternalServerError,
+					errors.New("checking API key failed"))
+				return
+			}
+			s.AuthCache().PutAPIKey(stored, now)
 		}
 		if !apikey.VerifySecret(secret, stored.KeyHash) {
 			s.writeUnauthorized(w)
 			return
+		}
+		if h := auditHolderFrom(r.Context()); h != nil {
+			cp := stored
+			h.apiKey = &cp
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -193,6 +204,7 @@ func (s *Server) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("revoking API key failed"))
 		return
 	}
+	s.notifyAPIKeyInvalidation(r.Context(), id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -294,9 +306,10 @@ func credentialFromRequest(r *http.Request) string {
 // makes the boundary a property of the request rather than a decision each
 // handler gets to make (or forget).
 type Principal struct {
-	Tenant store.Tenant
-	Scope  store.Scope
-	KeyID  int64
+	Tenant    store.Tenant
+	Scope     store.Scope
+	KeyID     int64
+	KeyPrefix string
 	// Untenanted marks the implicit principal of a MULTI_TENANT=false
 	// deployment: full access, no key required, no usage accounting. It
 	// exists so downstream code can tell "single-tenant mode" apart from
@@ -309,6 +322,10 @@ type principalCtxKey struct{}
 // WithPrincipal returns a context carrying p. Exported for tests, which
 // exercise handlers without going through the authentication middleware.
 func WithPrincipal(ctx context.Context, p Principal) context.Context {
+	if h := auditHolderFrom(ctx); h != nil {
+		h.hasPrincipal = true
+		h.principal = p
+	}
 	return context.WithValue(ctx, principalCtxKey{}, p)
 }
 
@@ -372,6 +389,12 @@ var publicPaths = map[string]bool{
 // rely on scopeFrom returning a real answer instead of silently denying.
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if handled, ok := s.authenticateMTLS(w, &r); handled {
+			if ok {
+				next.ServeHTTP(w, r)
+			}
+			return
+		}
 		if !s.multiTenant {
 			ctx := WithPrincipal(r.Context(), Principal{
 				Scope:      store.WildcardScope(),
@@ -396,15 +419,20 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 
-		key, storedDigest, tenant, err := s.tenants.LookupTenantAPIKey(r.Context(), prefix)
-		if errors.Is(err, store.ErrNotFound) {
-			writeUnauthorized(w, "unknown or revoked API key")
-			return
-		}
-		if err != nil {
-			loggerFromContext(r.Context()).Error("looking up api key", "error", err)
-			writeError(w, http.StatusInternalServerError, errors.New("authentication failed"))
-			return
+		now := time.Now()
+		key, storedDigest, tenant, scope, cached := s.AuthCache().GetTenantAuth(prefix, now)
+		if !cached {
+			var err error
+			key, storedDigest, tenant, err = s.tenants.LookupTenantAPIKey(r.Context(), prefix)
+			if errors.Is(err, store.ErrNotFound) {
+				writeUnauthorized(w, "unknown or revoked API key")
+				return
+			}
+			if err != nil {
+				loggerFromContext(r.Context()).Error("looking up api key", "error", err)
+				writeError(w, http.StatusInternalServerError, errors.New("authentication failed"))
+				return
+			}
 		}
 		// Constant-time: a byte-by-byte comparison would let an attacker
 		// who already knows a valid prefix recover the secret through
@@ -420,12 +448,23 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			writeError(w, http.StatusForbidden, errors.New("tenant is disabled"))
 			return
 		}
-
-		scope, err := s.tenants.ScopeForTenant(r.Context(), tenant)
-		if err != nil {
-			loggerFromContext(r.Context()).Error("resolving tenant scope", "tenant", tenant.ID, "error", err)
-			writeError(w, http.StatusInternalServerError, errors.New("authentication failed"))
+		if expectedTenantID, ok := r.Context().Value(expectedMTLSTenantCtxKey{}).(int64); ok && expectedTenantID != tenant.ID {
+			writeMTLSRejection(w, http.StatusForbidden, CodeForbidden, "API key tenant does not match client certificate identity")
 			return
+		}
+
+		if !cached {
+			var err error
+			scope, err = s.tenantScope(r.Context(), tenant)
+			if err != nil {
+				loggerFromContext(r.Context()).Error("resolving tenant scope", "tenant", tenant.ID, "error", err)
+				writeError(w, http.StatusInternalServerError, errors.New("authentication failed"))
+				return
+			}
+			if key.Prefix == "" {
+				key.Prefix = prefix
+			}
+			s.AuthCache().PutTenantAuth(key, storedDigest, tenant, scope, now)
 		}
 
 		// Advisory; a failure here must not deny an otherwise valid request.
@@ -434,9 +473,10 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		}
 
 		ctx := WithPrincipal(r.Context(), Principal{
-			Tenant: tenant,
-			Scope:  scope,
-			KeyID:  key.ID,
+			Tenant:    tenant,
+			Scope:     scope,
+			KeyID:     key.ID,
+			KeyPrefix: prefix,
 		})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

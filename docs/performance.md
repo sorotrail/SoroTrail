@@ -75,6 +75,73 @@ These figures are a reference point, not a guarantee: they depend on the host, t
 
 ---
 
+## Conditional requests
+
+Following a contract means polling its listing, and most polls find nothing
+new. The event, contract and address read endpoints therefore answer
+conditional requests.
+
+- A `200` response carries a strong `ETag`: a hash of the exact response body,
+  so it changes when, and only when, the bytes a client would receive change.
+  Tenant scope, filters, cursor, order and page size all shape the body, so two
+  tenants, or two different queries, never share a validator.
+- Repeat the tag in `If-None-Match` (a single tag, a list, a weak `W/` form or
+  `*`) and an unchanged result comes back as `304 Not Modified` with no body,
+  repeating `ETag`, `Cache-Control` and `Vary`.
+- Live listings keep `Cache-Control: no-cache`, so a client revalidates on
+  every poll; the validator is what makes that revalidation cheap. Windows that
+  end below the ingestion frontier keep their existing immutable caching and
+  their own filter-derived validator.
+- With compression on, the tag is computed on the uncompressed body and
+  weakened for the gzip representation; revalidating with the weak tag still
+  gets a `304`.
+- `/health` and `/stats` change constantly and are never tagged. Errors,
+  non-200 responses, streamed exports and responses over 8 MiB are not tagged.
+
+What this saves is the body: bandwidth and the client's parse. It does not skip
+the database query, because the validator is derived from the response, so the
+handler still runs. A validator that avoids the query would need a store-side
+change counter, which the store does not have today.
+
+## Bulk export
+
+`GET /events.csv` (any filter the listing takes) and
+`GET /contracts/{id}/export` (a closed ledger range, capped by
+`EXPORT_MAX_RANGE`) stream events as CSV or NDJSON.
+
+- **Streaming, bounded memory.** The handler walks the same cursor-paged query
+  the listing uses, 200 rows at a time, writes and flushes each page, and
+  holds nothing else. `TestExportMemoryIsFlatInTheSizeOfTheResult` streams
+  20k and 200k synthetic rows through each format: 85 MiB of NDJSON written at
+  a 3 MiB heap peak, the same peak as the 8 MiB run. Cursor paging was chosen
+  over one long server-side cursor so the database working set stays bounded
+  too and the filter code path is shared with the listing.
+- **Bounded or unbounded.** The contract export requires a ledger range. The
+  filtered `/events.csv` has no row cap by design; it is bounded by the
+  server's request timeout, which ends the walk (see below) and by the client
+  hanging up, which the loop notices between pages.
+- **A truncated export is detectable.** Once a row is sent the status is
+  `200`, so the end is reported separately. A complete export sets the
+  `X-Export-Status: complete` and `X-Export-Rows: N` trailers. An export that
+  stops after rows were sent aborts the connection, so the client sees a
+  transport error, never a short file that parses cleanly. Consumers that
+  cannot read trailers pass `terminator=true` to get an in-band marker: a last
+  NDJSON line `{"export":{"complete":true,"rows":N}}` or a last CSV record
+  `#export-complete,N`. A failure before any NDJSON row is an ordinary 500.
+- **Columns.** `id, ledger, type, tx_hash, topics, value`. `topics` and `value`
+  are JSON documents written verbatim into one cell (quoted by the CSV writer).
+- **CSV injection.** A cell that starts with `=`, `+`, `@`, a tab or a carriage
+  return, or a `-` that is not a JSON number, is prefixed with a single quote so
+  a spreadsheet shows it as text. Valid JSON cells (`topics`, `value`) are left
+  alone, so the column stays parseable.
+- **Cost.** Every exported row counts against the tenant's events-served usage,
+  the same counter the paged listing feeds. Exports are not otherwise rate
+  limited beyond the per-tenant request limiter.
+- **Why not an asynchronous job.** A job producing a downloadable artefact
+  would need somewhere to store it. Streaming needs nothing stored, and the
+  range cap and the timeout already bound the work, so it is the simpler shape
+  until an export larger than a request timeout is a real requirement.
+
 ## 1. Methodology
 
 All performance benchmarks are reproducible using the included benchmark suite and database seeding tool.
@@ -111,20 +178,36 @@ All performance benchmarks are reproducible using the included benchmark suite a
 
 ## 2. Benchmark Results
 
-### A. Decode Throughput (`internal/decode`)
+### A. Decode & Ingestion Hot-Path Throughput (`internal/decode`, `internal/ingester`)
 
-Micro-benchmarks measuring base64 XDR unmarshaling, `ScVal` type parsing, and JSON conversion.
+Micro-benchmarks and end-to-end batch benchmarks measuring base64 XDR unmarshaling, `ScVal` JSON serialization, `G...`/`C...` address extraction, and full 100-event batch ingestion (`BenchmarkIngestHotPath`, Apple M4 arm64, `go test -bench=... -benchmem`).
 
-| Benchmark | ns/op | B/op | Allocs/op | Ops/sec |
-| :--- | :--- | :--- | :--- | :--- |
-| `BenchmarkXDRDecode_Symbol` | ~420 ns | 384 B | 8 allocs | ~2,380,000 |
-| `BenchmarkXDRDecode_Address` | ~850 ns | 712 B | 14 allocs | ~1,170,000 |
-| `BenchmarkXDRDecode_U128` | ~680 ns | 512 B | 11 allocs | ~1,470,000 |
-| `BenchmarkXDRDecode_Vec` | ~1,450 ns | 1,280 B | 24 allocs | ~690,000 |
-| `BenchmarkEventTopicsValue_XDR` | ~1,820 ns | 1,536 B | 29 allocs | ~549,000 |
-| `BenchmarkEventTopicsValue_JSONPassthrough` | ~210 ns | 128 B | 3 allocs | ~4,760,000 |
+| Benchmark | Before (`ns/op`) | After (`ns/op`) | Speedup | Before (`B/op`) | After (`B/op`) | Bytes Saved | Before (`allocs/op`) | After (`allocs/op`) | Allocs Saved |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `BenchmarkXDRDecode_Symbol` | 605.0 ns | **103.7 ns** | **5.8x** | 2,897 B | **152 B** | **-94.8%** | 17 allocs | **5 allocs** | **-70.6%** |
+| `BenchmarkXDRDecode_Address` | 786.0 ns | **227.4 ns** | **3.5x** | 3,097 B | **352 B** | **-88.6%** | 18 allocs | **6 allocs** | **-66.7%** |
+| `BenchmarkXDRDecode_U128` | 735.3 ns | **199.6 ns** | **3.7x** | 3,098 B | **320 B** | **-89.7%** | 21 allocs | **8 allocs** | **-61.9%** |
+| `BenchmarkXDRDecode_Vec` | 1,640 ns | **313.7 ns** | **5.2x** | 4,938 B | **848 B** | **-82.8%** | 43 allocs | **12 allocs** | **-72.1%** |
+| `BenchmarkEventTopicsValue_XDR` | 2,051 ns | **315.1 ns** | **6.5x** | 8,776 B | **424 B** | **-95.2%** | 52 allocs | **12 allocs** | **-76.9%** |
+| `BenchmarkEventTopicsValue_JSONPassthrough` | 357.8 ns | **277.1 ns** | **1.3x** | 120 B | **96 B** | **-20.0%** | 2 allocs | **1 alloc** | **-50.0%** |
+| `BenchmarkExtractAddresses_Transfer` | 4,996 ns | **355.1 ns** | **14.1x** | 6,040 B | **320 B** | **-94.7%** | 87 allocs | **3 allocs** | **-96.6%** |
+| `BenchmarkIngestHotPath` (100 events) | 929,545 ns | **109,827 ns** | **8.5x** | 1,895,155 B | **147,521 B** | **-92.2%** | 16,121 allocs | **1,906 allocs** | **-88.2%** |
 
-*Note: Server-side JSON passthrough (`xdrFormat="json"`) provides ~8.6x higher decode throughput compared to client-side XDR decoding.*
+#### Ingestion Hot-Path Allocation Profile (`pprof` Breakdown)
+
+Profiling a 100-event transfer batch (`go test -bench=^BenchmarkIngestHotPath$ -memprofile=... ./internal/ingester`) identified three primary allocation sources before optimization:
+
+1. **Address extraction (`decode.ExtractAddresses` / `decode.extractFromValue` — 54.6% of `alloc_objects`, 32.4% of `alloc_space`)**:
+   - Previously, `extractFromValue` attempted up to three `json.Unmarshal` calls (`map[string]json.RawMessage`, `[]json.RawMessage`, and `string`) at every node of the JSON tree and allocated a `map[[2]string]bool` plus `strings.Builder` per topic role.
+   - Replaced with a single-pass JSON byte scanner (`scanJSONValueEnd` / `scanJSONStringEnd`), precomputed `topic[0]`–`topic[15]` role strings, stack-backed deduplication for the common case (`≤8` unique `(address, role)` pairs per event), and `decode.AppendAddresses` so `ingester.indexEventAddresses` reuses one scratch slice across an entire batch.
+2. **Base64 + XDR unmarshaling (`xdr.SafeUnmarshalBase64` — 43.4% of `alloc_space`)**:
+   - `xdr.SafeUnmarshalBase64` allocated a streaming `base64.NewDecoder` (~2 KB read buffer), `strings.Reader`, `bytes.Buffer`, and `io.TeeReader` on every topic and value `ScVal`.
+   - Replaced with `decodeScratchPool` (`sync.Pool`), which decodes single-line base64 directly into a pooled byte slice (`sc.rawBuf`), resets a pooled `bytes.Reader`, and unmarshals into a pooled `sc.val` (`xdr.ScVal`).
+3. **Intermediate Go AST + reflection JSON marshaling (`decode.scValToGo` + `encoding/json.Marshal` — 22.4% of `alloc_objects`)**:
+   - `scValToGo` previously allocated intermediate `map[string]any` wrappers, `[]any` slices, and heap `big.Int` values before passing them to reflection-driven `json.Marshal`, and `decodeXDROnlyEvent` marshaled each topic separately before re-marshaling `[]json.RawMessage`.
+   - Replaced with direct byte-buffer serialization (`appendScValJSON`), 64-bit fast paths for `u128`/`i128`/`u256`/`i256` values whose upper words are zero/sign-extension, stack `big.Int` formatting for wide integers, and single-allocation topic array assembly in `decodeXDROnlyEvent`.
+
+**Pool Lifetime Rule**: `decodeScratch` instances are acquired from `decodeScratchPool` at the entry of `DecodeScVal` or `decodeXDROnlyEvent` and returned via `defer` before returning. Every returned `json.RawMessage` is copied into a freshly allocated slice of exact length before `Put`, so pooled buffers never alias `store.Event` fields or cross goroutines.
 
 ---
 

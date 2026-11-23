@@ -242,7 +242,18 @@ func (c *Cache) GetByContractID(contractID string) *ContractSpec {
 }
 
 // Set stores a spec in both memory and (if configured) database.
-// Counts a fetch: Set is only called after a spec was (re)fetched.
+//
+// This method is called after a spec has been (re)fetched from the contract
+// RPC. It updates the in-memory cache and optionally persists the spec to
+// the durable store. The fetch counter is incremented to track how many
+// specs have been stored.
+//
+// The spec is stored in the in-memory map keyed by its WasmHash. If the spec
+// has a non-empty ContractID, the contractID → wasm-hash mapping is also
+// updated so that future lookups by contract ID can find the correct hash.
+//
+// If a dbStore is configured, the spec is also marshaled to JSON and
+// persisted via SetContractSpec.
 func (c *Cache) Set(ctx context.Context, spec *ContractSpec) error {
 	c.mu.Lock()
 	c.mem[spec.WasmHash] = &entry{spec: spec, cachedAt: c.now()}

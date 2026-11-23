@@ -200,6 +200,10 @@ type SyntheticRPC struct {
 	events []rpc.Event
 }
 
+// NewSyntheticRPC creates a synthetic RPC that emits deterministic contract events
+// per ledger for load testing. It implements the rpc.Client interface so the
+// ingester can be driven against it without contacting a real RPC endpoint.
+// The same configuration with a non-zero Seed produces identical events on every run.
 func NewSyntheticRPC(cfg LoadTestConfig) *SyntheticRPC {
 	r := &SyntheticRPC{cfg: cfg, latest: cfg.Ledgers + 1, rng: rand.New(rand.NewPCG(cfg.Seed, 1))}
 	for ledger := uint32(2); ledger <= cfg.Ledgers+1; ledger++ {
@@ -227,6 +231,7 @@ func (r *SyntheticRPC) event(ledger uint32, n int) rpc.Event {
 	}
 }
 
+// LatestLedger reports the highest ledger sequence available from the synthetic RPC.
 func (r *SyntheticRPC) LatestLedger() uint32 { return r.latest }
 func (r *SyntheticRPC) GetHealth(context.Context) (rpc.Health, error) {
 	return rpc.Health{LatestLedger: r.latest, OldestLedger: 2}, nil

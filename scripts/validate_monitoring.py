@@ -179,35 +179,79 @@ def check_dashboard_structure(path: Path) -> tuple[dict | None, list[str]]:
     return dashboard, problems
 
 
+GRAFANA_DIR = Path("deploy/grafana")
+RECORDED_RE = re.compile(r"(?<![A-Za-z0-9_:])sorotrail:[A-Za-z0-9_:]+")
+
+
+def panel_descriptions_missing(dashboard: dict) -> list[str]:
+    """Every non-row panel must say what good looks like (issue #1258)."""
+    missing = []
+
+    def walk(panels):
+        for panel in panels:
+            if panel.get("type") != "row" and not str(panel.get("description", "")).strip():
+                missing.append(str(panel.get("title", "?")))
+            walk(panel.get("panels") or [])
+
+    walk(dashboard.get("panels") or [])
+    return missing
+
+
 def main() -> int:
-    for asset in (RULES, DASHBOARD):
+    dashboards = sorted(GRAFANA_DIR.glob("*.json"))
+    for asset in [RULES, *dashboards]:
         if not asset.is_file():
             print(f"FAIL: {asset} is missing")
             return 1
+    if not dashboards:
+        print(f"FAIL: no dashboards under {GRAFANA_DIR}")
+        return 1
 
     exported = load_exported(EXPORTED)
     failures = []
+    rule_text = RULES.read_text()
+    recorded = set(re.findall(r"record:\s*(\S+)", rule_text))
+    uids = {}
 
-    dashboard, problems = check_dashboard_structure(DASHBOARD)
-    if problems:
-        print(f"FAIL: {DASHBOARD} is not a valid Grafana dashboard:")
-        for problem in problems:
-            print(f"  - {problem}")
-        failures.extend(problems)
-    else:
-        print(f"ok:   {DASHBOARD}: valid JSON with the required dashboard fields")
+    for path in dashboards:
+        dashboard, problems = check_dashboard_structure(path)
+        if problems:
+            print(f"FAIL: {path} is not a valid Grafana dashboard:")
+            for problem in problems:
+                print(f"  - {problem}")
+            failures.extend(problems)
+        else:
+            print(f"ok:   {path}: valid JSON with the required dashboard fields")
+        if dashboard is None:
+            continue
+        uid = dashboard.get("uid")
+        if not uid or uid in uids:
+            failures.append(f"{path}: uid {uid!r} is empty or duplicates {uids.get(uid)}")
+            print(f"FAIL: {failures[-1]}")
+        uids[uid] = path
+        exprs = extract_dashboard_exprs(dashboard)
+        failures.extend(check_metrics(path, exprs, exported))
+        unknown = sorted({t for e in exprs for t in RECORDED_RE.findall(e) if t not in recorded})
+        if unknown:
+            print(f"FAIL: {path} reads recording rules that {RULES} does not define: {unknown}")
+            failures.extend(unknown)
+        if path.name != "sorotrail-dashboard.json":
+            missing = panel_descriptions_missing(dashboard)
+            if missing:
+                print(f"FAIL: {path} panels without a description: {missing}")
+                failures.extend(missing)
 
     failures.extend(check_metrics(RULES, extract_rule_exprs(RULES), exported))
-    if dashboard is not None:
-        failures.extend(
-            check_metrics(DASHBOARD, extract_dashboard_exprs(dashboard), exported)
-        )
+
+    alerts = rule_text.count("- alert:")
+    if alerts != rule_text.count("dashboard_url:"):
+        print("FAIL: every alert must carry a dashboard_url annotation")
+        failures.append("dashboard_url")
 
     if failures:
         return 1
     print("All monitoring asset checks passed.")
     return 0
-
 
 def fail(message: str) -> None:
     print(f"FAIL: {message}")

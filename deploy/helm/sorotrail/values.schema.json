@@ -270,6 +270,44 @@
         }
       },
       "additionalProperties": false
+    },
+    "mtls": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable inbound mutual TLS on the HTTP API server."
+        },
+        "secretName": {
+          "type": "string",
+          "description": "Name of the Kubernetes Secret containing server tls.crt, tls.key, and ca.crt."
+        },
+        "clientCASecretName": {
+          "type": "string",
+          "description": "Optional separate Secret containing ca.crt for verifying client certificates."
+        },
+        "mountPath": {
+          "type": "string",
+          "description": "Mount path for the server mTLS Secret volume."
+        },
+        "allowedIdentities": {
+          "type": "string",
+          "description": "Comma-separated allowlist of client certificate identities."
+        },
+        "tenantMap": {
+          "type": "string",
+          "description": "Comma-separated <cert_identity>=<tenant_name> mappings."
+        },
+        "dbSecretName": {
+          "type": "string",
+          "description": "Optional Secret containing tls.crt, tls.key, and ca.crt for outbound Postgres mTLS."
+        },
+        "archiveSecretName": {
+          "type": "string",
+          "description": "Optional Secret containing tls.crt, tls.key, and ca.crt for outbound Archive mTLS."
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

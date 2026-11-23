@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/url"
@@ -395,7 +394,7 @@ func (c *ClickHouse) QueryEvents(ctx context.Context, f EventFilter) ([]Event, s
 	next := ""
 	if len(events) > limit {
 		events = events[:limit]
-		next = EncodeCursor(f.OrderBy, events[limit-1])
+		next = EncodeCursorForBackend(CursorBackendClickHouse, f.OrderBy, events[limit-1])
 	}
 	return events, next, nil
 }
@@ -1425,13 +1424,9 @@ func (c *ClickHouse) ListDeadLetters(ctx context.Context, contractID string, lim
 		where = append(where, "contract_id = "+clickHouseQuoteString(contractID))
 	}
 	if cursor != "" {
-		raw, err := base64.RawURLEncoding.DecodeString(cursor)
+		id, err := DecodeDeadLetterCursorForBackend(CursorBackendClickHouse, cursor)
 		if err != nil {
-			return nil, "", fmt.Errorf("%w: dead letter cursor", ErrInvalidContractsCursor)
-		}
-		id, err := strconv.ParseInt(string(raw), 10, 64)
-		if err != nil {
-			return nil, "", fmt.Errorf("%w: dead letter cursor", ErrInvalidContractsCursor)
+			return nil, "", err
 		}
 		where = append(where, "id < "+strconv.FormatInt(id, 10))
 	}
@@ -1449,7 +1444,7 @@ func (c *ClickHouse) ListDeadLetters(ctx context.Context, contractID string, lim
 	if len(letters) > limit {
 		last := letters[limit-1]
 		letters = letters[:limit]
-		next = base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(last.ID, 10)))
+		next = EncodeDeadLetterCursorForBackend(CursorBackendClickHouse, last.ID)
 	}
 	return letters, next, nil
 }

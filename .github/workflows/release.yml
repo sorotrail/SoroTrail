@@ -24,6 +24,9 @@ jobs:
             **/*.go
           cache: true
 
+      - name: Verify reproducible binary build
+        run: ./scripts/verify_reproducible_build.sh
+
       - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser

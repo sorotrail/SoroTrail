@@ -3293,3 +3293,68 @@ func TestStats_SurfaceDecodeMetrics(t *testing.T) {
 	assert.Equal(t, float64(3), got["decode_failures"])
 }
 func TestAPIErrorBranches(t *testing.T) { t.Log("Covered every error branch in the API handlers") }
+
+func TestCursorStabilityContract_HTTPEndToEndRejectsCrossBackendAndTamperedCursors(t *testing.T) {
+	st := newIdempotencyTestStore(t)
+	srv := New(st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "", nil)
+
+	ev := store.Event{
+		ID:        "0001099511627776-0000000001",
+		Ledger:    500001,
+		CreatedAt: time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC),
+	}
+	chEventCursor := store.EncodeCursorForBackend(store.CursorBackendClickHouse, store.OrderByLedger, ev)
+	sqLedgerCursor := store.EncodeCursorForBackend(store.CursorBackendSQLite, store.OrderByLedger, ev)
+	tamperedEventCursor := sqLedgerCursor[:len(sqLedgerCursor)-1] + "X"
+	if sqLedgerCursor[len(sqLedgerCursor)-1] == 'X' {
+		tamperedEventCursor = sqLedgerCursor[:len(sqLedgerCursor)-1] + "Y"
+	}
+
+	pgContractCursor := store.EncodeContractsCursorForBackend(store.CursorBackendPostgres, "event_count", "42", "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC")
+	sqContractCursor := store.EncodeContractsCursorForBackend(store.CursorBackendSQLite, "event_count", "42", "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC")
+	tamperedContractCursor := sqContractCursor[:len(sqContractCursor)-1] + "X"
+	if sqContractCursor[len(sqContractCursor)-1] == 'X' {
+		tamperedContractCursor = sqContractCursor[:len(sqContractCursor)-1] + "Y"
+	}
+
+	cases := []struct {
+		name string
+		path string
+	}{
+		{
+			name: "events cross-backend v2.ch cursor rejected with 400 INVALID_CURSOR",
+			path: "/events?order_by=ledger&cursor=" + url.QueryEscape(chEventCursor),
+		},
+		{
+			name: "events tampered v2.sq cursor rejected with 400 INVALID_CURSOR",
+			path: "/events?order_by=ledger&cursor=" + url.QueryEscape(tamperedEventCursor),
+		},
+		{
+			name: "events ledger cursor replayed with order_by=created_at rejected with 400 INVALID_CURSOR",
+			path: "/events?order_by=created_at&cursor=" + url.QueryEscape(sqLedgerCursor),
+		},
+		{
+			name: "contracts cross-backend v2.pg cursor rejected with 400 INVALID_CURSOR",
+			path: "/contracts?cursor=" + url.QueryEscape(pgContractCursor),
+		},
+		{
+			name: "contracts tampered v2.sq cursor rejected with 400 INVALID_CURSOR",
+			path: "/contracts?cursor=" + url.QueryEscape(tamperedContractCursor),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := doGet(t, srv, tc.path)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", string(body))
+			var errEnv struct {
+				Error string `json:"error"`
+				Code  string `json:"code"`
+				Field string `json:"field"`
+			}
+			require.NoError(t, json.Unmarshal(body, &errEnv))
+			assert.Equal(t, "INVALID_CURSOR", errEnv.Code)
+			assert.Equal(t, "cursor", errEnv.Field)
+		})
+	}
+}

@@ -36,6 +36,13 @@ jobs:
             type=semver,pattern={{version}}
             type=raw,value=latest
 
+      - name: Resolve deterministic build metadata from commit
+        id: buildinfo
+        run: |
+          echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(TZ=UTC git show -s --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push (amd64 + arm64)
         uses: docker/build-push-action@v7
         with:
@@ -44,5 +51,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.buildinfo.outputs.version }}
+            COMMIT=${{ steps.buildinfo.outputs.commit }}
+            BUILD_DATE=${{ steps.buildinfo.outputs.build_date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
