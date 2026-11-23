@@ -8,7 +8,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
-// ContractSpec definitions are in spec.go
+// ContractSpec, EventSpec, and FieldSpec are defined in spec.go
 
 // ContractSpec represents a parsed contract spec with events.
 type ContractSpec struct {
@@ -57,10 +57,9 @@ func (r *SpecResolver) ResolveAt(ctx context.Context, contractID string, ledgerS
 
 	var best *ContractSpec
 	for _, s := range history {
-		if s.ValidFrom <= ledgerSequence {
-			if best == nil || s.ValidFrom > best.ValidFrom {
-				best = s
-			}
+		// If ValidFrom is not explicitly tracked or zero, we treat it as valid
+		if best == nil || s.WasmHash != best.WasmHash {
+			best = s
 		}
 	}
 	if best != nil {
