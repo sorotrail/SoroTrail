@@ -323,7 +323,7 @@ DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=di
 | Variable | Type | Default | Description | Reload |
 | --- | --- | --- | --- | --- |
 | `POLL_INTERVAL` | duration | `5s` | Sleep between polls once caught up with the chain head. | SIGHUP |
-| `POLL_INTERVAL_MIN` | duration | unset | Lower bound for the adaptive poll interval. Once caught up, the effective interval shrinks toward this when a cycle just observed backlog. Both `POLL_INTERVAL_MIN` and `POLL_INTERVAL_MAX` unset (the default) disables adaptation — the ingester always polls at exactly `POLL_INTERVAL`. See [Ingestion behavior additions](#ingestion-behavior-additions). | restart |
+| `POLL_INTERVAL_MIN` | duration | unset | Lower bound for the adaptive poll interval. Once caught up, the effective interval shrinks toward this when a cycle just observed backlog. Both `POLL_INTERVAL_MIN` and `POLL_INTERVAL_MAX` unset (the default) disables adaptation — the ingester always polls at exactly `POLL_INTERVAL`. For example, set `POLL_INTERVAL_MIN=1s` (with `POLL_INTERVAL_MAX` also set) to use a one-second minimum. See [Ingestion behavior additions](#ingestion-behavior-additions). | restart |
 | `POLL_INTERVAL_MAX` | duration | unset | Upper bound for the adaptive poll interval. The effective interval grows toward this on an idle cycle. See `POLL_INTERVAL_MIN`. | restart |
 | `WATCHED_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract triggers a backfill from `latest − RETENTION_LEDGERS`. | restart |
 | `SKIP_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`) to never index events from. | restart |
