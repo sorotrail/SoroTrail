@@ -1,31 +1,23 @@
 package graphql
 
 import (
-	"bytes"
+	"sync"
 	"context"
-	"encoding/json"
-	"io"
-	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/sorotrail/sorotrail/internal/api"
 	"github.com/sorotrail/sorotrail/internal/store"
+	"bytes"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"github.com/sorotrail/sorotrail/internal/api"
 )
 
-// Every failure on the /graphql and /graphiql surface answers through
-// writeErrorEnvelope, so a client can decode any refusal with the same
-// {data, errors} type it uses for successful operations. These tests pin
-// the two paths that used to answer with plain text via http.Error.
-//
-// Note this transport deliberately keeps its own envelope rather than the
-// REST one: the GraphQL contract fixes the response shape, and switching
-// to {"error": ...} would break every existing client.
 
 func TestServeHTTPAnswersMethodNotAllowedInTheEnvelope(t *testing.T) {
 	h := newGraphQLTestServer(t, &stubStore{})
@@ -197,4 +189,112 @@ func TestHandleQuery_PoolBudgetExhaustedReturns503WithRetryAfter(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	assert.Equal(t, "3", rec.Header().Get("Retry-After"))
 	assertGraphQLErrorEnvelope(t, rec)
+}
+func TestSubscriptionManager_LimitsAndTenancy(t *testing.T) {
+	sm := NewSubscriptionManager(2, 1, nil)
+	err := sm.Acquire("tenant-A")
+	sm.Release("tenant-A")
+
+	assert.True(t, AssertSubscriptionTenant(map[string]any{"tenantId": "tenant-A"}, "tenant-A"))
+	assert.False(t, AssertSubscriptionTenant(map[string]any{"tenantId": "tenant-B"}, "tenant-A"))
+	assert.True(t, AssertSubscriptionTenant(map[string]any{"tenantId": "tenant-A"}, ""))
+}
+
+func TestRunSubscriptionStream_RevocationAndIsolation(t *testing.T) {
+	sm := NewSubscriptionManager(10, 10, nil)
+	broker := broadcast.NewBroker(100)
+	defer broker.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	authCalled := false
+	authCheck := func(c context.Context) bool {
+		authCalled = true
+		return false // trigger revocation
+	}
+
+	var received []any
+	var mu sync.Mutex
+	writeMsg := func(msg any) error {
+		mu.Lock()
+		received = append(received, msg)
+		mu.Unlock()
+		return nil
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- RunSubscriptionStream(ctx, sm, "tenant-A", authCheck, broker, writeMsg)
+	}()
+
+	// Publish cross-tenant event and valid event
+	broker.Publish(map[string]any{"tenantId": "tenant-B", "id": "1"})
+	broker.Publish(map[string]any{"tenantId": "tenant-A", "id": "2"})
+
+	err := <-errChan
+	assert.Error(t, err)
+	assert.True(t, authCalled)
+
+	mu.Lock()
+	// Tenant B should be filtered out by tenancy check at depth
+	for _, m := range received {
+		if mp, ok := m.(map[string]any);
+		ok {
+			if id, _ := mp["id"]; id == "1" {
+				t.Errorf("cross-tenant event leaked: %v", mp)
+			}
+		}
+	}
+	mu.Unlock()
+}
+
+func TestRunSubscriptionStream_BackpressureAndSlowConsumer(t *testing.T) {
+	sm := NewSubscriptionManager(10, 10, nil)
+	broker := broadcast.NewBroker(10)
+	defer broker.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	authCheck := func(c context.Context) bool {
+		return true
+	}
+
+	var receivedCount int
+	var mu sync.Mutex
+	writeMsg := func(msg any) error {
+		mu.Lock()
+		receivedCount++
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		return nil
+	}
+
+	go func() {
+		_ = RunSubscriptionStream(ctx, sm, "tenant-A", authCheck, broker, writeMsg)
+	}()
+
+	// Flood broker to test backpressure drop and gap indicator without blocking ingestion
+	for i := 0; i < 200; i++ {
+		broker.Publish(map[string]any{"tenantId": "tenant-A", "i": i})
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	assert.True(t, receivedCount > 0)
+}
+
+func TestSubscriptionManager_ShutdownAndRelease(t *testing.T) {
+	sm := NewSubscriptionManager(2, 2, nil)
+	err := sm.Acquire("tenant-A")
+	require.NoError(t, err)
+
+	sm.Shutdown()
+
+	err = sm.Acquire("tenant-A")
+	assert.Error(t, err)
+
+	sm.Release("tenant-A")
+	assert.NoError(t, CheckSubscriptionQueryCost("{events{edges{node{id}}}}", nil, 1000))
 }

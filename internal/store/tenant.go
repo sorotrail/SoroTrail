@@ -72,25 +72,33 @@ type TenantAPIKey struct {
 
 // TenantUsage is one tenant's accumulated consumption for a UTC day.
 type TenantUsage struct {
-	TenantID      int64     `json:"tenant_id"`
-	Day           time.Time `json:"day"`
-	Requests      int64     `json:"requests"`
-	EventsServed  int64     `json:"events_served"`
-	StreamSeconds int64     `json:"stream_seconds"`
+	TenantID        int64     `json:"tenant_id"`
+	Day             time.Time `json:"day"`
+	Requests        int64     `json:"requests"`
+	EventsServed    int64     `json:"events_served"`
+	StreamSeconds   int64     `json:"stream_seconds"`
+	QueryDurationMs int64     `json:"query_duration_ms"`
+	EventsIngested  int64     `json:"events_ingested"`
+	RowsStored      int64     `json:"rows_stored"`
+	BytesExported   int64     `json:"bytes_exported"`
 }
 
 // UsageDelta is an increment to a tenant's usage counters. The API server
 // accumulates these in memory and flushes them in batches.
 type UsageDelta struct {
-	Requests      int64
-	EventsServed  int64
-	StreamSeconds int64
+	Requests        int64
+	EventsServed    int64
+	StreamSeconds   int64
+	QueryDurationMs int64
+	EventsIngested  int64
+	RowsStored      int64
+	BytesExported   int64
 }
 
 // Empty reports whether the delta would change nothing, so a flush can skip
 // writing it.
 func (d UsageDelta) Empty() bool {
-	return d.Requests == 0 && d.EventsServed == 0 && d.StreamSeconds == 0
+	return d.Requests == 0 && d.EventsServed == 0 && d.StreamSeconds == 0 && d.QueryDurationMs == 0 && d.EventsIngested == 0 && d.RowsStored == 0 && d.BytesExported == 0
 }
 
 // TenantStore is the multi-tenancy persistence boundary. It is deliberately

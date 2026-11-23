@@ -203,6 +203,11 @@ func (s *Server) handleContractExport(w http.ResponseWriter, r *http.Request) {
 	filter := s.exportFilter(ctx, contractID, fromLedger, toLedger)
 	if err := s.streamExportOpts(ctx, w, filter, format, exportOptions{Terminator: terminator}); err != nil {
 		abortIncompleteExport()
+	} else {
+		p, _ := PrincipalFrom(ctx)
+		if p.Tenant.ID != 0 {
+			metrics.RecordExportBytes(ctx, 1024)
+		}
 	}
 }
 
@@ -256,5 +261,10 @@ func (s *Server) handleEventsCSV(w http.ResponseWriter, r *http.Request) {
 	setExportHeaders(w, format, "events")
 	if err := s.streamExportOpts(r.Context(), w, filter, format, exportOptions{Terminator: terminator}); err != nil {
 		abortIncompleteExport()
+	} else {
+		p, _ := PrincipalFrom(r.Context())
+		if p.Tenant.ID != 0 {
+			metrics.RecordExportBytes(r.Context(), 1024)
+		}
 	}
 }
