@@ -37,8 +37,35 @@ func newStubAPIKeyStore() *stubAPIKeyStore {
 	}
 }
 
-func (s *stubAPIKeyStore) RotateAPIKey(_ context.Context, id int64, k store.APIKey) (store.APIKey, error) {
-	return store.APIKey{}, nil
+func (s *stubAPIKeyStore) RotateAPIKey(_ context.Context, predecessorID int64, newKey store.APIKey, expiresIn time.Duration) (store.APIKey, error) {
+	_, ok := s.keys[predecessorID]
+	if !ok {
+		return store.APIKey{}, store.ErrNotFound
+	}
+	newKey.ID = s.nextID
+	s.nextID++
+	newKey.CreatedAt = time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC()
+	newKey.ExpiresAt = &now
+	if expiresIn > 0 {
+		exp := now.Add(expiresIn)
+		newKey.ExpiresAt = &exp
+	}
+	newKey.Predecessor = &predecessorID
+	s.keys[newKey.ID] = newKey
+	s.byPrefix[newKey.Prefix] = newKey
+	return newKey, nil
+}
+
+func (s *stubAPIKeyStore) AbandonAPIKeyRotation(_ context.Context, successorID int64) error {
+	k, ok := s.keys[successorID]
+	if !ok {
+		return store.ErrNotFound
+	}
+	now := time.Now().UTC()
+	k.RevokedAt = &now
+	s.keys[successorID] = k
+	return nil
 }
 
 func (s *stubAPIKeyStore) GetAPIKey(_ context.Context, id int64) (store.APIKey, error) {
