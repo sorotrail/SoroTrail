@@ -10,27 +10,6 @@ import (
 
 // ContractSpec, EventSpec, and FieldSpec are defined in spec.go
 
-// ContractSpec represents a parsed contract spec with events.
-type ContractSpec struct {
-	ContractID string      `json:"contract_id"`
-	WasmHash   string      `json:"wasm_hash"`
-	Events     []EventSpec `json:"events"`
-	ValidFrom  uint32      `json:"valid_from"`
-}
-
-// EventSpec describes an individual event in a contract spec.
-type EventSpec struct {
-	Name       string      `json:"name"`
-	TopicSpecs []FieldSpec `json:"topic_specs"`
-	ValueSpec  *FieldSpec  `json:"value_spec,omitempty"`
-}
-
-// FieldSpec describes a single field name and type.
-type FieldSpec struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
-}
-
 // SpecResolver resolves contract specs respecting history and caching with bounding.
 type SpecResolver struct {
 	store store.Store
