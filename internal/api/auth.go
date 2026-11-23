@@ -2,10 +2,6 @@ package api
 
 import (
 	"context"
-	"net/http"
-	"strings"
-
-	"github.com/sorotrail/sorotrail/internal/apikey"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -14,12 +10,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
+	"strings"
 	"time"
+
 	"github.com/go-chi/chi/v5"
+
+	"github.com/sorotrail/sorotrail/internal/apikey"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
-
 
 // errInvalidAPIKey is the single unauthenticated response for missing,
 // malformed, unknown, revoked, and mismatched keys. Collapsing them
@@ -538,6 +538,7 @@ func writeUnauthorized(w http.ResponseWriter, msg string) {
 	w.Header().Set("WWW-Authenticate", `Bearer realm="sorotrail"`)
 	writeError(w, http.StatusUnauthorized, errors.New(msg))
 }
+
 // ResolveAuth extracts and validates either an API key or an OIDC token from the request, returning a unified Principal.
 func ResolveAuth(r *http.Request, oidcVerifier *apikey.OIDCVerifier) (*apikey.Principal, error) {
 	authHeader := r.Header.Get("Authorization")

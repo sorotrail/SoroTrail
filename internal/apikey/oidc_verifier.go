@@ -7,7 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"errors" 
+	"errors"
 	"strings"
 	"time"
 )
@@ -62,8 +62,7 @@ func (v *OIDCVerifier) VerifyToken(ctx context.Context, tokenString string) (*Pr
 	}
 
 	var claims map[string]interface{}
-	if err := json.Unmarshal(payloadBytes, &claims);
-	err != nil {
+	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
 		return nil, errors.New("malformed token claims")
 	}
 
@@ -77,17 +76,17 @@ func (v *OIDCVerifier) VerifyToken(ctx context.Context, tokenString string) (*Pr
 	aud := claims["aud"]
 	validAud := false
 	switch a := aud.(type) {
-		case string:
-			if a == v.config.Audience {
+	case string:
+		if a == v.config.Audience {
+			validAud = true
+		}
+	case []interface{}:
+		for _, item := range a {
+			if s, ok := item.(string); ok && s == v.config.Audience {
 				validAud = true
+				break
 			}
-		case []interface{}:
-			for _, item := range a {
-				if s, ok := item.(string); ok && s == v.config.Audience {
-					validAud = true
-					break
-				}
-			}
+		}
 	}
 	if !validAud {
 		return nil, errors.New("invalid audience")
@@ -97,8 +96,7 @@ func (v *OIDCVerifier) VerifyToken(ctx context.Context, tokenString string) (*Pr
 	// Tolerated clock skew: 60 seconds
 	const skew = 60
 
-	if exp, ok := claims["exp"].(float64);
-	ok {
+	if exp, ok := claims["exp"].(float64); ok {
 		if now > int64(exp)+skew {
 			return nil, errors.New("token is expired")
 		}
@@ -106,8 +104,7 @@ func (v *OIDCVerifier) VerifyToken(ctx context.Context, tokenString string) (*Pr
 		return nil, errors.New("missing exp claim")
 	}
 
-	if nbf, ok := claims["nbf"].(float64);
-	ok {
+	if nbf, ok := claims["nbf"].(float64); ok {
 		if now < int64(nbf)-skew {
 			return nil, errors.New("token not yet valid")
 		}
