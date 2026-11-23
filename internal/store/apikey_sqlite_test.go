@@ -10,9 +10,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+
+
 func testAPIKey(name, prefix string) APIKey {
 	return APIKey{Name: name, Prefix: prefix, KeyHash: "bcrypt-hash-placeholder"}
 }
+// testSQLiteAPIKey builds a key row with a fixed fake hash for SQLite tests.
 func testSQLiteAPIKey(name, prefix string) APIKey {
 	return APIKey{Name: name, Prefix: prefix, KeyHash: "bcrypt-hash-placeholder"}
 }
