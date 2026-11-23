@@ -300,7 +300,6 @@ func TestRun_IdentityInvariant(t *testing.T) {
 	_, err := r.Run(context.Background())
 	require.NoError(t, err)
 
-	// Inspect store internals directly or verify identity fields via another query
 	events, err := st.NextReplayBatch(context.Background(), 1, 1000, "", 10)
 	require.NoError(t, err)
 	require.Len(t, events, 1)
