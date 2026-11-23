@@ -24,6 +24,8 @@ type apiKeyStore interface {
 	GetAPIKey(ctx context.Context, id int64) (store.APIKey, error)
 	ListAPIKeys(ctx context.Context) ([]store.APIKey, error)
 	RevokeAPIKey(ctx context.Context, id int64) error
+	RotateAPIKey(ctx context.Context, predecessorID int64, newKey store.APIKey, expiresIn time.Duration) (store.APIKey, error)
+	AbandonAPIKeyRotation(ctx context.Context, successorID int64) error
 }
 
 // openAPIKeyStore is the store opener seam used by apikey subcommands.
@@ -312,12 +314,11 @@ flags:
 		return fmt.Errorf("hashing successor API key secret: %w", err)
 	}
 
-	created, err := st.CreateAPIKey(ctx, store.APIKey{
-		Name:          pred.Name + "-successor",
-		Prefix:        prefix,
-		KeyHash:       hash,
-		PredecessorID: predecessorID,
-	})
+	created, err := st.RotateAPIKey(ctx, predecessorID, store.APIKey{
+		Name:    pred.Name + "-successor",
+		Prefix:  prefix,
+		KeyHash: hash,
+	}, *expiresIn)
 	if err != nil {
 		return err
 	}
@@ -372,8 +373,9 @@ the predecessor key valid.
 		}
 		return err
 	}
+	_ = succ
 
-	if err := st.RevokeAPIKey(ctx, successorID); err != nil {
+	if err := st.AbandonAPIKeyRotation(ctx, successorID); err != nil {
 		return err
 	}
 
