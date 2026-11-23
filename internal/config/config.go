@@ -211,16 +211,9 @@ type Config struct {
 	// HTTPRequestBodyLimit caps the max size accepted for any request body (all endpoints).
 	// Default 1048576 (1 MiB) protects against memory/resource exhaustion. Set higher if needed when trusting clients.
 	HTTPRequestBodyLimit int64 `env:"HTTP_REQUEST_BODY_LIMIT" envDefault:"1048576"`
-	// HTTPResponseBodyLimit caps the maximum serialized response size (in bytes)
-	// for non-streaming HTTP endpoints (#1283). Zero disables the response size cap.
-	HTTPResponseBodyLimit int64 `env:"-"`
-	// HTTPDecompressedBodyLimit caps the maximum decompressed request body size
-	// (in bytes) when Content-Encoding: gzip/deflate is accepted (#1283).
-	// Zero defaults to HTTPRequestBodyLimit.
-	HTTPDecompressedBodyLimit int64 `env:"-"`
-	// HTTPEndpointBodyLimits holds optional per-endpoint request body size
-	// overrides keyed by "METHOD /pattern" or "/pattern" (#1283).
-	HTTPEndpointBodyLimits map[string]int64 `env:"-"`
+	// HTTPResponseBodyLimit caps the max size produced for any non-streaming JSON response body.
+	// Default 16777216 (16 MiB) bounds response memory while leaving streaming endpoints unaffected. 0 disables.
+	HTTPResponseBodyLimit int64 `env:"HTTP_RESPONSE_BODY_LIMIT" envDefault:"16777216"`
 
 	// APIKey, when set, gates the watched-contracts management endpoints
 	// via a constant-time comparison against the X-API-Key request header.
@@ -860,6 +853,9 @@ func (c Config) collectLegacyValidateErrors() []string {
 		if strings.TrimSpace(k) == "" || v <= 0 {
 			errs = append(errs, fmt.Sprintf("HTTP_ENDPOINT_BODY_LIMITS entry %q must have a positive byte limit, got %d", k, v))
 		}
+	}
+	if c.HTTPResponseBodyLimit < 0 {
+		return fmt.Errorf("HTTP_RESPONSE_BODY_LIMIT must be non-negative, got %d", c.HTTPResponseBodyLimit)
 	}
 	if c.APIMaxLimit < 1 {
 		errs = append(errs, fmt.Sprintf("API_MAX_LIMIT must be positive, got %d", c.APIMaxLimit))

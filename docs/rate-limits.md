@@ -258,12 +258,28 @@ saturated.
   sizing a deployment, or move the limit to the gateway.
 - Plan for the idle-eviction quota reset until #1141 is resolved.
 
+## Request and response size limits
+
+In addition to request-rate and quota enforcement, SoroTrail bounds request and
+response payload sizes so oversized inputs, compression bombs, and unbounded
+JSON responses fail predictably with `413 Request Entity Too Large`:
+
+| Bound | Configuration / Header | Default | Scope | Failure |
+| --- | --- | --- | --- | --- |
+| Request wire size | `HTTP_REQUEST_BODY_LIMIT` | `1048576` (1 MiB) | Every request body (`PUT /contracts/{id}/spec` defaults to 2 MiB when the global default is unchanged) | `413` + `reason="request_body"` |
+| Decompressed request size | `HTTP_REQUEST_BODY_LIMIT` (`Content-Encoding: gzip` or `deflate`) | Same as endpoint request limit | Incremental decompression stream | `413` + `reason="request_decompressed"` |
+| Non-streaming JSON response size | `HTTP_RESPONSE_BODY_LIMIT` and optional `X-Max-Response-Bytes` request header | `16777216` (16 MiB) | Non-streaming JSON responses (`writeJSON`); streaming endpoints (`/events.csv`, `/contracts/{id}/export`, `/events?stream=true`, `/events/ws`) flush incrementally and are exempt | `413` + `reason="response_body"` |
+
+Every `413` rejection increments `sorotrail_http_limit_rejections_total{reason="request_body|request_decompressed|response_body"}`.
+
 ## Source of truth
 
 The behavior above is implemented in:
 
 - `internal/api/ratelimit.go` - token bucket, quotas, key derivation and
   response headers;
+- `internal/api/limits.go` - request/response size bounds, decompression bomb
+  protection, and per-endpoint overrides;
 - `internal/api/auth.go` - `TenantLimitResolver`;
 - `cmd/sorotrail/main.go` - wiring of the limiter and tenant resolver;
 - `internal/config/config.go` and `internal/config/validation.go` - startup

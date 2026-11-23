@@ -189,11 +189,9 @@ type Server struct {
 	// Off by default: the API behaves exactly as before.
 	apiKeyAuth bool
 
-	httpRequestBodyLimit      int64            // max accepted request body size, in bytes
-	httpResponseBodyLimit     int64            // max serialized response body size, in bytes (0 = unbounded)
-	maxDecompressedBodySize   int64            // max decompressed request body size, in bytes
-	endpointBodyLimitsMu      sync.RWMutex     // guards endpointRequestBodyLimits
-	endpointRequestBodyLimits map[string]int64 // per-endpoint request body size overrides
+	httpRequestBodyLimit      int64 // max accepted request body size, in bytes
+	httpResponseBodyLimit     int64 // max non-streaming JSON response body size, in bytes
+	endpointRequestBodyLimits map[string]int64
 
 	// specInvalidationPublisher tells the other replicas that a contract's
 	// cached spec must be evicted after a write. Optional: a single-process
@@ -637,8 +635,6 @@ func (s *Server) router() chi.Router {
 	// Applied after CORS so preflight requests (OPTIONS) pass through
 	// without body size restrictions.
 	r.Use(s.bodyLimitMiddleware)
-	r.Use(s.responseLimitMiddleware)
-	r.Use(s.adminActionAuditMiddleware)
 	r.Use(s.recoverer.Middleware)
 	r.Use(middleware.Timeout(30 * time.Second))
 	// authenticate must run before any handler that reads events: it is what
@@ -659,10 +655,10 @@ func (s *Server) router() chi.Router {
 	r.Use(s.usageMiddleware)
 	r.Use(s.queryAttributionMiddleware)
 
-	// prettyMiddleware must be the innermost wrapper (closest to the handler)
-	// so the type assertion in writeJSON sees the prettyWriter interface.
-	// It reads ?pretty=true from the query and wraps the ResponseWriter.
-	r.Use(prettyMiddleware)
+	// responseMiddleware must be the innermost wrapper (closest to the handler)
+	// so the type assertions in writeJSON see the prettyWriter and
+	// responseLimitWriter interfaces.
+	r.Use(s.responseMiddleware)
 
 	// Non-list routes: health, metrics, writes — responses are always
 	// small, so compression is just overhead with no benefit.
@@ -939,31 +935,15 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 	})
 }
 
-// bodyLimitMiddleware wraps the request body with http.MaxBytesReader to
-// enforce the effective request body size limit (including per-endpoint
-// overrides) and bounds decompressed Content-Encoding streams (#1283).
+// bodyLimitMiddleware wraps the request body to enforce a maximum request
+// body size (and decompressed size for gzip/deflate bodies). This prevents
+// resource exhaustion from clients sending excessively large request bodies
+// or compression bombs. A limit <= 0 means no size limit is enforced.
 func (s *Server) bodyLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		limit := s.EffectiveRequestBodyLimit(r)
-		if limit > 0 && r.Body != nil {
-			r.Body = http.MaxBytesReader(w, r.Body, limit)
-		}
-		if r.Body != nil {
-			enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding")))
-			if enc != "" && enc != "identity" {
-				if enc != "gzip" && enc != "deflate" {
-					status := http.StatusBadRequest
-					writeError(w, status, fmt.Errorf("unsupported Content-Encoding %q", enc))
-					return
-				}
-				decompLimit := s.EffectiveDecompressedBodyLimit(r)
-				r.Body = newBoundedDecompressedReader(r.Body, enc, decompLimit, func() {
-					s.recordPayloadRejection(r, "decompressed_body")
-				})
-				r.Header.Del("Content-Encoding")
-				r.Header.Del("Content-Length")
-				r.ContentLength = -1
-			}
+		limit := s.effectiveRequestBodyLimit(r)
+		if limit > 0 || r.Header.Get("Content-Encoding") != "" {
+			wrapBoundedRequestBody(w, r, limit)
 		}
 		next.ServeHTTP(w, r)
 	})

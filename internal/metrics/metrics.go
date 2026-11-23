@@ -251,36 +251,20 @@ var (
 		Help: "Total number of spec cache invalidations received from other replicas.",
 	})
 
-	// DeprecatedHTTPRequestsTotal counts requests to HTTP endpoints marked
-	// deprecated in the OpenAPI specification, labelled by route pattern and
-	// HTTP method so operators can verify traffic has reached zero before
-	// removing an endpoint after its Sunset date.
-	DeprecatedHTTPRequestsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "sorotrail_http_deprecated_requests_total",
-			Help: "Total HTTP requests to deprecated API endpoints, labelled by route and method.",
-		},
-		[]string{"route", "method"},
-	)
+	// HTTPLimitRejectionsTotal counts HTTP requests or responses rejected
+	// for exceeding a configured size limit, labelled by reason
+	// (request_body | request_decompressed | response_body).
+	HTTPLimitRejectionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_http_limit_rejections_total",
+		Help: "Total number of HTTP requests or responses rejected for exceeding a configured size limit, labelled by reason (request_body | request_decompressed | response_body).",
+	}, []string{"reason"})
+)
 
-	// TLSCertificateExpiryDays reports the minimum remaining validity in days
-	// across active mTLS certificates loaded by the process, so operators can
-	// alert before a certificate expires.
-	TLSCertificateExpiryDays = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "sorotrail_tls_certificate_expiry_days",
-		Help: "Minimum remaining validity in days across active mTLS certificates.",
-	})
-
-	// HTTPPayloadSizeRejectionsTotal counts HTTP requests or responses rejected
-	// because their size exceeded the configured request, decompressed-stream,
-	// or response byte limit (#1283).
-	HTTPPayloadSizeRejectionsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "sorotrail_http_payload_size_rejections_total",
-			Help: "Total HTTP requests or responses rejected for exceeding configured size limits, labelled by route and reason (request_body | decompressed_body | response_body).",
-		},
-		[]string{"route", "reason"},
-	)
+// Limit rejection reasons for HTTPLimitRejectionsTotal.
+const (
+	LimitReasonRequestBody         = "request_body"
+	LimitReasonRequestDecompressed = "request_decompressed"
+	LimitReasonResponseBody        = "response_body"
 )
 
 func init() {
@@ -311,9 +295,7 @@ func init() {
 		RPCProviderDemotionsTotal,
 		RPCProviderPromotionsTotal,
 		SpecInvalidationsReceived,
-		DeprecatedHTTPRequestsTotal,
-		TLSCertificateExpiryDays,
-		HTTPPayloadSizeRejectionsTotal,
+		HTTPLimitRejectionsTotal,
 	)
 }
 
