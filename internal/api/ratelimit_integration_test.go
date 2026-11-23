@@ -3,8 +3,10 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/sorotrail/sorotrail/internal/store"
 	"github.com/sorotrail/sorotrail/internal/testdb"
@@ -12,10 +14,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type pgQuotaStore struct {
+	pool *pgxpool.Pool
+}
+
+func (p *pgQuotaStore) IncrementQuota(ctx context.Context, clientKey string, now time.Time, batchSize int) (int64, int64, error) {
+	return p.pool.IncrementQuota(ctx, clientKey, now, batchSize)
+}
+
 func TestMultiInstanceRateLimiterQuotaSharedPostgres(t *testing.T) {
 	st := testdb.Setup(t, store.Migrate)
-	limiter1 := NewRateLimiter(10, 100, false, WithQuotaStore(st), WithDailyQuota(5))
-	limiter2 := NewRateLimiter(10, 100, false, WithQuotaStore(st), WithDailyQuota(5))
+	qStore := &pgQuotaStore{pool: st}
+	limiter1 := NewRateLimiter(10, 100, false, WithQuotaStore(qStore), WithDailyQuota(5))
+	limiter2 := NewRateLimiter(10, 100, false, WithQuotaStore(qStore), WithDailyQuota(5))
 
 	for i := 0; i < 3; i++ {
 		rec := sendFrom(limiter1, "203.0.113.88:1234")
