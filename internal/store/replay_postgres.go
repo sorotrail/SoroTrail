@@ -97,7 +97,7 @@ func (p *Postgres) StartReplayState(ctx context.Context, fromLedger, toLedger in
 // NextReplayBatch returns up to limit events from [fromLedger, toLedger].
 func (p *Postgres) NextReplayBatch(ctx context.Context, fromLedger, toLedger int64, afterID string, limit int) ([]DecodedEvent, error) {
 	rows, err := p.pool.Query(ctx, `
-		SELECT id, contract_id, ledger, network, raw_topic_xdr, raw_value_xdr, topics, value
+		SELECT id, contract_id, ledger, network, raw_topic_xdr, raw_value_xdr, topics, value, decoder_version
 		FROM events
 		WHERE ledger >= $1 AND ledger <= $2 AND id > $3
 		ORDER BY id ASC
@@ -116,7 +116,7 @@ func (p *Postgres) NextReplayBatch(ctx context.Context, fromLedger, toLedger int
 			rawValue  *string
 		)
 		if err := rows.Scan(&d.ID, &d.ContractID, &d.Ledger, &d.Network, &rawTopics,
-			&rawValue, &d.Topics, &d.Value); err != nil {
+			&rawValue, &d.Topics, &d.Value, &d.DecoderVersion); err != nil {
 			return nil, fmt.Errorf("scanning replay batch: %w", err)
 		}
 		d.RawTopicXDR = rawTopics
@@ -141,12 +141,12 @@ func (p *Postgres) CommitReplayBatch(ctx context.Context, b ReplayBatch) error {
 
 	if len(b.Events) > 0 {
 		if _, err := tx.Exec(ctx, `
-			UPDATE events SET topics = data.topics, value = data.value
+			UPDATE events SET topics = data.topics, value = data.value, decoder_version = $4
 			FROM (SELECT unnest($1::text[]) AS id,
 			             unnest($2::jsonb[]) AS topics,
 			             unnest($3::jsonb[]) AS value) AS data
 			WHERE events.id = data.id`,
-			eventIDs(b.Events), eventTopics(b.Events), eventValues(b.Events),
+			eventIDs(b.Events), eventTopics(b.Events), eventValues(b.Events), b.DecoderVersion,
 		); err != nil {
 			return fmt.Errorf("updating replay events: %w", err)
 		}
