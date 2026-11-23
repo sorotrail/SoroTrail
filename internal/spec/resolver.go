@@ -8,7 +8,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
-// ContractSpec is defined in spec.go
+// ContractSpec definitions are in spec.go
 
 // ContractSpec represents a parsed contract spec with events.
 type ContractSpec struct {
@@ -64,8 +64,7 @@ func (r *SpecResolver) ResolveAt(ctx context.Context, contractID string, ledgerS
 		}
 	}
 	if best != nil {
-		return best,
-			nil
+		return best, nil
 	}
 	return nil, nil
 }
