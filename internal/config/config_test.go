@@ -1673,9 +1673,9 @@ func TestLoggableFieldsRedactsCredentials(t *testing.T) {
 
 func TestEffectiveEncryptionKeySpec(t *testing.T) {
 	tests := []struct {
-		name    string
-		cfg     Config
-		want    string
+		name string
+		cfg  Config
+		want string
 	}{
 		{
 			name: "both empty returns empty string",
