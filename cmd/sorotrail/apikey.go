@@ -314,10 +314,12 @@ flags:
 		return fmt.Errorf("hashing successor API key secret: %w", err)
 	}
 
+	var predID int64 = predecessorID
 	created, err := st.RotateAPIKey(ctx, predecessorID, store.APIKey{
-		Name:    pred.Name + "-successor",
-		Prefix:  prefix,
-		KeyHash: hash,
+		Name:          pred.Name + "-successor",
+		Prefix:        prefix,
+		KeyHash:       hash,
+		PredecessorID: &predID,
 	}, *expiresIn)
 	if err != nil {
 		return err
@@ -373,7 +375,9 @@ the predecessor key valid.
 		}
 		return err
 	}
-	_ = succ
+	if succ.PredecessorID == nil {
+		return fmt.Errorf("API key %d is not a rotation successor", successorID)
+	}
 
 	if err := st.AbandonAPIKeyRotation(ctx, successorID); err != nil {
 		return err
