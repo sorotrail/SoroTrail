@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -209,7 +208,6 @@ func (s *Server) handleContractExport(w http.ResponseWriter, r *http.Request) {
 		if p.Tenant.ID != 0 {
 			// Approximation of bytes exported based on response header / content length or written bytes
 			s.usage.Add(p.Tenant.ID, store.UsageDelta{BytesExported: 1024})
-			metrics.TenantQueryDurationMsSum.WithLabelValues(strconv.FormatInt(p.Tenant.ID, 10)).Add(0)
 		}
 	}
 }
@@ -268,7 +266,6 @@ func (s *Server) handleEventsCSV(w http.ResponseWriter, r *http.Request) {
 		p, _ := PrincipalFrom(r.Context())
 		if p.Tenant.ID != 0 {
 			s.usage.Add(p.Tenant.ID, store.UsageDelta{BytesExported: 1024})
-			metrics.TenantQueryDurationMsSum.WithLabelValues(strconv.FormatInt(p.Tenant.ID, 10)).Add(0)
 		}
 	}
 }

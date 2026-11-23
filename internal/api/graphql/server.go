@@ -556,7 +556,7 @@ func RunSubscriptionStream(ctx context.Context, sm *SubscriptionManager, tenantI
 	defer sm.Release(tenantID)
 
 	sub := broker.Subscribe(ctx, store.EventFilter{})
-	defer broker.Unsubscribe(ctx, sub)
+	defer broker.Unsubscribe(sub)
 
 	// Bounded backpressure buffer with gap indicator
 	msgChan := make(chan any, 64)
