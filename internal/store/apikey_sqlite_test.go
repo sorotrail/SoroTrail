@@ -30,15 +30,11 @@ func testSQLiteStore(t *testing.T) *SQLite {
 	return NewSQLite(baseDB)
 }
 
-func testSQLiteAPIKey(name, prefix string) APIKey {
-	return APIKey{Name: name, Prefix: prefix, KeyHash: "bcrypt-hash-placeholder"}
-}
-
 func TestSQLiteAPIKeyCRUD(t *testing.T) {
 	st := testSQLiteStore(t)
 	ctx := context.Background()
 
-	created, err := st.CreateAPIKey(ctx, testSQLiteAPIKey("ops", "aabbccdd0011"))
+	created, err := st.CreateAPIKey(ctx, testAPIKey("ops", "aabbccdd0011"))
 	require.NoError(t, err)
 	assert.Positive(t, created.ID)
 	assert.NotZero(t, created.CreatedAt)
@@ -62,7 +58,7 @@ func TestSQLiteAPIKeyRevocation(t *testing.T) {
 	st := testSQLiteStore(t)
 	ctx := context.Background()
 
-	created, err := st.CreateAPIKey(ctx, testSQLiteAPIKey("tmp", "deadbeef0022"))
+	created, err := st.CreateAPIKey(ctx, testAPIKey("tmp", "deadbeef0022"))
 	require.NoError(t, err)
 
 	require.NoError(t, st.RevokeAPIKey(ctx, created.ID))
