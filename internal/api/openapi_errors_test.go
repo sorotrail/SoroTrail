@@ -40,13 +40,15 @@ type specResponse struct {
 	Description string         `json:"description"`
 	Headers     map[string]any `json:"headers"`
 	Content     map[string]any `json:"content"`
+	ErrorCodes  []string       `json:"x-error-codes"`
 }
 
 type specDocument struct {
 	Security   []map[string][]string               `json:"security"`
 	Paths      map[string]map[string]specOperation `json:"paths"`
 	Components struct {
-		Responses       map[string]specResponse `json:"responses"`
+		Schemas         map[string]map[string]any `json:"schemas"`
+		Responses       map[string]specResponse   `json:"responses"`
 		SecuritySchemes map[string]struct {
 			Type        string `json:"type"`
 			Scheme      string `json:"scheme"`
@@ -545,11 +547,68 @@ func methodKey(method string) string {
 func assertErrorEnvelope(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
 	var env struct {
-		Error string `json:"error"`
+		Error string    `json:"error"`
+		Code  ErrorCode `json:"code"`
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env),
 		"error responses must be JSON: %s", rec.Body.String())
 	assert.NotEmpty(t, env.Error, "the error envelope must carry a message")
+	assert.NotEmpty(t, env.Code, "the error envelope must carry a stable machine-readable code")
+
+	matched := false
+	for _, spec := range allErrorCodeSpecs {
+		if spec.Code == env.Code {
+			matched = true
+			assert.Equal(t, rec.Code, spec.Status, "code %s must match HTTP status", env.Code)
+			break
+		}
+	}
+	assert.Truef(t, matched, "response returned unknown error code %q", env.Code)
+}
+
+// TestOpenAPIErrorCodesMatchTaxonomy checks that the OpenAPI ErrorResponse
+// schema enum and reusable error responses stay in lockstep with the Go
+// ErrorCode taxonomy in errors.go.
+func TestOpenAPIErrorCodesMatchTaxonomy(t *testing.T) {
+	doc := loadSpec(t)
+
+	errSchema, ok := doc.Components.Schemas["ErrorResponse"]
+	require.True(t, ok, "components.schemas.ErrorResponse must exist")
+	props, ok := errSchema["properties"].(map[string]any)
+	require.True(t, ok, "ErrorResponse must declare properties")
+	codeProp, ok := props["code"].(map[string]any)
+	require.True(t, ok, "ErrorResponse must declare a code property")
+	rawEnum, ok := codeProp["enum"].([]any)
+	require.True(t, ok, "ErrorResponse.properties.code must declare an enum")
+
+	var gotEnum []ErrorCode
+	for _, v := range rawEnum {
+		s, isStr := v.(string)
+		require.True(t, isStr)
+		gotEnum = append(gotEnum, ErrorCode(s))
+	}
+
+	wantEnum := make([]ErrorCode, len(allErrorCodeSpecs))
+	for i, s := range allErrorCodeSpecs {
+		wantEnum[i] = s.Code
+	}
+	assert.Equal(t, wantEnum, gotEnum, "ErrorResponse.properties.code.enum must match allErrorCodeSpecs")
+
+	// Every JSON error response in components/responses must list valid x-error-codes,
+	// and the union across components/responses must cover all 16 codes.
+	covered := make(map[ErrorCode]bool, len(allErrorCodeSpecs))
+	for name, resp := range doc.Components.Responses {
+		if _, isJSON := resp.Content["application/json"]; !isJSON {
+			continue
+		}
+		require.NotEmptyf(t, resp.ErrorCodes, "components.responses.%s must declare x-error-codes", name)
+		for _, c := range resp.ErrorCodes {
+			covered[ErrorCode(c)] = true
+		}
+	}
+	for _, spec := range allErrorCodeSpecs {
+		assert.Truef(t, covered[spec.Code], "ErrorCode %s is not listed in any components.responses.*.x-error-codes", spec.Code)
+	}
 }
 
 // assertDocumentsErrorEnvelope checks the spec points the same body at the

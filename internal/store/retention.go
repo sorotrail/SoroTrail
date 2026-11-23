@@ -12,6 +12,10 @@ const DefaultRetentionPollInterval = time.Hour
 type RetentionOptions struct {
 	Age          time.Duration
 	PollInterval time.Duration
+	// Policies, when set, applies per-tenant retention (#1249) with Age as
+	// the instance default, so this job never deletes a shared contract's
+	// events before the longest horizon of the tenants entitled to it.
+	Policies RetentionPolicyStore
 }
 
 // RetentionStore is the persistence surface required by the retention job.
@@ -56,13 +60,29 @@ func (p *RetentionPruner) Run(ctx context.Context) error {
 }
 
 func (p *RetentionPruner) prune(ctx context.Context) {
-	cutoff := time.Now().Add(-p.opts.Age)
-	deleted, err := p.store.PruneEventsBefore(ctx, cutoff)
+	plan, err := LoadRetentionPlan(ctx, p.opts.Policies, p.opts.Age)
 	if err != nil {
 		p.log.Error("event retention pruning failed", "error", err)
 		return
 	}
-	if deleted > 0 {
-		p.log.Info("event retention pruning complete", "deleted", deleted, "cutoff", cutoff)
+	for _, g := range plan.Groups {
+		// This job is age-only: a group with no age bound keeps its events.
+		if g.MaxAge <= 0 {
+			continue
+		}
+		cutoff := time.Now().Add(-g.MaxAge)
+		var deleted int64
+		if g.Contracts.All() {
+			deleted, err = p.store.PruneEventsBefore(ctx, cutoff)
+		} else {
+			deleted, err = p.opts.Policies.PruneEventsBeforeIn(ctx, cutoff, g.Contracts)
+		}
+		if err != nil {
+			p.log.Error("event retention pruning failed", "error", err, "policy", g.Policy)
+			return
+		}
+		if deleted > 0 {
+			p.log.Info("event retention pruning complete", "deleted", deleted, "cutoff", cutoff, "policy", g.Policy)
+		}
 	}
 }

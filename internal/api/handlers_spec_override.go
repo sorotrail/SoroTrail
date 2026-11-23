@@ -70,6 +70,9 @@ func (s *Server) handlePutContractSpecOverride(w http.ResponseWriter, r *http.Re
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, errBodyTooLarge) {
+			if !isDecompressedLimitError(err) {
+				s.recordPayloadRejection(r, "request_body")
+			}
 			status = http.StatusRequestEntityTooLarge
 		}
 		writeError(w, status, err)

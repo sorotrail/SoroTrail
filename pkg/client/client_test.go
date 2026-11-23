@@ -92,10 +92,37 @@ func TestClientMapsHTTPFailuresToAPIError(t *testing.T) {
 		statusCode int
 		body       string
 		wantMsg    string
+		wantCode   client.ErrorCode
+		wantField  string
 	}{
-		{name: "client error", statusCode: http.StatusBadRequest, body: `{"error":"invalid limit"}`, wantMsg: "invalid limit"},
-		{name: "server error", statusCode: http.StatusInternalServerError, body: `{"error":"database unavailable"}`, wantMsg: "database unavailable"},
-		{name: "error without envelope", statusCode: http.StatusBadGateway, body: "upstream unavailable", wantMsg: "sorotrail: HTTP 502"},
+		{
+			name:       "client error with code and field",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error":"limit must be an integer in [1,1000]","code":"LIMIT_EXCEEDED","field":"limit"}`,
+			wantMsg:    "limit must be an integer in [1,1000]",
+			wantCode:   client.CodeLimitExceeded,
+			wantField:  "limit",
+		},
+		{
+			name:       "not found error with code",
+			statusCode: http.StatusNotFound,
+			body:       `{"error":"event \"0001\" not found","code":"NOT_FOUND"}`,
+			wantMsg:    `event "0001" not found`,
+			wantCode:   client.CodeNotFound,
+		},
+		{
+			name:       "server error",
+			statusCode: http.StatusInternalServerError,
+			body:       `{"error":"database unavailable","code":"INTERNAL_ERROR"}`,
+			wantMsg:    "database unavailable",
+			wantCode:   client.CodeInternalError,
+		},
+		{
+			name:       "error without envelope",
+			statusCode: http.StatusBadGateway,
+			body:       "upstream unavailable",
+			wantMsg:    "sorotrail: HTTP 502",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -109,6 +136,8 @@ func TestClientMapsHTTPFailuresToAPIError(t *testing.T) {
 			var apiErr *client.APIError
 			require.ErrorAs(t, err, &apiErr)
 			assert.Equal(t, tt.statusCode, apiErr.StatusCode)
+			assert.Equal(t, tt.wantCode, apiErr.Code)
+			assert.Equal(t, tt.wantField, apiErr.Field)
 			if tt.wantMsg == "sorotrail: HTTP 502" {
 				assert.Equal(t, tt.wantMsg, apiErr.Error())
 			} else {
@@ -235,4 +264,80 @@ func TestGetEventEscapesPathParameter(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "event/1", event.ID)
 	assert.Equal(t, "/events/event%2F1", escapedPath)
+}
+
+func TestClientSendsIdempotencyKeyFromContextAndClientClone(t *testing.T) {
+	var gotKeys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKeys = append(gotKeys, r.Header.Get(client.IdempotencyKeyHeader))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	base := client.New(server.URL)
+	ctx := client.WithIdempotencyKey(context.Background(), "ctx-key-123")
+	require.Equal(t, "ctx-key-123", client.IdempotencyKeyFromContext(ctx))
+	require.NoError(t, base.DeleteSubscription(ctx, 42))
+
+	scoped := base.WithIdempotencyKey("client-key-456")
+	require.NoError(t, scoped.DeleteSubscription(context.Background(), 42))
+	// Context key overrides client-scoped key.
+	require.NoError(t, scoped.DeleteSubscription(client.WithIdempotencyKey(context.Background(), "override-key-789"), 42))
+
+	assert.Equal(t, []string{"ctx-key-123", "client-key-456", "override-key-789"}, gotKeys)
+}
+
+func TestClientDetectsStaleCursorErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		wantStale  bool
+	}{
+		{
+			name:       "INVALID_CURSOR code",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error":"invalid cursor \"v99.pg.abc.1234\"","code":"INVALID_CURSOR","field":"cursor"}`,
+			wantStale:  true,
+		},
+		{
+			name:       "legacy cursor message without code",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error":"invalid cursor \"v1.sq.abc\""}`,
+			wantStale:  true,
+		},
+		{
+			name:       "non-cursor bad request",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error":"limit must be an integer in [1,1000]","code":"LIMIT_EXCEEDED","field":"limit"}`,
+			wantStale:  false,
+		},
+		{
+			name:       "server error",
+			statusCode: http.StatusInternalServerError,
+			body:       `{"error":"database unavailable","code":"INTERNAL_ERROR"}`,
+			wantStale:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			_, err := client.New(server.URL).ListEvents(context.Background(), client.ListEventsParams{
+				Cursor: "v99.pg.abc.1234",
+			})
+			require.Error(t, err)
+			assert.Equal(t, tt.wantStale, client.IsStaleCursor(err))
+			assert.Equal(t, tt.wantStale, errors.Is(err, client.ErrStaleCursor))
+
+			var apiErr *client.APIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, tt.wantStale, apiErr.IsStaleCursor())
+		})
+	}
 }

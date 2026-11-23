@@ -35,6 +35,13 @@ var (
 		Help: "Total number of ingestion passes that failed with an error.",
 	})
 
+	// DeadLettersTotal counts poison events quarantined to the dead-letter
+	// sink during ingestion, labelled by reason (decode | store) (#1240).
+	DeadLettersTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_dead_letters_total",
+		Help: "Total number of poison events recorded in the dead-letter table, labelled by reason (decode | store).",
+	}, []string{"reason"})
+
 	// RPCCallLatency records the wall-clock duration of a single
 	// JSON-RPC call (HTTP round trip + body read + unmarshal), labelled
 	// by method (a fixed enum: getEvents, getLatestLedger, getHealth,
@@ -93,6 +100,22 @@ var (
 		Help: "Per-provider failover health state as a 0/1 gauge per state (active | degraded | down).",
 	}, []string{"provider", "state"})
 
+	// RPCProviderDemotionsTotal counts every time a failover provider is
+	// demoted, labelled by provider hostname and the reason for demotion
+	// (consecutive_errors | behind_cursor | retention_gap | network_mismatch | divergence).
+	RPCProviderDemotionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_rpc_provider_demotions_total",
+		Help: "Total number of RPC provider demotions, labelled by provider and reason.",
+	}, []string{"provider", "reason"})
+
+	// RPCProviderPromotionsTotal counts every time a demoted failover
+	// provider passes probation and is promoted back to active, labelled by
+	// provider hostname.
+	RPCProviderPromotionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_rpc_provider_promotions_total",
+		Help: "Total number of RPC provider promotions back to active, labelled by provider.",
+	}, []string{"provider"})
+
 	// DBWriteLatency records the wall-clock duration of a database write
 	// operation (batch upsert, replace-in-range, etc.).
 	DBWriteLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -120,6 +143,50 @@ var (
 		Name: "sorotrail_db_operations_total",
 		Help: "Total store operations, labelled by operation and outcome (success | error).",
 	}, []string{"operation", "outcome"})
+
+	// DBAttributedCostSeconds records cumulative database wall-clock time
+	// attributed to the originating HTTP route pattern or background job and
+	// opaque tenant bucket (#1278).
+	DBAttributedCostSeconds = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_db_attributed_cost_seconds_total",
+		Help: "Cumulative database query time in seconds attributed by originator, operation, and tenant.",
+	}, []string{"originator", "operation", "tenant"})
+
+	// DBAttributedQueriesTotal counts database operations attributed to their
+	// originating route or background job and opaque tenant bucket (#1278).
+	DBAttributedQueriesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_db_attributed_queries_total",
+		Help: "Total database queries attributed by originator, operation, tenant, and outcome.",
+	}, []string{"originator", "operation", "tenant", "outcome"})
+
+	// CostBudgetConsumedTotal counts cost units charged against per-tenant
+	// cost budgets (#1242), by opaque tenant bucket.
+	CostBudgetConsumedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_cost_budget_consumed_total",
+		Help: "Total query cost units charged against per-tenant cost budgets, by tenant.",
+	}, []string{"tenant"})
+
+	// CostEstimatedTotal counts the cost units estimated before execution for
+	// requests charged against a cost budget. Against
+	// CostBudgetConsumedTotal (actual units) it shows estimator drift (#1242).
+	CostEstimatedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "sorotrail_cost_estimated_total",
+		Help: "Total query cost units estimated before execution for requests charged against a cost budget.",
+	})
+
+	// DBCircuitBreakerState exposes the database circuit breaker's current
+	// state as a 0/1 gauge per state (closed | open | half-open) (#1282).
+	DBCircuitBreakerState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sorotrail_db_circuit_breaker_state",
+		Help: "Database circuit breaker state as a 0/1 gauge per state (closed | open | half-open).",
+	}, []string{"state"})
+
+	// DBDegradedRejectionsTotal counts requests that failed fast because the
+	// database circuit breaker was open (#1282).
+	DBDegradedRejectionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "sorotrail_db_degraded_rejections_total",
+		Help: "Total store calls rejected fast because the database circuit breaker is open.",
+	})
 
 	// IngestionLag is the number of ledgers the indexer is behind the
 	// Stellar RPC chain head. Updated after every ingestion pass that
@@ -204,10 +271,17 @@ func init() {
 	prometheus.MustRegister(
 		EventsIngested,
 		IngestErrors,
+		DeadLettersTotal,
 		RPCCallLatency,
 		DBWriteLatency,
 		DBQueryDuration,
 		DBOperationsTotal,
+		DBAttributedCostSeconds,
+		DBAttributedQueriesTotal,
+		CostBudgetConsumedTotal,
+		CostEstimatedTotal,
+		DBCircuitBreakerState,
+		DBDegradedRejectionsTotal,
 		IngestionLag,
 		EventBatchWrites,
 		EventBatchSize,
@@ -218,6 +292,8 @@ func init() {
 		RPCFailoversTotal,
 		RPCCircuitBreakerState,
 		RPCProviderState,
+		RPCProviderDemotionsTotal,
+		RPCProviderPromotionsTotal,
 		SpecInvalidationsReceived,
 		HTTPLimitRejectionsTotal,
 	)

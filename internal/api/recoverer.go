@@ -36,6 +36,14 @@ func (r *Recoverer) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		defer func() {
 			if rvr := recover(); rvr != nil {
+				// http.ErrAbortHandler is not a fault: a streaming handler
+				// raises it to cut the connection when its response cannot be
+				// completed (an export that stopped early), and net/http
+				// swallows it. Recovering it here would turn a deliberately
+				// broken stream into a clean one with a 500 body glued on.
+				if rvr == http.ErrAbortHandler {
+					panic(rvr)
+				}
 				r.count.Add(1)
 				// The request-scoped logger carries the request_id field,
 				// so a recovered panic is correlatable with the rest of

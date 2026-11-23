@@ -37,6 +37,17 @@ func TestRetentionEnabled(t *testing.T) {
 	}
 }
 
+// TestDefaultEventRetention pins the horizon a tenant without its own
+// retention policy inherits (#1249): whichever retention job deletes first.
+func TestDefaultEventRetention(t *testing.T) {
+	day := 24 * time.Hour
+	assert.Equal(t, time.Duration(0), Config{}.DefaultEventRetention(), "no age job: no age bound")
+	assert.Equal(t, 30*day, Config{RetentionMaxAge: 30 * day}.DefaultEventRetention())
+	assert.Equal(t, 7*day, Config{RetentionAge: 7 * day}.DefaultEventRetention())
+	assert.Equal(t, 7*day, Config{RetentionMaxAge: 30 * day, RetentionAge: 7 * day}.DefaultEventRetention())
+	assert.Equal(t, time.Duration(0), Config{RetentionAge: -day}.DefaultEventRetention())
+}
+
 // TestArchiveEnabled tables the flag that decides whether an archiver is
 // constructed at all. The bucket is the switch: without it every other
 // archive_* value is inert and the binary behaves exactly like the

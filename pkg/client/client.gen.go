@@ -267,8 +267,12 @@ type EnrichedEvent map[string]any
 
 // ErrorResponse Standard error envelope
 type ErrorResponse struct {
+	// Code Stable machine-readable error code
+	Code string `json:"code"`
 	// Error Human-readable error message
 	Error string `json:"error"`
+	// Field Request parameter or JSON field that caused a validation error
+	Field string `json:"field,omitempty"`
 }
 
 // Event A Stellar/Soroban contract event
@@ -423,7 +427,9 @@ type Tenant struct {
 	Name                string          `json:"name"`
 	RateLimitBurst      json.RawMessage `json:"rate_limit_burst,omitempty"`
 	RateLimitRps        json.RawMessage `json:"rate_limit_rps,omitempty"`
-	Wildcard            bool            `json:"wildcard"`
+	// RetentionMaxAgeSeconds The tenant's own event-retention horizon in seconds. Absent or null means it inherits the instance default.
+	RetentionMaxAgeSeconds json.RawMessage `json:"retention_max_age_seconds,omitempty"`
+	Wildcard               bool            `json:"wildcard"`
 }
 
 // TenantAPIKey Tenant API key metadata; secret is returned only on creation.
@@ -464,6 +470,8 @@ type TenantCreateRequest struct {
 	RateLimitBurst int64 `json:"rate_limit_burst,omitempty"`
 	// RateLimitRps Optional requests-per-second override. Set together with rate_limit_burst; omit both to inherit the instance limit.
 	RateLimitRps float64 `json:"rate_limit_rps,omitempty"`
+	// RetentionMaxAgeSeconds The tenant's event-retention horizon in seconds. Omit or send 0 to inherit the instance default (RETENTION_MAX_AGE). A shared contract's events are kept for the longest horizon among the tenants entitled to it, and each tenant reads only within its own horizon. See docs/multi-tenancy.md#retention.
+	RetentionMaxAgeSeconds int64 `json:"retention_max_age_seconds,omitempty"`
 	// Wildcard When true, the tenant can read events for every contract.
 	Wildcard bool `json:"wildcard,omitempty"`
 }
@@ -477,6 +485,8 @@ type TenantList struct {
 type TenantUpdateRequest struct {
 	// Admin When true, the tenant may use the administrative API.
 	Admin bool `json:"admin,omitempty"`
+	// ConfirmRetentionShortening Must be true when the update shortens the tenant's effective retention horizon. Shortening is irreversible once the next prune sweep runs, so without it the request is refused with 409.
+	ConfirmRetentionShortening bool `json:"confirm_retention_shortening,omitempty"`
 	// Enabled Whether the tenant is enabled for requests.
 	Enabled bool `json:"enabled,omitempty"`
 	// MaxWatchedContracts Maximum number of contracts this tenant may watch.
@@ -487,6 +497,8 @@ type TenantUpdateRequest struct {
 	RateLimitBurst int64 `json:"rate_limit_burst,omitempty"`
 	// RateLimitRps Requests-per-second override. Set together with rate_limit_burst; omit both to inherit the instance limit.
 	RateLimitRps float64 `json:"rate_limit_rps,omitempty"`
+	// RetentionMaxAgeSeconds Replacement event-retention horizon in seconds; 0 clears the override so the tenant inherits the instance default again.
+	RetentionMaxAgeSeconds int64 `json:"retention_max_age_seconds,omitempty"`
 	// Wildcard When true, the tenant can read events for every contract.
 	Wildcard bool `json:"wildcard,omitempty"`
 }
@@ -515,7 +527,19 @@ type UpdateSubscriptionRequest struct {
 
 // UsagePage API schema used by the SoroTrail client.
 type UsagePage struct {
-	Usage []TenantUsage `json:"usage"`
+	// InstanceWatchListFull Tenant view only, and only when the instance has a watch-list cap. True when the instance-wide watch list is full, so adding a contract that no tenant already watches would be refused. The instance total is deliberately not given: it is aggregate usage across every tenant.
+	InstanceWatchListFull bool `json:"instance_watch_list_full,omitempty"`
+	// InstanceWatchedContracts Admin view only (`GET /admin/tenants/{id}/usage`): distinct contracts watched across the whole instance against `MULTI_TENANT_MAX_WATCHED`.
+	InstanceWatchedContracts any           `json:"instance_watched_contracts,omitempty"`
+	Usage                    []TenantUsage `json:"usage"`
+	// WatchedContracts The tenant's own watch list: contracts held against its `max_watched_contracts`. `POST /tenant/watch` returns 429 once `held` reaches `limit`; a null `limit` means the tenant has no cap of its own (the instance-wide cap still applies).
+	WatchedContracts any `json:"watched_contracts"`
+}
+
+// WatchHeadroom How much of a watch-list cap is in use. `limit` is null when there is no cap.
+type WatchHeadroom struct {
+	Held  int64  `json:"held"`
+	Limit *int64 `json:"limit"`
 }
 
 // WatchedContract One contract in the global ingestion watch list.
@@ -1058,6 +1082,7 @@ func (c *Client) ContractExport(ctx context.Context, id string, params ContractE
 
 // ContractExportParams are the query parameters for ContractExport.
 type ContractExportParams struct {
+	Terminator string
 	FromLedger int64
 	ToLedger   int64
 	Format     string
@@ -1067,6 +1092,9 @@ type ContractExportParams struct {
 // unset field is omitted from the URL rather than sent as empty.
 func (p ContractExportParams) values() url.Values {
 	v := url.Values{}
+	if p.Terminator != "" {
+		v.Set("terminator", p.Terminator)
+	}
 	if p.FromLedger != 0 {
 		v.Set("from_ledger", strconv.FormatInt(p.FromLedger, 10))
 	}
@@ -1366,6 +1394,7 @@ func (c *Client) EventsCSV(ctx context.Context, params EventsCSVParams) ([]byte,
 
 // EventsCSVParams are the query parameters for EventsCSV.
 type EventsCSVParams struct {
+	Terminator       string
 	ContractID       string
 	Type             string
 	Topic            string
@@ -1393,6 +1422,9 @@ type EventsCSVParams struct {
 // unset field is omitted from the URL rather than sent as empty.
 func (p EventsCSVParams) values() url.Values {
 	v := url.Values{}
+	if p.Terminator != "" {
+		v.Set("terminator", p.Terminator)
+	}
 	if p.ContractID != "" {
 		v.Set("contract_id", p.ContractID)
 	}

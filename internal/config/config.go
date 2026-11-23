@@ -88,6 +88,16 @@ type Config struct {
 	DBMinConns        int32         `env:"DB_MIN_CONNS" envDefault:"0"`
 	DBMaxConnLifetime time.Duration `env:"DB_MAX_CONN_LIFETIME" envDefault:"0"`
 	DBMaxConnIdleTime time.Duration `env:"DB_MAX_CONN_IDLE_TIME" envDefault:"0"`
+	// Per-subsystem connection pool budget overrides (#1231). Zero applies the
+	// default sizing formula in ResolvePoolSizing() (25% reserved floor for
+	// ingester, bounded caps for api_read, graphql, subscription, maintenance).
+	DBIngesterReservedConns int32         `env:"-"`
+	DBAPIReadMaxConns       int32         `env:"-"`
+	DBGraphQLMaxConns       int32         `env:"-"`
+	DBSubscriptionMaxConns  int32         `env:"-"`
+	DBMaintenanceMaxConns   int32         `env:"-"`
+	DBPoolAcquireTimeout    time.Duration `env:"-"`
+	DBPoolPressureThreshold float64       `env:"-"`
 	// HTTPAddr is the address the HTTP server listens on (host:port), e.g.
 	// ":8080" or "0.0.0.0:9090". See HTTP_ADDR in .env.example. It must be a
 	// valid host:port pair.
@@ -215,6 +225,10 @@ type Config struct {
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
+	// Per-tenant query cost budget (#1242). Per-instance only: each replica
+	// keeps its own buckets. Off when CostBudgetCapacity is 0.
+	CostBudgetCapacity     float64 `env:"COST_BUDGET_CAPACITY"`
+	CostBudgetRefillPerSec float64 `env:"COST_BUDGET_REFILL_PER_SEC"`
 	// APIKeyAuthEnabled turns on optional API key authentication: when
 	// true, write, streaming, and key-management endpoints reject
 	// requests that do not present a valid API key (see README "API key
@@ -370,6 +384,32 @@ type Config struct {
 	// request logger (#29), so it is the default; an operator can extend
 	// the list or empty it to suppress the header entirely.
 	CORSExposedHeaders []string `env:"CORS_EXPOSED_HEADERS" envDefault:"X-Request-ID,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset"`
+
+	// Mutual TLS (mTLS) between components (#1267). All mTLS fields default
+	// to disabled/empty so existing HTTP and local-dev deployments run
+	// unchanged without certificates.
+	MTLSEnabled                bool     `env:"MTLS_ENABLED" envDefault:"false"`
+	TLSCertFile                string   `env:"TLS_CERT_FILE"`
+	TLSKeyFile                 string   `env:"TLS_KEY_FILE"`
+	TLSClientCAFile            string   `env:"TLS_CLIENT_CA_FILE"`
+	TLSClientAllowedIdentities []string `env:"TLS_CLIENT_ALLOWED_IDENTITIES"`
+	TLSClientTenantMap         string   `env:"TLS_CLIENT_TENANT_MAP"`
+	DBTLSCertFile              string   `env:"DB_TLS_CERT_FILE"`
+	DBTLSKeyFile               string   `env:"DB_TLS_KEY_FILE"`
+	DBTLSCAFile                string   `env:"DB_TLS_CA_FILE"`
+	ArchiveTLSCertFile         string   `env:"ARCHIVE_TLS_CERT_FILE"`
+	ArchiveTLSKeyFile          string   `env:"ARCHIVE_TLS_KEY_FILE"`
+	ArchiveTLSCAFile           string   `env:"ARCHIVE_TLS_CA_FILE"`
+
+	// Field-level encryption at rest for sensitive database columns (#1225).
+	// ENCRYPTION_KEYS accepts a comma-separated keyring of "<version>:<key>"
+	// entries (first entry is the active write key; remaining entries are
+	// retained for decrypting older rows during zero-downtime key rotation).
+	// ENCRYPTION_KEY accepts a single 32-byte AES-256 key (64-char hex or
+	// base64) and defaults to version "v1". Both support *_FILE indirection
+	// via resolveFileEnv().
+	EncryptionKey  string `env:"-"`
+	EncryptionKeys string `env:"-"`
 }
 
 // Load reads configuration from the environment and validates it.
@@ -393,22 +433,19 @@ func Load() (Config, error) {
 	if _, explicitlySet := os.LookupEnv("RPC_URL"); !explicitlySet && len(cfg.RPCURLS) == 0 {
 		cfg.RPCURL = networks[cfg.Network].RPCURL
 	}
-	if err := cfg.ValidateAll(); err != nil {
+	if err := cfg.loadBodySizeEnvOverrides(); err != nil {
 		return Config{}, err
 	}
-	// Validate() holds the per-field rules that predate ValidateAll
-	// (API_QUERY_TIMEOUT, LOG_FORMAT, the HTTP_* timeouts, audit and
-	// retention bounds). It is called here rather than from ValidateAll
-	// because it assumes envDefaults have been applied, which is only true
-	// on this path; ValidateAll also runs against hand-built Configs in
-	// tests. Without this call those rules were silently unenforced.
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.loadPoolBudgetEnvOverrides(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.ValidateAll(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
 
-// IsSQLite reports whether the database URL points to a SQLite database.
+// resolveFileEnv reads secrets from files indicated by *_FILE environment variables.
 func resolveFileEnv() error {
 	for _, kv := range os.Environ() {
 		parts := strings.SplitN(kv, "=", 2)
@@ -434,8 +471,211 @@ func resolveFileEnv() error {
 	return nil
 }
 
+// IsSQLite reports whether the database URL points to a SQLite database.
 func IsSQLite(databaseURL string) bool {
 	return strings.HasPrefix(databaseURL, "sqlite:")
+}
+
+// ParseEndpointBodyLimits parses a comma-separated list of "ROUTE=BYTES"
+// overrides (e.g. "POST /watched-contracts=4194304,/contracts/{id}/spec=2097152").
+func ParseEndpointBodyLimits(raw string) (map[string]int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	out := make(map[string]int64)
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		route, valStr, ok := strings.Cut(entry, "=")
+		route = strings.TrimSpace(route)
+		valStr = strings.TrimSpace(valStr)
+		if !ok || route == "" || valStr == "" {
+			return nil, fmt.Errorf("HTTP_ENDPOINT_BODY_LIMITS: invalid entry %q (want ROUTE=BYTES)", entry)
+		}
+		n, err := strconv.ParseInt(valStr, 10, 64)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("HTTP_ENDPOINT_BODY_LIMITS: invalid byte limit for %q: %q", route, valStr)
+		}
+		out[route] = n
+	}
+	return out, nil
+}
+
+func (c *Config) loadBodySizeEnvOverrides() error {
+	if raw, ok := os.LookupEnv("HTTP_RESPONSE_BODY_LIMIT"); ok && strings.TrimSpace(raw) != "" {
+		n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		if err != nil {
+			return fmt.Errorf("parsing HTTP_RESPONSE_BODY_LIMIT: %w", err)
+		}
+		c.HTTPResponseBodyLimit = n
+	}
+	if raw, ok := os.LookupEnv("HTTP_DECOMPRESSED_BODY_LIMIT"); ok && strings.TrimSpace(raw) != "" {
+		n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		if err != nil {
+			return fmt.Errorf("parsing HTTP_DECOMPRESSED_BODY_LIMIT: %w", err)
+		}
+		c.HTTPDecompressedBodyLimit = n
+	}
+	if raw, ok := os.LookupEnv("HTTP_ENDPOINT_BODY_LIMITS"); ok && strings.TrimSpace(raw) != "" {
+		limits, err := ParseEndpointBodyLimits(raw)
+		if err != nil {
+			return err
+		}
+		c.HTTPEndpointBodyLimits = limits
+	}
+	if raw, ok := os.LookupEnv("ENCRYPTION_KEY"); ok && strings.TrimSpace(raw) != "" {
+		c.EncryptionKey = strings.TrimSpace(raw)
+	}
+	if raw, ok := os.LookupEnv("ENCRYPTION_KEYS"); ok && strings.TrimSpace(raw) != "" {
+		c.EncryptionKeys = strings.TrimSpace(raw)
+	}
+	return nil
+}
+
+// DefaultDBMaxConns is the default total connection pool size used by the
+// pool budget sizing formula when DB_MAX_CONNS is 0 (#1231).
+const DefaultDBMaxConns int32 = 20
+
+// PoolSizing holds the resolved connection pool budget parameters derived from
+// Config (#1231).
+//
+// Sizing formula (for total pool N = max(DB_MAX_CONNS, DefaultDBMaxConns)):
+//   - IngesterReserved = max(2, floor(0.25 * N))  (reserved floor, never touchable by read/maintenance traffic)
+//   - SharedMax        = N - IngesterReserved     (shared ceiling across non-ingester subsystems)
+//   - APIReadMax       = min(SharedMax, max(1, floor(0.50 * N)))
+//   - GraphQLMax       = min(SharedMax, max(1, floor(0.30 * N)))
+//   - SubscriptionMax  = min(SharedMax, max(1, floor(0.20 * N)))
+//   - MaintenanceMax   = min(SharedMax, max(1, floor(0.15 * N)))
+type PoolSizing struct {
+	TotalConns        int32
+	MinConns          int32
+	IngesterReserved  int32
+	SharedMax         int32
+	APIReadMax        int32
+	GraphQLMax        int32
+	SubscriptionMax   int32
+	MaintenanceMax    int32
+	AcquireTimeout    time.Duration
+	PressureThreshold float64
+}
+
+// ResolvePoolSizing computes the effective pool sizing and per-subsystem caps
+// using the documented sizing formula and any explicit operator overrides.
+func (c Config) ResolvePoolSizing() PoolSizing {
+	total := c.DBMaxConns
+	if total <= 0 {
+		total = DefaultDBMaxConns
+	}
+	if total < 4 {
+		total = 4
+	}
+	minConns := c.DBMinConns
+	if minConns <= 0 {
+		minConns = max(int32(2), total/4)
+	}
+	if minConns > total {
+		minConns = total
+	}
+
+	ingesterReserved := c.DBIngesterReservedConns
+	if ingesterReserved <= 0 {
+		ingesterReserved = max(int32(2), (total*25)/100)
+	}
+	if ingesterReserved >= total {
+		ingesterReserved = total - 1
+	}
+	sharedMax := total - ingesterReserved
+
+	clampShared := func(explicit, def int32) int32 {
+		v := explicit
+		if v <= 0 {
+			v = max(int32(1), def)
+		}
+		if v > sharedMax {
+			v = sharedMax
+		}
+		return v
+	}
+
+	acquireTimeout := c.DBPoolAcquireTimeout
+	if acquireTimeout <= 0 {
+		acquireTimeout = 50 * time.Millisecond
+	}
+	pressure := c.DBPoolPressureThreshold
+	if pressure <= 0 {
+		pressure = 0.75
+	}
+
+	return PoolSizing{
+		TotalConns:        total,
+		MinConns:          minConns,
+		IngesterReserved:  ingesterReserved,
+		SharedMax:         sharedMax,
+		APIReadMax:        clampShared(c.DBAPIReadMaxConns, (total*50)/100),
+		GraphQLMax:        clampShared(c.DBGraphQLMaxConns, (total*30)/100),
+		SubscriptionMax:   clampShared(c.DBSubscriptionMaxConns, (total*20)/100),
+		MaintenanceMax:    clampShared(c.DBMaintenanceMaxConns, (total*15)/100),
+		AcquireTimeout:    acquireTimeout,
+		PressureThreshold: pressure,
+	}
+}
+
+func (c *Config) loadPoolBudgetEnvOverrides() error {
+	parseInt32Env := func(key string, dst *int32) error {
+		raw, ok := os.LookupEnv(key)
+		if !ok || strings.TrimSpace(raw) == "" {
+			return nil
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 32)
+		if err != nil {
+			return fmt.Errorf("parsing %s: %w", key, err)
+		}
+		*dst = int32(n)
+		return nil
+	}
+	if err := parseInt32Env("DB_INGESTER_RESERVED_CONNS", &c.DBIngesterReservedConns); err != nil {
+		return err
+	}
+	if err := parseInt32Env("DB_API_READ_MAX_CONNS", &c.DBAPIReadMaxConns); err != nil {
+		return err
+	}
+	if err := parseInt32Env("DB_GRAPHQL_MAX_CONNS", &c.DBGraphQLMaxConns); err != nil {
+		return err
+	}
+	if err := parseInt32Env("DB_SUBSCRIPTION_MAX_CONNS", &c.DBSubscriptionMaxConns); err != nil {
+		return err
+	}
+	if err := parseInt32Env("DB_MAINTENANCE_MAX_CONNS", &c.DBMaintenanceMaxConns); err != nil {
+		return err
+	}
+	if raw, ok := os.LookupEnv("DB_POOL_ACQUIRE_TIMEOUT"); ok && strings.TrimSpace(raw) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(raw))
+		if err != nil {
+			return fmt.Errorf("parsing DB_POOL_ACQUIRE_TIMEOUT: %w", err)
+		}
+		c.DBPoolAcquireTimeout = d
+	}
+	if raw, ok := os.LookupEnv("DB_POOL_PRESSURE_THRESHOLD"); ok && strings.TrimSpace(raw) != "" {
+		f, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if err != nil {
+			return fmt.Errorf("parsing DB_POOL_PRESSURE_THRESHOLD: %w", err)
+		}
+		c.DBPoolPressureThreshold = f
+	}
+	return nil
+}
+
+// EffectiveEncryptionKeySpec returns the configured field-level encryption
+// key specification, preferring ENCRYPTION_KEYS when both ENCRYPTION_KEYS
+// and ENCRYPTION_KEY are set.
+func (c Config) EffectiveEncryptionKeySpec() string {
+	if s := strings.TrimSpace(c.EncryptionKeys); s != "" {
+		return s
+	}
+	return strings.TrimSpace(c.EncryptionKey)
 }
 
 // ParseLogLevel maps a LOG_LEVEL string to a slog.Level. Unknown or empty
@@ -467,265 +707,220 @@ func NewLogHandler(w io.Writer, format string, opts *slog.HandlerOptions) slog.H
 }
 
 // Validate checks the configuration for values that would fail at runtime.
+// It is a thin wrapper around ValidateAll so callers using either entry point
+// enforce the exact same set of rules in one pass (#1143).
 func (c Config) Validate() error {
-	if c.DatabaseURL == "" {
-		return fmt.Errorf("DATABASE_URL is required")
-	}
-	// RPC_URLS takes priority when set; RPC_URL is the single-provider
-	// fallback that works unchanged for existing deployments.
-	if len(c.RPCURLS) > 0 {
-		for i, raw := range c.RPCURLS {
-			u, err := url.Parse(raw)
-			if err != nil || u.Scheme == "" || u.Host == "" {
-				return fmt.Errorf("RPC_URLS[%d] %q is not a valid URL", i, raw)
-			}
-		}
-	} else if !IsSQLite(c.DatabaseURL) {
-		u, err := url.Parse(c.RPCURL)
-		if err != nil || u.Scheme == "" || u.Host == "" {
-			return fmt.Errorf("RPC_URL %q is not a valid URL", c.RPCURL)
-		}
-	}
+	return c.ValidateAll()
+}
+
+// collectLegacyValidateErrors collects every validation failure that formerly
+// lived only in Validate() so ValidateAll() reports all configuration errors
+// in a single pass rather than two rounds (#1143).
+func (c Config) collectLegacyValidateErrors() []string {
+	var errs []string
 	if IsSQLite(c.DatabaseURL) {
 		path := c.DatabaseURL[7:]
 		if path == "" || path == ":memory:" {
 		} else if path[0] != '/' && path[0] != '.' && path[0] != ':' {
-			return fmt.Errorf("sqlite DATABASE_URL %q must be an absolute or relative path (or :memory:)", c.DatabaseURL)
+			errs = append(errs, fmt.Sprintf("DATABASE_URL: sqlite DATABASE_URL %q must be an absolute or relative path (or :memory:)", c.DatabaseURL))
 		}
 	}
 	if c.DBMaxConns < 0 {
-		return fmt.Errorf("DB_MAX_CONNS must be non-negative, got %d", c.DBMaxConns)
+		errs = append(errs, fmt.Sprintf("DB_MAX_CONNS must be non-negative, got %d", c.DBMaxConns))
 	}
 	if c.DBMinConns < 0 {
-		return fmt.Errorf("DB_MIN_CONNS must be non-negative, got %d", c.DBMinConns)
+		errs = append(errs, fmt.Sprintf("DB_MIN_CONNS must be non-negative, got %d", c.DBMinConns))
+	}
+	if c.DBMaxConns > 0 && c.DBMinConns > c.DBMaxConns {
+		errs = append(errs, fmt.Sprintf("DB_MIN_CONNS (%d) must be <= DB_MAX_CONNS (%d)", c.DBMinConns, c.DBMaxConns))
 	}
 	if c.DBMaxConnLifetime < 0 {
-		return fmt.Errorf("DB_MAX_CONN_LIFETIME must be non-negative, got %s", c.DBMaxConnLifetime)
+		errs = append(errs, fmt.Sprintf("DB_MAX_CONN_LIFETIME must be non-negative, got %s", c.DBMaxConnLifetime))
 	}
 	if c.DBMaxConnIdleTime < 0 {
-		return fmt.Errorf("DB_MAX_CONN_IDLE_TIME must be non-negative, got %s", c.DBMaxConnIdleTime)
+		errs = append(errs, fmt.Sprintf("DB_MAX_CONN_IDLE_TIME must be non-negative, got %s", c.DBMaxConnIdleTime))
 	}
-	// Empty means "unused": HORIZON_URL is only read by `sorotrail backfill`
-	// and Load supplies a default, so an unset value is not a misconfigured
-	// indexer. Validate the shape only when someone actually set one.
+	if c.DBIngesterReservedConns < 0 {
+		errs = append(errs, fmt.Sprintf("DB_INGESTER_RESERVED_CONNS must be non-negative, got %d", c.DBIngesterReservedConns))
+	}
+	if c.DBMaxConns > 0 && c.DBIngesterReservedConns >= c.DBMaxConns {
+		errs = append(errs, fmt.Sprintf("DB_INGESTER_RESERVED_CONNS (%d) must be < DB_MAX_CONNS (%d)", c.DBIngesterReservedConns, c.DBMaxConns))
+	}
+	if c.DBAPIReadMaxConns < 0 {
+		errs = append(errs, fmt.Sprintf("DB_API_READ_MAX_CONNS must be non-negative, got %d", c.DBAPIReadMaxConns))
+	}
+	if c.DBGraphQLMaxConns < 0 {
+		errs = append(errs, fmt.Sprintf("DB_GRAPHQL_MAX_CONNS must be non-negative, got %d", c.DBGraphQLMaxConns))
+	}
+	if c.DBSubscriptionMaxConns < 0 {
+		errs = append(errs, fmt.Sprintf("DB_SUBSCRIPTION_MAX_CONNS must be non-negative, got %d", c.DBSubscriptionMaxConns))
+	}
+	if c.DBMaintenanceMaxConns < 0 {
+		errs = append(errs, fmt.Sprintf("DB_MAINTENANCE_MAX_CONNS must be non-negative, got %d", c.DBMaintenanceMaxConns))
+	}
+	if c.DBPoolAcquireTimeout < 0 {
+		errs = append(errs, fmt.Sprintf("DB_POOL_ACQUIRE_TIMEOUT must be non-negative, got %s", c.DBPoolAcquireTimeout))
+	}
+	if c.DBPoolPressureThreshold < 0 || c.DBPoolPressureThreshold > 1 {
+		errs = append(errs, fmt.Sprintf("DB_POOL_PRESSURE_THRESHOLD must be in [0,1], got %v", c.DBPoolPressureThreshold))
+	}
 	if u, err := url.Parse(c.HorizonURL); c.HorizonURL != "" && (err != nil || u.Scheme == "" || u.Host == "") {
-		return fmt.Errorf("HORIZON_URL %q is not a valid URL", c.HorizonURL)
+		errs = append(errs, fmt.Sprintf("HORIZON_URL %q is not a valid URL", c.HorizonURL))
 	}
-
 	if c.HTTPAddr != "" {
 		if _, _, err := net.SplitHostPort(c.HTTPAddr); err != nil {
-			return fmt.Errorf("HTTP_ADDR %q is not a valid host:port (e.g. :8080)", c.HTTPAddr)
+			errs = append(errs, fmt.Sprintf("HTTP_ADDR %q is not a valid host:port (e.g. :8080)", c.HTTPAddr))
 		}
-	}
-
-	if c.PollInterval <= 0 {
-		return fmt.Errorf("POLL_INTERVAL must be positive, got %s", c.PollInterval)
-	}
-	if c.PollIntervalMin < 0 {
-		return fmt.Errorf("POLL_INTERVAL_MIN must be non-negative, got %s", c.PollIntervalMin)
-	}
-	if c.PollIntervalMax < 0 {
-		return fmt.Errorf("POLL_INTERVAL_MAX must be non-negative, got %s", c.PollIntervalMax)
-	}
-	if c.PollIntervalMin > 0 && c.PollIntervalMax > 0 && c.PollIntervalMin > c.PollIntervalMax {
-		return fmt.Errorf("POLL_INTERVAL_MIN (%s) must be <= POLL_INTERVAL_MAX (%s)",
-			c.PollIntervalMin, c.PollIntervalMax)
 	}
 	if c.APIQueryTimeout <= 0 {
-		return fmt.Errorf("API_QUERY_TIMEOUT must be positive, got %s", c.APIQueryTimeout)
+		errs = append(errs, fmt.Sprintf("API_QUERY_TIMEOUT must be positive, got %s", c.APIQueryTimeout))
 	}
 	if c.APISlowQueryThreshold <= 0 {
-		return fmt.Errorf("API_SLOW_QUERY_THRESHOLD must be positive, got %s", c.APISlowQueryThreshold)
-	}
-	if c.RetentionLedgers == 0 {
-		return fmt.Errorf("RETENTION_LEDGERS must be positive")
+		errs = append(errs, fmt.Sprintf("API_SLOW_QUERY_THRESHOLD must be positive, got %s", c.APISlowQueryThreshold))
 	}
 	if c.RetentionAge < 0 {
-		return fmt.Errorf("RETENTION_AGE must be non-negative")
+		errs = append(errs, "RETENTION_AGE must be non-negative")
 	}
-	// RetentionPoll mirrors RetentionAge: it only matters once age-based
-	// pruning is enabled, and zero (the hand-built, non-default value) is a
-	// valid "disabled" state rather than a misconfiguration.
 	if c.RetentionPoll < 0 {
-		return fmt.Errorf("RETENTION_POLL_INTERVAL must be non-negative")
-	}
-	if c.PartitionLedgerSpan == 0 {
-		return fmt.Errorf("PARTITION_LEDGER_SPAN must be positive")
-	}
-	switch strings.ToLower(c.LogLevel) {
-	case "debug", "info", "warn", "error":
-	default:
-		return fmt.Errorf("LOG_LEVEL %q is not one of debug|info|warn|error", c.LogLevel)
-	}
-	switch strings.ToLower(c.LogFormat) {
-	case "text", "json":
-	default:
-		return fmt.Errorf("LOG_FORMAT %q is not one of text|json", c.LogFormat)
-	}
-	for _, id := range c.WatchedContracts {
-		if !ValidContractID(id) {
-			return fmt.Errorf("WATCHED_CONTRACTS entry %q is not a valid contract ID (want C... strkey, 56 chars)", id)
-		}
+		errs = append(errs, "RETENTION_POLL_INTERVAL must be non-negative")
 	}
 	for _, id := range c.SkipContracts {
 		if !ValidContractID(id) {
-			return fmt.Errorf("SKIP_CONTRACTS entry %q is not a valid contract ID (want C... strkey, 56 chars)", id)
+			errs = append(errs, fmt.Sprintf("SKIP_CONTRACTS entry %q is not a valid contract ID (want C... strkey, 56 chars)", id))
 		}
 	}
-	if c.AuditPollInterval <= 0 {
-		return fmt.Errorf("AUDIT_POLL_INTERVAL must be positive")
-	}
-	if c.AuditBatchLedgers == 0 {
-		return fmt.Errorf("AUDIT_BATCH_LEDGERS must be positive")
-	}
-	if c.AuditLagThreshold == 0 {
-		return fmt.Errorf("AUDIT_LAG_THRESHOLD must be positive")
-	}
-	if c.AuditBudgetShare < 0 || c.AuditBudgetShare > 1 {
-		return fmt.Errorf("AUDIT_BUDGET_SHARE must be in [0,1]")
-	}
-	if c.AuditMaxRPS <= 0 {
-		return fmt.Errorf("AUDIT_MAX_RPS must be positive")
-	}
-	if c.AuditMaxRepair <= 0 {
-		return fmt.Errorf("AUDIT_MAX_REPAIR_ATTEMPTS must be positive")
-	}
-	if c.AuditFindingMaxLgrs == 0 {
-		return fmt.Errorf("AUDIT_FINDING_MAX_LEDGERS must be positive")
-	}
 	if c.RPCRateLimitRPS <= 0 {
-		return fmt.Errorf("RPC_RATE_LIMIT_RPS must be positive")
+		errs = append(errs, "RPC_RATE_LIMIT_RPS must be positive")
 	}
 	if c.RPCRateLimit <= 0 {
-		return fmt.Errorf("RPC_RATE_LIMIT must be positive, got %v", c.RPCRateLimit)
+		errs = append(errs, fmt.Sprintf("RPC_RATE_LIMIT must be positive, got %v", c.RPCRateLimit))
 	}
 	if c.RetentionBatchSize <= 0 {
-		return fmt.Errorf("RETENTION_BATCH_SIZE must be positive")
+		errs = append(errs, "RETENTION_BATCH_SIZE must be positive")
 	}
 	if c.IngestPageSize == 0 {
-		return fmt.Errorf("INGEST_PAGE_SIZE must be positive")
+		errs = append(errs, "INGEST_PAGE_SIZE must be positive")
 	}
 	if c.IngestBatchSize == 0 {
-		return fmt.Errorf("INGEST_BATCH_SIZE must be positive")
+		errs = append(errs, "INGEST_BATCH_SIZE must be positive")
 	}
 	if c.RetentionPause < 0 {
-		return fmt.Errorf("RETENTION_PAUSE must be non-negative")
+		errs = append(errs, "RETENTION_PAUSE must be non-negative")
 	}
 	if c.RetentionInterval <= 0 {
-		return fmt.Errorf("RETENTION_INTERVAL must be positive")
+		errs = append(errs, "RETENTION_INTERVAL must be positive")
 	}
 	if c.RetentionMaxAge < 0 {
-		return fmt.Errorf("RETENTION_MAX_AGE must be non-negative")
+		errs = append(errs, "RETENTION_MAX_AGE must be non-negative")
 	}
 	if c.BackfillRateRPS <= 0 {
-		return fmt.Errorf("BACKFILL_RATE_RPS must be positive, got %v", c.BackfillRateRPS)
+		errs = append(errs, fmt.Sprintf("BACKFILL_RATE_RPS must be positive, got %v", c.BackfillRateRPS))
 	}
 	if c.RPCMaxAttempts <= 0 {
-		return fmt.Errorf("RPC_MAX_ATTEMPTS must be positive, got %d", c.RPCMaxAttempts)
+		errs = append(errs, fmt.Sprintf("RPC_MAX_ATTEMPTS must be positive, got %d", c.RPCMaxAttempts))
 	}
 	if c.RPCBaseBackoff <= 0 {
-		return fmt.Errorf("RPC_BASE_BACKOFF must be positive, got %s", c.RPCBaseBackoff)
+		errs = append(errs, fmt.Sprintf("RPC_BASE_BACKOFF must be positive, got %s", c.RPCBaseBackoff))
 	}
 	if c.RPCMaxBackoff <= 0 {
-		return fmt.Errorf("RPC_MAX_BACKOFF must be positive, got %s", c.RPCMaxBackoff)
+		errs = append(errs, fmt.Sprintf("RPC_MAX_BACKOFF must be positive, got %s", c.RPCMaxBackoff))
 	}
 	if c.RPCHTTPTimeout < 0 {
-		return fmt.Errorf("RPC_HTTP_TIMEOUT must be non-negative, got %s", c.RPCHTTPTimeout)
-	}
-	if c.RateLimitRPS < 0 {
-		return fmt.Errorf("RATE_LIMIT_RPS must be non-negative")
-	}
-	if c.RateLimitBurst < 0 {
-		return fmt.Errorf("RATE_LIMIT_BURST must be non-negative")
+		errs = append(errs, fmt.Sprintf("RPC_HTTP_TIMEOUT must be non-negative, got %s", c.RPCHTTPTimeout))
 	}
 	if c.HTTPReadTimeout < 0 {
-		return fmt.Errorf("HTTP_READ_TIMEOUT must be non-negative, got %s", c.HTTPReadTimeout)
+		errs = append(errs, fmt.Sprintf("HTTP_READ_TIMEOUT must be non-negative, got %s", c.HTTPReadTimeout))
 	}
 	if c.HTTPWriteTimeout < 0 {
-		return fmt.Errorf("HTTP_WRITE_TIMEOUT must be non-negative, got %s", c.HTTPWriteTimeout)
+		errs = append(errs, fmt.Sprintf("HTTP_WRITE_TIMEOUT must be non-negative, got %s", c.HTTPWriteTimeout))
 	}
 	if c.HTTPIdleTimeout < 0 {
-		return fmt.Errorf("HTTP_IDLE_TIMEOUT must be non-negative, got %s", c.HTTPIdleTimeout)
+		errs = append(errs, fmt.Sprintf("HTTP_IDLE_TIMEOUT must be non-negative, got %s", c.HTTPIdleTimeout))
 	}
 	if c.HTTPReadHeaderTimeout < 0 {
-		return fmt.Errorf("HTTP_READ_HEADER_TIMEOUT must be non-negative, got %s", c.HTTPReadHeaderTimeout)
+		errs = append(errs, fmt.Sprintf("HTTP_READ_HEADER_TIMEOUT must be non-negative, got %s", c.HTTPReadHeaderTimeout))
 	}
 	if c.HTTPRequestBodyLimit < 0 {
-		return fmt.Errorf("HTTP_REQUEST_BODY_LIMIT must be non-negative, got %d", c.HTTPRequestBodyLimit)
+		errs = append(errs, fmt.Sprintf("HTTP_REQUEST_BODY_LIMIT must be non-negative, got %d", c.HTTPRequestBodyLimit))
+	}
+	if c.HTTPResponseBodyLimit < 0 {
+		errs = append(errs, fmt.Sprintf("HTTP_RESPONSE_BODY_LIMIT must be non-negative, got %d", c.HTTPResponseBodyLimit))
+	}
+	if c.HTTPDecompressedBodyLimit < 0 {
+		errs = append(errs, fmt.Sprintf("HTTP_DECOMPRESSED_BODY_LIMIT must be non-negative, got %d", c.HTTPDecompressedBodyLimit))
+	}
+	for k, v := range c.HTTPEndpointBodyLimits {
+		if strings.TrimSpace(k) == "" || v <= 0 {
+			errs = append(errs, fmt.Sprintf("HTTP_ENDPOINT_BODY_LIMITS entry %q must have a positive byte limit, got %d", k, v))
+		}
 	}
 	if c.HTTPResponseBodyLimit < 0 {
 		return fmt.Errorf("HTTP_RESPONSE_BODY_LIMIT must be non-negative, got %d", c.HTTPResponseBodyLimit)
 	}
 	if c.APIMaxLimit < 1 {
-		return fmt.Errorf("API_MAX_LIMIT must be positive, got %d", c.APIMaxLimit)
+		errs = append(errs, fmt.Sprintf("API_MAX_LIMIT must be positive, got %d", c.APIMaxLimit))
 	}
 	if c.ShutdownTimeout < 0 {
-		return fmt.Errorf("SHUTDOWN_TIMEOUT must be non-negative, got %s", c.ShutdownTimeout)
+		errs = append(errs, fmt.Sprintf("SHUTDOWN_TIMEOUT must be non-negative, got %s", c.ShutdownTimeout))
 	}
 	if c.SweepConcurrency < 1 {
-		return fmt.Errorf("SWEEP_CONCURRENCY must be positive, got %d", c.SweepConcurrency)
+		errs = append(errs, fmt.Sprintf("SWEEP_CONCURRENCY must be positive, got %d", c.SweepConcurrency))
 	}
-	// MAX_EVENTS_PER_CYCLE needs no explicit rule: the env parser rejects
-	// negatives (uint), and zero is the documented "disabled" value.
-	// BATCH_TARGET_LATENCY and BATCH_MAX_BACKOFF tune the batching
-	// behavior that only exists when BATCH_SIZE is set, but tolerating
-	// them when batching is off (a config that sets a budget but forgets
-	// the size) is safer than rejecting it — the operator sees a warning
-	// at startup rather than a crash loop only during a deploy review.
 	if c.BatchSize > 0 && c.BatchTargetLatency < 0 {
-		return fmt.Errorf("BATCH_TARGET_LATENCY must be non-negative, got %s", c.BatchTargetLatency)
+		errs = append(errs, fmt.Sprintf("BATCH_TARGET_LATENCY must be non-negative, got %s", c.BatchTargetLatency))
 	}
 	if c.BatchMaxBackoff < 0 {
-		return fmt.Errorf("BATCH_MAX_BACKOFF must be non-negative, got %s", c.BatchMaxBackoff)
+		errs = append(errs, fmt.Sprintf("BATCH_MAX_BACKOFF must be non-negative, got %s", c.BatchMaxBackoff))
 	}
 	if c.ReorgConfirmationWindow > 0 && c.ReorgRescanInterval <= 0 {
-		return fmt.Errorf("REORG_RESCAN_INTERVAL must be positive when REORG_CONFIRMATION_WINDOW is set")
+		errs = append(errs, "REORG_RESCAN_INTERVAL must be positive when REORG_CONFIRMATION_WINDOW is set")
 	}
 	if c.ExportMaxRange <= 0 {
-		return fmt.Errorf("EXPORT_MAX_RANGE must be positive, got %d", c.ExportMaxRange)
+		errs = append(errs, fmt.Sprintf("EXPORT_MAX_RANGE must be positive, got %d", c.ExportMaxRange))
 	}
 	if err := validateCORSOrigins(c.CORSAllowedOrigins); err != nil {
-		return err
-	}
-	// Both must be set together: half-configured limits would silently
-	// behave like the disabled case (Enabled returns false when either is
-	// non-positive), which would confuse operators who set one and
-	// expected throttling to kick in.
-	if (c.RateLimitRPS > 0) != (c.RateLimitBurst > 0) {
-		return fmt.Errorf("RATE_LIMIT_RPS and RATE_LIMIT_BURST must both be set or both unset")
+		errs = append(errs, err.Error())
 	}
 	if c.MultiTenantMaxWatched < 0 {
-		return fmt.Errorf("MULTI_TENANT_MAX_WATCHED must be non-negative")
+		errs = append(errs, "MULTI_TENANT_MAX_WATCHED must be non-negative")
 	}
 	if c.MultiTenantUsageFlush <= 0 {
-		return fmt.Errorf("MULTI_TENANT_USAGE_FLUSH must be positive")
+		errs = append(errs, "MULTI_TENANT_USAGE_FLUSH must be positive")
 	}
 	if c.MultiTenantStreamScopeSync <= 0 {
-		return fmt.Errorf("MULTI_TENANT_STREAM_SCOPE_SYNC must be positive")
+		errs = append(errs, "MULTI_TENANT_STREAM_SCOPE_SYNC must be positive")
 	}
-	// Rejected rather than ignored: an operator who sets a bootstrap key
-	// without enabling multi-tenancy has configured a credential that
-	// authenticates nothing, and would reasonably assume the instance is
-	// protected when it is wide open.
 	if c.MultiTenantBootstrapKey != "" && !c.MultiTenant {
-		return fmt.Errorf("MULTI_TENANT_BOOTSTRAP_KEY is set but MULTI_TENANT is false")
+		errs = append(errs, "MULTI_TENANT_BOOTSTRAP_KEY is set but MULTI_TENANT is false")
 	}
-	// Archive configuration: ARCHIVE_BUCKET is the master switch. When
-	// set, the endpoint must also be provided (S3-compatible stores
-	// need an explicit endpoint).
 	if c.ArchiveBucket != "" && c.ArchiveEndpoint == "" {
-		return fmt.Errorf("ARCHIVE_ENDPOINT is required when ARCHIVE_BUCKET is set")
+		errs = append(errs, "ARCHIVE_ENDPOINT is required when ARCHIVE_BUCKET is set")
 	}
 	if c.ArchiveMaxRetries < 0 {
-		return fmt.Errorf("ARCHIVE_MAX_RETRIES must be non-negative")
+		errs = append(errs, "ARCHIVE_MAX_RETRIES must be non-negative")
 	}
-	return nil
+	return errs
 }
 
 // RetentionEnabled reports whether at least one retention policy is
 // configured — the pruner only runs when this is true.
 func (c Config) RetentionEnabled() bool {
 	return c.RetentionMaxAge > 0 || c.RetentionMinLedger > 0
+}
+
+// DefaultEventRetention is the instance-wide retention horizon a tenant
+// without its own policy inherits (#1249): the shorter of RETENTION_MAX_AGE
+// and RETENTION_AGE when both are set, because either job deletes at its
+// own age. Zero means events are not aged out.
+func (c Config) DefaultEventRetention() time.Duration {
+	switch {
+	case c.RetentionMaxAge > 0 && c.RetentionAge > 0:
+		return min(c.RetentionMaxAge, c.RetentionAge)
+	case c.RetentionMaxAge > 0:
+		return c.RetentionMaxAge
+	default:
+		return max(c.RetentionAge, 0)
+	}
 }
 
 // ArchiveEnabled reports whether the S3-compatible archive backend

@@ -146,6 +146,35 @@ jobs:
       - name: Verify Benchmarks (compilation and short run)
         run: make bench-ci
 
+  # A few seconds per fuzz target is enough to keep the targets compiling and to
+  # replay their checked-in corpora; `make fuzz FUZZTIME=2m` hunts for new
+  # crashers locally. It is a job of its own, not a step of test-matrix, because
+  # `go test -fuzz` rebuilds each package with coverage instrumentation and the
+  # matrix legs already use most of their ten minutes: adding the step there
+  # made both legs time out.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        id: go
+        with:
+          go-version-file: go.mod
+          # See `test-matrix` for why setup-go's own caching is off.
+          cache: false
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-
+      - name: Fuzz the input parsers (short)
+        run: make fuzz FUZZTIME=3s
+
   # Branch protection on main requires a status check named `test`. A matrix
   # job never reports that name — it reports `test (15)` and `test (16)` —
   # so the required context stayed permanently "Expected — Waiting for

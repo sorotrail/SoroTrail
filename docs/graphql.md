@@ -418,6 +418,188 @@ Similarly, a query whose field weights plus the `5`-unit operation overhead exce
 }
 ```
 
+## Persisted operations and allowlist mode
+
+SoroTrail supports persisted GraphQL operations and an optional allowlist-only execution mode (`GRAPHQL_PERSISTED_ONLY=true`) on `/graphql`.
+
+For production frontends whose GraphQL query set is known at build time, registering a persisted-query allowlist lets the server execute only pre-approved query documents identified by their canonical SHA-256 digest and refuse arbitrary ad-hoc query documents altogether.
+
+### 1. Canonical Identifier & Registration Validation
+
+Every persisted operation is identified by the **lowercase hex-encoded SHA-256 digest** of its GraphQL query document (`sha256(query)`):
+
+```sh
+printf '%s' 'query GetContract($id: ID!) { contract(id: $id) { contractId addedAt } }' | shasum -a 256
+# e.g. 9f2c8b...
+```
+
+When an operation is registered (via startup manifest file, `POST / PUT /graphql/persisted`, or Automatic Persisted Queries):
+
+1. **Hash verification**: If the caller supplies an `id` / `sha256Hash`, SoroTrail computes `sha256(query)` and verifies that the supplied identifier matches. Any mismatch is rejected (`400 Bad Request` on `/graphql/persisted`, or `PERSISTED_QUERY_HASH_MISMATCH` on `/graphql`), preventing callers from binding an arbitrary query to a chosen ID.
+2. **AST & operation validation**: The document must parse as valid GraphQL containing exactly one read-only `Query` operation (`mutation` and `subscription` operations are rejected).
+3. **Static depth & complexity guards**: The document must pass `CheckDepth` (`<= 10`) and static `CheckComplexity` (`<= 1000`) at registration time.
+
+### 2. Persisted Operations Configuration
+
+| Environment Variable | Default | Description |
+| :--- | :--- | :--- |
+| `GRAPHQL_PERSISTED_ONLY` | `false` | When `true`, enables strict allowlist mode: `/graphql` refuses ad-hoc query documents and unauthenticated on-the-fly APQ registrations. Only pre-registered operations may execute. |
+| `GRAPHQL_PERSISTED_OPERATIONS_FILE` | *(unset)* | Optional path to a JSON manifest file of persisted operations loaded at startup and atomically updated when operations are registered, replaced, or deleted via `/graphql/persisted`. |
+| `API_KEY` | *(unset)* | Operator API key required via `X-API-Key` or `Authorization: Bearer` on `POST`, `PUT`, and `DELETE` requests to `/graphql/persisted` (and for authenticated on-the-fly APQ registration when `GRAPHQL_PERSISTED_ONLY=true`). |
+
+### 3. Registering, Inspecting, and Updating Persisted Operations
+
+#### A. Startup Manifest File (`GRAPHQL_PERSISTED_OPERATIONS_FILE`)
+
+A frontend build can export a JSON manifest and load it at server startup:
+
+- **Map format (Apollo / Relay / GraphQL Codegen)**:
+  ```json
+  {
+    "2c9a6f0b1a4e...": "query GetContracts { contracts { totalCount } }",
+    "8d4e1f7c9b02...": "query GetEvent($id: ID!) { event(id: $id) { id ledger } }"
+  }
+  ```
+- **Structured object or array format**:
+  ```json
+  {
+    "operations": [
+      {
+        "id": "2c9a6f0b1a4e...",
+        "query": "query GetContracts { contracts { totalCount } }"
+      }
+    ]
+  }
+  ```
+
+#### B. Inspecting the Allowlist (`GET /graphql/persisted`)
+
+Anyone with read access to the GraphQL transport can inspect the currently registered operations:
+
+```sh
+curl -s http://localhost:8080/graphql/persisted
+```
+
+Response (`200 OK`, sorted deterministically by `id`):
+
+```json
+{
+  "allowlistOnly": true,
+  "count": 1,
+  "operations": [
+    {
+      "id": "2c9a6f0b1a4e...",
+      "operationName": "GetContracts",
+      "query": "query GetContracts { contracts { totalCount } }",
+      "registeredAt": "2026-07-16T12:00:00Z"
+    }
+  ]
+}
+```
+
+Fetch a single operation by SHA-256 ID:
+
+```sh
+curl -s http://localhost:8080/graphql/persisted/2c9a6f0b1a4e...
+```
+
+#### C. Registering or Merging Operations (`POST /graphql/persisted`)
+
+Requires `X-API-Key: <API_KEY>` or `Authorization: Bearer <API_KEY>`:
+
+```sh
+curl -s -X POST http://localhost:8080/graphql/persisted \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{
+    "query": "query GetEvent($id: ID!) { event(id: $id) { id contractId ledger } }"
+  }'
+```
+
+If `"id"` is omitted, SoroTrail derives and returns the canonical SHA-256 digest. If `"id"` is provided, SoroTrail verifies that it matches the SHA-256 digest of `"query"`.
+
+#### D. Atomic Release Replacement (`PUT /graphql/persisted`)
+
+When deploying a new frontend release, replace the entire allowlist atomically with `PUT /graphql/persisted` (or `POST /graphql/persisted` with `"replace": true`). Every operation in the manifest is validated before the swap; if any operation is invalid or has a mismatched hash, the request fails with `400 Bad Request` and the existing allowlist remains untouched:
+
+```sh
+curl -s -X PUT http://localhost:8080/graphql/persisted \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{
+    "operations": [
+      {
+        "id": "2c9a6f0b1a4e...",
+        "query": "query GetContracts { contracts { totalCount } }"
+      }
+    ]
+  }'
+```
+
+#### E. Removing a Retired Operation (`DELETE /graphql/persisted/{id}`)
+
+```sh
+curl -s -X DELETE http://localhost:8080/graphql/persisted/2c9a6f0b1a4e... \
+  -H "X-API-Key: $API_KEY"
+```
+
+### 4. Executing a Persisted Query
+
+Clients can execute a registered operation by supplying its SHA-256 identifier (along with `variables` and optional `operationName`) in place of `query` on either `POST /graphql` or `GET /graphql`.
+
+#### A. Apollo Automatic Persisted Queries (APQ) Shape (`extensions.persistedQuery`)
+
+```sh
+curl -s -X POST http://localhost:8080/graphql \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operationName": "GetEvent",
+    "variables": { "id": "0001099511627776-0000000001" },
+    "extensions": {
+      "persistedQuery": {
+        "version": 1,
+        "sha256Hash": "8d4e1f7c9b02..."
+      }
+    }
+  }'
+```
+
+Or via `GET /graphql`:
+
+```sh
+curl -s -G http://localhost:8080/graphql \
+  --data-urlencode 'extensions={"persistedQuery":{"version":1,"sha256Hash":"8d4e1f7c9b02..."}}' \
+  --data-urlencode 'variables={"id":"0001099511627776-0000000001"}'
+```
+
+#### B. Top-Level Identifier Shape (`id` / `documentId` / `persistedId` / `sha256Hash`)
+
+```sh
+curl -s -X POST http://localhost:8080/graphql \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "8d4e1f7c9b02...",
+    "variables": { "id": "0001099511627776-0000000001" }
+  }'
+```
+
+### 5. Error Codes & Allowlist Mode Behavior
+
+All GraphQL-level persisted-query errors return HTTP `200 OK` with the standard GraphQL envelope and a machine-readable `extensions.code`:
+
+| `errors[0].extensions.code` | When it is returned |
+| :--- | :--- |
+| `PERSISTED_QUERY_NOT_FOUND` | The request supplied a persisted identifier without a `query` body, and the identifier is not in the registered allowlist (`message: "PersistedQueryNotFound"`). |
+| `PERSISTED_QUERY_HASH_MISMATCH` | The request supplied both a persisted identifier and a `query` document whose SHA-256 digest does not match the identifier. |
+| `PERSISTED_QUERY_ONLY` | `GRAPHQL_PERSISTED_ONLY=true` is enabled and the caller sent an ad-hoc `query` document or attempted unauthenticated on-the-fly APQ registration. |
+
+#### Per-Request Variable Validation & Cost Checks
+
+Persisted operations do **not** bypass runtime checks when executed by ID:
+
+1. **Variable validation**: Required non-null variables (`$id: ID!`) must be provided and non-null, default variable values are applied, and runtime variable types (`Int`, `Int64`, `Float`, `Boolean`, `String`, `ID`, lists, and input objects) are validated before resolver execution.
+2. **Variable-dependent complexity checks**: When a connection field (`events`, `tokenEvents`, `contracts`) receives a runtime `page.first` / `first` variable exceeding the default page size (`50`), `CheckComplexityWithVariables` scales that connection field's cost by `ceil(first / 50)`. A query that passed static registration checks is still rejected at execution time if runtime variables push its cost past `ComplexityLimit` (`1000`).
+
 ## Filter parity with `GET /events`
 
 `EventFilterInput` and `PageInput` pass through `queries.BuildEventFilter`, the same function used by REST's `filterFromQuery`. `TestFilterParity_RESTAndGraphQLProduceIdenticalFilters` in [`internal/api/graphql/filter_parity_test.go`](../internal/api/graphql/filter_parity_test.go) enforces that equivalent inputs produce identical `store.EventFilter` structs.

@@ -113,6 +113,15 @@ var metricCatalogue = []metricSpec{
 		Meaning: "Ingestion passes that ended in an error — an RPC failure, a decode failure or a database write failure. Retries are not counted, only passes that ended badly. Registered but not yet incremented by any call site, so it reads 0; it is pinned here so the wiring lands against a documented contract.",
 	},
 	{
+		Name: "sorotrail_dead_letters_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "reason", Values: "decode | store"},
+		},
+		Help:    "Total number of poison events recorded in the dead-letter table, labelled by reason (decode | store).",
+		Meaning: "Poison events that could not be decoded or permanently failed per-event storage validation and were quarantined in dead_letters so ingestion could advance past them without stalling or silently dropping history.",
+		touch:   func() { DeadLettersTotal.WithLabelValues("decode") },
+	},
+	{
 		Name: "sorotrail_ingestion_lag_ledgers", Scope: scopeGlobal, Kind: "gauge",
 		Help:    "Number of ledgers the indexer is behind the chain head.",
 		Meaning: "Chain head minus last ingested ledger, updated after every ingestion pass that knows the chain head. The direct alert for a stalled pipeline: anything above zero for a sustained window means ingestion is falling behind.",
@@ -192,6 +201,25 @@ var metricCatalogue = []metricSpec{
 		Meaning: "One 0/1 series per (provider, state). Only present in multi-provider mode (RPC_URLS). Shows which provider traffic is on and which have failed, without reading logs.",
 		touch:   func() { RPCProviderState.WithLabelValues("localhost", "active") },
 	},
+	{
+		Name: "sorotrail_rpc_provider_demotions_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "provider", Values: "the hostname of one RPC_URLS entry — scheme, credentials, path and query are stripped, so nothing client-identifying is exported"},
+			{Name: "reason", Values: "consecutive_errors | behind_cursor | retention_gap | network_mismatch | divergence"},
+		},
+		Help:    "Total number of RPC provider demotions, labelled by provider and reason.",
+		Meaning: "Every time a provider is demoted from active to degraded or down, labelled by the exact reason: consecutive network/5xx errors, lagging behind the ingestion cursor, retention window not covering the requested ledger range, network passphrase mismatch, or divergent event answers for an overlapping ledger.",
+		touch:   func() { RPCProviderDemotionsTotal.WithLabelValues("localhost", "consecutive_errors") },
+	},
+	{
+		Name: "sorotrail_rpc_provider_promotions_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "provider", Values: "the hostname of one RPC_URLS entry — scheme, credentials, path and query are stripped, so nothing client-identifying is exported"},
+		},
+		Help:    "Total number of RPC provider promotions back to active, labelled by provider.",
+		Meaning: "Every time a degraded or down provider completes probation and returns to active rotation.",
+		touch:   func() { RPCProviderPromotionsTotal.WithLabelValues("localhost") },
+	},
 
 	// --- Storage ---
 	{
@@ -218,6 +246,60 @@ var metricCatalogue = []metricSpec{
 		Meaning: "Count of guarded Store calls. Errors are counted separately from successes so a failing backend is a direct query rather than something inferred by subtracting histograms.",
 		touch:   func() { DBOperationsTotal.WithLabelValues("store.QueryEvents", "success") },
 	},
+	{
+		Name: "sorotrail_db_attributed_cost_seconds_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "originator", Values: "matched HTTP route pattern (e.g. GET /events/{id}) or background worker id (ingester | pruner | auditor | archiver | reconciler | webhook | unknown)"},
+			{Name: "operation", Values: "store.<Store method> — the same fixed table as sorotrail_db_query_duration_seconds"},
+			{Name: "tenant", Values: "default, or an opaque hashed tenant bucket (t_<8hex>) capped at 64 series with overflow folded into other"},
+		},
+		Help:    "Cumulative database query time in seconds attributed by originator, operation, and tenant.",
+		Meaning: "Joins database execution time back to the HTTP endpoint or background worker and tenant that caused it, so capacity and quota decisions can be driven from observed database cost.",
+		touch:   func() { DBAttributedCostSeconds.WithLabelValues("ingester", "store.UpsertEvents", "default") },
+	},
+	{
+		Name: "sorotrail_cost_budget_consumed_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "tenant", Values: "default, or an opaque hashed tenant bucket (t_<8hex>) capped at 64 series with overflow folded into other"},
+		},
+		Help:    "Total query cost units charged against per-tenant cost budgets, by tenant.",
+		Meaning: "Cost units each tenant has consumed from its COST_BUDGET_CAPACITY bucket. Only moves when the cost budget is enabled; compare its rate to COST_BUDGET_REFILL_PER_SEC to see which tenants run near their budget.",
+		touch:   func() { CostBudgetConsumedTotal.WithLabelValues("default") },
+	},
+	{
+		Name: "sorotrail_cost_estimated_total", Scope: scopeGlobal, Kind: "counter",
+		Help:    "Total query cost units estimated before execution for requests charged against a cost budget.",
+		Meaning: "Pre-execution cost estimates. Divide the rate of sorotrail_cost_budget_consumed_total (actual units) by this to reconcile actual against estimate: near 1 means the estimator is sound, well below 1 means requests are over-charged up front and refunded.",
+		touch:   func() { CostEstimatedTotal.Add(0) },
+	},
+	{
+		Name: "sorotrail_db_attributed_queries_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "originator", Values: "matched HTTP route pattern (e.g. GET /events/{id}) or background worker id (ingester | pruner | auditor | archiver | reconciler | webhook | unknown)"},
+			{Name: "operation", Values: "store.<Store method> — the same fixed table as sorotrail_db_query_duration_seconds"},
+			{Name: "tenant", Values: "default, or an opaque hashed tenant bucket (t_<8hex>) capped at 64 series with overflow folded into other"},
+			{Name: "outcome", Values: "success | error"},
+		},
+		Help:    "Total database queries attributed by originator, operation, tenant, and outcome.",
+		Meaning: "Counts database queries per originating route/background job and opaque tenant bucket, separating cheap high-frequency endpoints from rare expensive ones.",
+		touch: func() {
+			DBAttributedQueriesTotal.WithLabelValues("ingester", "store.UpsertEvents", "default", "success")
+		},
+	},
+	{
+		Name: "sorotrail_db_circuit_breaker_state", Scope: scopeGlobal, Kind: "gauge",
+		Labels: []metricLabel{
+			{Name: "state", Values: "closed | open | half-open"},
+		},
+		Help:    "Database circuit breaker state as a 0/1 gauge per state (closed | open | half-open).",
+		Meaning: "Exposes whether the store circuit breaker is closed (normal), open (failing fast with 503 and Retry-After during a database outage), or half-open (probing recovery).",
+		touch:   func() { DBCircuitBreakerState.WithLabelValues("closed") },
+	},
+	{
+		Name: "sorotrail_db_degraded_rejections_total", Scope: scopeGlobal, Kind: "counter",
+		Help:    "Total store calls rejected fast because the database circuit breaker is open.",
+		Meaning: "Counts requests rejected immediately in degraded mode while the database circuit breaker is open, separating dependency-unavailable rejections from application errors.",
+	},
 
 	// --- Batching ---
 	{
@@ -242,6 +324,31 @@ var metricCatalogue = []metricSpec{
 	},
 
 	// --- HTTP (per-server) ---
+	{
+		Name: "sorotrail_http_deprecated_requests_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "route", Values: "the matched chi route pattern (e.g. /events/{id}), or \"unmatched\" for a path no route registered — never the raw path, so probes cannot grow cardinality"},
+			{Name: "method", Values: "the HTTP method (GET | POST | PUT | PATCH | DELETE)"},
+		},
+		Help:    "Total HTTP requests to deprecated API endpoints, labelled by route and method.",
+		Meaning: "Calls to HTTP endpoints marked deprecated: true in the OpenAPI specification. Operators watch this counter approach zero during a deprecation window before removing the endpoint after its Sunset date.",
+		touch:   func() { DeprecatedHTTPRequestsTotal.WithLabelValues("/events", "GET") },
+	},
+	{
+		Name: "sorotrail_tls_certificate_expiry_days", Scope: scopeGlobal, Kind: "gauge",
+		Help:    "Minimum remaining validity in days across active mTLS certificates.",
+		Meaning: "Remaining days until the earliest-expiring active mTLS certificate (HTTP listener, Postgres client, or Archive client) expires, updated whenever certificates are loaded or reloaded from disk. Alert when this drops below your rotation window (for example, < 7 days).",
+	},
+	{
+		Name: "sorotrail_http_payload_size_rejections_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "route", Values: "the matched chi route pattern (e.g. /events/{id}), or \"unmatched\" for a path no route registered — never the raw path, so probes cannot grow cardinality"},
+			{Name: "reason", Values: "request_body | decompressed_body | response_body"},
+		},
+		Help:    "Total HTTP requests or responses rejected for exceeding configured size limits, labelled by route and reason (request_body | decompressed_body | response_body).",
+		Meaning: "Requests or responses rejected with HTTP 413 for exceeding HTTP_REQUEST_BODY_LIMIT (or an endpoint override), the decompressed Content-Encoding ceiling, or the response body size cap. Spikes indicate oversized client writes, compression-bomb attempts, or list queries that need smaller page limits.",
+		touch:   func() { HTTPPayloadSizeRejectionsTotal.WithLabelValues("/watched-contracts", "request_body") },
+	},
 	{
 		Name: "http_request_duration_seconds", Scope: scopeServer, Kind: "histogram",
 		Labels: []metricLabel{
@@ -273,14 +380,16 @@ var idBearingLabelRe = regexp.MustCompile(`(?i)(^|_)(id|ids|uuid|hash|digest|tx|
 // label name must be added here deliberately, with its cardinality
 // bounded by construction at the call site.
 var allowedLabelNames = map[string]bool{
-	"method":    true, // fixed enum: RPC methods, or HTTP verbs
-	"outcome":   true, // success | error
-	"reason":    true, // fixed enum per metric
-	"state":     true, // fixed enum per metric
-	"provider":  true, // one value per configured RPC URL, hostname only
-	"operation": true, // one value per guarded Store method
-	"route":     true, // matched chi route pattern, or "unmatched"
-	"status":    true, // decimal status code of a real response
+	"method":     true, // fixed enum: RPC methods, or HTTP verbs
+	"outcome":    true, // success | error
+	"reason":     true, // fixed enum per metric
+	"state":      true, // fixed enum per metric
+	"provider":   true, // one value per configured RPC URL, hostname only
+	"operation":  true, // one value per guarded Store method
+	"originator": true, // matched chi route pattern or background job name
+	"tenant":     true, // opaque tenant bucket (default | t_<8hex> | other)
+	"route":      true, // matched chi route pattern, or "unmatched"
+	"status":     true, // decimal status code of a real response
 }
 
 // catalogueByName indexes the catalogue for the reverse checks.

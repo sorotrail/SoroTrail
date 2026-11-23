@@ -623,17 +623,19 @@ func TestWriteUnauthorizedHelper(t *testing.T) {
 	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
 	assert.Contains(t, rec.Header().Get("Content-Type"), "application/json")
 
-	// Exactly one key, and it is the error. An extra field would be a
+	// Exactly two keys ("error" and "code"): an extra field would be a
 	// place for an internal reason to leak; a missing one would break
 	// clients that decode the shared envelope.
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
-	require.Len(t, body, 1, "the envelope must carry only the error field")
+	require.Len(t, body, 2, "the envelope must carry only the error and code fields")
 	assert.Equal(t, "missing API key", body["error"])
+	assert.Equal(t, string(CodeUnauthorized), body["code"])
 
 	var env errorResponse
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
 	assert.Equal(t, "missing API key", env.Error)
+	assert.Equal(t, CodeUnauthorized, env.Code)
 }
 
 // authStubStore wraps stubStore with in-memory API key persistence so

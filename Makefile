@@ -150,6 +150,39 @@ bench: ## Run benchmarks with environment capture
 bench-ci: ## Benchmark smoke run (CI-length, no DB required)
 	go test -bench=. -benchtime=10ms ./...
 
+# Every fuzz target for the API's untrusted-input parsers, as package:Target.
+# `go test -fuzz` accepts one target in one package per run, so `make fuzz`
+# loops over this list.
+FUZZ_TARGETS := \
+	./internal/config:FuzzValidContractID \
+	./internal/config:FuzzValidCursor \
+	./internal/config:FuzzParseStartLedger \
+	./internal/api/queries:FuzzParseTopic \
+	./internal/api/queries:FuzzParseTopicContains \
+	./internal/api/queries:FuzzParseLedgerParam \
+	./internal/api/queries:FuzzParseTimeParam \
+	./internal/api/queries:FuzzParseTypes \
+	./internal/api/queries:FuzzBuildEventFilter \
+	./internal/api:FuzzDecodeJSONBytes \
+	./internal/api:FuzzReadJSONBody \
+	./internal/api:FuzzFilterValues \
+	./internal/store:FuzzDecodeCompositeCursor \
+	./internal/store:FuzzCompositeCursorRoundTrip \
+	./internal/store:FuzzEventCursorRoundTrip \
+	./internal/api/graphql:FuzzParseCursor
+
+# How long each target runs. Raise it locally (make fuzz FUZZTIME=2m) to hunt
+# for crashers; CI keeps it to a few seconds so the targets stay compiling.
+FUZZTIME ?= 10s
+
+.PHONY: fuzz
+fuzz: ## Fuzz the request decoders and query-parameter parsers (FUZZTIME=10s per target)
+	@set -e; for t in $(FUZZ_TARGETS); do \
+		pkg=$${t%%:*}; name=$${t##*:}; \
+		echo "==> fuzzing $$name ($$pkg) for $(FUZZTIME)"; \
+		go test -run='^$$' -fuzz="^$$name$$" -fuzztime=$(FUZZTIME) $$pkg; \
+	done
+
 # ── CI gate ──────────────────────────────────────────────────────────────────
 # Composed from the existing targets so the two cannot drift.
 # Runs as sub-makes so the first failure stops the run.

@@ -1729,3 +1729,237 @@ func TestNewLogHandlerRespectsHandlerOptions(t *testing.T) {
 	assert.Equal(t, "kept", got["msg"])
 	assert.Equal(t, "req-2", got["request_id"])
 }
+
+func TestParseEndpointBodyLimitsAndOverrides(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    map[string]int64
+		wantErr string
+	}{
+		{
+			name: "empty input returns no overrides",
+			raw:  "",
+			want: nil,
+		},
+		{
+			name: "whitespace and empty entries are ignored",
+			raw:  "  , POST /watched-contracts=4194304 ,  , PUT /contracts/{id}/spec=2097152 , ",
+			want: map[string]int64{
+				"POST /watched-contracts":  4194304,
+				"PUT /contracts/{id}/spec": 2097152,
+			},
+		},
+		{
+			name: "boundary value of one byte is accepted",
+			raw:  "POST /watched-contracts=1",
+			want: map[string]int64{"POST /watched-contracts": 1},
+		},
+		{
+			name:    "invalid entry without equals is rejected",
+			raw:     "invalid-entry",
+			wantErr: "invalid entry",
+		},
+		{
+			name:    "zero byte limit is rejected",
+			raw:     "POST /watched-contracts=0",
+			wantErr: "invalid byte limit",
+		},
+		{
+			name:    "negative byte limit is rejected",
+			raw:     "POST /watched-contracts=-1",
+			wantErr: "invalid byte limit",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			limits, err := ParseEndpointBodyLimits(tt.raw)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, limits)
+		})
+	}
+}
+
+func TestResolvePoolSizingAndEnvOverrides(t *testing.T) {
+	t.Run("default formula from DefaultDBMaxConns=20", func(t *testing.T) {
+		var cfg Config
+		sizing := cfg.ResolvePoolSizing()
+		assert.Equal(t, int32(20), sizing.TotalConns)
+		assert.Equal(t, int32(5), sizing.MinConns)
+		assert.Equal(t, int32(5), sizing.IngesterReserved)
+		assert.Equal(t, int32(15), sizing.SharedMax)
+		assert.Equal(t, int32(10), sizing.APIReadMax)
+		assert.Equal(t, int32(6), sizing.GraphQLMax)
+		assert.Equal(t, int32(4), sizing.SubscriptionMax)
+		assert.Equal(t, int32(3), sizing.MaintenanceMax)
+		assert.Equal(t, 50*time.Millisecond, sizing.AcquireTimeout)
+		assert.InDelta(t, 0.75, sizing.PressureThreshold, 1e-6)
+	})
+
+	t.Run("environment overrides and validation", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("DATABASE_URL", "postgres://localhost:5432/sorotrail")
+		t.Setenv("DB_MAX_CONNS", "32")
+		t.Setenv("DB_MIN_CONNS", "8")
+		t.Setenv("DB_INGESTER_RESERVED_CONNS", "8")
+		t.Setenv("DB_API_READ_MAX_CONNS", "16")
+		t.Setenv("DB_GRAPHQL_MAX_CONNS", "10")
+		t.Setenv("DB_SUBSCRIPTION_MAX_CONNS", "6")
+		t.Setenv("DB_MAINTENANCE_MAX_CONNS", "4")
+		t.Setenv("DB_POOL_ACQUIRE_TIMEOUT", "75ms")
+		t.Setenv("DB_POOL_PRESSURE_THRESHOLD", "0.80")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+
+		sizing := cfg.ResolvePoolSizing()
+		assert.Equal(t, int32(32), sizing.TotalConns)
+		assert.Equal(t, int32(8), sizing.MinConns)
+		assert.Equal(t, int32(8), sizing.IngesterReserved)
+		assert.Equal(t, int32(24), sizing.SharedMax)
+		assert.Equal(t, int32(16), sizing.APIReadMax)
+		assert.Equal(t, int32(10), sizing.GraphQLMax)
+		assert.Equal(t, int32(6), sizing.SubscriptionMax)
+		assert.Equal(t, int32(4), sizing.MaintenanceMax)
+		assert.Equal(t, 75*time.Millisecond, sizing.AcquireTimeout)
+		assert.InDelta(t, 0.80, sizing.PressureThreshold, 1e-6)
+	})
+
+	t.Run("rejects invalid pool budget relationships", func(t *testing.T) {
+		cfg := Config{
+			DatabaseURL:                "postgres://localhost:5432/sorotrail",
+			RPCURL:                     "https://soroban-testnet.stellar.org",
+			PollInterval:               5 * time.Second,
+			APIQueryTimeout:            25 * time.Second,
+			APISlowQueryThreshold:      2 * time.Second,
+			RetentionLedgers:           17280,
+			PartitionLedgerSpan:        120960,
+			LogLevel:                   "info",
+			LogFormat:                  "text",
+			AuditPollInterval:          30 * time.Second,
+			AuditBatchLedgers:          100,
+			AuditLagThreshold:          200,
+			AuditMaxRPS:                10,
+			AuditMaxRepair:             3,
+			AuditFindingMaxLgrs:        100,
+			RPCRateLimitRPS:            10,
+			RPCRateLimit:               10,
+			RetentionBatchSize:         5000,
+			IngestPageSize:             1000,
+			IngestBatchSize:            1000,
+			RetentionInterval:          time.Hour,
+			BackfillRateRPS:            10,
+			RPCMaxAttempts:             3,
+			RPCBaseBackoff:             500 * time.Millisecond,
+			RPCMaxBackoff:              30 * time.Second,
+			APIMaxLimit:                500,
+			SweepConcurrency:           1,
+			ExportMaxRange:             17280,
+			MultiTenantUsageFlush:      10 * time.Second,
+			MultiTenantStreamScopeSync: 30 * time.Second,
+			DBMaxConns:                 10,
+			DBIngesterReservedConns:    10,
+		}
+		require.ErrorContains(t, cfg.Validate(), "DB_INGESTER_RESERVED_CONNS")
+	})
+}
+
+func TestConfig_FieldLevelEncryptionValidationAndRedaction(t *testing.T) {
+	hexKey1 := strings.Repeat("a1", 32)
+	hexKey2 := strings.Repeat("b2", 32)
+
+	t.Run("single ENCRYPTION_KEY and multi-version ENCRYPTION_KEYS load and validate", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("DATABASE_URL", "postgres://user:pass@localhost/sorotrail")
+		t.Setenv("RPC_URL", "https://soroban-testnet.stellar.org")
+		t.Setenv("ENCRYPTION_KEY", hexKey1)
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, hexKey1, cfg.EffectiveEncryptionKeySpec())
+
+		t.Setenv("ENCRYPTION_KEYS", "v2:"+hexKey2+",v1:"+hexKey1)
+		cfg, err = Load()
+		require.NoError(t, err)
+		assert.Equal(t, "v2:"+hexKey2+",v1:"+hexKey1, cfg.EffectiveEncryptionKeySpec())
+	})
+
+	t.Run("ENCRYPTION_KEY_FILE and ENCRYPTION_KEYS_FILE load via resolveFileEnv", func(t *testing.T) {
+		clearEnv(t)
+		dir := t.TempDir()
+		keyFile := dir + "/enc_key.txt"
+		keysFile := dir + "/enc_keys.txt"
+		require.NoError(t, os.WriteFile(keyFile, []byte(hexKey1+"\n"), 0o600))
+		require.NoError(t, os.WriteFile(keysFile, []byte("v2:"+hexKey2+",v1:"+hexKey1+"\n"), 0o600))
+
+		t.Setenv("DATABASE_URL", "postgres://user:pass@localhost/sorotrail")
+		t.Setenv("RPC_URL", "https://soroban-testnet.stellar.org")
+		t.Setenv("ENCRYPTION_KEY_FILE", keyFile)
+		t.Setenv("ENCRYPTION_KEYS_FILE", keysFile)
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, hexKey1, cfg.EncryptionKey)
+		assert.Equal(t, "v2:"+hexKey2+",v1:"+hexKey1, cfg.EncryptionKeys)
+		assert.Equal(t, "v2:"+hexKey2+",v1:"+hexKey1, cfg.EffectiveEncryptionKeySpec())
+	})
+
+	t.Run("invalid key length, invalid version identifier, or duplicate version fails startup without leaking raw key", func(t *testing.T) {
+		clearEnv(t)
+		shortSecret := "c2hvcnRfa2V5XzE2Ynl0ZQ==" // "short_key_16byte" (16 bytes)
+		t.Setenv("DATABASE_URL", "postgres://user:pass@localhost/sorotrail")
+		t.Setenv("RPC_URL", "https://soroban-testnet.stellar.org")
+		t.Setenv("ENCRYPTION_KEY", shortSecret)
+
+		_, err := Load()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ENCRYPTION_KEY")
+		assert.Contains(t, err.Error(), "want 32-byte AES-256 key")
+		assert.NotContains(t, err.Error(), shortSecret)
+
+		t.Setenv("ENCRYPTION_KEY", "")
+		t.Setenv("ENCRYPTION_KEYS", "v1:"+hexKey1+",v1:"+hexKey2)
+		_, err = Load()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duplicate key version \"v1\"")
+		assert.NotContains(t, err.Error(), hexKey1)
+		assert.NotContains(t, err.Error(), hexKey2)
+
+		for _, badVer := range []string{"v1.0", "-v1", "_v1"} {
+			t.Setenv("ENCRYPTION_KEYS", badVer+":"+hexKey1)
+			_, err = Load()
+			require.Error(t, err, "version %q must be rejected", badVer)
+			assert.Contains(t, err.Error(), "invalid key version identifier")
+			assert.NotContains(t, err.Error(), hexKey1)
+		}
+	})
+
+	t.Run("sensitiveEnvVars redacts ENCRYPTION_KEY and ENCRYPTION_KEYS", func(t *testing.T) {
+		assert.Equal(t, "***", redact("ENCRYPTION_KEY", hexKey1))
+		assert.Equal(t, "***", redact("ENCRYPTION_KEYS", "v2:"+hexKey2+",v1:"+hexKey1))
+	})
+}
+
+func TestParseLogLevel_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want slog.Level
+	}{
+		{name: "empty string defaults to info", raw: "", want: slog.LevelInfo},
+		{name: "whitespace only defaults to info", raw: " \t\n ", want: slog.LevelInfo},
+		{name: "unknown level defaults to info", raw: "verbose", want: slog.LevelInfo},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, ParseLogLevel(tt.raw))
+		})
+	}
+}

@@ -61,6 +61,9 @@ func (s *Server) decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any)
 	body, err := readJSONBody(r, s.effectiveRequestBodyLimit(r))
 	if err != nil {
 		if errors.Is(err, errBodyTooLarge) {
+			if !isDecompressedLimitError(err) {
+				s.recordPayloadRejection(r, "request_body")
+			}
 			writeError(w, http.StatusRequestEntityTooLarge, err)
 		} else {
 			writeError(w, http.StatusBadRequest, err)
@@ -159,6 +162,22 @@ var cachePrivate atomic.Bool
 
 func SetCachePrivate(v bool) { cachePrivate.Store(v) }
 
+var maxSparseFilterLedgerSpan atomic.Int64
+
+// SetMaxSparseFilterLedgerSpan configures the maximum ledger span allowed
+// when querying sparse JSONB topic filters (topic, topic_contains, topic0..topic3)
+// on /events and /contracts/{id}/events. A value <= 0 disables the API-level cap.
+func SetMaxSparseFilterLedgerSpan(span int64) {
+	maxSparseFilterLedgerSpan.Store(span)
+	store.SetMaxSparseFilterLedgerSpan(span)
+}
+
+// MaxSparseFilterLedgerSpan returns the currently configured maximum ledger
+// span for sparse JSONB topic filters.
+func MaxSparseFilterLedgerSpan() int64 {
+	return maxSparseFilterLedgerSpan.Load()
+}
+
 // tenantScoped mirrors Server.multiTenant for the package-level cache
 // helpers, which are plain functions and have no server to ask.
 // WithMultiTenancy sets it at startup, before any request is served.
@@ -207,7 +226,9 @@ const (
 )
 
 type errorResponse struct {
-	Error string `json:"error"`
+	Error string    `json:"error"`
+	Code  ErrorCode `json:"code"`
+	Field string    `json:"field,omitempty"`
 }
 
 type eventsResponse struct {
@@ -554,6 +575,9 @@ func (s *Server) handleCountEvents(w http.ResponseWriter, r *http.Request) {
 
 	total, err := s.store.CountEvents(r.Context(), filter)
 	if err != nil {
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 		loggerFromContext(r.Context()).Error("counting events", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("counting events failed"))
 		return
@@ -611,6 +635,9 @@ func (s *Server) handleAggregateEvents(w http.ResponseWriter, r *http.Request) {
 
 	buckets, err := s.store.AggregateEvents(r.Context(), filter, bucket)
 	if err != nil {
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 		loggerFromContext(r.Context()).Error("aggregating events", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("aggregating events failed"))
 		return
@@ -707,7 +734,15 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 
 	events, cursor, qerr := s.store.QueryEvents(ctx, filter)
 
+	if errors.Is(qerr, store.ErrSparseFilterRangeTooWide) || errors.Is(qerr, store.ErrInvalidCursor) {
+		writeFilterError(w, qerr)
+		return
+	}
+
 	if qerr != nil {
+		if writePoolBudgetExhausted(w, qerr) {
+			return
+		}
 
 		loggerFromContext(ctx).Error("streaming events (first batch)", "error", qerr)
 
@@ -943,7 +978,15 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 
 	}
 
+	if errors.Is(qerr, store.ErrSparseFilterRangeTooWide) {
+		writeFilterError(w, qerr)
+		return
+	}
+
 	if qerr != nil {
+		if writePoolBudgetExhausted(w, qerr) {
+			return
+		}
 
 		loggerFromContext(r.Context()).Error("querying events", "error", qerr)
 
@@ -1324,6 +1367,9 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 
 		loggerFromContext(r.Context()).Error("loading event", "id", id, "error", err)
 
@@ -1520,6 +1566,9 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		loggerFromContext(r.Context()).Error("listing contracts", "error", err)
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
 		return
 	}
@@ -1654,6 +1703,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	stats, err := s.assembleStats(r.Context())
 	if err != nil {
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 		loggerFromContext(r.Context()).Error("loading stats", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
@@ -1667,7 +1719,11 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		stats.SpecCache = sc.SpecCacheStats()
 	}
 
-	s.getStatsCache().Put(key, stats, time.Now())
+	var tenantID int64
+	if p, ok := PrincipalFrom(r.Context()); ok && !p.Untenanted {
+		tenantID = p.Tenant.ID
+	}
+	s.getStatsCache().PutForTenant(tenantID, key, stats, time.Now())
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
 }
@@ -2812,6 +2868,12 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		f.Limit = n
 	}
 
+	if span := maxSparseFilterLedgerSpan.Load(); span > 0 {
+		if err := store.ValidateSparseFilterRange(f, span); err != nil {
+			return f, err
+		}
+	}
+
 	return f, nil
 
 }
@@ -2844,44 +2906,74 @@ func (s *Server) syncStreamScope(ctx context.Context, sub *broadcast.Subscriptio
 	if every <= 0 {
 		every = DefaultStreamScopeSync
 	}
+	watchCh, unregister := s.registerStreamWatcher(p.Tenant.ID, p.KeyID)
 	go func() {
+		defer unregister()
 		ticker := time.NewTicker(every)
 		defer ticker.Stop()
+		refresh := func() bool {
+			if p.KeyID > 0 {
+				keys, err := s.tenants.ListTenantAPIKeys(ctx, p.Tenant.ID)
+				if err != nil {
+					loggerFromContext(ctx).Warn("refreshing stream api key", "tenant", p.Tenant.ID, "error", err)
+					return true
+				}
+				keyActive := false
+				for _, k := range keys {
+					if k.ID == p.KeyID && k.RevokedAt == nil {
+						keyActive = true
+						break
+					}
+				}
+				if !keyActive {
+					sub.SetScope(store.Scope{})
+					return false
+				}
+			}
+			// Re-read the tenant too, so a suspension (enabled=false)
+			// or a switch away from wildcard takes effect on open
+			// streams and not just on new requests.
+			tenant, err := s.tenants.GetTenant(ctx, p.Tenant.ID)
+			if errors.Is(err, store.ErrNotFound) {
+				// Deleted mid-stream: revoke everything. The read loop
+				// sees an empty scope and the connection goes quiet
+				// rather than continuing to serve a tenant that no
+				// longer exists.
+				sub.SetScope(store.Scope{})
+				return false
+			}
+			if err != nil {
+				// Leave the existing scope in place on a transient
+				// database error: it was correct as of the last
+				// successful resolve, and widening or narrowing on a
+				// failed read would be guessing.
+				loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
+				return true
+			}
+			if !tenant.Enabled {
+				sub.SetScope(store.Scope{})
+				return false
+			}
+			scope, err := s.tenantScope(ctx, tenant)
+			if err != nil {
+				loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
+				return true
+			}
+			sub.SetScope(scope)
+			return true
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-watchCh:
+				if !refresh() {
+					return
+				}
 			case <-ticker.C:
-				// Re-read the tenant too, so a suspension (enabled=false)
-				// or a switch away from wildcard takes effect on open
-				// streams and not just on new requests.
-				tenant, err := s.tenants.GetTenant(ctx, p.Tenant.ID)
-				if errors.Is(err, store.ErrNotFound) {
-					// Deleted mid-stream: revoke everything. The read loop
-					// sees an empty scope and the connection goes quiet
-					// rather than continuing to serve a tenant that no
-					// longer exists.
-					sub.SetScope(store.Scope{})
+				if !refresh() {
 					return
 				}
-				if err != nil {
-					// Leave the existing scope in place on a transient
-					// database error: it was correct as of the last
-					// successful resolve, and widening or narrowing on a
-					// failed read would be guessing.
-					loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
-					continue
-				}
-				if !tenant.Enabled {
-					sub.SetScope(store.Scope{})
-					return
-				}
-				scope, err := s.tenants.ScopeForTenant(ctx, tenant)
-				if err != nil {
-					loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
-					continue
-				}
-				sub.SetScope(scope)
 			}
 		}
 	}()
@@ -3103,9 +3195,54 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_, _ = w.Write(buf.Bytes())
 }
 
-func writeError(w http.ResponseWriter, status int, err error) {
+// writePoolBudgetExhausted writes a retriable 503 Service Unavailable with a
+// Retry-After header when err wraps store.ErrPoolBudgetExhausted (#1231) or
+// store.ErrStoreUnavailable (#1282).
+func writePoolBudgetExhausted(w http.ResponseWriter, err error) bool {
+	if errors.Is(err, store.ErrStoreUnavailable) {
+		retrySecs := 2
+		var unavailErr *store.StoreUnavailableError
+		if errors.As(err, &unavailErr) && unavailErr.RetryAfter > 0 {
+			if s := int(unavailErr.RetryAfter.Seconds()); s > 0 {
+				retrySecs = s
+			}
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+		writeCacheHeaders(w, cacheNoStore, 0, "")
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{
+			Error: "database is temporarily unavailable; retry after recovery backoff",
+			Code:  CodeServiceUnavailable,
+		})
+		return true
+	}
+	if !errors.Is(err, store.ErrPoolBudgetExhausted) {
+		return false
+	}
+	retrySecs := 1
+	var budgetErr *store.PoolBudgetExhaustedError
+	if errors.As(err, &budgetErr) && budgetErr.RetryAfter > 0 {
+		if s := int(budgetErr.RetryAfter.Seconds()); s > 0 {
+			retrySecs = s
+		}
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
 	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusServiceUnavailable, errorResponse{
+		Error: "database connection pool budget exhausted; retry after backpressure clears",
+		Code:  CodeServiceUnavailable,
+	})
+	return true
+}
 
-	writeJSON(w, status, errorResponse{Error: err.Error()})
-
+func writeError(w http.ResponseWriter, status int, err error) {
+	if writePoolBudgetExhausted(w, err) {
+		return
+	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	code, field, msg := classifyError(status, err)
+	writeJSON(w, status, errorResponse{
+		Error: msg,
+		Code:  code,
+		Field: field,
+	})
 }

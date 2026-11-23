@@ -42,7 +42,33 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 	"github.com/sorotrail/sorotrail/internal/telemetry"
 	"github.com/sorotrail/sorotrail/internal/webhook"
+	"github.com/sorotrail/sorotrail/internal/workerhealth"
 )
+
+const (
+	exitOK           = 0
+	exitRuntimeError = 1
+	exitConfigError  = 2
+)
+
+type exitError struct {
+	code int
+	err  error
+}
+
+// Error returns the wrapped error's message, or "exit <code>" when there is
+// no wrapped error.
+func (e *exitError) Error() string {
+	if e.err == nil {
+		return fmt.Sprintf("exit %d", e.code)
+	}
+	return e.err.Error()
+}
+
+// Unwrap returns the underlying error so errors.Is and errors.As can inspect it.
+func (e *exitError) Unwrap() error {
+	return e.err
+}
 
 var errInterrupted = errors.New("interrupted")
 
@@ -52,26 +78,28 @@ func main() {
 	if code == 0 {
 		return
 	}
-	if code == 1 {
+	if err != nil && !errors.Is(err, errInterrupted) {
 		fmt.Fprintln(os.Stderr, "sorotrail:", err)
 	}
 	os.Exit(code)
 }
 
 // exitCode maps dispatch's result onto the process exit status: 0 on
-// success, 2 when a one-shot run was interrupted (scripts re-run to
-// resume, so the distinction from a genuine failure is part of the
-// interface), and 1 for every other error. It is a separate function
+// success, 2 when a one-shot run was interrupted or failed configuration
+// validation, and 1 for runtime/dependency errors. It is a separate function
 // so the mapping is testable without os.Exit.
 func exitCode(err error) int {
-	switch {
-	case err == nil:
-		return 0
-	case errors.Is(err, errInterrupted):
-		return 2
-	default:
-		return 1
+	if err == nil {
+		return exitOK
 	}
+	var coded *exitError
+	if errors.As(err, &coded) {
+		return coded.code
+	}
+	if errors.Is(err, errInterrupted) {
+		return 2
+	}
+	return exitRuntimeError
 }
 
 // dispatch routes to a subcommand, defaulting to the indexer so existing
@@ -144,6 +172,12 @@ func dispatch(args []string) error {
 		return runStats(args[1:])
 	case "config":
 		return runConfig(args[1:])
+	case "preflight", "self-check":
+		return runPreflight(args[1:])
+	case "backup":
+		return runBackup(args[1:])
+	case "restore":
+		return runRestore(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -196,6 +230,12 @@ subcommands:
                    (sorotrail stats --help)
   config           print the effective configuration with secrets redacted
                    (sorotrail config --help)
+  preflight        run startup self-checks (config, database, migrations, RPC, archive, retention)
+                   (sorotrail preflight --help)
+  backup           snapshot operator configuration, checkpoints, and optional events
+                   (sorotrail backup --help)
+  restore          restore and verify a backup archive into a migrated database
+                   (sorotrail restore --help)
 `)
 }
 
@@ -270,6 +310,10 @@ func runService(dryRun bool) error {
 	_ = provider
 	defer stop()
 
+	if err := workerhealth.VerifyRPCNetworkOnStartup(ctx, nil, workerhealth.EffectiveRPCURLs(cfg), cfg.Network); err != nil {
+		return err
+	}
+
 	// A dry-run must not mutate the database merely to make the preview
 	// possible. The normal startup path still migrates before opening the
 	// pool, while the preview assumes the existing schema is already
@@ -285,6 +329,7 @@ func runService(dryRun bool) error {
 		pool *pgxpool.Pool
 		pg   *store.Postgres
 	)
+	sizing := cfg.ResolvePoolSizing()
 	if strings.HasPrefix(cfg.DatabaseURL, "clickhouse://") {
 		if cfg.RetentionEnabled() {
 			return fmt.Errorf("clickhouse: retention pruning is not supported by the clickhouse backend")
@@ -302,7 +347,11 @@ func runService(dryRun bool) error {
 		return fmt.Errorf(
 			"clickhouse: the backend is not production-ready; use a postgres:// DATABASE_URL")
 	} else {
-		pool, err = store.NewPool(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns, cfg.DBMaxConnLifetime, cfg.DBMaxConnIdleTime)
+		dbTLS, _, tlsErr := cfg.OutboundDBTLSConfig(log)
+		if tlsErr != nil {
+			return fmt.Errorf("configuring postgres TLS: %w", tlsErr)
+		}
+		pool, err = store.NewPoolWithTLS(ctx, cfg.DatabaseURL, sizing.TotalConns, cfg.DBMinConns, cfg.DBMaxConnLifetime, cfg.DBMaxConnIdleTime, dbTLS)
 		if err != nil {
 			return fmt.Errorf("connecting to postgres: %w", err)
 		}
@@ -345,6 +394,16 @@ func runService(dryRun bool) error {
 		log.Info("postgres connection established")
 		pg = store.NewPostgresWithHealthCheck(ctx, pool, cfg.DatabaseURL, int64(cfg.PartitionLedgerSpan))
 		defer pg.StopHealthCheck()
+		if keySpec := cfg.EffectiveEncryptionKeySpec(); keySpec != "" {
+			enc, encErr := store.ParseFieldEncryptor(keySpec)
+			if encErr != nil {
+				return fmt.Errorf("configuring field-level encryption: %w", encErr)
+			}
+			pg.SetFieldEncryptor(enc)
+		}
+		if err := pg.VerifyEncryptionReadiness(ctx); err != nil {
+			return fmt.Errorf("verifying field-level encryption readiness: %w", err)
+		}
 		st = pg
 	}
 
@@ -386,7 +445,24 @@ func runService(dryRun bool) error {
 
 	// Shared broadcaster for live event streaming across all networks.
 	bcast := broadcast.New(broadcast.DefaultBufferSize)
-	wh := webhook.NewNotifier(st, log)
+	poolBudget := store.NewPoolBudget(store.PoolBudgetConfig{
+		TotalConns:        int(sizing.TotalConns),
+		IngesterReserved:  int(sizing.IngesterReserved),
+		APIReadMax:        int(sizing.APIReadMax),
+		GraphQLMax:        int(sizing.GraphQLMax),
+		SubscriptionMax:   int(sizing.SubscriptionMax),
+		MaintenanceMax:    int(sizing.MaintenanceMax),
+		AcquireTimeout:    sizing.AcquireTimeout,
+		PressureThreshold: sizing.PressureThreshold,
+	})
+	budgetedRoot := store.NewBudgetedStore(st, poolBudget, store.SubsystemAPIRead)
+	ingesterStore := budgetedRoot.ForSubsystem(store.SubsystemIngester)
+	subStore := budgetedRoot.ForSubsystem(store.SubsystemSubscription)
+	maintStore := budgetedRoot.ForSubsystem(store.SubsystemMaintenance)
+	apiReadStore := budgetedRoot.ForSubsystem(store.SubsystemAPIRead)
+	gqlBudgetStore := budgetedRoot.ForSubsystem(store.SubsystemGraphQL)
+
+	wh := webhook.NewNotifier(subStore, log)
 
 	// Wire the spec cache and enricher for spec-decoded event views.
 	// The cache is keyed by wasm hash with a TTL; the fetcher doubles as
@@ -474,7 +550,7 @@ func runService(dryRun bool) error {
 	// The decoder is wrapped in a memoizing cache: ingestion re-decodes the
 	// same topic symbols and values constantly, so hashing the raw XDR and
 	// serving repeats from an LRU removes that redundant work.
-	ing := ingester.New(countingClient, st, decode.NewCachingDecoder(decode.XDRDecoder{}, 0), log, ingester.Options{
+	ing := ingester.New(countingClient, ingesterStore, decode.NewCachingDecoder(decode.XDRDecoder{}, 0), log, ingester.Options{
 		PollInterval:            cfg.PollInterval,
 		PollIntervalMin:         cfg.PollIntervalMin,
 		PollIntervalMax:         cfg.PollIntervalMax,
@@ -500,11 +576,12 @@ func runService(dryRun bool) error {
 	// Wire the same store as the dead-letter sink: events that fail to
 	// decode/persist land in the dead_letters table instead of
 	// stalling the cycle (issue #131).
-	ing.SetDeadLetterSink(st)
+	ing.SetDeadLetterSink(ingesterStore)
 	// Exposes the adaptive poll interval via /stats (issue #146). Always
 	// registered — there is exactly one Ingester per process even when
 	// INGESTION_LOCK_ENABLED causes its Run loop to be skipped.
 	api.SetIngester(ing)
+	yieldCtl := store.CombineYieldControllers(ing.LagCoordinator(), poolBudget)
 
 	// SIGHUP config hot-reload (issue #148): re-reads and validates the
 	// full environment on every SIGHUP, then applies only the safe subset
@@ -546,22 +623,32 @@ func runService(dryRun bool) error {
 			return err
 		}
 		auditClient := audit.NewBudgetedClient(countingClient, budget)
-		aud = audit.New(auditClient, st, ing, log, audit.Options{
+		aud = audit.New(auditClient, maintStore, ing, log, audit.Options{
 			PollInterval:      cfg.AuditPollInterval,
 			BatchLedgers:      cfg.AuditBatchLedgers,
 			LagThreshold:      cfg.AuditLagThreshold,
 			MaxRepairAttempts: cfg.AuditMaxRepair,
 			FindingMaxLedgers: cfg.AuditFindingMaxLgrs,
+			LagController:     yieldCtl,
 		})
 		// Expose the auditor's counters via /stats so operators don't need
 		// to parse logs to see pass/finding rates.
 		api.SetAuditor(aud)
 	}
+	// With multi-tenancy, both retention jobs apply per-tenant policies
+	// (#1249): a shared contract's events are kept for the longest horizon
+	// of the tenants entitled to it. Only the Postgres backend has tenant
+	// storage, and MULTI_TENANT refuses any other backend further down.
+	var retentionPolicies store.RetentionPolicyStore
+	if cfg.MultiTenant {
+		retentionPolicies = maintStore
+	}
 	var retPruner *store.RetentionPruner
 	if cfg.RetentionAge > 0 {
-		retPruner = store.NewRetentionPruner(pg, log, store.RetentionOptions{
+		retPruner = store.NewRetentionPruner(maintStore, log, store.RetentionOptions{
 			Age:          cfg.RetentionAge,
 			PollInterval: cfg.RetentionPoll,
+			Policies:     retentionPolicies,
 		})
 	}
 
@@ -576,6 +663,10 @@ func runService(dryRun bool) error {
 	// to the pre-archive build.
 	var arch *archive.Archiver
 	if cfg.ArchiveEnabled() {
+		archTLS, _, tlsErr := cfg.OutboundArchiveTLSConfig(log)
+		if tlsErr != nil {
+			return fmt.Errorf("configuring archive TLS: %w", tlsErr)
+		}
 		var err error
 		aArchiverOpts := archive.Options{
 			Bucket:          cfg.ArchiveBucket,
@@ -585,10 +676,12 @@ func runService(dryRun bool) error {
 			AccessKeyID:     cfg.ArchiveAccessKeyID,
 			SecretAccessKey: cfg.ArchiveSecretAccessKey,
 			UseSSL:          cfg.ArchiveUseSSL,
+			TLSConfig:       archTLS,
 			MaxRetries:      cfg.ArchiveMaxRetries,
 			Logger:          log,
+			LagController:   yieldCtl,
 		}
-		arch, err = archive.New(st, aArchiverOpts)
+		arch, err = archive.New(maintStore, aArchiverOpts)
 		if err != nil {
 			return fmt.Errorf("initializing archive: %w", err)
 		}
@@ -602,15 +695,17 @@ func runService(dryRun bool) error {
 	// Expose spec-cache hit/miss metrics via /stats.
 	api.SetSpecCache(specCache)
 
-	prn := pruner.NewWithArchiver(st, log, pruner.Options{
+	prn := pruner.NewWithArchiver(maintStore, log, pruner.Options{
 		MaxAge:             cfg.RetentionMaxAge,
 		MinLedger:          cfg.RetentionMinLedger,
 		BatchSize:          cfg.RetentionBatchSize,
 		Pause:              cfg.RetentionPause,
 		Interval:           cfg.RetentionInterval,
 		ArchiveBeforePrune: cfg.ArchiveBeforePrune,
+		LagController:      yieldCtl,
+		Policies:           retentionPolicies,
 	}, arch)
-	if cfg.RetentionEnabled() {
+	if prn.Enabled() {
 		api.SetPruner(prn)
 	}
 
@@ -633,11 +728,13 @@ func runService(dryRun bool) error {
 	defer limiter.Stop()
 
 	// Guarded store for API-originated reads with timeout and slow-query logging.
-	apiStore := store.NewGuardedStore(st, store.GuardedStoreOptions{
+	guardOpts := store.GuardedStoreOptions{
 		Timeout:            cfg.APIQueryTimeout,
 		SlowQueryThreshold: cfg.APISlowQueryThreshold,
 		Logger:             log,
-	})
+	}
+	apiStore := store.NewGuardedStore(apiReadStore, guardOpts)
+	gqlStore := store.NewGuardedStore(gqlBudgetStore, guardOpts)
 	api.SetMaxLimit(cfg.APIMaxLimit)
 
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
@@ -649,6 +746,8 @@ func runService(dryRun bool) error {
 	}
 	apiServer.SetStatsTTL(cfg.StatsCacheTTL)
 	apiServer.SetRateLimiter(limiter)
+	apiServer.SetCostBudget(api.NewCostBudget(cfg.CostBudgetCapacity, cfg.CostBudgetRefillPerSec,
+		api.WithGraphQLEstimator(graphql.EstimateQueryCost)))
 	if cfg.APIKeyAuthEnabled {
 		log.Info("api key authentication enabled", "gated", "write/streaming/subscriptions routes")
 	}
@@ -669,11 +768,11 @@ func runService(dryRun bool) error {
 		ExposedHeaders: cfg.CORSExposedHeaders,
 	})
 
-	// GraphQL transport: reads against the same store + spec enricher
+	// GraphQL transport: reads against the GraphQL-budgeted store + spec enricher
 	// the REST handlers use. Dev-mode playground is gated on
 	// GRAPHQL_PLAYGROUND. The schema is the same shape as
 	// internal/api/graphql/schema.graphqls.
-	gqlHandler, gqlErr := graphql.New(graphqlServerDeps(apiStore, specEnricher), log, cfg.GraphQLPlayground)
+	gqlHandler, gqlErr := graphql.New(graphqlServerDeps(gqlStore, specEnricher), log, cfg.GraphQLPlayground)
 	if gqlErr != nil {
 		return fmt.Errorf("constructing graphql handler: %w", gqlErr)
 	}
@@ -694,6 +793,7 @@ func runService(dryRun bool) error {
 			MaxWatchedContracts: cfg.MultiTenantMaxWatched,
 			UsageFlushInterval:  cfg.MultiTenantUsageFlush,
 			StreamScopeSync:     cfg.MultiTenantStreamScopeSync,
+			DefaultRetention:    cfg.DefaultEventRetention(),
 		})
 		if err := bootstrapAdminKey(ctx, tenants, cfg.MultiTenantBootstrapKey, log); err != nil {
 			return err
@@ -706,9 +806,26 @@ func runService(dryRun bool) error {
 			"stream_scope_sync", cfg.MultiTenantStreamScopeSync)
 	}
 
+	srvTLS, _, tlsErr := cfg.ServerTLSConfig(log)
+	if tlsErr != nil {
+		return fmt.Errorf("configuring HTTP server TLS: %w", tlsErr)
+	}
+	if cfg.MTLSEnabled || len(cfg.TLSClientAllowedIdentities) > 0 || cfg.TLSClientTenantMap != "" {
+		tenantMap, mapErr := config.ParseTenantCertMap(cfg.TLSClientTenantMap)
+		if mapErr != nil {
+			return mapErr
+		}
+		apiServer.SetMTLSConfig(api.MTLSConfig{
+			Enabled:           cfg.MTLSEnabled,
+			AllowedIdentities: cfg.TLSClientAllowedIdentities,
+			TenantMap:         tenantMap,
+		})
+	}
+
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiServer.Router(),
+		TLSConfig:         srvTLS,
 		ReadTimeout:       cfg.HTTPReadTimeout,
 		WriteTimeout:      cfg.HTTPWriteTimeout,
 		IdleTimeout:       cfg.HTTPIdleTimeout,
@@ -746,9 +863,15 @@ func runService(dryRun bool) error {
 		}()
 	}
 	go func() {
-		log.Info("http api listening", "addr", cfg.HTTPAddr)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("http server: %w", err)
+		log.Info("http api listening", "addr", cfg.HTTPAddr, "mtls_enabled", cfg.MTLSEnabled)
+		var serveErr error
+		if server.TLSConfig != nil {
+			serveErr = server.ListenAndServeTLS("", "")
+		} else {
+			serveErr = server.ListenAndServe()
+		}
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("http server: %w", serveErr)
 		} else {
 			errCh <- nil
 		}
@@ -787,8 +910,9 @@ func runService(dryRun bool) error {
 	// returns immediately and reports nil so shutdown accounting holds.
 	remaining++ // + pruner
 	go func() {
-		if cfg.RetentionEnabled() {
+		if prn.Enabled() {
 			log.Info("pruner starting", requestid.Field, requestid.JobPruner,
+				"tenant_policies", retentionPolicies != nil,
 				"max_age", cfg.RetentionMaxAge,
 				"min_ledger", cfg.RetentionMinLedger,
 				"batch_size", cfg.RetentionBatchSize,

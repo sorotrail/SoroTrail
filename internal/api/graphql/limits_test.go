@@ -8,6 +8,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vektah/gqlparser/v2/ast"
 	"github.com/vektah/gqlparser/v2/parser"
+
+	"github.com/sorotrail/sorotrail/internal/api/queries"
 )
 
 // parseOp walks a GraphQL string and returns the first Query
@@ -163,4 +165,24 @@ func createMassiveComplexityQuery(count int) string {
 	}
 	b.WriteString("}")
 	return b.String()
+}
+
+func TestEstimateQueryCost(t *testing.T) {
+	flat := EstimateQueryCost(`{ events(first: 10) { totalCount } }`, nil)
+	if flat <= 0 {
+		t.Fatalf("flat cost = %d, want positive", flat)
+	}
+	// A second list field adds the fan-out charge on top of its own cost.
+	fan := EstimateQueryCost(`{ events(first: 10) { totalCount } contracts(first: 10) { totalCount } }`, nil)
+	if fan <= flat+queries.FanOutCost {
+		t.Fatalf("fan-out cost %d should exceed single %d by more than %d", fan, flat, queries.FanOutCost)
+	}
+	// Page size scales through the shared queries.PageCost.
+	big := EstimateQueryCost(`query($n: Int) { events(first: $n) { totalCount } }`, map[string]any{"n": 200})
+	if big <= flat {
+		t.Fatalf("200-row page cost %d should exceed 10-row cost %d", big, flat)
+	}
+	if got := EstimateQueryCost(`not graphql`, nil); got != queries.BaseRequestCost {
+		t.Fatalf("unparseable document cost = %d, want %d", got, queries.BaseRequestCost)
+	}
 }

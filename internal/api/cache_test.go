@@ -136,7 +136,7 @@ func TestListEvents_OpenEnded(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "Accept-Encoding", resp.Header.Get("Vary"))
 	assert.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
-	assert.Empty(t, resp.Header.Get("ETag"), "no-cache responses must not carry an ETag")
+	assert.Regexp(t, `^"[0-9a-f]{32}"$`, resp.Header.Get("ETag"), "a no-cache list carries a body-derived validator so clients can revalidate (#1244)")
 }
 
 // TestListEvents_AboveFrontier: to_ledger is past the frontier. The
@@ -151,7 +151,7 @@ func TestListEvents_AboveFrontier(t *testing.T) {
 	resp, _ := doGet(t, s, "/events?to_ledger=1000")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
-	assert.Empty(t, resp.Header.Get("ETag"))
+	assert.Regexp(t, `^"[0-9a-f]{32}"$`, resp.Header.Get("ETag"), "a no-cache list carries a body-derived validator so clients can revalidate (#1244)")
 }
 
 // TestListEvents_AtFrontier: to_ledger == last_ingested_ledger.
@@ -170,7 +170,7 @@ func TestListEvents_AtFrontier(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "no-cache", resp.Header.Get("Cache-Control"),
 		"to_ledger equal to frontier must be treated as still-growing")
-	assert.Empty(t, resp.Header.Get("ETag"))
+	assert.Regexp(t, `^"[0-9a-f]{32}"$`, resp.Header.Get("ETag"), "a no-cache list carries a body-derived validator so clients can revalidate (#1244)")
 }
 
 // TestListEvents_BelowFrontier: to_ledger is strictly below the last
@@ -236,7 +236,7 @@ func TestListEvents_ColdStart(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "no-cache", resp.Header.Get("Cache-Control"),
 		"cold-start must never declare an immutable page")
-	assert.Empty(t, resp.Header.Get("ETag"))
+	assert.Regexp(t, `^"[0-9a-f]{32}"$`, resp.Header.Get("ETag"), "a no-cache list carries a body-derived validator so clients can revalidate (#1244)")
 }
 
 // otherContract is a second shape-valid (56 chars, C-prefix, base32
@@ -369,7 +369,7 @@ func TestListEvents_FrontierErr(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "no-cache", resp.Header.Get("Cache-Control"),
 		"a frontier lookup error must fall through to no-cache")
-	assert.Empty(t, resp.Header.Get("ETag"))
+	assert.Regexp(t, `^"[0-9a-f]{32}"$`, resp.Header.Get("ETag"), "a no-cache list carries a body-derived validator so clients can revalidate (#1244)")
 }
 
 // TestGetEvent_IfNoneMatch_WeakPrefix: per RFC 7232 §3.2, an

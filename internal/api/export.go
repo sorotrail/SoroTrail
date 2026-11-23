@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -55,15 +54,44 @@ var exportCSVHeader = []string{"id", "ledger", "type", "tx_hash", "topics", "val
 // topics and value are written as JSON strings so spreadsheets and pandas
 // can parse them as a single cell without splitting on commas inside the
 // event payload.
+//
+// Every cell goes through csvSafe, which neutralises spreadsheet formulas.
 func exportCSVRow(ev store.Event) []string {
 	return []string{
-		ev.ID,
+		csvSafe(ev.ID),
 		fmt.Sprintf("%d", ev.Ledger),
-		ev.Type,
-		ev.TxHash,
-		string(ev.Topics),
-		string(ev.Value),
+		csvSafe(ev.Type),
+		csvSafe(ev.TxHash),
+		csvSafe(string(ev.Topics)),
+		csvSafe(string(ev.Value)),
 	}
+}
+
+// csvSafe stops a cell from being executed as a formula when the file is
+// opened in a spreadsheet. Excel, LibreOffice and Sheets treat a cell that
+// starts with =, +, - or @ (and a leading tab or carriage return) as a
+// formula, and these values come from contracts, so an event can carry one.
+// A dangerous cell is prefixed with a single quote, the spreadsheet escape
+// that makes it display as text.
+//
+// topics and value are JSON documents, so a leading - is a negative number,
+// which a spreadsheet reads as a number and not a formula; those cells are
+// left alone when they are valid JSON, which keeps the column parseable.
+// Any other cell starting with - is escaped.
+func csvSafe(cell string) string {
+	if cell == "" {
+		return cell
+	}
+	switch cell[0] {
+	case 0x3d, 0x2b, 0x40, 0x09, 0x0d: // = + @ tab CR
+		return "'" + cell
+	case 0x2d: // -
+		if json.Valid([]byte(cell)) {
+			return cell
+		}
+		return "'" + cell
+	}
+	return cell
 }
 
 // setExportHeaders commits the Content-Type, Content-Disposition and
@@ -79,6 +107,9 @@ func setExportHeaders(w http.ResponseWriter, format exportFormat, filenameStem s
 	}
 	w.Header().Set("Content-Disposition",
 		fmt.Sprintf(`attachment; filename="%s.%s"`, filenameStem, format))
+	// How the export ended is only known after the last row, so it travels as
+	// an HTTP trailer; see streamExportOpts.
+	w.Header().Set("Trailer", exportStatusTrailer+", "+exportRowsTrailer)
 	// Streaming responses always flush before reaching the compression
 	// threshold, but we still set it via writeCacheHeaders — a stale
 	// browser cache keeping an old export would be a bug, so we mark
@@ -86,74 +117,11 @@ func setExportHeaders(w http.ResponseWriter, format exportFormat, filenameStem s
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 }
 
-// streamExport pages through filter via QueryEvents and writes each page
-// to w in the requested format, flushing after every page so the client
-// sees data as it's produced rather than after the whole export
-// completes. This is the one streaming path both export endpoints use,
-// so a change to pagination, error handling, or event shape can't drift
-// between them.
-//
-// Once the first byte is written the response is committed: a later
-// store error is logged and the connection is dropped rather than
-// surfaced, since there is no way left to send a JSON error envelope.
-func (s *Server) streamExport(ctx context.Context, w http.ResponseWriter, filter store.EventFilter, format exportFormat) {
-	flusher, flushable := w.(http.Flusher)
-
-	var cw *csv.Writer
-	var enc *json.Encoder
-	if format == formatCSV {
-		cw = csv.NewWriter(w)
-		if err := cw.Write(exportCSVHeader); err != nil {
-			loggerFromContext(ctx).Error("writing csv header", "error", err)
-			return
-		}
-		if flushable {
-			flusher.Flush() // header row lands before any other body
-		}
-	} else {
-		enc = json.NewEncoder(w)
-	}
-
-	for {
-		events, cursor, err := s.store.QueryEvents(ctx, filter)
-		if errors.Is(err, store.ErrInvalidCursor) {
-			loggerFromContext(ctx).Error("export cursor", "error", err)
-			return
-		}
-		if err != nil {
-			loggerFromContext(ctx).Error("export query", "error", err)
-			return
-		}
-		for _, ev := range events {
-			if cw != nil {
-				if err := cw.Write(exportCSVRow(ev)); err != nil {
-					loggerFromContext(ctx).Error("export csv write", "error", err)
-					return
-				}
-			} else {
-				if err := enc.Encode(ev); err != nil {
-					loggerFromContext(ctx).Error("export ndjson write", "error", err)
-					return
-				}
-			}
-		}
-		if cw != nil {
-			cw.Flush()
-		}
-		if flushable {
-			flusher.Flush()
-		}
-		if cursor == "" {
-			return
-		}
-		filter.Cursor = cursor
-		// Client disconnect: bail without an error envelope (already
-		// streaming, so the headers are gone and any error body would
-		// just be noise).
-		if ctx.Err() != nil {
-			return
-		}
-	}
+// streamExport streams filter in the requested format with the default
+// options. It is the one streaming path both export endpoints use; see
+// streamExportOpts for the contract.
+func (s *Server) streamExport(ctx context.Context, w http.ResponseWriter, filter store.EventFilter, format exportFormat) error {
+	return s.streamExportOpts(ctx, w, filter, format, exportOptions{})
 }
 
 // handleContractExport streams a contract's events for a closed ledger
@@ -217,6 +185,11 @@ func (s *Server) handleContractExport(w http.ResponseWriter, r *http.Request) {
 			fmt.Errorf("from_ledger %d is after to_ledger %d", fromLedger, toLedger))
 		return
 	}
+	terminator, err := parseExportTerminator(r.URL.Query().Get("terminator"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	span := toLedger - fromLedger + 1
 	if s.exportMaxRange > 0 && span > s.exportMaxRange {
 		writeError(w, http.StatusBadRequest,
@@ -228,7 +201,9 @@ func (s *Server) handleContractExport(w http.ResponseWriter, r *http.Request) {
 	setExportHeaders(w, format, fmt.Sprintf("%s-ledgers-%d-%d", contractID, fromLedger, toLedger))
 
 	filter := s.exportFilter(ctx, contractID, fromLedger, toLedger)
-	s.streamExport(ctx, w, filter, format)
+	if err := s.streamExportOpts(ctx, w, filter, format, exportOptions{Terminator: terminator}); err != nil {
+		abortIncompleteExport()
+	}
 }
 
 // exportFilter is the filter every export page request uses; the
@@ -272,7 +247,14 @@ func (s *Server) handleEventsCSV(w http.ResponseWriter, r *http.Request) {
 	}
 	filter.Cursor = ""
 	filter.Limit = exportQueryBatchSize
+	terminator, err := parseExportTerminator(r.URL.Query().Get("terminator"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 
 	setExportHeaders(w, format, "events")
-	s.streamExport(r.Context(), w, filter, format)
+	if err := s.streamExportOpts(r.Context(), w, filter, format, exportOptions{Terminator: terminator}); err != nil {
+		abortIncompleteExport()
+	}
 }
