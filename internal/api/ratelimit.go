@@ -38,6 +38,18 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// QuotaStore defines the interface for shared quota persistence across replicas.
+type QuotaStore interface {
+	IncrementQuota(ctx context.Context, clientKey string, now time.Time, batchSize int) (int64, int64, error)
+}
+
+// WithQuotaStore configures a shared store for hourly and daily quotas.
+func WithQuotaStore(store QuotaStore) LimiterOption {
+	return func(l *RateLimiter) {
+		l.quotaStore = store
+	}
+}
+
 // exemptPaths are HTTP paths that bypass the limiter. /health is polled
 // by orchestrators and /metrics is scraped by Prometheus — throttling
 // either of those degrades observability without slowing an abuser.
@@ -59,6 +71,7 @@ type RateLimiter struct {
 
 	hourlyQuota int64
 	dailyQuota  int64
+	quotaStore  QuotaStore
 
 	// idleTTL is the wall-clock age beyond which an untouched bucket is
 	// evicted. sweepEvery is the cleanup tick. Both are tunable for tests
@@ -144,7 +157,9 @@ func WithClock(now func() time.Time) LimiterOption {
 
 // LimitResolver derives a request's bucket identity and limits from the
 // request itself. ok=false falls back to the IP-keyed instance-wide limits.
-type LimitResolver func(r *http.Request) (key string, rps float64, burst int, ok bool)
+type LimitResolver interface {
+	Resolve(r *http.Request) (key string, rps float64, burst int, ok bool)
+}
 
 // WithLimitResolver keys the limiter on something other than the source IP —
 // in practice, on the authenticated tenant.
@@ -381,7 +396,7 @@ func (l *RateLimiter) Middleware(next http.Handler) http.Handler {
 		}
 		if l.quotaEnabled() {
 			l.mu.Lock()
-			remaining, retryAfter, ok := l.checkQuota(key, l.now())
+			remaining, retryAfter, ok := l.checkQuota(r.Context(), key, l.now())
 			l.mu.Unlock()
 			if !ok {
 				l.writeLimited(w, retryAfter, burst)
@@ -456,7 +471,35 @@ func (l *RateLimiter) quotaEnabled() bool {
 
 // checkQuota enforces the fixed quota windows for key and increments the
 // counters when the request is admitted. The caller holds l.mu.
-func (l *RateLimiter) checkQuota(key string, now time.Time) (remaining int64, retryAfter time.Duration, ok bool) {
+
+func (l *RateLimiter) checkQuota(ctx context.Context, key string, now time.Time) (remaining int64, retryAfter time.Duration, ok bool) {
+	if l.quotaStore != nil {
+		hUsed, dUsed, err := l.quotaStore.IncrementQuota(ctx, key, now, 1)
+		if err == nil {
+			q := l.quotas[key]
+			if q == nil {
+				q = &quotaEntry{}
+				l.quotas[key] = q
+			}
+			q.hourUsed = hUsed
+			q.dayUsed = dUsed
+			remaining = l.hourlyQuota - q.hourUsed
+			if l.dailyQuota > 0 {
+				dailyRemaining := l.dailyQuota - q.dayUsed
+				if l.hourlyQuota <= 0 || dailyRemaining < remaining {
+					remaining = dailyRemaining
+				}
+			}
+			if l.hourlyQuota > 0 && remaining < 0 {
+				remaining = 0
+			}
+			if l.dailyQuota > 0 && remaining < 0 {
+				remaining = 0
+			}
+			return remaining, 0, true
+		}
+	}
+
 	q := l.quotas[key]
 	if q == nil {
 		q = &quotaEntry{}
@@ -531,7 +574,7 @@ func (l *RateLimiter) limitsFor(r *http.Request) (key string, rps float64, burst
 	if l.resolve == nil {
 		return "", 0, 0, false
 	}
-	return l.resolve(r)
+	return l.resolve.Resolve(r)
 }
 
 // clientKey returns the rate-limit key for this request.
