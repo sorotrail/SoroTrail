@@ -110,6 +110,8 @@ type Archiver struct {
 }
 
 type objectClient interface {
+	// StatObject returns metadata about the object at key in bucket without
+	// fetching its content.
 	StatObject(context.Context, string, string, minio.StatObjectOptions) (minio.ObjectInfo, error)
 	GetObject(context.Context, string, string, minio.GetObjectOptions) (io.ReadCloser, error)
 	PutObject(context.Context, string, string, io.Reader, int64, minio.PutObjectOptions) (minio.UploadInfo, error)

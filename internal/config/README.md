@@ -21,10 +21,14 @@ field halts the process mid-flight; every problem is printed before `os.Exit(1)`
 endpoint and Stellar network passphrase. Ingestion state and persisted events
 are keyed by this network, so changing networks does not reuse cursors.
 
+`RPC_URL` sets a custom Soroban RPC endpoint URL. When not set, defaults to the standard RPC endpoint corresponding to the configured `NETWORK`. Example: `RPC_URL=https://soroban-testnet.stellar.org`.
+
 ## URL format
 | Variable   | Rule                                 |
 |------------|--------------------------------------|
 | `RPC_URL`  | Must be a valid absolute URL with scheme and host. |
+
+`RPC_URL` specifies the Soroban RPC endpoint used for ledger and event ingestion. When unset, SoroTrail defaults to the public RPC URL for the selected `NETWORK`. Default: unset (uses selected network's standard RPC). Example: `RPC_URL=https://soroban-testnet.stellar.org:443`.
 
 ## Duration format
 | Variable              | Rule                                        |
@@ -65,6 +69,12 @@ are keyed by this network, so changing networks does not reuse cursors.
 - `RATE_LIMIT_RPS` and `RATE_LIMIT_BURST`: must both be set or both be unset
   (zero). Setting only one silently disables the rate limiter, which is
   almost certainly an operator mistake.
+
+## Contract selection
+`WATCHED_CONTRACTS` is a comma-separated list of Soroban contract IDs (`C...`)
+to ingest events for. Default: empty, which ingests events for every contract.
+Each watched contract tracks its own resume cursor. Example:
+`WATCHED_CONTRACTS=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`.
 
 ## Contract ID format
 `WATCHED_CONTRACTS` entries must be valid Soroban strkeys (C-prefix, 56 base32

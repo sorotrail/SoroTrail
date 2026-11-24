@@ -655,3 +655,18 @@ func TestRateLimiterQuotaCountersSurviveBucketRecreation(t *testing.T) {
 	assert.Equal(t, int64(1), lim.quotas["203.0.113.83"].dayUsed,
 		"a refused request must not consume quota or reset the window")
 }
+
+// TestClearBuckets drops all cached token buckets.
+func TestClearBuckets(t *testing.T) {
+	lim := NewRateLimiter(1, 1, false)
+
+	// Populate some buckets first.
+	sendFrom(lim, "203.0.113.1:1")
+	sendFrom(lim, "203.0.113.2:2")
+
+	assert.Equal(t, 2, lim.Size(), "buckets must exist before ClearBuckets")
+
+	lim.ClearBuckets()
+
+	assert.Equal(t, 0, lim.Size(), "ClearBuckets must remove all buckets")
+}

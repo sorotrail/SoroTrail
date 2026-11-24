@@ -97,6 +97,8 @@ type Metrics struct {
 	MaxDeferralOverrides  uint64
 }
 
+// Metrics returns a snapshot of the counters the auditor has accumulated
+// since it was created.
 func (a *Auditor) Metrics() Metrics { return a.metrics }
 
 // WithLagController attaches a LagYieldController to the Auditor.
