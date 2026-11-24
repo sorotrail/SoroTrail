@@ -253,6 +253,20 @@ the Postgres-backed conformance tests and the `integration`-tagged job for
 migrations, reorgs and the API filter tests — so a planner or index behaviour
 difference between the two majors fails a leg rather than reaching a deployment.
 
+Example running against a supported PostgreSQL 16 instance with Docker:
+
+```sh
+# Start a supported PostgreSQL 16 instance
+docker run -d --name sorotrail-postgres -p 5432:5432 \
+  -e POSTGRES_USER=sorotrail \
+  -e POSTGRES_PASSWORD=sorotrail \
+  -e POSTGRES_DB=sorotrail \
+  postgres:16-alpine
+
+# Connect SoroTrail to PostgreSQL
+DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable' ./sorotrail
+```
+
 ## Configuration
 
 All configuration comes from environment variables (see `.env.example`).
