@@ -1,6 +1,7 @@
 package graphql
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -60,4 +61,62 @@ func TestDecodeCursor_TamperResistance(t *testing.T) {
 	tampered := valid + "malformed"
 	_, err := DecodeCursor(tampered)
 	require.Error(t, err, "tampered base64 should fail to decode")
+}
+
+// TestDecodeCursor_EdgeCases covers table-driven edge cases: empty input,
+// boundary values, missing ID, and malformed inputs.
+func TestDecodeCursor_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantErr   bool
+		errSubstr string
+		wantID    string
+	}{
+		{
+			name:    "empty string returns empty payload without error",
+			input:   "",
+			wantErr: false,
+			wantID:  "",
+		},
+		{
+			name:      "missing id in JSON payload",
+			input:     base64.StdEncoding.EncodeToString([]byte(`{"order_by":"id","order":"asc"}`)),
+			wantErr:   true,
+			errSubstr: "invalid cursor: missing id",
+		},
+		{
+			name:      "empty id string in JSON payload",
+			input:     base64.StdEncoding.EncodeToString([]byte(`{"id":"","order_by":"id"}`)),
+			wantErr:   true,
+			errSubstr: "invalid cursor: missing id",
+		},
+		{
+			name:      "empty JSON object payload",
+			input:     base64.StdEncoding.EncodeToString([]byte(`{}`)),
+			wantErr:   true,
+			errSubstr: "invalid cursor: missing id",
+		},
+		{
+			name:      "invalid base64 padding and characters",
+			input:     "==invalid-base64==",
+			wantErr:   true,
+			errSubstr: "invalid cursor: not base64",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := DecodeCursor(tt.input)
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.errSubstr != "" {
+					assert.Contains(t, err.Error(), tt.errSubstr)
+				}
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.wantID, got.LastID)
+			}
+		})
+	}
 }
