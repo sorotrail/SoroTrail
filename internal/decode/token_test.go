@@ -375,9 +375,6 @@ func TestScvAddress(t *testing.T) {
 		wantOK bool
 	}{
 		{
-			// Address filtering and the address index both key off this
-			// string, so a mangled prefix would silently split one
-			// account's history in two; the G prefix must survive intact.
 			name:   "account address yields a G-prefixed strkey",
 			input:  json.RawMessage(`{"address":"` + accountStrkey + `"}`),
 			want:   accountStrkey,
@@ -443,9 +440,6 @@ func TestScvAddress(t *testing.T) {
 			assert.Equal(t, tt.wantOK, ok, "ok flag")
 			assert.Equal(t, tt.want, got, "extracted address")
 			if tt.wantOK {
-				// A strkey is a version byte, a 32-byte payload and a
-				// 2-byte checksum base32-encoded, so every address the
-				// decoder hands on is exactly 56 characters.
 				assert.Len(t, got, 56, "strkey length")
 			}
 		})
