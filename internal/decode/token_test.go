@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+
 func TestParseTokenEvent_Transfer(t *testing.T) {
 	topics := json.RawMessage(`[
 		{"symbol": "transfer"},
@@ -349,6 +350,17 @@ func TestScvAmount(t *testing.T) {
 	}
 }
 
+func TestParseTokenEvent_ZeroAmount(t *testing.T) {
+	topics := json.RawMessage(`[
+		{"symbol": "mint"},
+		{"address": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"}
+	]`)
+	value := json.RawMessage(`{"i128": "0"}`)
+
+	te := ParseTokenEvent("CA3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJA", "ev-12", 111, "testnet", topics, value)
+	require.NotNil(t, te)
+	assert.Equal(t, "0", te.Amount.String())
+}
 func TestScvAddress(t *testing.T) {
 	// Real, checksummed strkeys: GA... is an account, CD... a contract.
 	const (
@@ -438,16 +450,4 @@ func TestScvAddress(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestParseTokenEvent_ZeroAmount(t *testing.T) {
-	topics := json.RawMessage(`[
-		{"symbol": "mint"},
-		{"address": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"}
-	]`)
-	value := json.RawMessage(`{"i128": "0"}`)
-
-	te := ParseTokenEvent("CA3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJA", "ev-12", 111, "testnet", topics, value)
-	require.NotNil(t, te)
-	assert.Equal(t, "0", te.Amount.String())
 }
