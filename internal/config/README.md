@@ -34,7 +34,11 @@ are keyed by this network, so changing networks does not reuse cursors.
 | Variable              | Rule                                        |
 |-----------------------|---------------------------------------------|
 | `POLL_INTERVAL`       | Must be a positive Go duration (e.g. `5s`). |
+| `POLL_INTERVAL_MIN`   | Must be a non-negative Go duration (e.g. `1s`). |
+| `POLL_INTERVAL_MAX`   | Must be a non-negative Go duration (e.g. `30s`).|
 | `AUDIT_POLL_INTERVAL` | Must be a positive Go duration (e.g. `30s`).|
+
+`POLL_INTERVAL_MAX` sets the upper bound for the adaptive poll interval. On idle cycles without new events, the effective polling interval backs off toward this value. Default: unset (adaptive polling disabled; ingester polls at fixed `POLL_INTERVAL`). Example: `POLL_INTERVAL_MAX=30s`.
 
 ## Numeric ranges
 | Variable                    | Rule                    |
