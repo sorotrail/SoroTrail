@@ -21,16 +21,24 @@ field halts the process mid-flight; every problem is printed before `os.Exit(1)`
 endpoint and Stellar network passphrase. Ingestion state and persisted events
 are keyed by this network, so changing networks does not reuse cursors.
 
+`RPC_URL` sets a custom Soroban RPC endpoint URL. When not set, defaults to the standard RPC endpoint corresponding to the configured `NETWORK`. Example: `RPC_URL=https://soroban-testnet.stellar.org`.
+
 ## URL format
 | Variable   | Rule                                 |
 |------------|--------------------------------------|
 | `RPC_URL`  | Must be a valid absolute URL with scheme and host. |
 
+`RPC_URL` specifies the Soroban RPC endpoint used for ledger and event ingestion. When unset, SoroTrail defaults to the public RPC URL for the selected `NETWORK`. Default: unset (uses selected network's standard RPC). Example: `RPC_URL=https://soroban-testnet.stellar.org:443`.
+
 ## Duration format
 | Variable              | Rule                                        |
 |-----------------------|---------------------------------------------|
 | `POLL_INTERVAL`       | Must be a positive Go duration (e.g. `5s`). |
+| `POLL_INTERVAL_MIN`   | Must be a non-negative Go duration (e.g. `1s`). |
+| `POLL_INTERVAL_MAX`   | Must be a non-negative Go duration (e.g. `30s`).|
 | `AUDIT_POLL_INTERVAL` | Must be a positive Go duration (e.g. `30s`).|
+
+`POLL_INTERVAL_MAX` sets the upper bound for the adaptive poll interval. On idle cycles without new events, the effective polling interval backs off toward this value. Default: unset (adaptive polling disabled; ingester polls at fixed `POLL_INTERVAL`). Example: `POLL_INTERVAL_MAX=30s`.
 
 ## Numeric ranges
 | Variable                    | Rule                    |
