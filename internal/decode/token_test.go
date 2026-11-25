@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-
 func TestParseTokenEvent_Transfer(t *testing.T) {
 	topics := json.RawMessage(`[
 		{"symbol": "transfer"},
