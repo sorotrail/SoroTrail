@@ -229,6 +229,8 @@ func (w *boundedResponseWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
+// Flush implements http.Flusher, committing any buffered response bytes
+// and forwarding the flush signal to the underlying ResponseWriter.
 func (w *boundedResponseWriter) Flush() {
 	if w.hijacked || w.exceeded {
 		return

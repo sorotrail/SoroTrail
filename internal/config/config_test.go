@@ -1671,6 +1671,63 @@ func TestLoggableFieldsRedactsCredentials(t *testing.T) {
 	})
 }
 
+func TestEffectiveEncryptionKeySpec(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{
+			name: "both empty returns empty string",
+			cfg: Config{
+				EncryptionKey:  "",
+				EncryptionKeys: "",
+			},
+			want: "",
+		},
+		{
+			name: "only EncryptionKeys set returns Keys",
+			cfg: Config{
+				EncryptionKey:  "",
+				EncryptionKeys: "v1:abc123def456abc123def456abc123def456abc123def456abc123def456abc",
+			},
+			want: "v1:abc123def456abc123def456abc123def456abc123def456abc123def456abc",
+		},
+		{
+			name: "only EncryptionKey set returns Key",
+			cfg: Config{
+				EncryptionKey:  "mykey1234567890abcdefmykey1234567890abcdef",
+				EncryptionKeys: "",
+			},
+			want: "mykey1234567890abcdefmykey1234567890abcdef",
+		},
+		{
+			name: "both set, EncryptionKeys takes priority",
+			cfg: Config{
+				EncryptionKey:  "should-not-appear",
+				EncryptionKeys: "v1:abc123def456abc123def456abc123def456abc123def456abc123def456abc",
+			},
+			want: "v1:abc123def456abc123def456abc123def456abc123def456abc123def456abc",
+		},
+		{
+			name: "whitespace-only EncryptionKeys falls through to EncryptionKey",
+			cfg: Config{
+				EncryptionKey:  "mykey1234567890abcdefmykey1234567890abcdef",
+				EncryptionKeys: "   ",
+			},
+			want: "mykey1234567890abcdefmykey1234567890abcdef",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.EffectiveEncryptionKeySpec()
+			assert.NoError(t, nil) // placeholder to match the pattern; EffectiveEncryptionKeySpec never returns an error
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestNewLogHandler(t *testing.T) {
 	tests := []struct {
 		name   string
