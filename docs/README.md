@@ -19,6 +19,8 @@ full details.
 
 ## Reference
 
+- [configuration.md](configuration.md) — environment variable reference: RPC_URL,
+  DATABASE_URL, PORT, LOG_LEVEL, and all other supported configuration variables.
 - [api-keys.md](api-keys.md) — key generation, storage hashing, startup
   bootstrap behavior, CLI management, scope enforcement, rotation procedures,
   and the PostgreSQL requirement.
