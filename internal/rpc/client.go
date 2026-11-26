@@ -259,6 +259,7 @@ func (c *HTTPClient) GetHealth(ctx context.Context) (Health, error) {
 	return resp, err
 }
 
+// GetNetwork returns the network info from the RPC server.
 func (c *HTTPClient) GetNetwork(ctx context.Context) (NetworkInfo, error) {
 	var resp NetworkInfo
 	err := c.call(ctx, "getNetwork", nil, &resp)
