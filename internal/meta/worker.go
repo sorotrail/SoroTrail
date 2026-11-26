@@ -23,12 +23,13 @@ type MetadataStore interface {
 	Put(contractID string, m Metadata, t time.Time)
 }
 
-// Worker orchestrates contract metadata background refresh.
-type Worker struct{}
-
+// NewWorker creates a new Worker for contract metadata background refresh.
 func NewWorker() *Worker {
 	return &Worker{}
 }
+
+// Worker orchestrates contract metadata background refresh.
+type Worker struct{}
 
 // ResolveMetadata resolves contract metadata with caching and interval checks.
 func ResolveMetadata(ctx context.Context, rpc RPCClient, store MetadataStore, contractID string) (Metadata, error) {
