@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-
 func TestParseTokenEvent_Transfer(t *testing.T) {
 	topics := json.RawMessage(`[
 		{"symbol": "transfer"},
@@ -350,17 +349,6 @@ func TestScvAmount(t *testing.T) {
 	}
 }
 
-func TestParseTokenEvent_ZeroAmount(t *testing.T) {
-	topics := json.RawMessage(`[
-		{"symbol": "mint"},
-		{"address": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"}
-	]`)
-	value := json.RawMessage(`{"i128": "0"}`)
-
-	te := ParseTokenEvent("CA3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJA", "ev-12", 111, "testnet", topics, value)
-	require.NotNil(t, te)
-	assert.Equal(t, "0", te.Amount.String())
-}
 func TestScvAddress(t *testing.T) {
 	// Real, checksummed strkeys: GA... is an account, CD... a contract.
 	const (
@@ -375,6 +363,9 @@ func TestScvAddress(t *testing.T) {
 		wantOK bool
 	}{
 		{
+			// Address filtering and the address index both key off this
+			// string, so a mangled prefix would silently split one
+			// account's history in two; the G prefix must survive intact.
 			name:   "account address yields a G-prefixed strkey",
 			input:  json.RawMessage(`{"address":"` + accountStrkey + `"}`),
 			want:   accountStrkey,
@@ -428,6 +419,26 @@ func TestScvAddress(t *testing.T) {
 			want:   "",
 			wantOK: false,
 		},
+		{
+			// A JSON null decodes into a nil map without error, so the
+			// missing-key branch is what must reject it.
+			name:   "JSON null value does not panic and is rejected",
+			input:  json.RawMessage(`null`),
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "ScVal vector is rejected rather than returning its first element",
+			input:  json.RawMessage(`[{"address":"` + accountStrkey + `"}]`),
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "address nested in an object is rejected",
+			input:  json.RawMessage(`{"address":{"account":"` + accountStrkey + `"}}`),
+			want:   "",
+			wantOK: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -440,8 +451,23 @@ func TestScvAddress(t *testing.T) {
 			assert.Equal(t, tt.wantOK, ok, "ok flag")
 			assert.Equal(t, tt.want, got, "extracted address")
 			if tt.wantOK {
+				// A strkey is a version byte, a 32-byte payload and a
+				// 2-byte checksum base32-encoded, so every address the
+				// decoder hands on is exactly 56 characters.
 				assert.Len(t, got, 56, "strkey length")
 			}
 		})
 	}
+}
+
+func TestParseTokenEvent_ZeroAmount(t *testing.T) {
+	topics := json.RawMessage(`[
+		{"symbol": "mint"},
+		{"address": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"}
+	]`)
+	value := json.RawMessage(`{"i128": "0"}`)
+
+	te := ParseTokenEvent("CA3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJ3QJA", "ev-12", 111, "testnet", topics, value)
+	require.NotNil(t, te)
+	assert.Equal(t, "0", te.Amount.String())
 }
