@@ -1791,7 +1791,7 @@ func (p *Postgres) DeleteEventsBeforeIn(ctx context.Context, maxLedger int64, be
 	return tag.RowsAffected(), nil
 }
 
-func (p *Postgres) IncrementQuota(ctx context.Context, clientKey string, now time.Time) (int64, int64, error) {
+func (p *Postgres) IncrementQuota(ctx context.Context, clientKey string, now time.Time, batchSize int) (int64, int64, error) {
 	hourStart := now.Truncate(time.Hour)
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 
@@ -1833,8 +1833,8 @@ func (p *Postgres) IncrementQuota(ctx context.Context, clientKey string, now tim
 		dayUsed = 0
 	}
 
-	hourUsed++
-	dayUsed++
+	hourUsed += int64(batchSize)
+	dayUsed += int64(batchSize)
 
 	_, err = tx.Exec(ctx, `
 		UPDATE client_quotas

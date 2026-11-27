@@ -161,6 +161,12 @@ type LimitResolver interface {
 	Resolve(r *http.Request) (key string, rps float64, burst int, ok bool)
 }
 
+// LimitResolverFunc adapts a plain function to the LimitResolver interface.
+type LimitResolverFunc func(r *http.Request) (key string, rps float64, burst int, ok bool)
+
+// Resolve implements LimitResolver.
+func (f LimitResolverFunc) Resolve(r *http.Request) (string, float64, int, bool) { return f(r) }
+
 // WithLimitResolver keys the limiter on something other than the source IP —
 // in practice, on the authenticated tenant.
 //

@@ -30,13 +30,6 @@ func TestMultiInstanceRateLimiterQuotaShared(t *testing.T) {
 	require.Equal(t, http.StatusTooManyRequests, rec.Code)
 }
 
-func (m *mockQuotaStore) IncrementQuota(ctx context.Context, clientKey string, now time.Time, batchSize int) (int64, int64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.hourUsed += int64(batchSize)
-	m.dayUsed += int64(batchSize)
-	return m.hourUsed, m.dayUsed, nil
-}
 func mkReq(method, path string) *http.Request {
 	return httptest.NewRequest(method, path, nil)
 }
@@ -479,7 +472,7 @@ func TestRateLimiterResolvedBucketsArePerKey(t *testing.T) {
 		}
 		return key, 0.5, 2, true
 	}
-	lim := NewRateLimiter(1, 5, false, WithLimitResolver(resolve))
+	lim := NewRateLimiter(1, 5, false, WithLimitResolver(LimitResolverFunc(resolve)))
 
 	send := func(bucket, addr string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()

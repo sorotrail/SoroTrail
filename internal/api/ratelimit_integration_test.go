@@ -8,23 +8,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sorotrail/sorotrail/internal/store"
-	"github.com/sorotrail/sorotrail/internal/testdb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/testdb"
 )
 
-
 type pgQuotaStore struct {
-	pool *pgxpool.Pool
+	pg *store.Postgres
 }
 
 func (p *pgQuotaStore) IncrementQuota(ctx context.Context, clientKey string, now time.Time, batchSize int) (int64, int64, error) {
-	return p.pool.IncrementQuota(ctx, clientKey, now, batchSize)
+	return p.pg.IncrementQuota(ctx, clientKey, now, batchSize)
 }
+
 func TestMultiInstanceRateLimiterQuotaSharedPostgres(t *testing.T) {
-	st := testdb.Setup(t, store.Migrate)
-	qStore := &pgQuotaStore{pool: st}
+	pool := testdb.Setup(t, store.Migrate)
+	qStore := &pgQuotaStore{pg: store.NewPostgres(pool)}
 	limiter1 := NewRateLimiter(10, 100, false, WithQuotaStore(qStore), WithDailyQuota(5))
 	limiter2 := NewRateLimiter(10, 100, false, WithQuotaStore(qStore), WithDailyQuota(5))
 

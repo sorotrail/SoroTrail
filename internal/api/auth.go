@@ -528,7 +528,7 @@ func (s *Server) requireTenant(next http.Handler) http.Handler {
 // which sends them down the IP-keyed path, preserving exactly the pre-#48
 // behavior for deployments that never turn any of this on.
 func TenantLimitResolver(defaultRPS float64, defaultBurst int) LimitResolver {
-	return func(r *http.Request) (string, float64, int, bool) {
+	return LimitResolverFunc(func(r *http.Request) (string, float64, int, bool) {
 		p, ok := PrincipalFrom(r.Context())
 		if !ok || p.Untenanted || p.Tenant.ID == 0 {
 			return "", 0, 0, false
@@ -545,7 +545,7 @@ func TenantLimitResolver(defaultRPS float64, defaultBurst int) LimitResolver {
 			return "", 0, 0, false
 		}
 		return "tenant:" + strconv.FormatInt(p.Tenant.ID, 10), rps, burst, true
-	}
+	})
 }
 
 func writeUnauthorized(w http.ResponseWriter, msg string) {
