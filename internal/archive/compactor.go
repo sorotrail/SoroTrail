@@ -154,7 +154,7 @@ func CompactArchiveWithLogger(ctx context.Context, client *minio.Client, bucket,
 		return omp, fmt.Errorf("failed to upload compacted chunk: %w", err)
 	}
 
-	newChunk := Chunk{
+	newChunk := ManifestChunk{
 		LedgerStart: newLedgerStart,
 		LedgerEnd:   newLedgerEnd,
 		ObjectKey:   newChunkKey,
@@ -163,7 +163,7 @@ func CompactArchiveWithLogger(ctx context.Context, client *minio.Client, bucket,
 		Checksum:    mergedHash,
 	}
 
-	var newChunks []Chunk
+	var newChunks []ManifestChunk
 	skipMap := make(map[int]bool)
 	for _, idx := range bestGroup {
 		skipMap[idx] = true
