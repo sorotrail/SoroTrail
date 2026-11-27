@@ -43,14 +43,18 @@ func (m *routeMux) Get(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodGet, pattern, handler)
 }
 
+// Post registers a handler for HTTP POST requests at pattern and
+// rejects a duplicate POST registration for the same pattern.
 func (m *routeMux) Post(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodPost, pattern, handler)
 }
 
+// Put registers a PUT route pattern with its handler function.
 func (m *routeMux) Put(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodPut, pattern, handler)
 }
 
+// Patch registers a handler for HTTP PATCH requests at pattern.
 func (m *routeMux) Patch(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodPatch, pattern, handler)
 }
@@ -77,10 +81,13 @@ func (m *routeMux) Connect(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodConnect, pattern, handler)
 }
 
+// Trace registers a handler for HTTP TRACE requests at pattern.
 func (m *routeMux) Trace(pattern string, handler http.HandlerFunc) {
 	m.register(http.MethodTrace, pattern, handler)
 }
 
+// Method registers a handler for an arbitrary HTTP method at pattern and rejects
+// a duplicate registration for the same method and pattern.
 func (m *routeMux) Method(method, pattern string, handler http.Handler) {
 	m.register(method, pattern, handler)
 }
@@ -93,6 +100,7 @@ func (m *routeMux) Handle(pattern string, handler http.Handler) {
 	m.Router.Handle(pattern, handler)
 }
 
+// With returns a new router with the given middlewares wired in, sharing the same registration set.
 func (m *routeMux) With(middlewares ...func(http.Handler) http.Handler) chi.Router {
 	return &routeMux{
 		Router:     m.Router.With(middlewares...),
@@ -100,6 +108,7 @@ func (m *routeMux) With(middlewares ...func(http.Handler) http.Handler) chi.Rout
 	}
 }
 
+// Group creates a new inline router group sharing the routeMux registration set.
 func (m *routeMux) Group(fn func(r chi.Router)) chi.Router {
 	im := m.With()
 	if fn != nil {

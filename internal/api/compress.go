@@ -140,7 +140,6 @@ func (b *boundedDecompressedReader) Close() error {
 	return firstErr
 }
 
-// Pretty reports whether the request has requested pretty-printed JSON output.
 // isStreamingResponse reports whether a request or response header indicates a
 // streaming transport (SSE, NDJSON/CSV export, or WebSocket) that must not be
 // buffered by the response size limiter (#1283).
@@ -229,6 +228,8 @@ func (w *boundedResponseWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
+// Flush implements http.Flusher, committing any buffered response bytes
+// and forwarding the flush signal to the underlying ResponseWriter.
 func (w *boundedResponseWriter) Flush() {
 	if w.hijacked || w.exceeded {
 		return
@@ -269,6 +270,7 @@ func (w *boundedResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return conn, rw, err
 }
 
+// Pretty reports whether the request has requested pretty-printed JSON output.
 func (w *boundedResponseWriter) Pretty() bool {
 	if pw, ok := w.ResponseWriter.(prettyWriter); ok {
 		return pw.Pretty()
