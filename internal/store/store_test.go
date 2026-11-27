@@ -110,3 +110,34 @@ func TestValidOrderBy(t *testing.T) {
 		})
 	}
 }
+
+func TestIsAll(t *testing.T) {
+	tests := []struct {
+		name   string
+		filter store.EventFilter
+		want   bool
+	}{
+		{
+			name:   "empty filter is all",
+			filter: store.EventFilter{},
+			want:   true,
+		},
+		{
+			name:   "filter with contract id is not all",
+			filter: store.EventFilter{ContractID: "C1234"},
+			want:   false,
+		},
+		{
+			name:   "filter with limit is not all",
+			filter: store.EventFilter{Limit: 10},
+			want:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.filter.IsAll()
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
