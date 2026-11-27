@@ -338,7 +338,7 @@ func Compress(minSize int) func(http.Handler) http.Handler {
 			// a client that can't decode it. writeCacheHeaders sets this for
 			// cacheable responses already; set it here too so responses that
 			// bypass that path (errors, subscription CRUD) are also safe.
-			oaddVaryAcceptEncoding(w.Header())
+			addVaryAcceptEncoding(w.Header())
 
 			cw := &compressWriter{ResponseWriter: w, encoding: encoding, minSize: minSize}
 			defer cw.Close()
