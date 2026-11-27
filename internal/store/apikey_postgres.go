@@ -119,9 +119,10 @@ func (p *Postgres) AbandonAPIKeyRotation(ctx context.Context, successorID int64)
 }
 
 func (p *Postgres) UpdateAPIKeyLastUsed(ctx context.Context, id int64, t time.Time) error {
+	threshold := t.Add(-time.Minute)
 	_, err := p.pool.Exec(ctx, `
 		UPDATE api_keys SET last_used_at = $2
-		WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < $2 - interval '1 minute')`, id, t)
+		WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < $3)`, id, t, threshold)
 	if err != nil {
 		return fmt.Errorf("updating API key last used: %w", err)
 	}
