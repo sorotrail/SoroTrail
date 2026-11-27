@@ -62,10 +62,15 @@ watch the logs to see events flow in.
 Compose services are isolated by environment profile. Choose one profile for
 each invocation:
 
-```sh
-# Development: Postgres, indexer, and Jaeger
-docker compose --profile dev up --build
+For example, start the development stack with:
 
+```sh
+docker compose --profile dev up --build
+```
+
+Other common profile workflows:
+
+```sh
 # Testing: Postgres only, for host-side integration tests
 docker compose --profile test up -d
 TEST_DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable' make test-integration
@@ -253,11 +258,33 @@ the Postgres-backed conformance tests and the `integration`-tagged job for
 migrations, reorgs and the API filter tests — so a planner or index behaviour
 difference between the two majors fails a leg rather than reaching a deployment.
 
+Example running against a supported PostgreSQL 16 instance with Docker:
+
+```sh
+# Start a supported PostgreSQL 16 instance
+docker run -d --name sorotrail-postgres -p 5432:5432 \
+  -e POSTGRES_USER=sorotrail \
+  -e POSTGRES_PASSWORD=sorotrail \
+  -e POSTGRES_DB=sorotrail \
+  postgres:16-alpine
+
+# Connect SoroTrail to PostgreSQL
+DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable' ./sorotrail
+```
+
 ## Configuration
 
 All configuration comes from environment variables (see `.env.example`).
 Every variable the code reads is listed here — the table is generated from
 the struct tags in `internal/config/config.go` to prevent drift.
+
+```sh
+# Minimal local run: SQLite storage, testnet RPC, API on :8080
+NETWORK=testnet \
+DATABASE_URL='sqlite:./sorotrail.db' \
+HTTP_ADDR=:8080 \
+./sorotrail
+```
 
 The Reload column states when a change takes effect. `SIGHUP` marks the
 two values the running indexer re-reads and applies live; `restart` marks
@@ -323,7 +350,7 @@ DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=di
 | Variable | Type | Default | Description | Reload |
 | --- | --- | --- | --- | --- |
 | `POLL_INTERVAL` | duration | `5s` | Sleep between polls once caught up with the chain head. | SIGHUP |
-| `POLL_INTERVAL_MIN` | duration | unset | Lower bound for the adaptive poll interval. Once caught up, the effective interval shrinks toward this when a cycle just observed backlog. Both `POLL_INTERVAL_MIN` and `POLL_INTERVAL_MAX` unset (the default) disables adaptation — the ingester always polls at exactly `POLL_INTERVAL`. See [Ingestion behavior additions](#ingestion-behavior-additions). | restart |
+| `POLL_INTERVAL_MIN` | duration | unset | Lower bound for the adaptive poll interval. Once caught up, the effective interval shrinks toward this when a cycle just observed backlog. Both `POLL_INTERVAL_MIN` and `POLL_INTERVAL_MAX` unset (the default) disables adaptation — the ingester always polls at exactly `POLL_INTERVAL`. For example, set `POLL_INTERVAL_MIN=1s` (with `POLL_INTERVAL_MAX` also set) to use a one-second minimum. See [Ingestion behavior additions](#ingestion-behavior-additions). | restart |
 | `POLL_INTERVAL_MAX` | duration | unset | Upper bound for the adaptive poll interval. The effective interval grows toward this on an idle cycle. See `POLL_INTERVAL_MIN`. | restart |
 | `WATCHED_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract triggers a backfill from `latest − RETENTION_LEDGERS`. | restart |
 | `SKIP_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`) to never index events from. | restart |
@@ -344,6 +371,7 @@ DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=di
 | `BATCH_MAX_BACKOFF` | duration | `1s` | Maximum backpressure sleep between batch writes. Only effective when both `BATCH_SIZE` and `BATCH_TARGET_LATENCY` are set. | restart |
 | `INGESTION_LOCK_ENABLED` | bool | `false` | Acquire a Postgres advisory lock keyed by the RPC URL before starting ingestion. A second instance skips ingestion (but keeps serving the API), preventing double-processing. | restart |
 
+- **`RETENTION_LEDGERS`** — Cold-start reach-back in ledgers: when the database is empty, ingestion begins at `latest ledger − RETENTION_LEDGERS` (clamped to the RPC's oldest retained ledger). Also bounds the backfill triggered when a contract is added to the watch list. Default: `17280` (~24h at 5s/ledger). Example: `RETENTION_LEDGERS=34560` (~48h).
 - **`PARTITION_LEDGER_SPAN`** — Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. Default: `120960`. Example: `PARTITION_LEDGER_SPAN=120960`.
 
 ### Reorg detection
@@ -390,6 +418,8 @@ LOG_LEVEL=debug LOG_FORMAT=json ./sorotrail
 | `COMPRESS_MIN_SIZE` | int | `0` | Response body size (bytes) at or above which gzip/deflate encoding is applied. Negative disables compression entirely; `0` uses the built-in default. | restart |
 | `ENABLE_METRICS` | bool | `false` | Expose the Prometheus `/metrics` endpoint. | restart |
 | `SHUTDOWN_TIMEOUT` | duration | `15s` | Maximum time for graceful HTTP server drain and component shutdown before the process is killed. `0` waits indefinitely. | restart |
+
+- **`HTTP_ADDR`** — Host and port the API server binds to, in `host:port` form (`:8080` listens on all interfaces). Default: `:8080`. Example: `HTTP_ADDR=127.0.0.1:9090`.
 
 ```sh
 # Query the API server health check

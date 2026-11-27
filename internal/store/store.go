@@ -289,6 +289,33 @@ type EventFilter struct {
 	Scope Scope
 }
 
+// IsAll reports whether the filter has no narrowing constraints set,
+// meaning it would match every event in the store.
+func (f EventFilter) IsAll() bool {
+	return f.ContractID == "" &&
+		len(f.ContractIDs) == 0 &&
+		f.ContractIDPrefix == "" &&
+		len(f.Types) == 0 &&
+		len(f.Topic) == 0 &&
+		f.TxHash == "" &&
+		f.InSuccessfulCall == nil &&
+		len(f.Topic0) == 0 &&
+		len(f.Topic1) == 0 &&
+		len(f.Topic2) == 0 &&
+		len(f.Topic3) == 0 &&
+		len(f.TopicContains) == 0 &&
+		f.HasValue == nil &&
+		f.TxIndex == nil &&
+		f.OpIndex == nil &&
+		f.FromLedger == 0 &&
+		f.ToLedger == 0 &&
+		f.FromTime.IsZero() &&
+		f.ToTime.IsZero() &&
+		f.Cursor == "" &&
+		f.Limit == 0 &&
+		f.Network == ""
+}
+
 // Sort columns accepted in EventFilter.OrderBy. The zero value means
 // OrderByID, which is the historical behavior.
 const (
