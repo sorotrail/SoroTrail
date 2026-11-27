@@ -16,11 +16,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vektah/gqlparser/v2/ast"
+	"github.com/vektah/gqlparser/v2/parser"
+
 	"github.com/sorotrail/sorotrail/internal/api"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/store"
-	"github.com/vektah/gqlparser/v2/ast"
-	"github.com/vektah/gqlparser/v2/parser"
 )
 
 // Handler is the runtime for the GraphQL transport: one Resolver,

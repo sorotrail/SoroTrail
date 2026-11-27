@@ -240,9 +240,8 @@ func TestRunSubscriptionStream_RevocationAndIsolation(t *testing.T) {
 	mu.Lock()
 	// Tenant B should be filtered out by tenancy check at depth
 	for _, m := range received {
-		if mp, ok := m.(map[string]any);
-		ok {
-			if id, _ := mp["id"]; id == "1" {
+		if mp, ok := m.(map[string]any); ok {
+			if id := mp["id"]; id == "1" {
 				t.Errorf("cross-tenant event leaked: %v", mp)
 			}
 		}
