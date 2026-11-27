@@ -34,6 +34,40 @@ func TestCursorRoundTrip(t *testing.T) {
 	}
 }
 
+func TestEncodeCursor_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name string
+		in   cursorPayload
+	}{
+		{
+			name: "empty ID",
+			in:   cursorPayload{OrderBy: "id", Order: "asc"},
+		},
+		{
+			name: "empty ordering fields",
+			in:   cursorPayload{LastID: "id-1"},
+		},
+		{
+			name: "JSON-special characters",
+			in:   cursorPayload{LastID: "id/\"雪\n", OrderBy: "field\tname", Order: "asc\""},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := EncodeCursor(tt.in.LastID, tt.in.OrderBy, tt.in.Order)
+			if tt.in.LastID == "" {
+				assert.Empty(t, encoded)
+				return
+			}
+
+			decoded, err := DecodeCursor(encoded)
+			require.NoError(t, err)
+			assert.Equal(t, tt.in, decoded)
+		})
+	}
+}
+
 // TestDecodeCursor_InvalidBase64 ensures decode failures are errors,
 // not panics, and the error message is opaque-friendly.
 func TestDecodeCursor_InvalidBase64(t *testing.T) {
