@@ -204,11 +204,7 @@ func (s *Server) handleContractExport(w http.ResponseWriter, r *http.Request) {
 	if err := s.streamExportOpts(ctx, w, filter, format, exportOptions{Terminator: terminator}); err != nil {
 		abortIncompleteExport()
 	} else {
-		p, _ := PrincipalFrom(ctx)
-		if p.Tenant.ID != 0 {
-			s.usage.Add(p.Tenant.ID, 1)
-			metrics.RecordEventServed(ctx, p.Tenant.ID)
-		}
+		s.recordEventsServed(ctx, 1)
 	}
 }
 
@@ -263,10 +259,6 @@ func (s *Server) handleEventsCSV(w http.ResponseWriter, r *http.Request) {
 	if err := s.streamExportOpts(r.Context(), w, filter, format, exportOptions{Terminator: terminator}); err != nil {
 		abortIncompleteExport()
 	} else {
-		p, _ := PrincipalFrom(r.Context())
-		if p.Tenant.ID != 0 {
-			s.usage.Add(p.Tenant.ID, 1)
-			metrics.RecordEventServed(r.Context(), p.Tenant.ID)
-		}
+		s.recordEventsServed(r.Context(), 1)
 	}
 }
