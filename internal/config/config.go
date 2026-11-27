@@ -236,6 +236,10 @@ type Config struct {
 	RateLimitRPS          float64 `env:"RATE_LIMIT_RPS"`
 	RateLimitBurst        int     `env:"RATE_LIMIT_BURST"`
 	RateLimitTrustedProxy bool    `env:"RATE_LIMIT_TRUSTED_PROXY" envDefault:"false"`
+	// Per-tenant query cost budget (#1242). Per-instance only: each replica
+	// keeps its own buckets. Off when CostBudgetCapacity is 0.
+	CostBudgetCapacity     float64 `env:"COST_BUDGET_CAPACITY"`
+	CostBudgetRefillPerSec float64 `env:"COST_BUDGET_REFILL_PER_SEC"`
 	// APIKeyAuthEnabled turns on optional API key authentication: when
 	// true, write, streaming, and key-management endpoints reject
 	// requests that do not present a valid API key (see README "API key
@@ -452,7 +456,7 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// IsSQLite reports whether the database URL points to a SQLite database.
+// resolveFileEnv reads secrets from files indicated by *_FILE environment variables.
 func resolveFileEnv() error {
 	for _, kv := range os.Environ() {
 		parts := strings.SplitN(kv, "=", 2)
@@ -478,6 +482,7 @@ func resolveFileEnv() error {
 	return nil
 }
 
+// IsSQLite reports whether the database URL points to a SQLite database.
 func IsSQLite(databaseURL string) bool {
 	return strings.HasPrefix(databaseURL, "sqlite:")
 }
@@ -929,6 +934,21 @@ func (c Config) collectLegacyValidateErrors() []string {
 // configured — the pruner only runs when this is true.
 func (c Config) RetentionEnabled() bool {
 	return c.RetentionMaxAge > 0 || c.RetentionMinLedger > 0
+}
+
+// DefaultEventRetention is the instance-wide retention horizon a tenant
+// without its own policy inherits (#1249): the shorter of RETENTION_MAX_AGE
+// and RETENTION_AGE when both are set, because either job deletes at its
+// own age. Zero means events are not aged out.
+func (c Config) DefaultEventRetention() time.Duration {
+	switch {
+	case c.RetentionMaxAge > 0 && c.RetentionAge > 0:
+		return min(c.RetentionMaxAge, c.RetentionAge)
+	case c.RetentionMaxAge > 0:
+		return c.RetentionMaxAge
+	default:
+		return max(c.RetentionAge, 0)
+	}
 }
 
 // ArchiveEnabled reports whether the S3-compatible archive backend

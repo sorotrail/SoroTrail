@@ -324,11 +324,48 @@ func (p *Postgres) UpsertEvents(ctx context.Context, events []Event) (int64, err
 }
 
 func (p *Postgres) PruneEventsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
-	tag, err := p.pool.Exec(ctx, `DELETE FROM events WHERE created_at < $1`, cutoff)
+	return p.PruneEventsBeforeIn(ctx, cutoff, ContractSet{Exclude: true})
+}
+
+// PruneEventsBeforeIn is PruneEventsBefore restricted to the contracts in
+// set, for per-tenant retention (#1249). A set matching every contract
+// issues exactly the unrestricted statement.
+func (p *Postgres) PruneEventsBeforeIn(ctx context.Context, cutoff time.Time, set ContractSet) (int64, error) {
+	args := []any{cutoff}
+	where := "created_at < $1"
+	pred, ok := contractSetPredicate(set, func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	})
+	if !ok {
+		return 0, nil
+	}
+	if pred != "" {
+		where += " AND " + pred
+	}
+	tag, err := p.pool.Exec(ctx, `DELETE FROM events WHERE `+where, args...)
 	if err != nil {
 		return 0, fmt.Errorf("pruning events before %s: %w", cutoff.Format(time.RFC3339Nano), err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+// contractSetPredicate renders set as a SQL predicate on contract_id,
+// binding its list through arg. It returns ok=false when the set matches
+// nothing, so the caller can skip the statement, and an empty predicate
+// when the set matches everything. contract_id is NOT NULL, so the negated
+// form needs no NULL handling.
+func contractSetPredicate(set ContractSet, arg func(any) string) (string, bool) {
+	switch {
+	case set.All():
+		return "", true
+	case set.Exclude:
+		return "NOT (contract_id = ANY(" + arg(set.IDs) + "))", true
+	case len(set.IDs) == 0:
+		return "", false
+	default:
+		return "contract_id = ANY(" + arg(set.IDs) + ")", true
+	}
 }
 
 // insertEventsBatch builds the single batch used by upsertEvents (idempotent
@@ -831,6 +868,7 @@ func (p *Postgres) GetEvent(ctx context.Context, id string, sc Scope) (Event, er
 		query += ` AND contract_id = ANY($2)`
 		args = append(args, sc.Contracts())
 	}
+	query, args = appendRetentionCutoff(query, args, sc)
 	var e Event
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, query, args...)
@@ -900,6 +938,7 @@ func (p *Postgres) EventExists(ctx context.Context, id string, sc Scope) (bool, 
 		query += ` AND contract_id = ANY($2)`
 		args = append(args, sc.Contracts())
 	}
+	query, args = appendRetentionCutoff(query, args, sc)
 	var one int
 	err := p.withStatementTimeoutTx(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, query, args...).Scan(&one)
@@ -911,6 +950,18 @@ func (p *Postgres) EventExists(ctx context.Context, id string, sc Scope) (bool, 
 		return false, fmt.Errorf("checking event existence: %w", err)
 	}
 	return true, nil
+}
+
+// appendRetentionCutoff ANDs the scope's retention bound (#1249) into a
+// single-event lookup, so an event kept for a longer-retention tenant is
+// "not found" for a tenant whose own horizon it is past.
+func appendRetentionCutoff(query string, args []any, sc Scope) (string, []any) {
+	cutoff, ok := sc.RetentionCutoff(time.Now())
+	if !ok {
+		return query, args
+	}
+	args = append(args, cutoff)
+	return query + fmt.Sprintf(` AND created_at >= $%d`, len(args)), args
 }
 
 // buildEventWhereClause builds the WHERE clause and arguments shared by
@@ -937,6 +988,12 @@ func buildEventWhereClause(f EventFilter) ([]string, []any) {
 	// cannot widen the authorization.
 	if !f.Scope.IsWildcard() {
 		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
+	}
+	// The tenant's retention horizon is part of the boundary too (#1249):
+	// rows kept for a longer-retention tenant sharing the contract stay
+	// invisible to this one.
+	if cutoff, ok := f.Scope.RetentionCutoff(time.Now()); ok {
+		where = append(where, "created_at >= "+arg(cutoff))
 	}
 	// When ContractIDs is non-empty, use = ANY(...) (SQL IN). When both
 	// ContractID and ContractIDs are set, combine them via a single
@@ -1384,6 +1441,15 @@ const watchedContractsUnion = `
 		SELECT network, contract_id, added_at FROM tenant_watched_contracts
 	) w GROUP BY network, contract_id`
 
+// ListWatchedContracts returns the union of the operator-configured
+// watch list and every tenant's requests, all networks included,
+// which is what ingestion must fetch. It is intentionally not
+// scoped by a caller-side tenant: ingestion serves all tenants at
+// once, and a contract watched on one network is not fetched
+// with the filters of another.
+//
+// Removal is implicit per network — an entry disappears from the
+// union when the last row naming it on that network is gone.
 func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	return p.ListWatchedContractsScoped(ctx, WildcardScope())
 }
@@ -1631,6 +1697,12 @@ func (p *Postgres) frontierStats(ctx context.Context) (Stats, error) {
 // beforeTime is non-zero) older than beforeTime. The count is limited
 // by limit, matching DeleteEventsBefore's batching contract.
 func (p *Postgres) CountEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	return p.CountEventsBeforeIn(ctx, maxLedger, beforeTime, limit, ContractSet{Exclude: true})
+}
+
+// CountEventsBeforeIn is CountEventsBefore restricted to the contracts in
+// set (#1249).
+func (p *Postgres) CountEventsBeforeIn(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int, set ContractSet) (int64, error) {
 	if limit <= 0 {
 		return 0, nil
 	}
@@ -1643,6 +1715,13 @@ func (p *Postgres) CountEventsBefore(ctx context.Context, maxLedger int64, befor
 	where = "ledger < " + arg(maxLedger)
 	if !beforeTime.IsZero() {
 		where += " AND created_at < " + arg(beforeTime)
+	}
+	pred, ok := contractSetPredicate(set, arg)
+	if !ok {
+		return 0, nil
+	}
+	if pred != "" {
+		where += " AND " + pred
 	}
 	q := fmt.Sprintf(`SELECT count(*) FROM (SELECT 1 FROM events WHERE %s LIMIT %d) sub`, where, limit)
 	var total int64
@@ -1672,6 +1751,14 @@ func (p *Postgres) CountEventsBefore(ctx context.Context, maxLedger int64, befor
 // real row identities, not a DELETE result set, so dependent rows come
 // along for free once that table lands.
 func (p *Postgres) DeleteEventsBefore(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int) (int64, error) {
+	return p.DeleteEventsBeforeIn(ctx, maxLedger, beforeTime, limit, ContractSet{Exclude: true})
+}
+
+// DeleteEventsBeforeIn is DeleteEventsBefore restricted to the contracts in
+// set, which is how the pruner applies one per-tenant retention group
+// (#1249) in a single batched statement rather than a rule per row. The
+// contract predicate is served by idx_events_contract_ledger.
+func (p *Postgres) DeleteEventsBeforeIn(ctx context.Context, maxLedger int64, beforeTime time.Time, limit int, set ContractSet) (int64, error) {
 	if limit <= 0 {
 		return 0, nil
 	}
@@ -1687,6 +1774,13 @@ func (p *Postgres) DeleteEventsBefore(ctx context.Context, maxLedger int64, befo
 
 	if !beforeTime.IsZero() {
 		where += " AND created_at < " + arg(beforeTime)
+	}
+	pred, ok := contractSetPredicate(set, arg)
+	if !ok {
+		return 0, nil
+	}
+	if pred != "" {
+		where += " AND " + pred
 	}
 
 	q := fmt.Sprintf(`DELETE FROM events WHERE id IN (SELECT id FROM events WHERE %s LIMIT %d)`, where, limit)
@@ -2350,6 +2444,9 @@ func (p *Postgres) QueryAddressEvents(ctx context.Context, address string, f Eve
 	// Scope is applied before any other filter, exactly like QueryEvents.
 	if !f.Scope.IsWildcard() {
 		where = append(where, "e.contract_id = ANY("+arg(f.Scope.Contracts())+")")
+	}
+	if cutoff, ok := f.Scope.RetentionCutoff(time.Now()); ok {
+		where = append(where, "e.created_at >= "+arg(cutoff))
 	}
 
 	if f.ContractID != "" {

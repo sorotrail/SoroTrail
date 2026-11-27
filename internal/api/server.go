@@ -169,6 +169,7 @@ type Server struct {
 	log              *slog.Logger
 	apiKey           string
 	limiter          *RateLimiter
+	costBudget       *CostBudget
 	bcast            *broadcast.Broadcaster
 	enricher         Enricher
 	enableMetrics    bool
@@ -219,6 +220,9 @@ type Server struct {
 	usage           *UsageRecorder
 	maxWatched      int
 	streamScopeSync time.Duration
+	// defaultRetention is the instance-wide horizon a tenant without its own
+	// retention policy inherits; zero means no age bound (#1249).
+	defaultRetention time.Duration
 
 	// statsTTL is how long a /stats result is served from cache before it
 	// is recomputed. Zero disables caching (the pre-cache behavior).
@@ -493,6 +497,11 @@ type MultiTenantOptions struct {
 	// StreamScopeSync is how often a live stream re-resolves its tenant's
 	// grants. Zero uses DefaultStreamScopeSync.
 	StreamScopeSync time.Duration
+	// DefaultRetention is the instance-wide event-retention horizon that a
+	// tenant without retention_max_age_seconds inherits. It bounds what the
+	// tenant can read and decides whether a policy change shortens its
+	// history. Zero means no age bound.
+	DefaultRetention time.Duration
 }
 
 // WithMultiTenancy turns on tenant isolation. Without this call the server
@@ -508,6 +517,7 @@ func (s *Server) WithMultiTenancy(ts store.TenantStore, opts MultiTenantOptions)
 	SetTenantScopedCaching(true)
 	s.maxWatched = opts.MaxWatchedContracts
 	s.streamScopeSync = opts.StreamScopeSync
+	s.defaultRetention = opts.DefaultRetention
 	s.usage = NewUsageRecorder(ts, s.log, opts.UsageFlushInterval)
 	return s
 }
@@ -520,6 +530,12 @@ func (s *Server) Usage() *UsageRecorder { return s.usage }
 // The limiter's Start/Stop lifecycle is owned by main, not by the Server.
 func (s *Server) SetRateLimiter(l *RateLimiter) {
 	s.limiter = l
+}
+
+// SetCostBudget wires the per-tenant query cost budget. Nil (the default)
+// leaves it off.
+func (s *Server) SetCostBudget(b *CostBudget) {
+	s.costBudget = b
 }
 
 // WithBroadcaster attaches the live event broadcaster so streaming endpoints
@@ -633,6 +649,9 @@ func (s *Server) router() chi.Router {
 	r.Use(s.authenticate)
 	if s.limiter != nil {
 		r.Use(s.limiter.Middleware)
+	}
+	if s.costBudget != nil {
+		r.Use(s.costBudget.Middleware)
 	}
 
 	// usageMiddleware must run after authenticate: it reads the Principal

@@ -254,3 +254,67 @@ func TestMTLS_MultiTenantMappingAndAPIKeyDefenceInDepth(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, recMismatch.Code)
 	assert.Contains(t, recMismatch.Body.String(), "does not match client certificate identity")
 }
+
+func TestClientCertIdentity_AllIdentities(t *testing.T) {
+	tests := []struct {
+		name     string
+		identity ClientCertIdentity
+		want     []string
+	}{
+		{
+			name: "happy path: ordered URIs, DNS names, and SubjectCN without duplicates",
+			identity: ClientCertIdentity{
+				SubjectCN: "service-cn",
+				SANURIs:   []string{"spiffe://cluster.local/ns/prod/sa/caller"},
+				SANDNS:    []string{"service.prod.internal"},
+			},
+			want: []string{
+				"spiffe://cluster.local/ns/prod/sa/caller",
+				"service.prod.internal",
+				"service-cn",
+			},
+		},
+		{
+			name: "deduplication across SAN and CN",
+			identity: ClientCertIdentity{
+				SubjectCN: "dup.example.com",
+				SANURIs:   []string{"spiffe://example.com/id"},
+				SANDNS:    []string{"dup.example.com", "other.example.com"},
+			},
+			want: []string{
+				"spiffe://example.com/id",
+				"dup.example.com",
+				"other.example.com",
+			},
+		},
+		{
+			name: "error path / empty identity fields returns nil",
+			identity: ClientCertIdentity{
+				SubjectCN: "   ",
+				SANURIs:   []string{"", "  "},
+				SANDNS:    []string{""},
+			},
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.identity.AllIdentities()
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestClientCertIdentityFrom_HappyPath(t *testing.T) {
+	identity := ClientCertIdentity{
+		SubjectCN: "test-cn",
+		SANURIs:   []string{"spiffe://example.com/id"},
+		SANDNS:    []string{"test.dns.example"},
+	}
+
+	ctx := context.WithValue(context.Background(), clientCertCtxKey{}, identity)
+	got, ok := ClientCertIdentityFrom(ctx)
+	require.True(t, ok)
+	assert.Equal(t, identity, got)
+}

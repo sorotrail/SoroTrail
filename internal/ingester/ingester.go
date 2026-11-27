@@ -53,12 +53,16 @@ type Clock interface {
 	Now() time.Time
 	// SleepCtx sleeps for d or until ctx is done; it reports whether the
 	// full sleep completed. This is the only sleep seam in the ingester.
+	// The clock is consulted on every poll cycle to sleep between ingestion
+	// cycles; implementations may advance time without blocking (e.g. a
+	// virtual clock for tests) or use wall time (RealClock).
 	SleepCtx(ctx context.Context, d time.Duration) bool
 }
 
 // RealClock is the wall-clock implementation of Clock.
 type RealClock struct{}
 
+// Now returns the current wall-clock time.
 func (RealClock) Now() time.Time { return time.Now() }
 func (RealClock) SleepCtx(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)

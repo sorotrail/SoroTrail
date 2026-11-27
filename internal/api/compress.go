@@ -127,6 +127,8 @@ func (b *boundedDecompressedReader) fireRejected() {
 	}
 }
 
+// Close closes the decompressor and the underlying request body, returning
+// the first error encountered.
 func (b *boundedDecompressedReader) Close() error {
 	var firstErr error
 	if b.reader != nil {
@@ -226,6 +228,8 @@ func (w *boundedResponseWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
+// Flush implements http.Flusher, committing any buffered response bytes
+// and forwarding the flush signal to the underlying ResponseWriter.
 func (w *boundedResponseWriter) Flush() {
 	if w.hijacked || w.exceeded {
 		return
@@ -252,6 +256,8 @@ func (w *boundedResponseWriter) Flush() {
 	}
 }
 
+// Hijack implements http.Hijacker, permitting connection hijacking
+// and marking the response as hijacked.
 func (w *boundedResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	hj, ok := w.ResponseWriter.(http.Hijacker)
 	if !ok {
@@ -264,6 +270,7 @@ func (w *boundedResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return conn, rw, err
 }
 
+// Pretty reports whether the request has requested pretty-printed JSON output.
 func (w *boundedResponseWriter) Pretty() bool {
 	if pw, ok := w.ResponseWriter.(prettyWriter); ok {
 		return pw.Pretty()

@@ -761,3 +761,67 @@ func TestAuditorPassOnceLagBackpressureAndMaxDeferral(t *testing.T) {
 	assert.Equal(t, uint64(1), a.Metrics().MaxDeferralOverrides)
 	assert.GreaterOrEqual(t, a.Metrics().RPCRequests, uint64(1))
 }
+
+func TestNewEdgeCases(t *testing.T) {
+	tests := []struct {
+		name       string
+		client     rpc.Client
+		st         store.Store
+		reingest   Reingester
+		opts       Options
+		wantBatch  uint32
+		wantPoll   time.Duration
+		wantRepair int
+	}{
+		{
+			name:       "empty options receives defaults",
+			client:     &mockRPC{},
+			st:         newMockStore(),
+			reingest:   &stubReingest{},
+			opts:       Options{},
+			wantBatch:  DefaultBatchLedgers,
+			wantPoll:   DefaultPollInterval,
+			wantRepair: DefaultMaxRepairAttempts,
+		},
+		{
+			name:     "custom positive values preserved",
+			client:   &mockRPC{},
+			st:       newMockStore(),
+			reingest: &stubReingest{},
+			opts: Options{
+				BatchLedgers:      500,
+				PollInterval:      10 * time.Second,
+				MaxRepairAttempts: 5,
+				FindingMaxLedgers: 50,
+				LagThreshold:      150,
+				Network:           "custom-net",
+			},
+			wantBatch:  500,
+			wantPoll:   10 * time.Second,
+			wantRepair: 5,
+		},
+		{
+			name:     "negative values replaced by defaults",
+			client:   nil,
+			st:       nil,
+			reingest: nil,
+			opts: Options{
+				PollInterval:      -5 * time.Second,
+				MaxRepairAttempts: -2,
+			},
+			wantBatch:  DefaultBatchLedgers,
+			wantPoll:   DefaultPollInterval,
+			wantRepair: DefaultMaxRepairAttempts,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := New(tt.client, tt.st, tt.reingest, testLogger(), tt.opts)
+			assert.NotNil(t, a)
+			assert.Equal(t, tt.wantBatch, a.opts.BatchLedgers)
+			assert.Equal(t, tt.wantPoll, a.opts.PollInterval)
+			assert.Equal(t, tt.wantRepair, a.opts.MaxRepairAttempts)
+		})
+	}
+}

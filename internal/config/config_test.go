@@ -1671,6 +1671,63 @@ func TestLoggableFieldsRedactsCredentials(t *testing.T) {
 	})
 }
 
+func TestEffectiveEncryptionKeySpec(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{
+			name: "both empty returns empty string",
+			cfg: Config{
+				EncryptionKey:  "",
+				EncryptionKeys: "",
+			},
+			want: "",
+		},
+		{
+			name: "only EncryptionKeys set returns Keys",
+			cfg: Config{
+				EncryptionKey:  "",
+				EncryptionKeys: "v1:abc123def456abc123def456abc123def456abc123def456abc123def456abc",
+			},
+			want: "v1:abc123def456abc123def456abc123def456abc123def456abc123def456abc",
+		},
+		{
+			name: "only EncryptionKey set returns Key",
+			cfg: Config{
+				EncryptionKey:  "mykey1234567890abcdefmykey1234567890abcdef",
+				EncryptionKeys: "",
+			},
+			want: "mykey1234567890abcdefmykey1234567890abcdef",
+		},
+		{
+			name: "both set, EncryptionKeys takes priority",
+			cfg: Config{
+				EncryptionKey:  "should-not-appear",
+				EncryptionKeys: "v1:abc123def456abc123def456abc123def456abc123def456abc123def456abc",
+			},
+			want: "v1:abc123def456abc123def456abc123def456abc123def456abc123def456abc",
+		},
+		{
+			name: "whitespace-only EncryptionKeys falls through to EncryptionKey",
+			cfg: Config{
+				EncryptionKey:  "mykey1234567890abcdefmykey1234567890abcdef",
+				EncryptionKeys: "   ",
+			},
+			want: "mykey1234567890abcdefmykey1234567890abcdef",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.EffectiveEncryptionKeySpec()
+			assert.NoError(t, nil) // placeholder to match the pattern; EffectiveEncryptionKeySpec never returns an error
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestNewLogHandler(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1730,16 +1787,59 @@ func TestNewLogHandlerRespectsHandlerOptions(t *testing.T) {
 }
 
 func TestParseEndpointBodyLimitsAndOverrides(t *testing.T) {
-	limits, err := ParseEndpointBodyLimits("POST /watched-contracts=4194304, PUT /contracts/{id}/spec=2097152")
-	require.NoError(t, err)
-	assert.Equal(t, int64(4194304), limits["POST /watched-contracts"])
-	assert.Equal(t, int64(2097152), limits["PUT /contracts/{id}/spec"])
+	tests := []struct {
+		name    string
+		raw     string
+		want    map[string]int64
+		wantErr string
+	}{
+		{
+			name: "empty input returns no overrides",
+			raw:  "",
+			want: nil,
+		},
+		{
+			name: "whitespace and empty entries are ignored",
+			raw:  "  , POST /watched-contracts=4194304 ,  , PUT /contracts/{id}/spec=2097152 , ",
+			want: map[string]int64{
+				"POST /watched-contracts":  4194304,
+				"PUT /contracts/{id}/spec": 2097152,
+			},
+		},
+		{
+			name: "boundary value of one byte is accepted",
+			raw:  "POST /watched-contracts=1",
+			want: map[string]int64{"POST /watched-contracts": 1},
+		},
+		{
+			name:    "invalid entry without equals is rejected",
+			raw:     "invalid-entry",
+			wantErr: "invalid entry",
+		},
+		{
+			name:    "zero byte limit is rejected",
+			raw:     "POST /watched-contracts=0",
+			wantErr: "invalid byte limit",
+		},
+		{
+			name:    "negative byte limit is rejected",
+			raw:     "POST /watched-contracts=-1",
+			wantErr: "invalid byte limit",
+		},
+	}
 
-	_, err = ParseEndpointBodyLimits("invalid-entry")
-	assert.Error(t, err)
-
-	_, err = ParseEndpointBodyLimits("POST /watched-contracts=-1")
-	assert.Error(t, err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			limits, err := ParseEndpointBodyLimits(tt.raw)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, limits)
+		})
+	}
 }
 
 func TestResolvePoolSizingAndEnvOverrides(t *testing.T) {
@@ -1900,4 +2000,22 @@ func TestConfig_FieldLevelEncryptionValidationAndRedaction(t *testing.T) {
 		assert.Equal(t, "***", redact("ENCRYPTION_KEY", hexKey1))
 		assert.Equal(t, "***", redact("ENCRYPTION_KEYS", "v2:"+hexKey2+",v1:"+hexKey1))
 	})
+}
+
+func TestParseLogLevel_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want slog.Level
+	}{
+		{name: "empty string defaults to info", raw: "", want: slog.LevelInfo},
+		{name: "whitespace only defaults to info", raw: " \t\n ", want: slog.LevelInfo},
+		{name: "unknown level defaults to info", raw: "verbose", want: slog.LevelInfo},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, ParseLogLevel(tt.raw))
+		})
+	}
 }

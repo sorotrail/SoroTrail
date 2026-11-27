@@ -149,6 +149,7 @@ func decodeJSONBytes(body []byte, dst any) error {
 
 var cachePrivate atomic.Bool
 
+// SetCachePrivate sets whether API responses should be marked as private.
 func SetCachePrivate(v bool) { cachePrivate.Store(v) }
 
 var maxSparseFilterLedgerSpan atomic.Int64
@@ -2943,7 +2944,7 @@ func (s *Server) syncStreamScope(ctx context.Context, sub *broadcast.Subscriptio
 				sub.SetScope(store.Scope{})
 				return false
 			}
-			scope, err := s.tenants.ScopeForTenant(ctx, tenant)
+			scope, err := s.tenantScope(ctx, tenant)
 			if err != nil {
 				loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
 				return true

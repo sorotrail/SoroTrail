@@ -14,7 +14,8 @@ import (
 var _ TenantStore = (*Postgres)(nil)
 
 const tenantColumns = `id, name, wildcard, is_admin, enabled,
-	rate_limit_rps, rate_limit_burst, max_watched_contracts, created_at`
+	rate_limit_rps, rate_limit_burst, max_watched_contracts,
+	retention_max_age_seconds, created_at`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -23,7 +24,8 @@ type rowScanner interface {
 func scanTenant(row rowScanner) (Tenant, error) {
 	var t Tenant
 	err := row.Scan(&t.ID, &t.Name, &t.Wildcard, &t.Admin, &t.Enabled,
-		&t.RateLimitRPS, &t.RateLimitBurst, &t.MaxWatchedContracts, &t.CreatedAt)
+		&t.RateLimitRPS, &t.RateLimitBurst, &t.MaxWatchedContracts,
+		&t.RetentionMaxAgeSeconds, &t.CreatedAt)
 	return t, err
 }
 
@@ -38,11 +40,13 @@ func isUniqueViolation(err error) bool {
 func (p *Postgres) CreateTenant(ctx context.Context, t Tenant) (Tenant, error) {
 	row := p.pool.QueryRow(ctx, `
 		INSERT INTO tenants (name, wildcard, is_admin, enabled,
-			rate_limit_rps, rate_limit_burst, max_watched_contracts)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+			rate_limit_rps, rate_limit_burst, max_watched_contracts,
+			retention_max_age_seconds)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING `+tenantColumns,
 		t.Name, t.Wildcard, t.Admin, t.Enabled,
-		t.RateLimitRPS, t.RateLimitBurst, t.MaxWatchedContracts)
+		t.RateLimitRPS, t.RateLimitBurst, t.MaxWatchedContracts,
+		t.RetentionMaxAgeSeconds)
 	created, err := scanTenant(row)
 	if isUniqueViolation(err) {
 		return Tenant{}, fmt.Errorf("tenant %q: %w", t.Name, ErrDuplicate)
@@ -99,11 +103,13 @@ func (p *Postgres) UpdateTenant(ctx context.Context, t Tenant) (Tenant, error) {
 	row := p.pool.QueryRow(ctx, `
 		UPDATE tenants SET
 			name = $2, wildcard = $3, is_admin = $4, enabled = $5,
-			rate_limit_rps = $6, rate_limit_burst = $7, max_watched_contracts = $8
+			rate_limit_rps = $6, rate_limit_burst = $7, max_watched_contracts = $8,
+			retention_max_age_seconds = $9
 		WHERE id = $1
 		RETURNING `+tenantColumns,
 		t.ID, t.Name, t.Wildcard, t.Admin, t.Enabled,
-		t.RateLimitRPS, t.RateLimitBurst, t.MaxWatchedContracts)
+		t.RateLimitRPS, t.RateLimitBurst, t.MaxWatchedContracts,
+		t.RetentionMaxAgeSeconds)
 	updated, err := scanTenant(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Tenant{}, ErrNotFound
@@ -176,6 +182,41 @@ func (p *Postgres) ScopeForTenant(ctx context.Context, t Tenant) (Scope, error) 
 	// answer for a tenant that has been created but not yet granted
 	// anything.
 	return NewScope(ids), nil
+}
+
+var _ RetentionPolicyStore = (*Postgres)(nil)
+
+// ListTenantRetention returns every tenant's retention override and grants
+// in one round trip. Disabled tenants are included on purpose: suspension
+// is reversible, and a suspended customer is still entitled to its history
+// when it comes back.
+func (p *Postgres) ListTenantRetention(ctx context.Context) ([]TenantRetention, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT t.id, t.wildcard, t.retention_max_age_seconds,
+		       coalesce(array_agg(g.contract_id ORDER BY g.contract_id)
+		                FILTER (WHERE g.contract_id IS NOT NULL), '{}')
+		FROM tenants t
+		LEFT JOIN tenant_contract_grants g ON g.tenant_id = t.id
+		GROUP BY t.id
+		ORDER BY t.id`)
+	if err != nil {
+		return nil, fmt.Errorf("listing tenant retention: %w", err)
+	}
+	defer rows.Close()
+
+	out := []TenantRetention{}
+	for rows.Next() {
+		var (
+			tr      TenantRetention
+			seconds *int64
+		)
+		if err := rows.Scan(&tr.TenantID, &tr.Wildcard, &seconds, &tr.Contracts); err != nil {
+			return nil, fmt.Errorf("scanning tenant retention: %w", err)
+		}
+		tr.MaxAge = Tenant{RetentionMaxAgeSeconds: seconds}.RetentionOverride()
+		out = append(out, tr)
+	}
+	return out, rows.Err()
 }
 
 // The two counts AddTenantWatchedContract enforces its caps with. They are
@@ -427,7 +468,8 @@ func (p *Postgres) LookupTenantAPIKey(ctx context.Context, prefix string) (Tenan
 		SELECT k.id, k.tenant_id, k.name, k.prefix, k.created_at, k.last_used_at, k.revoked_at,
 		       k.key_hash,
 		       t.id, t.name, t.wildcard, t.is_admin, t.enabled,
-		       t.rate_limit_rps, t.rate_limit_burst, t.max_watched_contracts, t.created_at
+		       t.rate_limit_rps, t.rate_limit_burst, t.max_watched_contracts,
+		       t.retention_max_age_seconds, t.created_at
 		FROM tenant_api_keys k
 		JOIN tenants t ON t.id = k.tenant_id
 		WHERE k.prefix = $1 AND k.revoked_at IS NULL`, prefix)
@@ -440,7 +482,8 @@ func (p *Postgres) LookupTenantAPIKey(ctx context.Context, prefix string) (Tenan
 	err := row.Scan(&k.ID, &k.TenantID, &k.Name, &k.Prefix, &k.CreatedAt, &k.LastUsedAt, &k.RevokedAt,
 		&digest,
 		&t.ID, &t.Name, &t.Wildcard, &t.Admin, &t.Enabled,
-		&t.RateLimitRPS, &t.RateLimitBurst, &t.MaxWatchedContracts, &t.CreatedAt)
+		&t.RateLimitRPS, &t.RateLimitBurst, &t.MaxWatchedContracts,
+		&t.RetentionMaxAgeSeconds, &t.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return TenantAPIKey{}, nil, Tenant{}, ErrNotFound
 	}

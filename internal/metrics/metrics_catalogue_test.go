@@ -249,6 +249,21 @@ var metricCatalogue = []metricSpec{
 		touch:   func() { DBAttributedCostSeconds.WithLabelValues("ingester", "store.UpsertEvents", "default") },
 	},
 	{
+		Name: "sorotrail_cost_budget_consumed_total", Scope: scopeGlobal, Kind: "counter",
+		Labels: []metricLabel{
+			{Name: "tenant", Values: "default, or an opaque hashed tenant bucket (t_<8hex>) capped at 64 series with overflow folded into other"},
+		},
+		Help:    "Total query cost units charged against per-tenant cost budgets, by tenant.",
+		Meaning: "Cost units each tenant has consumed from its COST_BUDGET_CAPACITY bucket. Only moves when the cost budget is enabled; compare its rate to COST_BUDGET_REFILL_PER_SEC to see which tenants run near their budget.",
+		touch:   func() { CostBudgetConsumedTotal.WithLabelValues("default") },
+	},
+	{
+		Name: "sorotrail_cost_estimated_total", Scope: scopeGlobal, Kind: "counter",
+		Help:    "Total query cost units estimated before execution for requests charged against a cost budget.",
+		Meaning: "Pre-execution cost estimates. Divide the rate of sorotrail_cost_budget_consumed_total (actual units) by this to reconcile actual against estimate: near 1 means the estimator is sound, well below 1 means requests are over-charged up front and refunded.",
+		touch:   func() { CostEstimatedTotal.Add(0) },
+	},
+	{
 		Name: "sorotrail_db_attributed_queries_total", Scope: scopeGlobal, Kind: "counter",
 		Labels: []metricLabel{
 			{Name: "originator", Values: "matched HTTP route pattern (e.g. GET /events/{id}) or background worker id (ingester | pruner | auditor | archiver | reconciler | webhook | unknown)"},

@@ -163,10 +163,14 @@ type loadTestStore struct {
 	store.Store
 }
 
+// LoadTestEventCount returns the total number of events in the store, which
+// the load test uses to measure ingestion throughput.
 func (s *loadTestStore) LoadTestEventCount(ctx context.Context) (int64, error) {
 	return s.CountEvents(ctx, store.EventFilter{})
 }
 
+// LoadTestState returns the store's current ingestion state, which the load
+// test uses to track the last ingested ledger and compute lag.
 func (s *loadTestStore) LoadTestState(ctx context.Context) (store.IngestionState, error) {
 	return s.GetIngestionState(ctx)
 }

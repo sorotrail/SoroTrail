@@ -12,7 +12,7 @@
 
 # Build stage runs on the build host's native platform and cross-compiles,
 # so multi-arch builds don't pay for QEMU-emulated Go compilation.
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -51,7 +51,7 @@ LABEL org.opencontainers.image.title="sorotrail" \
 	org.opencontainers.image.licenses="Apache-2.0"
 
 # Runtime base, pinned by digest for the reason given at the top of the file.
-FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 RUN apk add --no-cache ca-certificates && adduser -D -u 10001 sorotrail
 USER sorotrail
 COPY --from=build /out/sorotrail /usr/local/bin/sorotrail

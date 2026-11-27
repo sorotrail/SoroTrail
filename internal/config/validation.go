@@ -191,6 +191,12 @@ func (c Config) ValidateAll() error {
 	if c.HourlyQuota < 0 {
 		errs = append(errs, fmt.Sprintf("HOURLY_QUOTA: %d must be non-negative", c.HourlyQuota))
 	}
+	if c.CostBudgetCapacity < 0 {
+		errs = append(errs, fmt.Sprintf("COST_BUDGET_CAPACITY: %v must be non-negative", c.CostBudgetCapacity))
+	}
+	if c.CostBudgetCapacity > 0 && c.CostBudgetRefillPerSec <= 0 {
+		errs = append(errs, "COST_BUDGET_REFILL_PER_SEC: must be positive when COST_BUDGET_CAPACITY is set")
+	}
 	if c.DailyQuota < 0 {
 		errs = append(errs, fmt.Sprintf("DAILY_QUOTA: %d must be non-negative", c.DailyQuota))
 	}

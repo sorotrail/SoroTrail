@@ -56,6 +56,8 @@ type exitError struct {
 	err  error
 }
 
+// Error returns the wrapped error's message, or "exit <code>" when there is
+// no wrapped error.
 func (e *exitError) Error() string {
 	if e.err == nil {
 		return fmt.Sprintf("exit %d", e.code)
@@ -63,6 +65,7 @@ func (e *exitError) Error() string {
 	return e.err.Error()
 }
 
+// Unwrap returns the underlying error so errors.Is and errors.As can inspect it.
 func (e *exitError) Unwrap() error {
 	return e.err
 }
@@ -668,11 +671,20 @@ func runService(dryRun bool) error {
 		// to parse logs to see pass/finding rates.
 		api.SetAuditor(aud)
 	}
+	// With multi-tenancy, both retention jobs apply per-tenant policies
+	// (#1249): a shared contract's events are kept for the longest horizon
+	// of the tenants entitled to it. Only the Postgres backend has tenant
+	// storage, and MULTI_TENANT refuses any other backend further down.
+	var retentionPolicies store.RetentionPolicyStore
+	if cfg.MultiTenant {
+		retentionPolicies = maintStore
+	}
 	var retPruner *store.RetentionPruner
 	if cfg.RetentionAge > 0 {
 		retPruner = store.NewRetentionPruner(maintStore, log, store.RetentionOptions{
 			Age:          cfg.RetentionAge,
 			PollInterval: cfg.RetentionPoll,
+			Policies:     retentionPolicies,
 		})
 	}
 
@@ -727,8 +739,9 @@ func runService(dryRun bool) error {
 		Interval:           cfg.RetentionInterval,
 		ArchiveBeforePrune: cfg.ArchiveBeforePrune,
 		LagController:      yieldCtl,
+		Policies:           retentionPolicies,
 	}, arch)
-	if cfg.RetentionEnabled() {
+	if prn.Enabled() {
 		api.SetPruner(prn)
 	}
 
@@ -769,6 +782,8 @@ func runService(dryRun bool) error {
 	}
 	apiServer.SetStatsTTL(cfg.StatsCacheTTL)
 	apiServer.SetRateLimiter(limiter)
+	apiServer.SetCostBudget(api.NewCostBudget(cfg.CostBudgetCapacity, cfg.CostBudgetRefillPerSec,
+		api.WithGraphQLEstimator(graphql.EstimateQueryCost)))
 	if cfg.APIKeyAuthEnabled {
 		log.Info("api key authentication enabled", "gated", "write/streaming/subscriptions routes")
 	}
@@ -813,6 +828,7 @@ func runService(dryRun bool) error {
 			MaxWatchedContracts: cfg.MultiTenantMaxWatched,
 			UsageFlushInterval:  cfg.MultiTenantUsageFlush,
 			StreamScopeSync:     cfg.MultiTenantStreamScopeSync,
+			DefaultRetention:    cfg.DefaultEventRetention(),
 		})
 		if err := bootstrapAdminKey(ctx, tenants, cfg.MultiTenantBootstrapKey, log); err != nil {
 			return err
@@ -929,8 +945,9 @@ func runService(dryRun bool) error {
 	// returns immediately and reports nil so shutdown accounting holds.
 	remaining++ // + pruner
 	go func() {
-		if cfg.RetentionEnabled() {
+		if prn.Enabled() {
 			log.Info("pruner starting", requestid.Field, requestid.JobPruner,
+				"tenant_policies", retentionPolicies != nil,
 				"max_age", cfg.RetentionMaxAge,
 				"min_ledger", cfg.RetentionMinLedger,
 				"batch_size", cfg.RetentionBatchSize,

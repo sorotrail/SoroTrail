@@ -28,6 +28,8 @@ func (c *budgetedClient) GetEvents(ctx context.Context, req rpc.GetEventsRequest
 	return c.inner.GetEvents(ctx, req)
 }
 
+// GetLatestLedger queries the latest ledger sequence from the network,
+// reserving tokens from the audit budget pool.
 func (c *budgetedClient) GetLatestLedger(ctx context.Context) (rpc.LatestLedger, error) {
 	if err := c.budget.WaitAudit(ctx); err != nil {
 		return rpc.LatestLedger{}, err
@@ -42,6 +44,8 @@ func (c *budgetedClient) GetHealth(ctx context.Context) (rpc.Health, error) {
 	return c.inner.GetHealth(ctx)
 }
 
+// GetLedgerEntries fetches the requested ledger entries through the inner
+// client, reserving tokens from the audit budget pool.
 func (c *budgetedClient) GetLedgerEntries(ctx context.Context, req rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
 	if err := c.budget.WaitAudit(ctx); err != nil {
 		return rpc.GetLedgerEntriesResponse{}, err
@@ -49,6 +53,8 @@ func (c *budgetedClient) GetLedgerEntries(ctx context.Context, req rpc.GetLedger
 	return c.inner.GetLedgerEntries(ctx, req)
 }
 
+// SimulateTransaction simulates a transaction against the current ledger state
+// using the underlying RPC client, reserving tokens from the audit budget pool.
 func (c *budgetedClient) SimulateTransaction(ctx context.Context, req rpc.SimulateTransactionRequest) (rpc.SimulateTransactionResponse, error) {
 	if err := c.budget.WaitAudit(ctx); err != nil {
 		return rpc.SimulateTransactionResponse{}, err

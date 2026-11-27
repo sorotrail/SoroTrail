@@ -87,3 +87,57 @@ func TestEvent_WithSEP41(t *testing.T) {
 			"populated sep41_event must appear in JSON, got %s", string(body))
 	})
 }
+
+func TestValidOrderBy(t *testing.T) {
+	tests := []struct {
+		name    string
+		orderBy string
+		want    bool
+	}{
+		{name: "empty string defaults to id", orderBy: "", want: true},
+		{name: "order by id", orderBy: store.OrderByID, want: true},
+		{name: "order by ledger", orderBy: store.OrderByLedger, want: true},
+		{name: "order by created_at", orderBy: store.OrderByCreatedAt, want: true},
+		{name: "unknown column error path", orderBy: "invalid_column", want: false},
+		{name: "sql injection error path", orderBy: "id; DROP TABLE events;", want: false},
+		{name: "uppercase mismatch error path", orderBy: "ID", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := store.ValidOrderBy(tc.orderBy)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestIsAll(t *testing.T) {
+	tests := []struct {
+		name   string
+		filter store.EventFilter
+		want   bool
+	}{
+		{
+			name:   "empty filter is all",
+			filter: store.EventFilter{},
+			want:   true,
+		},
+		{
+			name:   "filter with contract id is not all",
+			filter: store.EventFilter{ContractID: "C1234"},
+			want:   false,
+		},
+		{
+			name:   "filter with limit is not all",
+			filter: store.EventFilter{Limit: 10},
+			want:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.filter.IsAll()
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}

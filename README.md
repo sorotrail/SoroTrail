@@ -62,10 +62,15 @@ watch the logs to see events flow in.
 Compose services are isolated by environment profile. Choose one profile for
 each invocation:
 
-```sh
-# Development: Postgres, indexer, and Jaeger
-docker compose --profile dev up --build
+For example, start the development stack with:
 
+```sh
+docker compose --profile dev up --build
+```
+
+Other common profile workflows:
+
+```sh
 # Testing: Postgres only, for host-side integration tests
 docker compose --profile test up -d
 TEST_DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable' make test-integration
@@ -253,11 +258,33 @@ the Postgres-backed conformance tests and the `integration`-tagged job for
 migrations, reorgs and the API filter tests — so a planner or index behaviour
 difference between the two majors fails a leg rather than reaching a deployment.
 
+Example running against a supported PostgreSQL 16 instance with Docker:
+
+```sh
+# Start a supported PostgreSQL 16 instance
+docker run -d --name sorotrail-postgres -p 5432:5432 \
+  -e POSTGRES_USER=sorotrail \
+  -e POSTGRES_PASSWORD=sorotrail \
+  -e POSTGRES_DB=sorotrail \
+  postgres:16-alpine
+
+# Connect SoroTrail to PostgreSQL
+DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable' ./sorotrail
+```
+
 ## Configuration
 
 All configuration comes from environment variables (see `.env.example`).
 Every variable the code reads is listed here — the table is generated from
 the struct tags in `internal/config/config.go` to prevent drift.
+
+```sh
+# Minimal local run: SQLite storage, testnet RPC, API on :8080
+NETWORK=testnet \
+DATABASE_URL='sqlite:./sorotrail.db' \
+HTTP_ADDR=:8080 \
+./sorotrail
+```
 
 The Reload column states when a change takes effect. `SIGHUP` marks the
 two values the running indexer re-reads and applies live; `restart` marks
@@ -313,12 +340,17 @@ once. A single process still ingests one network — the one named by
 | `DB_MAX_CONN_LIFETIME` | duration | `0` | Max lifetime of a DB connection (`0` = no limit, e.g. `30m`). | restart |
 | `DB_MAX_CONN_IDLE_TIME` | duration | `0` | Max idle time of a DB connection (`0` = no limit, e.g. `5m`). | restart |
 
+```sh
+# Connect to PostgreSQL
+DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable' ./sorotrail
+```
+
 ### Ingestion
 
 | Variable | Type | Default | Description | Reload |
 | --- | --- | --- | --- | --- |
 | `POLL_INTERVAL` | duration | `5s` | Sleep between polls once caught up with the chain head. | SIGHUP |
-| `POLL_INTERVAL_MIN` | duration | unset | Lower bound for the adaptive poll interval. Once caught up, the effective interval shrinks toward this when a cycle just observed backlog. Both `POLL_INTERVAL_MIN` and `POLL_INTERVAL_MAX` unset (the default) disables adaptation — the ingester always polls at exactly `POLL_INTERVAL`. See [Ingestion behavior additions](#ingestion-behavior-additions). | restart |
+| `POLL_INTERVAL_MIN` | duration | unset | Lower bound for the adaptive poll interval. Once caught up, the effective interval shrinks toward this when a cycle just observed backlog. Both `POLL_INTERVAL_MIN` and `POLL_INTERVAL_MAX` unset (the default) disables adaptation — the ingester always polls at exactly `POLL_INTERVAL`. For example, set `POLL_INTERVAL_MIN=1s` (with `POLL_INTERVAL_MAX` also set) to use a one-second minimum. See [Ingestion behavior additions](#ingestion-behavior-additions). | restart |
 | `POLL_INTERVAL_MAX` | duration | unset | Upper bound for the adaptive poll interval. The effective interval grows toward this on an idle cycle. See `POLL_INTERVAL_MIN`. | restart |
 | `WATCHED_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract triggers a backfill from `latest − RETENTION_LEDGERS`. | restart |
 | `SKIP_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`) to never index events from. | restart |
@@ -339,6 +371,9 @@ once. A single process still ingests one network — the one named by
 | `BATCH_MAX_BACKOFF` | duration | `1s` | Maximum backpressure sleep between batch writes. Only effective when both `BATCH_SIZE` and `BATCH_TARGET_LATENCY` are set. | restart |
 | `INGESTION_LOCK_ENABLED` | bool | `false` | Acquire a Postgres advisory lock keyed by the RPC URL before starting ingestion. A second instance skips ingestion (but keeps serving the API), preventing double-processing. | restart |
 
+- **`RETENTION_LEDGERS`** — Cold-start reach-back in ledgers: when the database is empty, ingestion begins at `latest ledger − RETENTION_LEDGERS` (clamped to the RPC's oldest retained ledger). Also bounds the backfill triggered when a contract is added to the watch list. Default: `17280` (~24h at 5s/ledger). Example: `RETENTION_LEDGERS=34560` (~48h).
+- **`PARTITION_LEDGER_SPAN`** — Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. Default: `120960`. Example: `PARTITION_LEDGER_SPAN=120960`.
+
 ### Reorg detection
 
 | Variable | Type | Default | Description | Reload |
@@ -353,6 +388,15 @@ once. A single process still ingests one network — the one named by
 | `LOG_LEVEL` | string | `info` | `debug` \| `info` \| `warn` \| `error`. | SIGHUP |
 | `LOG_FORMAT` | string | `text` | `text` \| `json`. JSON emits one JSON object per line, compatible with Loki, CloudWatch, and ELK. | restart |
 | `LAG_WARN_LEDGERS` | uint32 | `100` | Ingest-lag alarm threshold in ledgers. When the gap between chain head and last ingested ledger exceeds this, a WARN is logged; an INFO fires once the gap closes. `0` disables the alarm. | restart |
+
+```sh
+# Run with JSON-formatted logs at debug level
+LOG_LEVEL=debug LOG_FORMAT=json ./sorotrail
+```
+
+- **`LOG_LEVEL`** — Sets the logging verbosity level (`debug`, `info`, `warn`, `error`). Hot-reloadable at runtime via SIGHUP. Default: `info`. Example: `LOG_LEVEL=debug`.
+- **`LOG_FORMAT`** — Sets the structured log output format (`text` or `json`). JSON emits one JSON object per line. Default: `text`. Example: `LOG_FORMAT=json`.
+- **`LAG_WARN_LEDGERS`** — Ingest-lag alarm threshold in ledgers. When the gap between the chain head and the last ingested ledger exceeds this value, one WARN log is emitted; one INFO log fires when the gap closes. `0` disables the alarm. Default: `100`. Example: `LAG_WARN_LEDGERS=250`.
 
 ### API server
 
@@ -375,6 +419,13 @@ once. A single process still ingests one network — the one named by
 | `ENABLE_METRICS` | bool | `false` | Expose the Prometheus `/metrics` endpoint. | restart |
 | `SHUTDOWN_TIMEOUT` | duration | `15s` | Maximum time for graceful HTTP server drain and component shutdown before the process is killed. `0` waits indefinitely. | restart |
 
+- **`HTTP_ADDR`** — Host and port the API server binds to, in `host:port` form (`:8080` listens on all interfaces). Default: `:8080`. Example: `HTTP_ADDR=127.0.0.1:9090`.
+
+```sh
+# Query the API server health check
+curl -s http://localhost:8080/health
+```
+
 ### CORS
 
 | Variable | Type | Default | Description | Reload |
@@ -393,10 +444,17 @@ once. A single process still ingests one network — the one named by
 | `RATE_LIMIT_TRUSTED_PROXY` | bool | `false` | Honor `X-Forwarded-For` for client IP detection. Only enable behind a trusted proxy that strips/rewrites the header. | restart |
 | `HOURLY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a fixed 1-hour window that starts at the client's first request. `0` disables the quota. See [Rate limits and quotas](docs/rate-limits.md). | restart |
 | `DAILY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a fixed 24-hour window that starts at the client's first request. `0` disables the quota. See [Rate limits and quotas](docs/rate-limits.md). | restart |
+| `COST_BUDGET_CAPACITY` | float64 | `0` (disabled) | Per-tenant query cost budget: the number of cost units a tenant's bucket holds. Requests are charged by estimated cost (page size, ledger range, index use, aggregate breadth, GraphQL depth) and rejected with `429` + `Retry-After` when the bucket is empty. Per instance only. See [Performance](docs/performance.md). | restart |
+| `COST_BUDGET_REFILL_PER_SEC` | float64 | `0` | Cost units added back to each tenant's bucket per second. Required (positive) when `COST_BUDGET_CAPACITY` is set. | restart |
 
 See [Rate limits and quotas](docs/rate-limits.md) for the evaluation order,
 client-key derivation, response headers, per-tenant overrides, and the
 multi-replica caveat.
+
+```sh
+# Run with per-client rate limiting enabled (10 req/s with burst of 20)
+RATE_LIMIT_RPS=10 RATE_LIMIT_BURST=20 ./sorotrail
+```
 
 ### Audit
 
@@ -424,6 +482,20 @@ multi-replica caveat.
 | `RETENTION_INTERVAL` | duration | `1h` | How often the pruner runs. | restart |
 | `RETENTION_DRY_RUN` | bool | `false` | Report what the pruner would delete without removing any rows. | restart |
 
+For example, to keep roughly the last 7 days of events and prune anything
+older, dry-run first to see what would be deleted:
+
+```sh
+RETENTION_MAX_AGE=168h RETENTION_DRY_RUN=true ./sorotrail
+```
+
+Then drop `RETENTION_DRY_RUN` to delete for real (the pruner runs hourly by
+default):
+
+```sh
+RETENTION_MAX_AGE=168h ./sorotrail
+```
+
 ### Archive
 
 | Variable | Type | Default | Description | Reload |
@@ -438,13 +510,68 @@ multi-replica caveat.
 | `ARCHIVE_BEFORE_PRUNE` | bool | `false` | Export events to the archive before the pruner deletes them. | restart |
 | `ARCHIVE_MAX_RETRIES` | int | `3` | Maximum upload retry attempts per event batch. | restart |
 
+If you have configured `RETENTION_MAX_AGE` or `RETENTION_MIN_LEDGER`, add
+these settings to `.env` to archive events before pruning. This example uses
+an existing `sorotrail-archive` bucket on local MinIO. Replace the sample
+credentials with your MinIO credentials.
+
+```dotenv
+ARCHIVE_BUCKET=sorotrail-archive
+ARCHIVE_ENDPOINT=localhost:9000
+ARCHIVE_ACCESS_KEY_ID=your-minio-access-key
+ARCHIVE_SECRET_ACCESS_KEY=your-minio-secret-key
+ARCHIVE_USE_SSL=false
+ARCHIVE_BEFORE_PRUNE=true
+```
+
 ### Export
+
+Export streams a contract's stored events for a closed ledger range as an
+attachment download. Supports CSV (default) or NDJSON format.
+
+```sh
+# CSV — id, ledger, type, tx_hash, topics (JSON string), value (JSON string)
+sorotrail contracts export \
+  --contract CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC \
+  --from-ledger 250000 --to-ledger 260000 \
+  --output contract_events.csv
+
+# NDJSON — one event object per line, same shape as /events
+sorotrail contracts export \
+  --contract CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC \
+  --from-ledger 250000 --to-ledger 260000 \
+  --format ndjson \
+  --output contract_events.ndjson
+```
 
 | Variable | Type | Default | Description | Reload |
 | --- | --- | --- | --- | --- |
 | `EXPORT_MAX_RANGE` | int64 | `17280` | Maximum ledger span a single `/contracts/{id}/export` call may request (~24h at 5s/ledger). Returns 400 if exceeded. | restart |
 
 ### Multi-tenancy
+
+Set `MULTI_TENANT=true` and provide a `MULTI_TENANT_BOOTSTRAP_KEY` to serve several consumers from one deployment, each scoped to its own contracts. Off = no authentication, no tenant boundary. See [Multi-tenancy](docs/multi-tenancy.md).
+
+**Example: start a multi-tenant deployment**
+
+```sh
+# 1. Bring up Postgres and the indexer
+docker compose --profile prod up -d --build
+
+# 2. Create an API key for the first tenant (admin access required)
+sorotrail apikey create --name "tenant-a"
+
+# 3. Add the first watched contract for tenant A
+sorotrail contracts add --url http://localhost:8080 --confirm \
+  -k "$(sorotrail apikey list --format '{{.Key}}' | head -1)" \
+  CDBLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+
+# 4. Add a second watched contract for tenant B (using a different key)
+sorotrail apikey create --name "tenant-b"
+sorotrail contracts add --url http://localhost:8080 --confirm \
+  -k "$(sorotrail apikey list --format '{{.Key}}' | tail -1)" \
+  CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+```
 
 | Variable | Type | Default | Description | Reload |
 | --- | --- | --- | --- | --- |
@@ -458,7 +585,7 @@ multi-replica caveat.
 
 | Variable | Type | Default | Description | Reload |
 | --- | --- | --- | --- | --- |
-| `HORIZON_URL` | URL | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. | restart |
+| `HORIZON_URL` | URL | `https://horizon-testnet.stellar.org` | Stellar Horizon REST base URL used by `sorotrail backfill` only. Set it to a Horizon endpoint for the network you are backfilling, for example `HORIZON_URL=https://horizon.example.com` for a private instance. | restart |
 | `BACKFILL_RATE_RPS` | float | `10` | Pace against Horizon when backfilling. 10 req/s matches the public-instance cap; private deployments can lift this. | restart |
 
 ### GraphQL
