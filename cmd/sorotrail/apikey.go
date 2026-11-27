@@ -366,7 +366,7 @@ the predecessor key valid.
 	}
 	defer cleanup()
 
-	succ, err := st.GetAPIKey(ctx, successorID)
+	_, err = st.GetAPIKey(ctx, successorID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return fmt.Errorf("successor API key %d not found", successorID)
