@@ -44,6 +44,8 @@ func (c *budgetedClient) GetHealth(ctx context.Context) (rpc.Health, error) {
 	return c.inner.GetHealth(ctx)
 }
 
+// GetLedgerEntries fetches the requested ledger entries through the inner
+// client, reserving tokens from the audit budget pool.
 func (c *budgetedClient) GetLedgerEntries(ctx context.Context, req rpc.GetLedgerEntriesRequest) (rpc.GetLedgerEntriesResponse, error) {
 	if err := c.budget.WaitAudit(ctx); err != nil {
 		return rpc.GetLedgerEntriesResponse{}, err
