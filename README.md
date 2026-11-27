@@ -62,10 +62,15 @@ watch the logs to see events flow in.
 Compose services are isolated by environment profile. Choose one profile for
 each invocation:
 
-```sh
-# Development: Postgres, indexer, and Jaeger
-docker compose --profile dev up --build
+For example, start the development stack with:
 
+```sh
+docker compose --profile dev up --build
+```
+
+Other common profile workflows:
+
+```sh
 # Testing: Postgres only, for host-side integration tests
 docker compose --profile test up -d
 TEST_DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable' make test-integration
