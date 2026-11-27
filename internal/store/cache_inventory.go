@@ -156,4 +156,17 @@ var AuthoritativeCacheInventory = []CacheInventoryEntry{
 		MaxRevocationLatency:   "N/A (non-security append-only spec history for event decoding)",
 		SecurityClassification: "non-security-metadata",
 	},
+	{
+		ID:                     "apikey.JWKSCache",
+		Package:                "internal/apikey",
+		Symbol:                 "JWKSCache",
+		File:                   "internal/apikey/oidc.go",
+		Holds:                  "JWKS public keys fetched from an OIDC provider, keyed by kid (key ID)",
+		LifetimeTTL:            "15 minutes (re-fetched when stale or kid is unknown)",
+		InvalidationTrigger:    "TTL expiry (15m) or unknown kid forces re-fetch from JWKS URL",
+		CrossReplica:           false,
+		CrossReplicaKind:       "",
+		MaxRevocationLatency:   "Up to 15m (TTL-bound; re-fetch on unknown kid is immediate)",
+		SecurityClassification: "security-critical",
+	},
 }

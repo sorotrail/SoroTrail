@@ -1144,11 +1144,11 @@ func TestClickHouse_Unsupported_Methods(t *testing.T) {
 	assert.ErrorIs(t, err, ErrUnsupported,
 		"GetContractMeta must report its absence explicitly: a backend that stores no metadata must not look like a contract that has none")
 
-	// ListContracts is an unsupported operation on ClickHouse: the
-	// backend has no contract registry to read and refuses rather than
-	// returning a zero value that would read as success.
+	// ListContracts is implemented on ClickHouse: it queries the events table.
+	// On a zero-value ClickHouse with no server, the only requirement is that
+	// it returns an error (not a nil one that looks like success).
 	_, _, err = st.ListContracts(ctx, ContractsFilter{})
-	assert.ErrorIs(t, err, ErrUnsupported, "ListContracts must report its absence explicitly")
+	assert.Error(t, err, "ListContracts must surface the failed ClickHouse request")
 
 	_, err = st.GetContractSummary(ctx, "test")
 	assert.Error(t, err,
