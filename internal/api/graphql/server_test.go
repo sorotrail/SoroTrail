@@ -274,6 +274,7 @@ func TestRunSubscriptionStream_BackpressureAndSlowConsumer(t *testing.T) {
 	go func() {
 		_ = RunSubscriptionStream(ctx, sm, "tenant-A", authCheck, broker, writeMsg)
 	}()
+	time.Sleep(5 * time.Millisecond) // allow the goroutine to reach broker.Subscribe before flooding
 
 	// Flood broker to test backpressure drop and gap indicator without blocking ingestion
 	for i := 0; i < 200; i++ {

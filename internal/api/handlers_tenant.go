@@ -445,6 +445,7 @@ func (s *Server) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleOwnUsage(w http.ResponseWriter, r *http.Request) {
 	p, _ := PrincipalFrom(r.Context())
+	s.usage.Flush(r.Context())
 	s.writeUsage(w, r, p.Tenant, false)
 }
 
