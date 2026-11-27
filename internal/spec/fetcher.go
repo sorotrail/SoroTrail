@@ -382,7 +382,6 @@ func convertScSpecEntry(entry xdr.ScSpecEntry) []EventSpec {
 		}
 		ev := EventSpec{
 			Name: entry.UdtStructV0.Name,
-			Doc:  entry.UdtStructV0.Doc,
 		}
 		if entry.UdtStructV0.Fields != nil {
 			for _, f := range entry.UdtStructV0.Fields {
