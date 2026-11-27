@@ -113,6 +113,8 @@ type objectClient interface {
 	// StatObject returns metadata about the object at key in bucket without
 	// fetching its content.
 	StatObject(context.Context, string, string, minio.StatObjectOptions) (minio.ObjectInfo, error)
+	// GetObject returns a reader for the specified object in the bucket.
+	// The caller must close the returned ReadCloser.
 	GetObject(context.Context, string, string, minio.GetObjectOptions) (io.ReadCloser, error)
 	PutObject(context.Context, string, string, io.Reader, int64, minio.PutObjectOptions) (minio.UploadInfo, error)
 }
@@ -125,6 +127,7 @@ func (c minioObjectClient) StatObject(ctx context.Context, bucket, key string, o
 	return c.client.StatObject(ctx, bucket, key, opts)
 }
 
+// GetObject fetches the object from the MinIO/S3 bucket.
 func (c minioObjectClient) GetObject(ctx context.Context, bucket, key string, opts minio.GetObjectOptions) (io.ReadCloser, error) {
 	return c.client.GetObject(ctx, bucket, key, opts)
 }
