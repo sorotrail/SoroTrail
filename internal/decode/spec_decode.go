@@ -1,11 +1,11 @@
 package decode
 
 import (
-	"github.com/sorotrail/sorotrail/internal/spec"
 	"fmt"
 	"math/big"
-)
 
+	"github.com/sorotrail/sorotrail/internal/spec"
+)
 
 // SpecDecodedEvent wraps structural event decoding with spec-derived field names and types.
 type SpecDecodedEvent struct {
