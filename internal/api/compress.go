@@ -110,7 +110,7 @@ func (b *boundedDecompressedReader) Read(p []byte) (int, error) {
 	}
 	if err != nil && !errors.Is(err, io.EOF) {
 		var maxErr *http.MaxBytesError
-		ifs errors.As(err, &maxErr) {
+		if errors.As(err, &maxErr) {
 			return n, err
 		}
 		return n, fmt.Errorf("reading %s request body: %w", b.encoding, err)
