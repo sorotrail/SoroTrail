@@ -66,7 +66,7 @@ type Manifest struct {
 	SchemaVersion int            `json:"schema_version"`
 	Chunk         ChunkInfo      `json:"chunk"`
 	Producer      string         `json:"producer"`
-	Chunks        []ManifestChunk`json:"chunks,omitempty"`
+	Chunks        []ManifestChunk `json:"chunks,omitempty"`
 	UpdatedAt     time.Time      `json:"updated_at,omitempty"`
 }
 
