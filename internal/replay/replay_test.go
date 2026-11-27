@@ -275,7 +275,7 @@ func TestRun_TargetDecoderVersion(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.EqualValues(t, 1, sum.Processed)
-	assert.Equal(t, `[{"unknown":{"type":"scvFoo"}}]|{"unknown":{"type":"scvFoo"}}`, st.snapshot()[eventID(1)], "event with version 1 is replayed")
+	assert.Equal(t, `[{"symbol":"transfer"}]|{"i128":"1000"}`, st.snapshot()[eventID(1)], "event with version 1 is replayed")
 	assert.Equal(t, `[{"unknown":{"type":"scvFoo"}}]|{"unknown":{"type":"scvFoo"}}`, st.snapshot()[eventID(2)], "event with version 2 is skipped")
 }
 

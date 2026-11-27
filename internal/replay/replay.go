@@ -136,7 +136,7 @@ func (r *Replayer) Run(ctx context.Context) (Summary, error) {
 		filteredEvents := make([]store.DecodedEvent, 0, found)
 		for _, e := range events {
 			if r.opts.TargetDecoderVersion > 0 && e.DecoderVersion >= int32(r.opts.TargetDecoderVersion) {
-				sum.Processed++
+				sum.Skipped++
 				continue
 			}
 			filteredEvents = append(filteredEvents, e)

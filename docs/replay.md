@@ -52,6 +52,7 @@ sorotrail replay --from-ledger N [--to-ledger M] [flags]
 | `--restart` | `false` | Discard saved progress and replay the range from the start. |
 | `--dry-run` | `false` | Report what would change; write nothing. |
 | `--progress-interval` | `0` | Emit periodic progress to stderr (e.g. `30s`, `1m`). `0` disables. |
+| `--target-decoder-version` | `0` | Skip events already at or above this decoder version. `0` = replay all. |
 
 Configuration (notably `DATABASE_URL`) comes from the same environment
 variables the indexer uses.

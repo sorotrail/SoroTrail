@@ -31,6 +31,7 @@ func replayFlagSet() *flag.FlagSet {
 	fs.Bool("restart", false, "discard saved progress and replay the range from the start")
 	fs.Bool("dry-run", false, "report what would change without writing anything")
 	fs.Duration("progress-interval", 0, "emit periodic progress to stderr")
+	fs.Int("target-decoder-version", 0, "skip events already at or above this decoder version")
 	return fs
 }
 
@@ -58,6 +59,7 @@ func TestReplayFlagsAreDocumented(t *testing.T) {
 		{"restart", "`false`"},
 		{"dry-run", "`false`"},
 		{"progress-interval", "`0`"},
+		{"target-decoder-version", "`0`"},
 	}
 
 	// The table must describe exactly the flags the command defines: no
