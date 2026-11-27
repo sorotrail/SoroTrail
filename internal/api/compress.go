@@ -140,7 +140,6 @@ func (b *boundedDecompressedReader) Close() error {
 	return firstErr
 }
 
-// Pretty reports whether the request has requested pretty-printed JSON output.
 // isStreamingResponse reports whether a request or response header indicates a
 // streaming transport (SSE, NDJSON/CSV export, or WebSocket) that must not be
 // buffered by the response size limiter (#1283).
@@ -271,6 +270,7 @@ func (w *boundedResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return conn, rw, err
 }
 
+// Pretty reports whether the request has requested pretty-printed JSON output.
 func (w *boundedResponseWriter) Pretty() bool {
 	if pw, ok := w.ResponseWriter.(prettyWriter); ok {
 		return pw.Pretty()
@@ -448,7 +448,7 @@ func (w *compressWriter) Write(b []byte) (int, error) {
 }
 
 // decide commits to compressing or not, flushes the buffered prefix, and
-// makes every later Write go straight through.
+	// makes every later Write go straight through.
 func (w *compressWriter) decide(big bool) error {
 	w.decided = true
 	h := w.Header()
@@ -560,7 +560,7 @@ func (w *compressWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 }
 
 // weakenETag converts a strong ETag to a weak one, leaving an already-weak
-// or absent validator alone.
+	// or absent validator alone.
 func weakenETag(h http.Header) {
 	etag := h.Get("ETag")
 	if etag == "" || strings.HasPrefix(etag, "W/") {

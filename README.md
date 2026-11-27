@@ -62,10 +62,15 @@ watch the logs to see events flow in.
 Compose services are isolated by environment profile. Choose one profile for
 each invocation:
 
-```sh
-# Development: Postgres, indexer, and Jaeger
-docker compose --profile dev up --build
+For example, start the development stack with:
 
+```sh
+docker compose --profile dev up --build
+```
+
+Other common profile workflows:
+
+```sh
 # Testing: Postgres only, for host-side integration tests
 docker compose --profile test up -d
 TEST_DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable' make test-integration
@@ -366,6 +371,7 @@ DATABASE_URL='postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=di
 | `BATCH_MAX_BACKOFF` | duration | `1s` | Maximum backpressure sleep between batch writes. Only effective when both `BATCH_SIZE` and `BATCH_TARGET_LATENCY` are set. | restart |
 | `INGESTION_LOCK_ENABLED` | bool | `false` | Acquire a Postgres advisory lock keyed by the RPC URL before starting ingestion. A second instance skips ingestion (but keeps serving the API), preventing double-processing. | restart |
 
+- **`RETENTION_LEDGERS`** — Cold-start reach-back in ledgers: when the database is empty, ingestion begins at `latest ledger − RETENTION_LEDGERS` (clamped to the RPC's oldest retained ledger). Also bounds the backfill triggered when a contract is added to the watch list. Default: `17280` (~24h at 5s/ledger). Example: `RETENTION_LEDGERS=34560` (~48h).
 - **`PARTITION_LEDGER_SPAN`** — Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. Default: `120960`. Example: `PARTITION_LEDGER_SPAN=120960`.
 
 ### Reorg detection

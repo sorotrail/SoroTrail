@@ -57,6 +57,8 @@ are keyed by this network, so changing networks does not reuse cursors.
 | `RATE_LIMIT_RPS`            | >= 0                    |
 | `RATE_LIMIT_BURST`          | >= 0                    |
 
+`RETENTION_LEDGERS` sets the cold-start reach-back in ledgers: when the database is empty, ingestion begins at `latest ledger − RETENTION_LEDGERS`, clamped to the RPC's oldest retained ledger. It also bounds the backfill triggered when a contract is added to the watch list. Default: `17280` (~24h at 5s/ledger). Example: `RETENTION_LEDGERS=34560` (~48h).
+
 `PARTITION_LEDGER_SPAN` sets the ledger span per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. Default: `120960`. Example: `PARTITION_LEDGER_SPAN=120960`.
 
 ## Allowed values
