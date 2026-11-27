@@ -27,9 +27,21 @@ type Broker struct {
 // NewBroker creates a new broker.
 func NewBroker(bufferSize int) *Broker {
 	return &Broker{
-	subscribers: make(map[string]map[*Subscriber]struct{}),
-	bufferSize:  bufferSize,
+		subscribers: make(map[string]map[*Subscriber]struct{}),
+		bufferSize:  bufferSize,
 	}
+}
+
+// Close closes all subscriber channels and clears the subscriber map.
+func (b *Broker) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, subs := range b.subscribers {
+		for sub := range subs {
+			close(sub.Ch)
+		}
+	}
+	b.subscribers = make(map[string]map[*Subscriber]struct{})
 }
 
 // Subscribe registers a subscriber for a given tenant.

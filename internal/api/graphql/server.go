@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coder/websocket"
 	"github.com/sorotrail/sorotrail/internal/api"
 	"github.com/sorotrail/sorotrail/internal/broadcast"
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -555,8 +554,8 @@ func RunSubscriptionStream(ctx context.Context, sm *SubscriptionManager, tenantI
 	}
 	defer sm.Release(tenantID)
 
-	sub := broker.Subscribe(ctx, store.EventFilter{})
-	defer broker.Unsubscribe(sub)
+	sub := broker.Subscribe(tenantID)
+	defer broker.Unsubscribe(tenantID, sub)
 
 	// Bounded backpressure buffer with gap indicator
 	msgChan := make(chan any, 64)
@@ -570,12 +569,12 @@ func RunSubscriptionStream(ctx context.Context, sm *SubscriptionManager, tenantI
 			select {
 			case <-stopPump:
 				return
-			case event, ok := <-sub:
+			case event, ok := <-sub.Ch:
 				if !ok {
 					return
 				}
 				select {
-				case msgChan <- event:
+				case msgChan <- event.Payload:
 				default:
 					// Backpressure: drop with gap indicator message
 					select {
@@ -588,7 +587,7 @@ func RunSubscriptionStream(ctx context.Context, sm *SubscriptionManager, tenantI
 	}()
 
 	// Periodic re-authorization check (bound: 10 seconds)
-	authTicker := time.NewTicker(10 * time.Second)
+	authTicker := time.NewTicker(1 * time.Second)
 	defer authTicker.Stop()
 
 	for {

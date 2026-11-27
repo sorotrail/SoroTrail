@@ -1,23 +1,24 @@
 package graphql
 
 import (
-	"sync"
-	"context"
-	"testing"
-	"time"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"github.com/sorotrail/sorotrail/internal/store"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"github.com/sorotrail/sorotrail/internal/api"
-)
+	"sync"
+	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/api"
+	"github.com/sorotrail/sorotrail/internal/broadcast"
+	"github.com/sorotrail/sorotrail/internal/store"
+)
 
 func TestServeHTTPAnswersMethodNotAllowedInTheEnvelope(t *testing.T) {
 	h := newGraphQLTestServer(t, &stubStore{})
@@ -192,7 +193,7 @@ func TestHandleQuery_PoolBudgetExhaustedReturns503WithRetryAfter(t *testing.T) {
 }
 func TestSubscriptionManager_LimitsAndTenancy(t *testing.T) {
 	sm := NewSubscriptionManager(2, 1, nil)
-	err := sm.Acquire("tenant-A")
+	require.NoError(t, sm.Acquire("tenant-A"))
 	sm.Release("tenant-A")
 
 	assert.True(t, AssertSubscriptionTenant(map[string]any{"tenantId": "tenant-A"}, "tenant-A"))
@@ -229,8 +230,8 @@ func TestRunSubscriptionStream_RevocationAndIsolation(t *testing.T) {
 	}()
 
 	// Publish cross-tenant event and valid event
-	broker.Publish(map[string]any{"tenantId": "tenant-B", "id": "1"})
-	broker.Publish(map[string]any{"tenantId": "tenant-A", "id": "2"})
+	broker.Publish(ctx, broadcast.Message{TenantID: "tenant-B", Payload: map[string]any{"tenantId": "tenant-B", "id": "1"}})
+	broker.Publish(ctx, broadcast.Message{TenantID: "tenant-A", Payload: map[string]any{"tenantId": "tenant-A", "id": "2"}})
 
 	err := <-errChan
 	assert.Error(t, err)
@@ -277,7 +278,7 @@ func TestRunSubscriptionStream_BackpressureAndSlowConsumer(t *testing.T) {
 
 	// Flood broker to test backpressure drop and gap indicator without blocking ingestion
 	for i := 0; i < 200; i++ {
-		broker.Publish(map[string]any{"tenantId": "tenant-A", "i": i})
+		broker.Publish(ctx, broadcast.Message{TenantID: "tenant-A", Payload: map[string]any{"tenantId": "tenant-A", "i": i}})
 	}
 
 	time.Sleep(100 * time.Millisecond)
