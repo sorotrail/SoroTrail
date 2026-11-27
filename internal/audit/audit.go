@@ -716,6 +716,16 @@ func (v *Verifier) VerifyChain(ctx context.Context, fromSequence int64, tenantID
 		expectedPrev = r.Hash
 		lastSeq = r.Sequence
 	}
+
+	// A checkpoint at sequence M records that the chain was intact through M.
+	// If a checkpoint exists beyond lastSeq, records were deleted after the
+	// checkpoint was written (tampering), not through a retention sweep which
+	// would have called EmitCheckpointForRange first.
+	var maxCP int64
+	if err := v.pool.QueryRow(ctx, `SELECT COALESCE(MAX(sequence), 0) FROM audit_checkpoints WHERE sequence >= $1`, fromSequence).Scan(&maxCP); err == nil && maxCP > lastSeq {
+		return lastSeq, fmt.Errorf("chain truncated: checkpoint at sequence %d but chain ends at %d", maxCP, lastSeq)
+	}
+
 	return lastSeq, nil
 }
 
