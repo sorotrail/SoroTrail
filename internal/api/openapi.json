@@ -29,7 +29,7 @@
       "get": {
         "operationId": "health",
         "summary": "Dependency health check",
-        "description": "Report whether the API process can reach its database and RPC dependencies, with each dependency's state reported individually. This probe is public and does not expose tenant data.\nEvery check runs concurrently under its own 5-second timeout, so one hung dependency cannot starve another's budget. Each check reports `status` (`ok`, `degraded` or `unready`), a `detail` explaining any non-ok status, and how long that check alone took. 200 only when every check is `ok`; a `degraded` or `unready` check answers 503. Ingestion freshness is deliberately not part of this probe \u2014 see `/readyz`.",
+        "description": "Report whether the API process can reach its database and RPC dependencies, with each dependency's state reported individually. This probe is public and does not expose tenant data.\nEvery check runs concurrently under its own 5-second timeout, so one hung dependency cannot starve another's budget. Each check reports `status` (`ok`, `degraded` or `unready`), a `detail` explaining any non-ok status, and how long that check alone took. 200 only when every check is `ok`; a `degraded` or `unready` check answers 503. Ingestion freshness is deliberately not part of this probe — see `/readyz`.",
         "tags": [
           "System"
         ],
@@ -1638,7 +1638,7 @@
       "get": {
         "operationId": "listAPIKeys",
         "summary": "List API keys",
-        "description": "Returns the metadata for every global API key on this instance. The plaintext key is never returned \u2014 it is visible only in the response to POST /apikeys, at creation time.\nThis endpoint is authenticated regardless of API_KEY_AUTH_ENABLED: an unauthenticated key-management surface would let any caller mint a key and bypass authentication entirely. The first key is issued out of band with `sorotrail apikey`.",
+        "description": "Returns the metadata for every global API key on this instance. The plaintext key is never returned — it is visible only in the response to POST /apikeys, at creation time.\nThis endpoint is authenticated regardless of API_KEY_AUTH_ENABLED: an unauthenticated key-management surface would let any caller mint a key and bypass authentication entirely. The first key is issued out of band with `sorotrail apikey`.",
         "tags": [
           "Auth"
         ],
@@ -1686,7 +1686,7 @@
       "post": {
         "operationId": "createAPIKey",
         "summary": "Create an API key",
-        "description": "Mints a new global API key and returns it. The `key` field in the response is the only time the plaintext key is ever available \u2014 only a bcrypt hash of its secret half is persisted, so a lost key cannot be recovered and must be revoked and reissued.\nThe request body is optional; omitting it creates an unnamed key.",
+        "description": "Mints a new global API key and returns it. The `key` field in the response is the only time the plaintext key is ever available — only a bcrypt hash of its secret half is persisted, so a lost key cannot be recovered and must be revoked and reissued.\nThe request body is optional; omitting it creates an unnamed key.",
         "tags": [
           "Auth"
         ],
@@ -1789,7 +1789,7 @@
             "name": "id",
             "in": "path",
             "required": true,
-            "description": "The key's database ID, as returned by POST /apikeys \u2014 not its public prefix and not the plaintext key. Must be a positive integer.",
+            "description": "The key's database ID, as returned by POST /apikeys — not its public prefix and not the plaintext key. Must be a positive integer.",
             "schema": {
               "type": "integer",
               "format": "int64",
@@ -1934,7 +1934,7 @@
       "get": {
         "operationId": "livez",
         "summary": "Liveness probe",
-        "description": "Reports only that the process is up. Never touches the database or RPC \u2014 the `checks` object carries the single `process` check and nothing else, and that independence is the contract: a dependency outage must not fail a liveness probe, or the orchestrator would restart the one component that could have reported the outage. A process that cannot answer 200 here cannot answer at all, so there is no failure response.",
+        "description": "Reports only that the process is up. Never touches the database or RPC — the `checks` object carries the single `process` check and nothing else, and that independence is the contract: a dependency outage must not fail a liveness probe, or the orchestrator would restart the one component that could have reported the outage. A process that cannot answer 200 here cannot answer at all, so there is no failure response.",
         "tags": [
           "Operations"
         ],
@@ -1966,7 +1966,7 @@
       "get": {
         "operationId": "readyz",
         "summary": "Readiness probe",
-        "description": "Reports whether the database, RPC and ingestion freshness are usable, with each dependency's state reported individually so a failing probe names the dependency that failed without anyone reading logs.\nEvery check runs concurrently under its own 5-second timeout. The thresholds that separate the states:\n- `unready` \u2014 a dependency gave no answer (it errored, or blew its\n  5-second per-check budget): the database is unreachable, the RPC\n  is unreachable, the ingestion state row cannot be read, or the\n  chain head is needed but unavailable.\n- `degraded` \u2014 everything answered, but a dependency reports a\n  suboptimal state: the RPC answers `getHealth` with something\n  other than \"healthy\", or ingestion is more than 100 ledgers\n  behind the chain head (`readinessLagThreshold`, evaluated only\n  once at least one ledger has been ingested).\n- `ok` \u2014 everything answered and is within threshold.\nBoth `degraded` and `unready` answer 503: staleness and failure both remove the instance from rotation, and the split lives in the body so an operator knows whether to wait or to intervene.",
+        "description": "Reports whether the database, RPC and ingestion freshness are usable, with each dependency's state reported individually so a failing probe names the dependency that failed without anyone reading logs.\nEvery check runs concurrently under its own 5-second timeout. The thresholds that separate the states:\n- `unready` — a dependency gave no answer (it errored, or blew its\n  5-second per-check budget): the database is unreachable, the RPC\n  is unreachable, the ingestion state row cannot be read, or the\n  chain head is needed but unavailable.\n- `degraded` — everything answered, but a dependency reports a\n  suboptimal state: the RPC answers `getHealth` with something\n  other than \"healthy\", or ingestion is more than 100 ledgers\n  behind the chain head (`readinessLagThreshold`, evaluated only\n  once at least one ledger has been ingested).\n- `ok` — everything answered and is within threshold.\nBoth `degraded` and `unready` answer 503: staleness and failure both remove the instance from rotation, and the split lives in the body so an operator knows whether to wait or to intervene.",
         "tags": [
           "Operations"
         ],
@@ -3209,7 +3209,7 @@
       "get": {
         "operationId": "listContractSpecOverrideHistory",
         "summary": "List a contract's spec override history",
-        "description": "Lists every recorded change to a contract's spec override, newest first. Each entry records the spec that was in force, the API key prefix that made the change, and when \u2014 so \"did someone change the override?\" has an answer.\nAn entry with no `spec` is a tombstone: the override was deleted at that point rather than replaced. The history is append-only and is retained in full; it is never consulted when decoding an event.\nPaginated with an opaque cursor over the version id.",
+        "description": "Lists every recorded change to a contract's spec override, newest first. Each entry records the spec that was in force, the API key prefix that made the change, and when — so \"did someone change the override?\" has an answer.\nAn entry with no `spec` is a tombstone: the override was deleted at that point rather than replaced. The history is append-only and is retained in full; it is never consulted when decoding an event.\nPaginated with an opaque cursor over the version id.",
         "tags": [
           "Operations"
         ],
@@ -3291,7 +3291,7 @@
       "post": {
         "operationId": "revertContractSpecOverride",
         "summary": "Restore a previous contract spec override",
-        "description": "Restores a previous version of a contract's spec override, named by the `version` in the request body \u2014 the id of an entry in the override history.\nThe revert is itself a change, so it is recorded as a new history entry: the history stays append-only and keeps the whole sequence, including the way back.",
+        "description": "Restores a previous version of a contract's spec override, named by the `version` in the request body — the id of an entry in the override history.\nThe revert is itself a change, so it is recorded as a new history entry: the history stays append-only and keeps the whole sequence, including the way back.",
         "tags": [
           "Operations"
         ],
@@ -3931,7 +3931,7 @@
           {
             "name": "contract_id",
             "in": "query",
-            "description": "Only list dead letters recorded for this contract. Matched exactly, and not validated as a strkey \u2014 a dead letter can be recorded for input the decoder could not make sense of.",
+            "description": "Only list dead letters recorded for this contract. Matched exactly, and not validated as a strkey — a dead letter can be recorded for input the decoder could not make sense of.",
             "schema": {
               "type": "string"
             },
@@ -4118,7 +4118,7 @@
       "get": {
         "operationId": "eventStreamWS",
         "summary": "WebSocket live event stream",
-        "description": "Upgrades to a WebSocket connection that pushes ingested events as they\nare stored. The stream starts at \"now\" \u2014 no replay of historical events.\nThe live broadcaster applies contract, event type, topic, ledger/time\nrange and has-value filters; pagination and historical-only query\nparameters do not create a replay stream.\n\nA handshake the websocket library refuses before the upgrade answers\nwith plain text rather than the JSON envelope: 426 when the request is\nnot an upgrade attempt at all (missing Connection/Upgrade headers, or\nHTTP/1.0), 400 when it is an upgrade attempt with a malformed handshake\n(unsupported protocol version, or a missing/invalid Sec-WebSocket-Key).\n",
+        "description": "Upgrades to a WebSocket connection that pushes ingested events as they\nare stored. The stream starts at \"now\" — no replay of historical events.\nThe live broadcaster applies contract, event type, topic, ledger/time\nrange and has-value filters; pagination and historical-only query\nparameters do not create a replay stream.\n\nA handshake the websocket library refuses before the upgrade answers\nwith plain text rather than the JSON envelope: 426 when the request is\nnot an upgrade attempt at all (missing Connection/Upgrade headers, or\nHTTP/1.0), 400 when it is an upgrade attempt with a malformed handshake\n(unsupported protocol version, or a missing/invalid Sec-WebSocket-Key).\n",
         "tags": [
           "Events"
         ],
@@ -4621,7 +4621,7 @@
       "Topic": {
         "name": "topic",
         "in": "query",
-        "description": "Exact JSON match against any topic position. Cannot be combined with\ntopic0..topic3 \u2014 a request carrying both is rejected, because the\ntwo ask different questions and silently preferring one would hide\nthe mistake.\n\nA value that parses as JSON is used as-is; anything else is treated\nas a JSON string, so `transfer` and `\"transfer\"` mean the same\nthing.\n",
+        "description": "Exact JSON match against any topic position. Cannot be combined with\ntopic0..topic3 — a request carrying both is rejected, because the\ntwo ask different questions and silently preferring one would hide\nthe mistake.\n\nA value that parses as JSON is used as-is; anything else is treated\nas a JSON string, so `transfer` and `\"transfer\"` mean the same\nthing.\n",
         "schema": {
           "type": "string"
         },
@@ -4721,7 +4721,7 @@
       "ContractsLimit": {
         "name": "limit",
         "in": "query",
-        "description": "Page size for the contract listing. Bounded tighter than the event endpoints, and by a compile-time constant rather than API_MAX_LIMIT, because the listing is a grouped scan over the events table \u2014 one row of output costs far more than one event does.",
+        "description": "Page size for the contract listing. Bounded tighter than the event endpoints, and by a compile-time constant rather than API_MAX_LIMIT, because the listing is a grouped scan over the events table — one row of output costs far more than one event does.",
         "schema": {
           "type": "integer",
           "minimum": 1,
@@ -4992,7 +4992,7 @@
     "schemas": {
       "APIKey": {
         "type": "object",
-        "description": "API key metadata. The secret half of the key is never included \u2014 only a bcrypt hash of it is stored, and the plaintext is returned exactly once, by POST /apikeys.",
+        "description": "API key metadata. The secret half of the key is never included — only a bcrypt hash of it is stored, and the plaintext is returned exactly once, by POST /apikeys.",
         "properties": {
           "id": {
             "type": "integer",
@@ -5016,21 +5016,6 @@
             "type": "string",
             "format": "date-time",
             "description": "When the key was revoked. Absent while the key is active."
-          },
-          "expires_at": {
-            "type": "string",
-            "format": "date-time",
-            "description": "When the key expires. Absent for keys that do not expire."
-          },
-          "last_used_at": {
-            "type": "string",
-            "format": "date-time",
-            "description": "When the key was last used to authenticate a request. Absent if never used."
-          },
-          "predecessor": {
-            "type": "integer",
-            "format": "int64",
-            "description": "ID of the key this key was rotated from. Absent for keys not created by rotation."
           }
         },
         "required": [
@@ -5198,7 +5183,7 @@
         "properties": {
           "status": {
             "type": "string",
-            "description": "`ok` \u2014 answered within its budget and healthy. `degraded` \u2014 answered, but reports a suboptimal state (a non-healthy RPC, or ingestion past the lag threshold). `unready` \u2014 did not answer at all: it errored or exceeded its per-check timeout.",
+            "description": "`ok` — answered within its budget and healthy. `degraded` — answered, but reports a suboptimal state (a non-healthy RPC, or ingestion past the lag threshold). `unready` — did not answer at all: it errored or exceeded its per-check timeout.",
             "enum": [
               "ok",
               "degraded",
@@ -6683,7 +6668,7 @@
         "type": "apiKey",
         "in": "header",
         "name": "X-API-Key",
-        "description": "The operator's instance-wide management key, configured through the\nAPI_KEY environment variable. It gates the endpoints that mutate\ningestion or read the dead-letter queue, and it is always required on\nthose endpoints \u2014 independently of MULTI_TENANT, and independently of\nthe tenant credential above.\n\nWhen API_KEY is unset the server fails closed: those endpoints answer\n503 rather than running unauthenticated.\n"
+        "description": "The operator's instance-wide management key, configured through the\nAPI_KEY environment variable. It gates the endpoints that mutate\ningestion or read the dead-letter queue, and it is always required on\nthose endpoints — independently of MULTI_TENANT, and independently of\nthe tenant credential above.\n\nWhen API_KEY is unset the server fails closed: those endpoints answer\n503 rather than running unauthenticated.\n"
       }
     },
     "responses": {
@@ -6705,7 +6690,7 @@
         }
       },
       "BadRequest": {
-        "description": "The request could not be parsed or violates a documented constraint \u2014 a malformed identifier (`INVALID_PARAMETER`), an out-of-range limit (`LIMIT_EXCEEDED`), an overly wide export span (`RANGE_TOO_WIDE`), an unparseable or mismatched cursor (`INVALID_CURSOR`), a missing ingestion-mode confirmation (`CONFIRMATION_REQUIRED`), or a JSON body the endpoint cannot decode (`INVALID_BODY`). The `field` property names the offending parameter when applicable.",
+        "description": "The request could not be parsed or violates a documented constraint — a malformed identifier (`INVALID_PARAMETER`), an out-of-range limit (`LIMIT_EXCEEDED`), an overly wide export span (`RANGE_TOO_WIDE`), an unparseable or mismatched cursor (`INVALID_CURSOR`), a missing ingestion-mode confirmation (`CONFIRMATION_REQUIRED`), or a JSON body the endpoint cannot decode (`INVALID_BODY`). The `field` property names the offending parameter when applicable.",
         "x-error-codes": [
           "INVALID_PARAMETER",
           "INVALID_CURSOR",
@@ -6729,7 +6714,7 @@
         ],
         "headers": {
           "WWW-Authenticate": {
-            "description": "The authentication challenge, per RFC 7235 \u00a74.1 \u2014 for example `Bearer realm=\"sorotrail\"`. Present on the tenant-authentication failures; the ManagementKey path answers without a challenge because it accepts no Bearer token.",
+            "description": "The authentication challenge, per RFC 7235 §4.1 — for example `Bearer realm=\"sorotrail\"`. Present on the tenant-authentication failures; the ManagementKey path answers without a challenge because it accepts no Bearer token.",
             "schema": {
               "type": "string",
               "examples": [
@@ -6773,7 +6758,7 @@
         }
       },
       "Conflict": {
-        "description": "The request collides with the current state (`CONFLICT`) \u2014 a duplicate tenant name, a tenant attempting to delete the account it is authenticated as, or an `Idempotency-Key` reused with a different method, path, or request body within its retention window.",
+        "description": "The request collides with the current state (`CONFLICT`) — a duplicate tenant name, a tenant attempting to delete the account it is authenticated as, or an `Idempotency-Key` reused with a different method, path, or request body within its retention window.",
         "x-error-codes": [
           "CONFLICT"
         ],
@@ -6786,7 +6771,7 @@
         }
       },
       "UpgradeRequired": {
-        "description": "The websocket handshake was refused before the upgrade because the request is not a valid upgrade attempt: HTTP/1.0, or the Connection and Upgrade headers are missing or do not name `websocket`. Only `/events/ws` can answer this, and \u2014 unlike every other error here \u2014 the body is plain text written by the websocket library, not the JSON envelope.",
+        "description": "The websocket handshake was refused before the upgrade because the request is not a valid upgrade attempt: HTTP/1.0, or the Connection and Upgrade headers are missing or do not name `websocket`. Only `/events/ws` can answer this, and — unlike every other error here — the body is plain text written by the websocket library, not the JSON envelope.",
         "content": {
           "text/plain": {
             "schema": {
@@ -6799,14 +6784,14 @@
         }
       },
       "TooManyRequests": {
-        "description": "The caller exceeded its request quota (`RATE_LIMITED`), or asked to\nwatch more contracts than its quota allows (`QUOTA_EXCEEDED`).\n\nRate limiting is per client \u2014 keyed on the authenticated tenant where\none exists and on the client IP otherwise \u2014 and is only active when\nthe operator configured RATE_LIMIT_RPS or a per-tenant override. The\nprobe and scrape endpoints (/health, /livez, /readyz, /metrics) are\nnever rate limited, so throttling cannot blind an operator to the\nthrottling itself.\n",
+        "description": "The caller exceeded its request quota (`RATE_LIMITED`), or asked to\nwatch more contracts than its quota allows (`QUOTA_EXCEEDED`).\n\nRate limiting is per client — keyed on the authenticated tenant where\none exists and on the client IP otherwise — and is only active when\nthe operator configured RATE_LIMIT_RPS or a per-tenant override. The\nprobe and scrape endpoints (/health, /livez, /readyz, /metrics) are\nnever rate limited, so throttling cannot blind an operator to the\nthrottling itself.\n",
         "x-error-codes": [
           "QUOTA_EXCEEDED",
           "RATE_LIMITED"
         ],
         "headers": {
           "Retry-After": {
-            "description": "Whole seconds to wait before retrying, per RFC 7231 \u00a77.1.3. Always at least 1, and rounded up from the limiter's own wait-to-next-token estimate.",
+            "description": "Whole seconds to wait before retrying, per RFC 7231 §7.1.3. Always at least 1, and rounded up from the limiter's own wait-to-next-token estimate.",
             "schema": {
               "type": "integer",
               "minimum": 1,
@@ -6868,7 +6853,7 @@
         }
       },
       "InternalError": {
-        "description": "The request failed for a reason the caller cannot act on (`INTERNAL_ERROR`) \u2014 a store or RPC failure, or a panic caught by the recovery middleware. The message is deliberately generic; the specifics are logged against the request's X-Request-ID rather than returned.",
+        "description": "The request failed for a reason the caller cannot act on (`INTERNAL_ERROR`) — a store or RPC failure, or a panic caught by the recovery middleware. The message is deliberately generic; the specifics are logged against the request's X-Request-ID rather than returned.",
         "x-error-codes": [
           "INTERNAL_ERROR"
         ],
