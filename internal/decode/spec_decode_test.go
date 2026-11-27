@@ -2,18 +2,16 @@ package decode
 
 import (
 	"testing"
-
-	"github.com/sorotrail/sorotrail/internal/spec"
 )
 
 func TestDecodeEventWithSpec_MatchingAndMismatched(t *testing.T) {
-	eventSpec := &spec.ContractSpec{
+	eventSpec := &ContractSpecView{
 		ContractID: "C123",
 		WasmHash:   "hash123",
-		Events: []spec.EventSpec{
+		Events: []EventSpecView{
 			{
 				Name: "transfer",
-				TopicSpecs: []spec.FieldSpec{
+				TopicSpecs: []FieldSpecView{
 					{Name: "from", Type: "address"},
 					{Name: "to", Type: "address"},
 					{Name: "amount", Type: "i128"},
@@ -59,12 +57,12 @@ func TestDecodeEventWithSpec_MissingSpec(t *testing.T) {
 }
 
 func TestDecodeEventWithSpec_VersionBoundary(t *testing.T) {
-	specV1 := &spec.ContractSpec{
+	specV1 := &ContractSpecView{
 		ContractID: "C123",
-		Events: []spec.EventSpec{
+		Events: []EventSpecView{
 			{
 				Name: "transfer",
-				TopicSpecs: []spec.FieldSpec{
+				TopicSpecs: []FieldSpecView{
 					{Name: "from", Type: "address"},
 				},
 			},

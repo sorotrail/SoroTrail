@@ -3,9 +3,30 @@ package decode
 import (
 	"fmt"
 	"math/big"
-
-	"github.com/sorotrail/sorotrail/internal/spec"
 )
+
+// ContractSpecView is a cycle-free view of a contract's ABI spec used by
+// DecodeEventWithSpec. It mirrors the relevant fields of spec.ContractSpec
+// without importing internal/spec, which would create an import cycle via
+// internal/spec → internal/store → (test) internal/decode.
+type ContractSpecView struct {
+	ContractID string
+	WasmHash   string
+	Events     []EventSpecView
+}
+
+// EventSpecView mirrors spec.EventSpec.
+type EventSpecView struct {
+	Name       string
+	TopicSpecs []FieldSpecView
+	ValueSpec  *FieldSpecView
+}
+
+// FieldSpecView mirrors spec.FieldSpec.
+type FieldSpecView struct {
+	Name string
+	Type string
+}
 
 // SpecDecodedEvent wraps structural event decoding with spec-derived field names and types.
 type SpecDecodedEvent struct {
@@ -16,7 +37,7 @@ type SpecDecodedEvent struct {
 }
 
 // DecodeEventWithSpec decodes an event payload using the provided contract spec while keeping structural decoding as truth.
-func DecodeEventWithSpec(structural interface{}, eventSpec *spec.ContractSpec, eventName string) SpecDecodedEvent {
+func DecodeEventWithSpec(structural interface{}, eventSpec *ContractSpecView, eventName string) SpecDecodedEvent {
 	result := SpecDecodedEvent{
 		Structural: structural,
 		SpecFields: make(map[string]interface{}),
@@ -26,7 +47,7 @@ func DecodeEventWithSpec(structural interface{}, eventSpec *spec.ContractSpec, e
 		return result
 	}
 
-	var targetEvent *spec.EventSpec
+	var targetEvent *EventSpecView
 	for _, ev := range eventSpec.Events {
 		if ev.Name == eventName {
 			targetEvent = &ev
@@ -104,12 +125,13 @@ func formatFieldValue(val interface{}, typ string) interface{} {
 		return val
 	}
 }
+
 // SpecDecoder provides helper utilities for decoding event payloads against a contract spec.
 type SpecDecoder struct {
-	spec *spec.ContractSpec
+	spec *ContractSpecView
 }
 
 // NewSpecDecoder creates a new SpecDecoder instance.
-func NewSpecDecoder(s *spec.ContractSpec) *SpecDecoder {
+func NewSpecDecoder(s *ContractSpecView) *SpecDecoder {
 	return &SpecDecoder{spec: s}
 }
