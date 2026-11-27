@@ -681,7 +681,7 @@ type APIKey struct {
 	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
 	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
 	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
-	Predecessor *int64     `json:"predecessor,omitempty"`
+	PredecessorID *int64   `json:"predecessor,omitempty"`
 
 	// KeyHash is the bcrypt hash of the secret part of the key. It is
 	// write-only: it is set on create and compared on validation, but

@@ -50,7 +50,7 @@ func (s *stubAPIKeyStore) RotateAPIKey(_ context.Context, predecessorID int64, n
 		exp := now.Add(expiresIn)
 		newKey.ExpiresAt = &exp
 	}
-	newKey.Predecessor = &predecessorID
+	newKey.PredecessorID = &predecessorID
 	s.keys[newKey.ID] = newKey
 	s.byPrefix[newKey.Prefix] = newKey
 	return newKey, nil

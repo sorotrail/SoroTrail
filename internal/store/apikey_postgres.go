@@ -19,7 +19,7 @@ func (p *Postgres) CreateAPIKey(ctx context.Context, k APIKey) (APIKey, error) {
 	INSERT INTO api_keys (name, prefix, key_hash, predecessor_id, expires_at)
 	VALUES ($1, $2, $3, $4, $5)
 	RETURNING id, created_at`,
-		k.Name, k.Prefix, k.KeyHash, k.Predecessor, k.ExpiresAt,
+		k.Name, k.Prefix, k.KeyHash, k.PredecessorID, k.ExpiresAt,
 	).Scan(&k.ID, &k.CreatedAt)
 	if err != nil {
 		return APIKey{}, fmt.Errorf("creating API key: %w", err)
@@ -103,7 +103,7 @@ func (p *Postgres) RotateAPIKey(ctx context.Context, predecessorID int64, newKey
 		return APIKey{}, fmt.Errorf("looking up predecessor API key: %w", err)
 	}
 	expiry := time.Now().UTC().Add(expiresIn)
-	newKey.Predecessor = &predecessorID
+	newKey.PredecessorID = &predecessorID
 	newKey.ExpiresAt = &expiry
 	created, err := p.CreateAPIKey(ctx, newKey)
 	if err != nil {
@@ -144,7 +144,7 @@ func scanAPIKey(row pgx.Row) (APIKey, error) {
 		return APIKey{}, fmt.Errorf("scanning API key: %w", err)
 	}
 	k.RevokedAt = revoked
-	k.Predecessor = predID
+	k.PredecessorID = predID
 	k.ExpiresAt = expires
 	k.LastUsedAt = lastUsed
 	return k, nil
