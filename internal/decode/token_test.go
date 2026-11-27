@@ -419,6 +419,26 @@ func TestScvAddress(t *testing.T) {
 			want:   "",
 			wantOK: false,
 		},
+		{
+			// A JSON null decodes into a nil map without error, so the
+			// missing-key branch is what must reject it.
+			name:   "JSON null value does not panic and is rejected",
+			input:  json.RawMessage(`null`),
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "ScVal vector is rejected rather than returning its first element",
+			input:  json.RawMessage(`[{"address":"` + accountStrkey + `"}]`),
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "address nested in an object is rejected",
+			input:  json.RawMessage(`{"address":{"account":"` + accountStrkey + `"}}`),
+			want:   "",
+			wantOK: false,
+		},
 	}
 
 	for _, tt := range tests {
