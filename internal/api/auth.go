@@ -527,8 +527,12 @@ func (s *Server) requireTenant(next http.Handler) http.Handler {
 // tenants with no override on an instance that configured no default —
 // which sends them down the IP-keyed path, preserving exactly the pre-#48
 // behavior for deployments that never turn any of this on.
+
 // tenantResolver is a LimitResolver that keys on the authenticated tenant.
-type tenantResolver struct{ defaultRPS float64; defaultBurst int }
+type tenantResolver struct {
+	defaultRPS   float64
+	defaultBurst int
+}
 
 func (tr tenantResolver) Resolve(r *http.Request) (string, float64, int, bool) {
 	p, ok := PrincipalFrom(r.Context())

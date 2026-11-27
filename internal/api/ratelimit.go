@@ -496,13 +496,12 @@ func (l *RateLimiter) checkQuota(ctx context.Context, key string, now time.Time)
 					remaining = dailyRemaining
 				}
 			}
-			if l.hourlyQuota > 0 && remaining < 0 {
+			if (l.hourlyQuota > 0 || l.dailyQuota > 0) && remaining < 0 {
 				remaining = 0
 			}
-			if l.dailyQuota > 0 && remaining < 0 {
-				remaining = 0
-			}
-			return remaining, 0, true
+			exceeded := (l.dailyQuota > 0 && q.dayUsed > l.dailyQuota) ||
+				(l.hourlyQuota > 0 && q.hourUsed > l.hourlyQuota)
+			return remaining, 0, !exceeded
 		}
 	}
 
