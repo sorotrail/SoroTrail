@@ -527,25 +527,34 @@ func (s *Server) requireTenant(next http.Handler) http.Handler {
 // tenants with no override on an instance that configured no default —
 // which sends them down the IP-keyed path, preserving exactly the pre-#48
 // behavior for deployments that never turn any of this on.
+
+// tenantResolver is a LimitResolver that keys on the authenticated tenant.
+type tenantResolver struct {
+	defaultRPS   float64
+	defaultBurst int
+}
+
+func (tr tenantResolver) Resolve(r *http.Request) (string, float64, int, bool) {
+	p, ok := PrincipalFrom(r.Context())
+	if !ok || p.Untenanted || p.Tenant.ID == 0 {
+		return "", 0, 0, false
+	}
+	rps, burst := tr.defaultRPS, tr.defaultBurst
+	overridden := false
+	if p.Tenant.RateLimitRPS != nil {
+		rps, overridden = *p.Tenant.RateLimitRPS, true
+	}
+	if p.Tenant.RateLimitBurst != nil {
+		burst, overridden = *p.Tenant.RateLimitBurst, true
+	}
+	if !overridden && (tr.defaultRPS <= 0 || tr.defaultBurst <= 0) {
+		return "", 0, 0, false
+	}
+	return "tenant:" + strconv.FormatInt(p.Tenant.ID, 10), rps, burst, true
+}
+
 func TenantLimitResolver(defaultRPS float64, defaultBurst int) LimitResolver {
-	return LimitResolverFunc(func(r *http.Request) (string, float64, int, bool) {
-		p, ok := PrincipalFrom(r.Context())
-		if !ok || p.Untenanted || p.Tenant.ID == 0 {
-			return "", 0, 0, false
-		}
-		rps, burst := defaultRPS, defaultBurst
-		overridden := false
-		if p.Tenant.RateLimitRPS != nil {
-			rps, overridden = *p.Tenant.RateLimitRPS, true
-		}
-		if p.Tenant.RateLimitBurst != nil {
-			burst, overridden = *p.Tenant.RateLimitBurst, true
-		}
-		if !overridden && (defaultRPS <= 0 || defaultBurst <= 0) {
-			return "", 0, 0, false
-		}
-		return "tenant:" + strconv.FormatInt(p.Tenant.ID, 10), rps, burst, true
-	})
+	return tenantResolver{defaultRPS: defaultRPS, defaultBurst: defaultBurst}
 }
 
 func writeUnauthorized(w http.ResponseWriter, msg string) {
