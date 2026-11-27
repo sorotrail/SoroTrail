@@ -143,4 +143,17 @@ var AuthoritativeCacheInventory = []CacheInventoryEntry{
 		MaxRevocationLatency:   "N/A (non-security contract metadata singleflight helper)",
 		SecurityClassification: "non-security-metadata",
 	},
+	{
+		ID:                     "spec.SpecResolver",
+		Package:                "internal/spec",
+		Symbol:                 "SpecResolver",
+		File:                   "internal/spec/resolver.go",
+		Holds:                  "Per-contractID history of registered ContractSpec versions (contractID -> []*ContractSpec), used for spec-aware event decoding",
+		LifetimeTTL:            "Process lifetime (append-only history; no TTL eviction)",
+		InvalidationTrigger:    "None (append-only; spec history is immutable per contractID once registered)",
+		CrossReplica:           false,
+		CrossReplicaKind:       "",
+		MaxRevocationLatency:   "N/A (non-security append-only spec history for event decoding)",
+		SecurityClassification: "non-security-metadata",
+	},
 }
