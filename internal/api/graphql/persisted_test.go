@@ -2,6 +2,8 @@ package graphql
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -492,4 +494,61 @@ func TestPersistedManagementHTTPAndManifestFileLifecycle(t *testing.T) {
 	srvItemRec := httptest.NewRecorder()
 	router.ServeHTTP(srvItemRec, httptest.NewRequest(http.MethodGet, "/graphql/persisted/"+q1ID, nil))
 	require.Equal(t, http.StatusOK, srvItemRec.Code)
+}
+
+func TestComputePersistedID_EdgeCases(t *testing.T) {
+	// SHA-256 of the empty byte sequence is a fixed, universally-known value used
+	// here as an independent cross-check that the function uses SHA-256 and not
+	// some other hash algorithm.
+	const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+	cases := []struct {
+		name  string
+		input string
+		want  string // expected lowercase hex-encoded SHA-256 digest
+	}{
+		{
+			// Verifies the function handles the zero-length input correctly and
+			// that the result matches the well-known SHA-256 of empty bytes.
+			name:  "empty string returns well-known SHA-256 of zero bytes",
+			input: "",
+			want:  emptySHA256,
+		},
+		{
+			// Verifies that whitespace is not stripped before hashing: the
+			// byte sequence "   " must yield a different digest than "".
+			name:  "whitespace-only is not equivalent to empty — bytes are not trimmed",
+			input: "   ",
+			want: func() string {
+				sum := sha256.Sum256([]byte("   "))
+				return hex.EncodeToString(sum[:])
+			}(),
+		},
+		{
+			// Verifies that multi-byte UTF-8 sequences are hashed on their raw
+			// byte representation: U+00E9 ("é") encodes as two bytes 0xC3 0xA9
+			// in UTF-8, not as a single rune value of 233.
+			name:  "multi-byte UTF-8 codepoint is hashed on raw bytes not rune count",
+			input: "é",
+			want: func() string {
+				sum := sha256.Sum256([]byte("é"))
+				return hex.EncodeToString(sum[:])
+			}(),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ComputePersistedID(tc.input)
+			assert.Equal(t, tc.want, got)
+			assert.Len(t, got, 64, "SHA-256 hex digest must always be exactly 64 hex characters")
+			assert.Equal(t, strings.ToLower(got), got, "hex digest must be lowercase")
+		})
+	}
+
+	// Cross-input distinctness: distinct byte sequences must yield distinct IDs.
+	assert.NotEqual(t, ComputePersistedID(""), ComputePersistedID("   "),
+		"empty and whitespace-only inputs must not collide")
+	assert.NotEqual(t, ComputePersistedID("a"), ComputePersistedID("A"),
+		"ASCII case variants must produce different IDs — input is byte-exact, not normalised")
 }
