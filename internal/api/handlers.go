@@ -149,6 +149,7 @@ func decodeJSONBytes(body []byte, dst any) error {
 
 var cachePrivate atomic.Bool
 
+// SetCachePrivate sets whether API responses should be marked as private.
 func SetCachePrivate(v bool) { cachePrivate.Store(v) }
 
 var maxSparseFilterLedgerSpan atomic.Int64
