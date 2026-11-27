@@ -558,14 +558,18 @@ func RunSubscriptionStream(ctx context.Context, sm *SubscriptionManager, tenantI
 	sub := broker.Subscribe(tenantID)
 	defer broker.Unsubscribe(tenantID, sub)
 
-	// Bounded backpressure buffer with gap indicator
+	// Bounded backpressure buffer with gap indicator.
+	// The pump goroutine owns msgChan and closes it on exit; the main loop
+	// must not close it to avoid a race with an in-flight channel send.
 	msgChan := make(chan any, 64)
-	defer close(msgChan)
 
 	// Non-blocking fan-out pump worker
 	stopPump := make(chan struct{})
-	defer close(stopPump)
+	var pumpDone sync.WaitGroup
+	pumpDone.Add(1)
 	go func() {
+		defer pumpDone.Done()
+		defer close(msgChan)
 		for {
 			select {
 			case <-stopPump:
@@ -586,6 +590,10 @@ func RunSubscriptionStream(ctx context.Context, sm *SubscriptionManager, tenantI
 			}
 		}
 	}()
+	// Signal pump to stop and wait for it to exit before unsubscribing so
+	// that close(stopPump) is never concurrent with a msgChan send.
+	defer pumpDone.Wait()
+	defer close(stopPump)
 
 	// Periodic re-authorization check (bound: 10 seconds)
 	authTicker := time.NewTicker(1 * time.Second)
