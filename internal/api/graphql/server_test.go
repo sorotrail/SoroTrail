@@ -271,7 +271,10 @@ func TestRunSubscriptionStream_BackpressureAndSlowConsumer(t *testing.T) {
 		return nil
 	}
 
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		_ = RunSubscriptionStream(ctx, sm, "tenant-A", authCheck, broker, writeMsg)
 	}()
 	time.Sleep(5 * time.Millisecond) // allow the goroutine to reach broker.Subscribe before flooding
@@ -283,7 +286,12 @@ func TestRunSubscriptionStream_BackpressureAndSlowConsumer(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 	cancel()
-	assert.True(t, receivedCount > 0)
+	wg.Wait() // ensure the goroutine has exited before reading shared state
+
+	mu.Lock()
+	rc := receivedCount
+	mu.Unlock()
+	assert.True(t, rc > 0)
 }
 
 func TestSubscriptionManager_ShutdownAndRelease(t *testing.T) {
