@@ -28,12 +28,12 @@ type OIDCMapping struct {
 
 // JWK represents a JSON Web Key.
 type JWK struct {
-	Kty string   `json:"kty"`
-	Kid string   `json:"kid"`
-	Use string   `json:"use"`
-	Alg string   `json:"alg"`
-	N   string   `json:"n"`
-	E   string   `json:"e"`
+	Kty string `json:"kty"`
+	Kid string `json:"kid"`
+	Use string `json:"use"`
+	Alg string `json:"alg"`
+	N   string `json:"n"`
+	E   string `json:"e"`
 }
 
 // JWKS represents a JSON Web Key Set.

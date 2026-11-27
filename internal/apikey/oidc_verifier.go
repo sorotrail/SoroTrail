@@ -39,6 +39,9 @@ func (v *OIDCVerifier) VerifyToken(ctx context.Context, tokenString string) (*Pr
 
 	// Decode header
 	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, errors.New("malformed token header")
+	}
 	UseJSON := map[string]interface{}{}
 	if err := json.Unmarshal(headerBytes, &UseJSON); err != nil {
 		return nil, errors.New("malformed token header")
