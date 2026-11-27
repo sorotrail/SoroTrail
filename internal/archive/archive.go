@@ -63,11 +63,11 @@ type Chunk struct {
 // Manifest is the JSON structure written alongside each archive file
 // so consumers can validate integrity without parsing the NDJSON.
 type Manifest struct {
-	SchemaVersion int            `json:"schema_version"`
-	Chunk         ChunkInfo      `json:"chunk"`
-	Producer      string         `json:"producer"`
+	SchemaVersion int             `json:"schema_version"`
+	Chunk         ChunkInfo       `json:"chunk"`
+	Producer      string          `json:"producer"`
 	Chunks        []ManifestChunk `json:"chunks,omitempty"`
-	UpdatedAt     time.Time      `json:"updated_at,omitempty"`
+	UpdatedAt     time.Time       `json:"updated_at,omitempty"`
 }
 
 // ChunkInfo holds the metadata for a single archived chunk.
