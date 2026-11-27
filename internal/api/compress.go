@@ -448,7 +448,7 @@ func (w *compressWriter) Write(b []byte) (int, error) {
 }
 
 // decide commits to compressing or not, flushes the buffered prefix, and
-	// makes every later Write go straight through.
+// makes every later Write go straight through.
 func (w *compressWriter) decide(big bool) error {
 	w.decided = true
 	h := w.Header()
