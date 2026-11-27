@@ -254,10 +254,6 @@ next request; the action cannot be undone (issue a new key instead).
 	return nil
 }
 
-func apikeyRotate(args []string) error {
-	return apikeyRotateTo(os.Stdout, args)
-}
-
 func apikeyRotateTo(w io.Writer, args []string) error {
 	fs := flag.NewFlagSet("apikey rotate", flag.ContinueOnError)
 	fs.SetOutput(w)
@@ -328,10 +324,6 @@ flags:
 	fmt.Fprintf(w, "key:           %s\n", key)
 	fmt.Fprintln(w, "store this key now — it will not be shown again.")
 	return nil
-}
-
-func apikeyAbandonRotation(args []string) error {
-	return apikeyAbandonRotationTo(os.Stdout, args)
 }
 
 func apikeyAbandonRotationTo(w io.Writer, args []string) error {
