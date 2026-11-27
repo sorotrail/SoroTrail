@@ -94,6 +94,30 @@ func (p *Postgres) RevokeAPIKey(ctx context.Context, id int64) error {
 	return nil
 }
 
+// RotateAPIKey creates a successor key for predecessorID and sets an expiry on
+// the predecessor so callers can transition without a gap in service. The
+// predecessor is NOT revoked here; call RevokeAPIKey when the transition is
+// complete, or AbandonAPIKeyRotation to cancel and revoke the successor instead.
+func (p *Postgres) RotateAPIKey(ctx context.Context, predecessorID int64, newKey APIKey, expiresIn time.Duration) (APIKey, error) {
+	if _, err := p.GetAPIKey(ctx, predecessorID); err != nil {
+		return APIKey{}, fmt.Errorf("looking up predecessor API key: %w", err)
+	}
+	expiry := time.Now().UTC().Add(expiresIn)
+	newKey.Predecessor = &predecessorID
+	newKey.ExpiresAt = &expiry
+	created, err := p.CreateAPIKey(ctx, newKey)
+	if err != nil {
+		return APIKey{}, fmt.Errorf("creating successor API key: %w", err)
+	}
+	return created, nil
+}
+
+// AbandonAPIKeyRotation revokes the successor key (cancelling the rotation).
+// The predecessor key is unaffected and remains active.
+func (p *Postgres) AbandonAPIKeyRotation(ctx context.Context, successorID int64) error {
+	return p.RevokeAPIKey(ctx, successorID)
+}
+
 func (p *Postgres) UpdateAPIKeyLastUsed(ctx context.Context, id int64, t time.Time) error {
 	_, err := p.pool.Exec(ctx, `
 		UPDATE api_keys SET last_used_at = $2
