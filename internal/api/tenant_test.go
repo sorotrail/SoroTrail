@@ -1005,7 +1005,7 @@ func TestTenantLimitResolver(t *testing.T) {
 	}
 
 	t.Run("tenant overrides win", func(t *testing.T) {
-		key, gotRPS, gotBurst, ok := TenantLimitResolver(1, 1)(newReq(Principal{Tenant: tenant}))
+		key, gotRPS, gotBurst, ok := TenantLimitResolver(1, 1).Resolve(newReq(Principal{Tenant: tenant}))
 		require.True(t, ok)
 		assert.Equal(t, "tenant:42", key)
 		assert.Equal(t, 7.0, gotRPS)
@@ -1013,7 +1013,7 @@ func TestTenantLimitResolver(t *testing.T) {
 	})
 
 	t.Run("instance defaults apply without an override", func(t *testing.T) {
-		key, gotRPS, gotBurst, ok := TenantLimitResolver(5, 2)(
+		key, gotRPS, gotBurst, ok := TenantLimitResolver(5, 2).Resolve(
 			newReq(Principal{Tenant: store.Tenant{ID: 9}}))
 		require.True(t, ok)
 		assert.Equal(t, "tenant:9", key)
@@ -1022,18 +1022,18 @@ func TestTenantLimitResolver(t *testing.T) {
 	})
 
 	t.Run("two tenants get separate buckets", func(t *testing.T) {
-		k1, _, _, _ := TenantLimitResolver(5, 2)(newReq(Principal{Tenant: store.Tenant{ID: 1}}))
-		k2, _, _, _ := TenantLimitResolver(5, 2)(newReq(Principal{Tenant: store.Tenant{ID: 2}}))
+		k1, _, _, _ := TenantLimitResolver(5, 2).Resolve(newReq(Principal{Tenant: store.Tenant{ID: 1}}))
+		k2, _, _, _ := TenantLimitResolver(5, 2).Resolve(newReq(Principal{Tenant: store.Tenant{ID: 2}}))
 		assert.NotEqual(t, k1, k2)
 	})
 
 	t.Run("untenanted requests fall back to IP keying", func(t *testing.T) {
-		_, _, _, ok := TenantLimitResolver(5, 2)(newReq(Principal{Untenanted: true}))
+		_, _, _, ok := TenantLimitResolver(5, 2).Resolve(newReq(Principal{Untenanted: true}))
 		assert.False(t, ok)
 	})
 
 	t.Run("no override and no default falls back", func(t *testing.T) {
-		_, _, _, ok := TenantLimitResolver(0, 0)(newReq(Principal{Tenant: store.Tenant{ID: 9}}))
+		_, _, _, ok := TenantLimitResolver(0, 0).Resolve(newReq(Principal{Tenant: store.Tenant{ID: 9}}))
 		assert.False(t, ok, "a deployment with no limits configured must not start denying")
 	})
 }
