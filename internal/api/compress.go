@@ -560,7 +560,7 @@ func (w *compressWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 }
 
 // weakenETag converts a strong ETag to a weak one, leaving an already-weak
-	// or absent validator alone.
+// or absent validator alone.
 func weakenETag(h http.Header) {
 	tag := h.Get("ETag")
 	if tag == "" || strings.HasPrefix(tag, "W/") {
