@@ -623,7 +623,7 @@ func Canonicalize(r Record) ([]byte, error) {
 		PrevHash  string `json:"prev_hash"`
 	}{
 		Sequence:  r.Sequence,
-		Timestamp: r.Timestamp.UTC().Format(time.RFC3339Nano),
+		Timestamp: r.Timestamp.UTC().Truncate(time.Microsecond).Format(time.RFC3339Nano),
 		TenantID:  r.TenantID,
 		Action:    r.Action,
 		Actor:     r.Actor,
