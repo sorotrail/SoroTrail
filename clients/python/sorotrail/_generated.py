@@ -410,10 +410,16 @@ class APIKey:
     """API key metadata. The secret half of the key is never included — only a bcrypt hash of it is stored, and the plaintext is returned exactly once, by POST /apikeys."""
 
     created_at: str = ""
+    # When the key expires and will no longer authenticate. Absent for non-expiring keys.
+    expires_at: str = ""
     # Database ID, used to revoke the key.
     id: int = 0
+    # When the key was last used to authenticate a request. Absent if the key has never been used.
+    last_used_at: str = ""
     # Human-readable label, empty for an unnamed key.
     name: str = ""
+    # ID of the API key this key was created to rotate. Set only for keys created via the rotation endpoint; absent for independently-created keys.
+    predecessor: int = 0
     # The non-secret 16-character hexadecimal lookup handle stored in the clear. It identifies the key without revealing it.
     prefix: str = ""
     # When the key was revoked. Absent while the key is active.
@@ -423,8 +429,11 @@ class APIKey:
     def from_dict(cls, data: Mapping[str, JSONValue]) -> APIKey:
         return cls(
             created_at=_as_str(data.get("created_at")),
+            expires_at=_as_str(data.get("expires_at")),
             id=_as_int(data.get("id")),
+            last_used_at=_as_str(data.get("last_used_at")),
             name=_as_str(data.get("name")),
+            predecessor=_as_int(data.get("predecessor")),
             prefix=_as_str(data.get("prefix")),
             revoked_at=_as_str(data.get("revoked_at")),
         )
@@ -432,8 +441,14 @@ class APIKey:
     def to_dict(self) -> JSONObject:
         out: JSONObject = {}
         out["created_at"] = self.created_at
+        if self.expires_at != "":
+            out["expires_at"] = self.expires_at
         out["id"] = self.id
+        if self.last_used_at != "":
+            out["last_used_at"] = self.last_used_at
         out["name"] = self.name
+        if self.predecessor != 0:
+            out["predecessor"] = self.predecessor
         out["prefix"] = self.prefix
         if self.revoked_at != "":
             out["revoked_at"] = self.revoked_at
@@ -2010,12 +2025,18 @@ class CreateAPIKeyResponse:
     """API schema used by the SoroTrail client."""
 
     created_at: str = ""
+    # When the key expires and will no longer authenticate. Absent for non-expiring keys.
+    expires_at: str = ""
     # Database ID, used to revoke the key.
     id: int = 0
     # The plaintext key, in the form `sorotrail_<16-hex-prefix>_<64-hex-secret>`. Returned once and never again; store it before discarding the response.
     key: str = ""
+    # When the key was last used to authenticate a request. Absent if the key has never been used.
+    last_used_at: str = ""
     # Human-readable label, empty for an unnamed key.
     name: str = ""
+    # ID of the API key this key was created to rotate. Set only for keys created via the rotation endpoint; absent for independently-created keys.
+    predecessor: int = 0
     # The non-secret 16-character hexadecimal lookup handle stored in the clear. It identifies the key without revealing it.
     prefix: str = ""
     # When the key was revoked. Absent while the key is active.
@@ -2025,9 +2046,12 @@ class CreateAPIKeyResponse:
     def from_dict(cls, data: Mapping[str, JSONValue]) -> CreateAPIKeyResponse:
         return cls(
             created_at=_as_str(data.get("created_at")),
+            expires_at=_as_str(data.get("expires_at")),
             id=_as_int(data.get("id")),
             key=_as_str(data.get("key")),
+            last_used_at=_as_str(data.get("last_used_at")),
             name=_as_str(data.get("name")),
+            predecessor=_as_int(data.get("predecessor")),
             prefix=_as_str(data.get("prefix")),
             revoked_at=_as_str(data.get("revoked_at")),
         )
@@ -2035,9 +2059,15 @@ class CreateAPIKeyResponse:
     def to_dict(self) -> JSONObject:
         out: JSONObject = {}
         out["created_at"] = self.created_at
+        if self.expires_at != "":
+            out["expires_at"] = self.expires_at
         out["id"] = self.id
         out["key"] = self.key
+        if self.last_used_at != "":
+            out["last_used_at"] = self.last_used_at
         out["name"] = self.name
+        if self.predecessor != 0:
+            out["predecessor"] = self.predecessor
         out["prefix"] = self.prefix
         if self.revoked_at != "":
             out["revoked_at"] = self.revoked_at

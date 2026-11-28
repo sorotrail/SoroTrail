@@ -674,11 +674,14 @@ func OwnedBy(tenantID int64) SubscriptionOwner {
 // once the key has been revoked — revoked keys fail validation
 // immediately.
 type APIKey struct {
-	ID        int64      `json:"id"`
-	Name      string     `json:"name"`
-	Prefix    string     `json:"prefix"`
-	CreatedAt time.Time  `json:"created_at"`
-	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	ID            int64      `json:"id"`
+	Name          string     `json:"name"`
+	Prefix        string     `json:"prefix"`
+	CreatedAt     time.Time  `json:"created_at"`
+	RevokedAt     *time.Time `json:"revoked_at,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt    *time.Time `json:"last_used_at,omitempty"`
+	PredecessorID *int64     `json:"predecessor,omitempty"`
 
 	// KeyHash is the bcrypt hash of the secret part of the key. It is
 	// write-only: it is set on create and compared on validation, but
