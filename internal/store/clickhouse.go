@@ -129,6 +129,71 @@ func (c *ClickHouse) ListContractsNeedingRefresh(context.Context, time.Time) ([]
 	return nil, errUnsupported("clickhouse", "ListContractsNeedingRefresh")
 }
 
+func (c *ClickHouse) MigrationVersion(ctx context.Context) (int, bool, error) {
+	query := "SELECT version, dirty FROM schema_migrations LIMIT 1"
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(), query)
+	if err != nil {
+		// If the table doesn't exist yet or query fails, return no migration version.
+		return 0, false, nil
+	}
+	if len(rows) == 0 {
+		return 0, false, nil
+	}
+	row := rows[0]
+	return int(row.int64("version")), row.int64("dirty") != 0, nil
+}
+
+func (c *ClickHouse) MigrationVersionOld(ctx context.Context) (int64, bool, error) {
+	query := "SELECT version, dirty FROM schema_migrations LIMIT 1"
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(), query)
+	if err != nil {
+		// If the table doesn't exist yet or query fails, return no migration version.
+		return 0, false, nil
+	}
+	if len(rows) == 0 {
+		return 0, false, nil
+	}
+	row := rows[0]
+	return row.int64("version"), row.int64("dirty") != 0, nil
+}
+
+func (c *ClickHouse) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {
+	query := "SELECT contract_id, count() AS event_count, min(ledger) AS first_ledger, " +
+		"max(ledger) AS last_ledger, max(created_at) AS last_seen " +
+		"FROM events GROUP BY contract_id ORDER BY last_seen DESC"
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+	query += " LIMIT " + strconv.Itoa(limit)
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(), query)
+	if err != nil {
+		return nil, "", fmt.Errorf("list contracts: %w", err)
+	}
+	out := make([]ContractSummary, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, ContractSummary{
+			ContractID:  row.str("contract_id"),
+			EventCount:  row.int64("event_count"),
+			FirstLedger: row.int64("first_ledger"),
+			LastLedger:  row.int64("last_ledger"),
+			LastSeen:    row.time("last_seen"),
+		})
+	}
+	return out, "", nil
+}
+
+func (c *ClickHouse) AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error) {
+	return nil, errUnsupported("clickhouse", "AggregateEvents")
+}
+
+func (c *ClickHouse) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error) {
+	return nil, errUnsupported("clickhouse", "LedgerRangeCensus")
+}
+
 func parseClickHouseConfig(raw string) (clickHouseConfig, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -536,14 +601,6 @@ func clickHouseQuoteList(values []string) string {
 		quoted[i] = clickHouseQuoteString(v)
 	}
 	return strings.Join(quoted, ", ")
-}
-
-func (c *ClickHouse) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error) {
-	return nil, errUnsupported("clickhouse", "LedgerRangeCensus")
-}
-
-func (c *ClickHouse) AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error) {
-	return nil, errUnsupported("clickhouse", "AggregateEvents")
 }
 
 // clickHouseIngestionStateVersion mints the updated_at version stamped onto
@@ -1162,10 +1219,6 @@ func (c *ClickHouse) DeleteEventsBeforeLedger(ctx context.Context, beforeLedger 
 	return affected, nil
 }
 
-func (c *ClickHouse) MigrationVersion(ctx context.Context) (int, bool, error) {
-	return 0, false, errUnsupported("clickhouse", "MigrationVersion")
-}
-
 // Stats aggregates the same counters as Postgres.Stats, against the tables
 // that carry the same data in the ClickHouse schema: events, ingestion_state,
 // audit_state and watched_contracts (see 0001_init.up.sql). Table size is
@@ -1246,10 +1299,6 @@ func (c *ClickHouse) Stats(ctx context.Context, sc Scope) (Stats, error) {
 	s.WatchedContracts = watched
 
 	return s, nil
-}
-
-func (c *ClickHouse) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {
-	return nil, "", errUnsupported("clickhouse", "ListContracts")
 }
 
 // CountContracts counts distinct contract_id values in events, matching

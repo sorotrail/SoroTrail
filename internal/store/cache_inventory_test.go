@@ -29,6 +29,7 @@ var nonCacheStructAllowlist = map[string]bool{
 	"internal/spec.Enricher":               true, // delegates to spec.Cache
 	"internal/api.Server":                  true, // delegates to AuthCache, StatsCache, RateLimiter, syncStreamScope
 	"internal/config.Config":               true, // holds StatsCacheTTL / CachePrivate config fields
+	"internal/apikey.OIDCVerifier":         true, // delegates to JWKSCache
 }
 
 // discoveredCache represents a cache symbol discovered by walking the Go AST.

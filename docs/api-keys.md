@@ -1,9 +1,9 @@
-# API Key Lifecycle and Scopes
+# Authentication: API Keys and OIDC Tokens
 
-SoroTrail protects its HTTP API with API keys. This document explains how keys
+SoroTrail protects its HTTP API with API keys and OIDC-issued tokens. This document explains how keys
 are generated, stored, and verified, how the initial administrative key is
 bootstrapped, the role and enforcement of scopes, how to execute zero-downtime key
-rotations, and the backend deployment constraints.
+rotations, the backend deployment constraints, and OIDC token authentication.
 
 - [Key format and storage](#key-format-and-storage)
 - [Where the first key comes from (bootstrap)](#where-the-first-key-comes-from-bootstrap)
@@ -12,8 +12,9 @@ rotations, and the backend deployment constraints.
 - [Under-scoped and unauthenticated responses](#under-scoped-and-unauthenticated-responses)
 - [Key rotation procedure](#key-rotation-procedure)
 - [Leaked key procedure](#leaked-key-procedure)
-- [Backend constraint: PostgreSQL only](#backend-constraint-postgresql-only)
+- [SQLite single-node authentication](#sqlite-single-node-authentication)
 - [Idempotency keys on write endpoints](#idempotency-keys-on-write-endpoints)
+- [OIDC token authentication](#oidc-token-authentication)
 - [Secret handling guidance](#secret-handling-guidance)
 
 ## Key format and storage
@@ -228,21 +229,17 @@ If an API key is committed to source control, leaked in logs, or otherwise compr
    If a bootstrap key was exposed, remove `MULTI_TENANT_BOOTSTRAP_KEY` from the
    environment configuration and restart the container.
 
-## Backend constraint: PostgreSQL only
+## SQLite single-node authentication
 
-> [!WARNING]
-> **API keys are not supported by the SQLite backend.**
-> 
-> The SQLite storage driver deliberately refuses all API key methods:
-> `CreateAPIKey`, `GetAPIKey`, `LookupAPIKeyByPrefix`, `ListAPIKeys`, and
-> `RevokeAPIKey` all return an unsupported backend error.
+SoroTrail supports secure API key authentication across both PostgreSQL and SQLite backends.
 
-The SQLite backend is intended for single-node embedded development. If you are
-running SoroTrail on SQLite:
-- Single-node authentication must be handled externally at your reverse proxy
-  (e.g., Caddy, NGINX, Envoy, or an API Gateway).
-- Any production deployment requiring multi-tenancy, per-tenant scopes, or
-  built-in API key management **must use PostgreSQL**.
+When deploying SoroTrail with SQLite (`DATABASE_URL=sqlite:./sorotrail.db`), API key
+authentication is fully supported. If no API keys are configured, SoroTrail logs a
+loud startup warning reminding operators to secure the deployment or run behind an
+authenticated reverse proxy.
+
+Any production deployment requiring multi-tenancy, per-tenant scopes, or advanced
+key management should use PostgreSQL.
 
 ## Idempotency keys on write endpoints
 
@@ -274,6 +271,29 @@ All SoroTrail write endpoints (`POST`, `PUT`, `PATCH`, and `DELETE`), including
   opportunistically on write operations. Twenty-four hours covers automated
   client retry budgets, webhook orchestrator backoffs, and CI/CD deployment
   pipelines while bounding storage growth in `idempotency_keys`.
+
+## OIDC Token Authentication
+
+SoroTrail supports accepting OIDC-issued JSON Web Tokens (JWTs) alongside API keys. When OIDC authentication is enabled, clients may present an OIDC bearer token in the `Authorization` header.
+
+### Configuration
+
+OIDC authentication is off by default. It is configured via environment variables:
+
+- `OIDC_ENABLED=true` — Enables OIDC verification.
+- `OIDC_ISSUER=https://auth.example.com/issuer` — Expected token issuer (`iss` claim).
+- `OIDC_AUDIENCE=sorotrail-api` — Expected token audience (`aud` claim).
+- `OIDC_JWKS_URL=https://auth.example.com/.well-known/jwks.json` — URL to fetch JSON Web Key Set for signature verification.
+- `OIDC_CLAIM_TENANT=tenant` — Claim name used to resolve the tenant name.
+- `OIDC_CLAIM_SCOPES=scope` — Claim name used to determine scopes or permissions.
+
+### Security & Validation Rules
+
+- **Fail-closed validation**: Issuer, audience, expiration (`exp`), not-before (`nbf`), and cryptographic signature are strictly checked. If JWKS cannot be fetched or rotated keys cannot be resolved, verification fails.
+- **Clock skew**: A small clock skew tolerance is applied to handle slight time drifts between the provider and the SoroTrail instance.
+- **Key set caching**: The remote JSON Web Key Set is cached with a bounded lifetime and negative result caching, ensuring provider key rotations are picked up without requiring server restarts while preventing unbounded requests on unknown key IDs (`kid`).
+- **No credential leakage**: No token claims, keys, or raw secrets appear in logs or error messages.
+- **Simultaneous presentation rule**: If both an API key and an OIDC token are present, authentication evaluates them deterministically according to precedence rules.
 
 ## Secret handling guidance
 

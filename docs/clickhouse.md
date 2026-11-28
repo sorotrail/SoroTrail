@@ -43,21 +43,21 @@ ones that still do not.
 | Event lookups | `GetEvent`, `GetEventsByTxHash`, `EventExists` | **implemented** | Scope predicates are applied in SQL, matching Postgres. |
 | Event listing | `QueryEvents`, `CountEvents` | **implemented** | Contract, type, ledger, time and cursor filters work. Topic filters take a separate refusing path below. |
 | Topic filters | `QueryEvents` | **refuses** | `topic`, `topic_contains` and `topic0`..`topic3` return `ErrUnsupported` because `topics` is an opaque JSON string with no jsonb containment operator. |
-| Event aggregation | `AggregateEvents`, `LedgerRangeCensus` | **silent no-op** | Both return an empty result. The auditor's census path therefore cannot verify ranges against this backend. [Tracking search](https://github.com/sorotrail/SoroTrail/issues?q=is%3Aissue+clickhouse+aggregate). |
+| Event aggregation | `AggregateEvents`, `LedgerRangeCensus` | **refuses** | Both return `ErrUnsupported` so callers and auditors do not receive empty false success. |
 | Stats | `Stats` | **implemented** | `table_size_bytes` stays 0. Tenant watch-list entries are not counted because ClickHouse has no tenant table. |
-| Migration version | `MigrationVersion` | **silent no-op** | Returns `(0, false, nil)` even though the schema series has been applied. [Tracking search](https://github.com/sorotrail/SoroTrail/issues?q=is%3Aissue+clickhouse+migration). |
+| Migration version | `MigrationVersion` | **implemented** | Queries schema_migrations table version and dirty status. |
 
 ### Contract inventory and metadata
 
 | Capability | Methods | State | Notes |
 | --- | --- | --- | --- |
-| Contract inventory | `ListContracts` | **silent no-op** | Returns a nil page and no cursor, which the API renders as "no contracts indexed". `CountContracts` is implemented, so the total can disagree with the page. [Tracking search](https://github.com/sorotrail/SoroTrail/issues?q=is%3Aissue+clickhouse+ListContracts). |
+| Contract inventory | `ListContracts` | **implemented** | Returns contract summaries ordered by last seen. |
 | Contract inventory count | `CountContracts` | **implemented** | Counts distinct contract IDs in events, matching Postgres. |
 | Contract summary | `GetContractSummary` | **implemented** | Exact `count()`, `min(ledger)`, `max(ledger)` and `max(created_at)`; unknown contract returns `ErrNotFound`. |
 | Per-type breakdown | `ContractEventTypeCounts` | **implemented** | Aggregated in ClickHouse with `GROUP BY type`, ordered by count descending. |
 | Contract metadata | `ListContractIDs`, `GetContractMeta`, `UpsertContractMeta`, `CountContractEvents`, `ListContractsNeedingRefresh` | **refuses** | All five return `ErrUnsupported`. The backend stores no contract metadata, so token enrichment cannot run here; a caller that recognises the sentinel stands down instead of retrying a capability that will never arrive. `GET /contracts/{id}/stats` answers 501 rather than an empty stats object. [Tracking search](https://github.com/sorotrail/SoroTrail/issues?q=is%3Aissue+clickhouse+metadata). |
-| Contract specs | `GetContractSpec`, `GetContractSpecOverride` | **silent no-op** | Both return `ErrNotFound`, so a cached spec looks absent. [Tracking search](https://github.com/sorotrail/SoroTrail/issues?q=is%3Aissue+clickhouse+spec). |
-| Contract spec writes | `SetContractSpec`, `SetContractSpecOverride`, `DeleteContractSpecOverride` | **silent no-op** | All return nil without persisting anything. [Tracking search](https://github.com/sorotrail/SoroTrail/issues?q=is%3Aissue+clickhouse+spec). |
+| Contract specs | `GetContractSpec`, `GetContractSpecOverride` | **refuses** | Refuses with `ErrUnsupported` to prevent silent caching misses. |
+| Contract spec writes | `SetContractSpec`, `SetContractSpecOverride`, `DeleteContractSpecOverride` | **refuses** | Refuses with `ErrUnsupported` instead of silent no-ops. |
 | Contract spec override history | `SetContractSpecOverrideWithHistory`, `DeleteContractSpecOverrideWithHistory`, `ListContractSpecOverrideHistory` | **refuses** | All three return `ErrUnsupported`, so the API answers 501 rather than reporting an empty history. The history is written in the same transaction as the override it records, and the backend has neither. |
 
 ### Ingestion, audit and watch state
