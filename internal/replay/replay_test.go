@@ -261,6 +261,73 @@ func TestRun_DryRunWritesNothing(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrNotFound, "dry run must not persist progress")
 }
 
+// Version-targeted replay: events at or above the target version are skipped.
+func TestRun_TargetDecoderVersion(t *testing.T) {
+	e1 := seedEvent(1, 100)
+	e1.DecoderVersion = 1
+	e2 := seedEvent(2, 101)
+	e2.DecoderVersion = 2
+
+	st := newFakeStore(e1, e2)
+	r := newTestReplayer(st, improvedDecoder(), Options{FromLedger: 1, ToLedger: 1000, TargetDecoderVersion: 2})
+
+	sum, err := r.Run(context.Background())
+	require.NoError(t, err)
+
+	assert.EqualValues(t, 1, sum.Processed)
+	assert.Equal(t, `[{"symbol":"transfer"}]|{"i128":"1000"}`, st.snapshot()[eventID(1)], "event with version 1 is replayed")
+	assert.Equal(t, `[{"unknown":{"type":"scvFoo"}}]|{"unknown":{"type":"scvFoo"}}`, st.snapshot()[eventID(2)], "event with version 2 is skipped")
+}
+
+// Unsupported backend behavior: a backend that cannot support replay refuses honestly.
+func TestRun_UnsupportedBackendRefuses(t *testing.T) {
+	unsupportedSt := &unsupportedStore{}
+	r := newTestReplayer(unsupportedSt, improvedDecoder(), Options{FromLedger: 1, ToLedger: 1000})
+	_, err := r.Run(context.Background())
+	errorIs(t, err, store.ErrUnsupported)
+}
+
+// Identity invariant assertion: event ID, ledger, and ordering are untouched.
+func TestRun_IdentityInvariant(t *testing.T) {
+	original := seedEvent(1, 100)
+
+	st := newFakeStore(original)
+	r := newTestReplayer(st, improvedDecoder(), Options{FromLedger: 1, ToLedger: 1000})
+
+	_, err := r.Run(context.Background())
+	require.NoError(t, err)
+
+	events, err := st.NextReplayBatch(context.Background(), 1, 1000, "", 10)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	assert.Equal(t, original.ID, events[0].ID)
+	assert.Equal(t, original.ContractID, events[0].ContractID)
+	assert.Equal(t, original.Ledger, events[0].Ledger)
+}
+
+type unsupportedStore struct{}
+
+func (u *unsupportedStore) AcquireReplayLock(ctx context.Context) (store.ReplayLock, error) {
+	return nil, store.ErrUnsupported
+}
+func (u *unsupportedStore) GetReplayState(ctx context.Context) (store.ReplayState, error) {
+	return store.ReplayState{}, store.ErrUnsupported
+}
+func (u *unsupportedStore) StartReplayState(ctx context.Context, fromLedger, toLedger int64) error {
+	return store.ErrUnsupported
+}
+func (u *unsupportedStore) NextReplayBatch(ctx context.Context, fromLedger, toLedger int64, afterID string, limit int) ([]store.DecodedEvent, error) {
+	return nil, store.ErrUnsupported
+}
+func (u *unsupportedStore) CommitReplayBatch(ctx context.Context, b store.ReplayBatch) error {
+	return store.ErrUnsupported
+}
+
+func errorIs(t *testing.T, err, target error) {
+	t.Helper()
+	assert.ErrorIs(t, err, target)
+}
+
 func TestJSONEqual(t *testing.T) {
 	tests := []struct {
 		name string

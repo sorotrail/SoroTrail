@@ -28,6 +28,16 @@ Start with a dry run to see the blast radius:
 sorotrail replay --from-ledger 250000 --dry-run
 ```
 
+## Decoder version marker
+
+Each event's decoded columns are recorded with a `decoder_version` marker (derived from `decode.CurrentDecoderVersion`). Replay can target events below a specific version marker rather than scanning the entire historical table:
+
+```sh
+sorotrail replay --from-ledger 250000 --target-decoder-version 1
+```
+
+Backends that cannot support decoder replay (such as backends lacking stored raw XDR or mutable storage for decoded columns) refuse honestly via the project's unsupported-operation sentinel rather than silently doing nothing.
+
 ## Usage
 
 ```sh
@@ -42,6 +52,7 @@ sorotrail replay --from-ledger N [--to-ledger M] [flags]
 | `--restart` | `false` | Discard saved progress and replay the range from the start. |
 | `--dry-run` | `false` | Report what would change; write nothing. |
 | `--progress-interval` | `0` | Emit periodic progress to stderr (e.g. `30s`, `1m`). `0` disables. |
+| `--target-decoder-version` | `0` | Skip events already at or above this decoder version. `0` = replay all. |
 
 Configuration (notably `DATABASE_URL`) comes from the same environment
 variables the indexer uses.
@@ -71,11 +82,15 @@ replay completed
   ingested before raw-XDR retention landed, and events the RPC delivered as
   JSON (`xdrFormat: "json"`), have no XDR to re-decode. Their stored decoding
   is left untouched.
-- **failed** — rows whose stored XDR could not be decoded at all. Logged with
-  the event ID and left untouched, so one malformed row can't wedge a replay
-  forever. A non-zero count deserves investigation.
+- **failed** — rows whose stored XDR could not be decoded at all. Recorded and logged with
+  the event ID and left untouched, consistent with the ingester dead-letter path, so one malformed row can't wedge a replay forever. A non-zero count deserves investigation.
+- **Identity invariant** — replay never changes an event's identity (`id`, `contract_id`, `ledger`, `tx_hash`, etc.) or its ordering. Only the decoded `topics` and `value` columns (and decoder version) change.
 
 Exit codes: `0` completed, `2` interrupted (re-run to resume), `1` error.
+
+## Archival caveat
+
+Archived chunks hold the old decoding state and will not be replayed. History retrieved from the archive may therefore be decoded differently than live database queries until restored chunks are reprocessed.
 
 ## The workflow, end to end
 

@@ -38,6 +38,7 @@ var (
 	auditor   *audit.Auditor
 )
 
+// SetAuditor registers the Auditor used for audit logging.
 func SetAuditor(a *audit.Auditor) {
 	auditorMu.Lock()
 	auditor = a
