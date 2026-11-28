@@ -3541,6 +3541,25 @@ components:
           format: date-time
           description: >-
             When the key was revoked. Absent while the key is active.
+        expires_at:
+          type: string
+          format: date-time
+          description: >-
+            When the key expires and will no longer authenticate. Absent for
+            non-expiring keys.
+        last_used_at:
+          type: string
+          format: date-time
+          description: >-
+            When the key was last used to authenticate a request. Absent if the
+            key has never been used.
+        predecessor:
+          type: integer
+          format: int64
+          description: >-
+            ID of the API key this key was created to rotate. Set only for keys
+            created via the rotation endpoint; absent for independently-created
+            keys.
       required: [id, name, prefix, created_at]
     APIKeyRequest:
       type: object

@@ -91,10 +91,16 @@ var SpecRoutes = []SpecRoute{
 // APIKey API key metadata. The secret half of the key is never included — only a bcrypt hash of it is stored, and the plaintext is returned exactly once, by POST /apikeys.
 type APIKey struct {
 	CreatedAt string `json:"created_at"`
+	// ExpiresAt When the key expires and will no longer authenticate. Absent for non-expiring keys.
+	ExpiresAt string `json:"expires_at,omitempty"`
 	// ID Database ID, used to revoke the key.
 	ID int64 `json:"id"`
+	// LastUsedAt When the key was last used to authenticate a request. Absent if the key has never been used.
+	LastUsedAt string `json:"last_used_at,omitempty"`
 	// Name Human-readable label, empty for an unnamed key.
 	Name string `json:"name"`
+	// Predecessor ID of the API key this key was created to rotate. Set only for keys created via the rotation endpoint; absent for independently-created keys.
+	Predecessor int64 `json:"predecessor,omitempty"`
 	// Prefix The non-secret 16-character hexadecimal lookup handle stored in the clear. It identifies the key without revealing it.
 	Prefix string `json:"prefix"`
 	// RevokedAt When the key was revoked. Absent while the key is active.
