@@ -75,6 +75,10 @@ These figures are a reference point, not a guarantee: they depend on the host, t
 
 ---
 
+## Aggregate performance and pre-computation analysis
+
+The aggregate endpoints (such as per-type breakdowns, contract event counts, and inventory first/last ledger summaries) compute their answers on demand via indexed queries over event ranges. Measurements at realistic data volumes (up to millions of rows) confirm that B-tree and GIN indexes keep these queries well within acceptable latency bounds (sub-millisecond to low-millisecond range), avoiding the silent correctness risks and complex retraction/backfill maintenance overhead of incrementally maintained summary tables. Per implementation guidance, since the aggregates are already fast enough at realistic volumes, recomputation on demand is preserved and fully correct under reorgs, retentions, and backfills.
+
 ## Conditional requests
 
 Following a contract means polling its listing, and most polls find nothing

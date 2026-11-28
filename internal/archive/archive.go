@@ -63,9 +63,11 @@ type Chunk struct {
 // Manifest is the JSON structure written alongside each archive file
 // so consumers can validate integrity without parsing the NDJSON.
 type Manifest struct {
-	SchemaVersion int       `json:"schema_version"`
-	Chunk         ChunkInfo `json:"chunk"`
-	Producer      string    `json:"producer"`
+	SchemaVersion int             `json:"schema_version"`
+	Chunk         ChunkInfo       `json:"chunk"`
+	Producer      string          `json:"producer"`
+	Chunks        []ManifestChunk `json:"chunks,omitempty"`
+	UpdatedAt     time.Time       `json:"updated_at,omitempty"`
 }
 
 // ChunkInfo holds the metadata for a single archived chunk.
@@ -73,6 +75,16 @@ type ChunkInfo struct {
 	LedgerStart int64 `json:"ledger_start"`
 	LedgerEnd   int64 `json:"ledger_end"`
 	RowCount    int64 `json:"row_count"`
+}
+
+// ManifestChunk describes one compacted chunk within a multi-chunk manifest.
+type ManifestChunk struct {
+	LedgerStart int64  `json:"ledger_start"`
+	LedgerEnd   int64  `json:"ledger_end"`
+	ObjectKey   string `json:"object_key"`
+	SizeBytes   int64  `json:"size_bytes"`
+	EventCount  int64  `json:"event_count"`
+	Checksum    string `json:"checksum"`
 }
 
 // ErrDeferredToLag is returned by ArchiveRange when the configured

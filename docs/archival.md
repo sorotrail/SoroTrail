@@ -78,6 +78,17 @@ have the same key.
 
 The `schema=v1/` directory level and the same field in each chunk's
 `manifest.json` are expected to agree. If they ever diverge — for
+
+## Chunk Compaction & Maintenance
+
+To mitigate high request costs, slow listing times, and read overhead caused by many small archived chunks, SoroTrail supports background chunk compaction.
+
+### Safety Properties
+
+1. **Concurrent Reader Safety**: Compaction updates the manifest atomically by writing a new manifest and swapping the pointer. Readers (queries or restores) see either the complete old chunk set or the complete new chunk set, never a half-updated state.
+2. **Idempotency & Resumability**: Compaction targets contiguous ledger ranges and can be safely re-run. Re-running a completed compaction inspects already-merged larger chunks and performs no unnecessary operations.
+3. **Verify-Then-Delete Ordering**: The merged chunk is fully written, verified against its manifest checksum, and registered in the manifest before any original chunks are removed. This ensures archived data is never permanently lost due to a faulty merge.
+4. **Bounded Memory**: Compaction streams chunk content through multi-writers without loading arbitrarily large data sets fully into RAM. For
 example, an older chunk was re-uploaded inconsistently during a
 v1→v2 migration — the archive is corrupt and must be re-exported;
 treat any schema mismatch as a hard error on read.
