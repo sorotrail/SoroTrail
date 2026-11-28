@@ -952,6 +952,7 @@ connections per cache:
 | `api.LagTracker` | `internal/api` (`LagTracker`) | Latest Stellar RPC chain head ledger number (`cachedLedger`) for `/stats` and `/metrics` | Bounded short TTL (`5s` default) | `5s` TTL expiry on next `LatestLedger(ctx)` call | No (telemetry-only) | `5s` TTL (read-only external RPC chain head telemetry) |
 | `decode.CachingDecoder` | `internal/decode` (`CachingDecoder`) | Bounded LRU (`4096` entries) memoizing pure base64 `ScVal` XDR -> decoded JSON | Process lifetime with `4096`-entry LRU eviction | LRU capacity eviction (pure deterministic XDR decoding) | No (pure memoization) | `0ms` (pure deterministic function of immutable XDR input) |
 | `meta.workerSingleFlightMap` | `internal/meta` (`workerSingleFlightMap`) | Process-local singleflight deduplication map for concurrent metadata fetches | Process lifetime | None (coordinates concurrent RPC metadata lookups) | No (non-security metadata) | N/A (singleflight helper) |
+| `spec.SpecResolver` | `internal/spec` (`SpecResolver`) | Per-contractID history of registered `ContractSpec` versions used for spec-aware event decoding | Process lifetime (append-only; no TTL eviction) | None (append-only spec history) | No (non-security metadata) | N/A (append-only spec history for event decoding) |
 
 #### Missed-invalidation observability and reconnect recovery
 

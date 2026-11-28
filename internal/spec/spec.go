@@ -17,6 +17,8 @@ import (
 	"fmt"
 )
 
+// ContractSpec types and parsing utilities.
+
 // ContractSpec holds the parsed contract specification — the set of event
 // definitions that describe the event shapes a contract can emit.
 type ContractSpec struct {
@@ -27,14 +29,14 @@ type ContractSpec struct {
 	ContractID string `json:"contract_id"`
 	// Events is the set of named event definitions derived from spec entries.
 	Events []EventSpec `json:"events"`
+	// ValidFrom is the ledger sequence or version boundary.
+	ValidFrom uint32 `json:"valid_from,omitempty"`
 }
 
 // EventSpec describes one named event the contract can emit.
 type EventSpec struct {
 	// Name is the event name — the symbol value of topic[0].
 	Name string `json:"name"`
-	// Doc is the optional documentation string from the spec entry.
-	Doc string `json:"doc,omitempty"`
 	// TopicSpecs describes the types of each topic position.
 	// topic[0] is always the event name symbol and is omitted here.
 	// topic[1..n] correspond to the positional fields.

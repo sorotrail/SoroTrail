@@ -42,6 +42,9 @@ full details.
 - [spec-overrides.md](spec-overrides.md) — uploading, inspecting, and deleting
   user-supplied contract event specs, JSON schema validation, precedence over
   on-chain Wasm specs, and cache invalidation behavior.
+- [spec_decoding.md](spec_decoding.md) — relationship between structural event
+  decoding and spec-aware decoding, the SpecResolver history cache, and how
+  specs are applied during event processing.
 - [subscriptions.md](subscriptions.md) — real-time event streaming over WebSocket,
   pub-sub broker architecture, at-most-once delivery semantics, backpressure handling,
   and the cursor catch-up pattern.

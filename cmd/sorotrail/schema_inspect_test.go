@@ -13,14 +13,12 @@ import (
 )
 
 func TestQuerySchemaMatch(t *testing.T) {
-	embedded, err := store.CountEmbeddedMigrations()
+	versions, err := store.EmbeddedMigrationVersions()
 	require.NoError(t, err)
-	require.Greater(t, embedded, 1)
+	require.Greater(t, len(versions), 1)
 
-	allPending := make([]uint, embedded)
-	for i := range allPending {
-		allPending[i] = uint(i + 1)
-	}
+	embedded := int(versions[len(versions)-1]) // max version
+	allPending := versions
 
 	tests := []struct {
 		name           string
