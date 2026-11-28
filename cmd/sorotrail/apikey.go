@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"text/tabwriter"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -20,8 +21,11 @@ import (
 // apiKeyStore abstracts the store calls required by the apikey subcommands.
 type apiKeyStore interface {
 	CreateAPIKey(ctx context.Context, k store.APIKey) (store.APIKey, error)
+	GetAPIKey(ctx context.Context, id int64) (store.APIKey, error)
 	ListAPIKeys(ctx context.Context) ([]store.APIKey, error)
 	RevokeAPIKey(ctx context.Context, id int64) error
+	RotateAPIKey(ctx context.Context, predecessorID int64, newKey store.APIKey, expiresIn time.Duration) (store.APIKey, error)
+	AbandonAPIKeyRotation(ctx context.Context, successorID int64) error
 }
 
 // openAPIKeyStore is the store opener seam used by apikey subcommands.
@@ -50,6 +54,10 @@ func runAPIKeyTo(w io.Writer, args []string) error {
 		return apikeyListTo(w, args[1:])
 	case "revoke":
 		return apikeyRevokeTo(w, args[1:])
+	case "rotate":
+		return apikeyRotateTo(w, args[1:])
+	case "abandon-rotation":
+		return apikeyAbandonRotationTo(w, args[1:])
 	case "help", "-h", "--help":
 		apikeyUsageTo(w)
 		return nil
@@ -69,9 +77,11 @@ Manages the API keys that authenticate write/streaming requests when
 API_KEY_AUTH_ENABLED=true (see README, "API key authentication").
 
 commands:
-  create    issue a new key and print it (shown exactly once)
-  list      list keys — prefixes only; secrets are never stored
-  revoke    revoke a key by id; revoked keys stop working immediately
+  create             issue a new key and print it (shown exactly once)
+  list               list keys — prefixes only; secrets are never stored
+  revoke             revoke a key by id; revoked keys stop working immediately
+  rotate             issue a successor key with overlapping validity while predecessor remains valid
+  abandon-rotation   revoke the successor key of an ongoing rotation and keep predecessor valid
 `)
 }
 
@@ -241,5 +251,125 @@ next request; the action cannot be undone (issue a new key instead).
 		return err
 	}
 	fmt.Fprintf(w, "revoked API key %d\n", id)
+	return nil
+}
+
+func apikeyRotateTo(w io.Writer, args []string) error {
+	fs := flag.NewFlagSet("apikey rotate", flag.ContinueOnError)
+	fs.SetOutput(w)
+	fs.Usage = func() {
+		fmt.Fprint(fs.Output(), `usage: sorotrail apikey rotate ID [--expires-in DURATION]
+
+Issues a successor key for an existing predecessor key, setting an expiry
+on the predecessor so zero-downtime rotation can proceed safely.
+
+flags:
+`)
+		fs.PrintDefaults()
+	}
+	expiresIn := fs.Duration("expires-in", 24*time.Hour, "duration until predecessor key expires during overlap")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if len(fs.Args()) != 1 {
+		fs.Usage()
+		return errors.New("exactly one predecessor key ID is required")
+	}
+	predecessorID, err := strconv.ParseInt(fs.Args()[0], 10, 64)
+	if err != nil || predecessorID <= 0 {
+		return fmt.Errorf("invalid predecessor API key id %q", fs.Args()[0])
+	}
+
+	ctx := context.Background()
+	st, cleanup, err := openAPIKeyStore(ctx)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	pred, err := st.GetAPIKey(ctx, predecessorID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("predecessor API key %d not found", predecessorID)
+		}
+		return err
+	}
+	if pred.Revoked() {
+		return fmt.Errorf("cannot rotate revoked predecessor API key %d", predecessorID)
+	}
+
+	key, prefix, secret, err := apikey.Generate()
+	if err != nil {
+		return fmt.Errorf("generating successor API key: %w", err)
+	}
+	hash, err := apikey.HashSecret(secret)
+	if err != nil {
+		return fmt.Errorf("hashing successor API key secret: %w", err)
+	}
+
+	created, err := st.RotateAPIKey(ctx, predecessorID, store.APIKey{
+		Name:    pred.Name + "-successor",
+		Prefix:  prefix,
+		KeyHash: hash,
+	}, *expiresIn)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(w, "rotated API key %d -> successor %d (%s)\n", predecessorID, created.ID, created.Name)
+	fmt.Fprintf(w, "prefix:        %s\n", created.Prefix)
+	fmt.Fprintf(w, "key:           %s\n", key)
+	fmt.Fprintln(w, "store this key now — it will not be shown again.")
+	return nil
+}
+
+func apikeyAbandonRotationTo(w io.Writer, args []string) error {
+	fs := flag.NewFlagSet("apikey abandon-rotation", flag.ContinueOnError)
+	fs.SetOutput(w)
+	fs.Usage = func() {
+		fmt.Fprint(fs.Output(), `usage: sorotrail apikey abandon-rotation SUCCESSOR_ID
+
+Abandons an ongoing rotation by revoking the successor key and leaving
+the predecessor key valid.
+`)
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if len(fs.Args()) != 1 {
+		fs.Usage()
+		return errors.New("exactly one successor key ID is required")
+	}
+	successorID, err := strconv.ParseInt(fs.Args()[0], 10, 64)
+	if err != nil || successorID <= 0 {
+		return fmt.Errorf("invalid successor API key id %q", fs.Args()[0])
+	}
+
+	ctx := context.Background()
+	st, cleanup, err := openAPIKeyStore(ctx)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	_, err = st.GetAPIKey(ctx, successorID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("successor API key %d not found", successorID)
+		}
+		return err
+	}
+
+	if err := st.AbandonAPIKeyRotation(ctx, successorID); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(w, "abandoned rotation: revoked successor API key %d\n", successorID)
 	return nil
 }

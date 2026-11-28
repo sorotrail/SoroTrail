@@ -16,10 +16,10 @@ import (
 // never passed to or stored by the store.
 func (p *Postgres) CreateAPIKey(ctx context.Context, k APIKey) (APIKey, error) {
 	err := p.pool.QueryRow(ctx, `
-		INSERT INTO api_keys (name, prefix, key_hash)
-		VALUES ($1, $2, $3)
-		RETURNING id, created_at`,
-		k.Name, k.Prefix, k.KeyHash,
+	INSERT INTO api_keys (name, prefix, key_hash, predecessor_id, expires_at)
+	VALUES ($1, $2, $3, $4, $5)
+	RETURNING id, created_at`,
+		k.Name, k.Prefix, k.KeyHash, k.PredecessorID, k.ExpiresAt,
 	).Scan(&k.ID, &k.CreatedAt)
 	if err != nil {
 		return APIKey{}, fmt.Errorf("creating API key: %w", err)
@@ -29,7 +29,7 @@ func (p *Postgres) CreateAPIKey(ctx context.Context, k APIKey) (APIKey, error) {
 
 func (p *Postgres) GetAPIKey(ctx context.Context, id int64) (APIKey, error) {
 	row := p.pool.QueryRow(ctx, `
-		SELECT id, name, prefix, key_hash, created_at, revoked_at
+		SELECT id, name, prefix, key_hash, created_at, revoked_at, predecessor_id, expires_at, last_used_at
 		FROM api_keys WHERE id = $1`, id,
 	)
 	return scanAPIKey(row)
@@ -40,16 +40,16 @@ func (p *Postgres) GetAPIKey(ctx context.Context, id int64) (APIKey, error) {
 // effect on the very next request that presents the key.
 func (p *Postgres) LookupAPIKeyByPrefix(ctx context.Context, prefix string) (APIKey, error) {
 	row := p.pool.QueryRow(ctx, `
-		SELECT id, name, prefix, key_hash, created_at, revoked_at
+		SELECT id, name, prefix, key_hash, created_at, revoked_at, predecessor_id, expires_at, last_used_at
 		FROM api_keys
-		WHERE prefix = $1 AND revoked_at IS NULL`, prefix,
+		WHERE prefix = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())`, prefix,
 	)
 	return scanAPIKey(row)
 }
 
 func (p *Postgres) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 	rows, err := p.pool.Query(ctx, `
-		SELECT id, name, prefix, key_hash, created_at, revoked_at
+		SELECT id, name, prefix, key_hash, created_at, revoked_at, predecessor_id, expires_at, last_used_at
 		FROM api_keys ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing API keys: %w", err)
@@ -94,12 +94,50 @@ func (p *Postgres) RevokeAPIKey(ctx context.Context, id int64) error {
 	return nil
 }
 
+// RotateAPIKey creates a successor key for predecessorID and sets an expiry on
+// the predecessor so callers can transition without a gap in service. The
+// predecessor is NOT revoked here; call RevokeAPIKey when the transition is
+// complete, or AbandonAPIKeyRotation to cancel and revoke the successor instead.
+func (p *Postgres) RotateAPIKey(ctx context.Context, predecessorID int64, newKey APIKey, expiresIn time.Duration) (APIKey, error) {
+	if _, err := p.GetAPIKey(ctx, predecessorID); err != nil {
+		return APIKey{}, fmt.Errorf("looking up predecessor API key: %w", err)
+	}
+	expiry := time.Now().UTC().Add(expiresIn)
+	newKey.PredecessorID = &predecessorID
+	newKey.ExpiresAt = &expiry
+	created, err := p.CreateAPIKey(ctx, newKey)
+	if err != nil {
+		return APIKey{}, fmt.Errorf("creating successor API key: %w", err)
+	}
+	return created, nil
+}
+
+// AbandonAPIKeyRotation revokes the successor key (cancelling the rotation).
+// The predecessor key is unaffected and remains active.
+func (p *Postgres) AbandonAPIKeyRotation(ctx context.Context, successorID int64) error {
+	return p.RevokeAPIKey(ctx, successorID)
+}
+
+func (p *Postgres) UpdateAPIKeyLastUsed(ctx context.Context, id int64, t time.Time) error {
+	threshold := t.Add(-time.Minute)
+	_, err := p.pool.Exec(ctx, `
+		UPDATE api_keys SET last_used_at = $2
+		WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < $3)`, id, t, threshold)
+	if err != nil {
+		return fmt.Errorf("updating API key last used: %w", err)
+	}
+	return nil
+}
+
 func scanAPIKey(row pgx.Row) (APIKey, error) {
 	var (
-		k       APIKey
-		revoked *time.Time
+		k        APIKey
+		revoked  *time.Time
+		predID   *int64
+		expires  *time.Time
+		lastUsed *time.Time
 	)
-	err := row.Scan(&k.ID, &k.Name, &k.Prefix, &k.KeyHash, &k.CreatedAt, &revoked)
+	err := row.Scan(&k.ID, &k.Name, &k.Prefix, &k.KeyHash, &k.CreatedAt, &revoked, &predID, &expires, &lastUsed)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return APIKey{}, ErrNotFound
 	}
@@ -107,5 +145,8 @@ func scanAPIKey(row pgx.Row) (APIKey, error) {
 		return APIKey{}, fmt.Errorf("scanning API key: %w", err)
 	}
 	k.RevokedAt = revoked
+	k.PredecessorID = predID
+	k.ExpiresAt = expires
+	k.LastUsedAt = lastUsed
 	return k, nil
 }
