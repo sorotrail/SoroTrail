@@ -188,44 +188,44 @@ func queryMigrationState(ctx context.Context, pool *pgxpool.Pool) (version int, 
 	return version, dirty, nil
 }
 
-// querySchemaMatch compares the applied migration version with the count of
-// embedded migration files. When the database is fully up to date, the applied
-// version equals the number of embedded .up.sql files and there are no pending
-// versions.
+// querySchemaMatch compares the applied migration version against the embedded
+// migration set. When the database is fully up to date there are no pending
+// versions. Using the actual version numbers (rather than the file count) means
+// the check is correct even when multiple in-flight branches add migrations with
+// non-consecutive version numbers.
 func querySchemaMatch(appliedVersion int) (*schemaMatchInfo, error) {
-	// Count embedded migrations (each version has exactly one .up.sql file).
-	entries, err := store.CountEmbeddedMigrations()
+	versions, err := store.EmbeddedMigrationVersions()
 	if err != nil {
-		return nil, fmt.Errorf("counting embedded migrations: %w", err)
+		return nil, fmt.Errorf("listing embedded migrations: %w", err)
+	}
+
+	maxVersion := 0
+	if len(versions) > 0 {
+		maxVersion = int(versions[len(versions)-1])
 	}
 
 	var pending []uint
-	if appliedVersion > 0 {
-		for v := appliedVersion + 1; v <= entries; v++ {
-			pending = append(pending, uint(v))
-		}
-	} else {
-		// No migrations applied — every embedded version is pending.
-		for v := 1; v <= entries; v++ {
-			pending = append(pending, uint(v))
+	for _, v := range versions {
+		if int(v) > appliedVersion {
+			pending = append(pending, v)
 		}
 	}
 
-	matched := appliedVersion > 0 && appliedVersion == entries
+	matched := appliedVersion > 0 && appliedVersion == maxVersion
 	detail := fmt.Sprintf("applied %d, embedded %d, pending %d",
-		appliedVersion, entries, len(pending))
+		appliedVersion, maxVersion, len(pending))
 	if appliedVersion == 0 {
 		detail = "no migrations applied"
-	} else if appliedVersion > entries {
-		detail = fmt.Sprintf("applied %d exceeds embedded %d", appliedVersion, entries)
+	} else if appliedVersion > maxVersion {
+		detail = fmt.Sprintf("applied %d exceeds embedded %d", appliedVersion, maxVersion)
 	} else if len(pending) > 0 {
 		detail = fmt.Sprintf("applied %d, embedded %d, %d pending: %v",
-			appliedVersion, entries, len(pending), pending)
+			appliedVersion, maxVersion, len(pending), pending)
 	}
 
 	return &schemaMatchInfo{
 		Matched:           matched,
-		EmbeddedVersion:   entries,
+		EmbeddedVersion:   maxVersion,
 		AppliedVersion:    appliedVersion,
 		PendingMigrations: pending,
 		Detail:            detail,
