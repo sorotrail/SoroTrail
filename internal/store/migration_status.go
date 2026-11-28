@@ -45,6 +45,28 @@ func CountEmbeddedMigrations() (int, error) {
 	return count, nil
 }
 
+// EmbeddedMigrationVersions returns the actual version numbers of embedded
+// Postgres .up.sql migration files in ascending order. Unlike
+// CountEmbeddedMigrations, this correctly handles non-sequential version
+// numbers (gaps introduced when multiple PRs branch from the same base and
+// each adds a migration with a different version number).
+func EmbeddedMigrationVersions() ([]uint, error) {
+	entries, err := postgresMigrationsFS.ReadDir("migrations")
+	if err != nil {
+		return nil, fmt.Errorf("reading embedded migrations: %w", err)
+	}
+	var versions []uint
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".up.sql") {
+			var v uint
+			if _, scanErr := fmt.Sscanf(e.Name(), "%d_", &v); scanErr == nil {
+				versions = append(versions, v)
+			}
+		}
+	}
+	return versions, nil
+}
+
 func migrationVersions(migrationSource source.Driver, current uint) ([]uint, error) {
 	first, err := migrationSource.First()
 	if err != nil {
