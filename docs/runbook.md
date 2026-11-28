@@ -1034,6 +1034,18 @@ See the README for full descriptions.
 | `AUDIT_ENABLED` | `false` | Enable the background auditor. Set to `true` for data integrity checks. |
 | `AUDIT_MAX_REPAIR_ATTEMPTS` | `3` | Repair iterations before a finding becomes `unrecoverable`. |
 | `AUDIT_MAX_RPS` | `10` | Total RPC request budget shared between ingest and audit. |
+| `REPLICA_DATABASE_URL` | unset | Optional Postgres read-replica connection string for read-only queries (`ReplicaSafeMethods`). |
+| `REPLICA_MAX_LAG` | `30s` | Maximum replication lag (sampled via `pg_last_xact_replay_timestamp`) before routed reads fall back to the primary. |
+
+---
+
+## Read-replica routing and lag fallback
+
+When `REPLICA_DATABASE_URL` is configured on a Postgres deployment, `store.ReplicaRouter` routes only the explicitly allowlisted read methods (`ReplicaSafeMethods`: `GetEvent`, `GetEventsByTxHash`, `EventExists`, `QueryEvents`, `CountEvents`, `AggregateEvents`, `GetContractSummary`, `ContractEventTypeCounts`, `ListContracts`, `CountContracts`, `Stats`, `QueryAddressEvents`, `CountAddressEvents`, `GetAddressSummary`, `GetContractMeta`, and `CountContractEvents`) to the replica pool.
+
+- **Primary-only reads**: Ingestion cursors (`GetIngestionState`, `GetContractCursor`, `ListContractCursors`), backfill checkpoints, audit state, subscriptions, API keys, and tenant management always stay on the primary pool so read-your-writes invariants hold.
+- **Cursor and lag safety**: Replication lag is sampled every 5 seconds via `pg_last_xact_replay_timestamp()` and exported as `sorotrail_db_replica_lag_seconds`. When lag exceeds `REPLICA_MAX_LAG` (default `30s`), or when a pagination cursor's ledger is ahead of the replica's `LastIngestedLedger`, or when the replica connection fails, the router transparently replays the read on the primary and increments `sorotrail_db_replica_fallbacks_total`.
+- **Readiness**: `Ping` checks only the primary pool, so losing a read replica degrades read capacity rather than failing `/readyz`.
 
 ---
 
